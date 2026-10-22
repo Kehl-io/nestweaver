@@ -1,8 +1,13 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6395
+assertion_line: 11755
 expression: "parsed_references(\"Simple.kt\", &source)"
 ---
+- name: com.example
+  kind: PackageBinding
+  start_line: 1
+  context: package com.example
+  receiver: ~
 - name: com.example.utils.Helper
   kind: Import
   start_line: 3

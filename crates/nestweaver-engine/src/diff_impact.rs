@@ -62,7 +62,9 @@ pub fn compute_diff_changes(
     // (no `core.quotePath` C-quoting), so accented/CJK filenames survive
     // instead of being emitted as `"caf\303\251.js"` and silently dropped
     // when handed to `git show`.
-    let output = crate::git_cmd::isolated_git()
+    // A working-tree side runs the repository's clean filters unless
+    // `isolated_git_in` disables them.
+    let output = crate::git_cmd::isolated_git_in(repo_path)?
         .args([
             "diff",
             "-M",
@@ -138,7 +140,7 @@ pub fn compute_diff_changes(
     }
 
     // Get deleted files. `--name-only -z` emits just NUL-separated paths.
-    let del_output = crate::git_cmd::isolated_git()
+    let del_output = crate::git_cmd::isolated_git_in(repo_path)?
         .args(["diff", "--name-only", "-z", "--diff-filter=D", diff_spec])
         .current_dir(repo_path)
         .output()
@@ -350,6 +352,30 @@ fn compute_rename_moves(
 
 #[cfg(test)]
 mod tests {
+    /// A range diff never runs a repository's filters or diff drivers.
+    #[test]
+    fn compute_diff_changes_runs_no_repository_attribute_programs() {
+        let repo = crate::git_cmd::hostile_repo::hostile_repo();
+        // Plain Git runs the filters to commit; only the code under test is
+        // measured.
+        // `inc`'s marker is not a real long-running process filter.
+        let commit = repo.plain_git(&[
+            "-c",
+            "filter.inc.process=",
+            "commit",
+            "-q",
+            "-a",
+            "-m",
+            "two",
+        ]);
+        assert!(commit.status.success(), "{commit:?}");
+        repo.clear();
+        let changes =
+            compute_diff_changes(repo.path(), "HEAD~1..HEAD", "https://example.com/r").unwrap();
+        assert!(!changes.is_empty(), "the edits must still be seen");
+        assert_eq!(repo.ran(), Vec::<String>::new());
+    }
+
     use super::*;
 
     /// Each side of the range starts a `git show <rev>:<path>` argument, so

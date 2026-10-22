@@ -3073,7 +3073,10 @@ impl CodeWatcher {
         &self,
         reader: &crate::content_reader::FilesystemReader,
     ) -> anyhow::Result<bool> {
-        let mut command = std::process::Command::new("git");
+        // `status` hashes stat-dirty files through the repository's clean
+        // filter: `isolated_git_in` disables attribute-selected programs.
+        let mut command = crate::git_cmd::isolated_git_in(&self.repo_root)
+            .context("git status for watcher HEAD record")?;
         command.current_dir(&self.repo_root).args([
             "status",
             "--porcelain=v1",
@@ -3348,15 +3351,8 @@ fn prepare_code_file(
     // still the exact snapshot represented by `symbols`.
     let lang = detect_language(&abs_path).unwrap_or(nestweaver_schema::Language::JavaScript);
 
-    // Load workspace context for JS/TS monorepo resolution.
-    let workspace_ctx = if matches!(
-        lang,
-        nestweaver_schema::Language::JavaScript
-            | nestweaver_schema::Language::TypeScript
-            | nestweaver_schema::Language::Vue
-            | nestweaver_schema::Language::Svelte
-            | nestweaver_schema::Language::Astro
-    ) {
+    // Load workspace context for JS/TS monorepo and Go module resolution.
+    let workspace_ctx = if crate::index::language_uses_workspace_context(lang) {
         discover_workspace_context(reader.root())
     } else {
         Default::default()
@@ -3552,6 +3548,17 @@ mod tests {
         ) -> anyhow::Result<()> {
             crate::index::FileSystemIndexEpilogueIo.save_pagerank(lease, path)
         }
+    }
+
+    /// The watcher's `git status` never runs a repository's clean filters.
+    #[test]
+    fn worktree_drift_status_runs_no_repository_attribute_programs() {
+        let repo = crate::git_cmd::hostile_repo::hostile_repo();
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), repo.path(), "test");
+        let reader = watcher.reader_for("file:///hostile").unwrap();
+        assert!(watcher.indexable_worktree_drift(&reader).unwrap());
+        assert_eq!(repo.ran(), Vec::<String>::new());
     }
 
     #[test]

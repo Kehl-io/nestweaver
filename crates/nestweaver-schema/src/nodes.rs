@@ -218,6 +218,31 @@ impl<'a> QualifiedSpec<'a> {
     }
 }
 
+/// The receiver type of a Go method, from its stored signature line:
+/// `func (u *UUID) String() string {` names `UUID`. `None` for a non-Go file
+/// or a plain function.
+///
+/// QA #5: Go declares methods outside their type, so the parser records no
+/// `MEMBER_OF` container and `UUID::String` named nothing. The receiver is
+/// the one place the owning type is written, so qualified lookups and
+/// candidate displays read it from there.
+pub fn go_receiver_type<'s>(file_path: &str, signature: &'s str) -> Option<&'s str> {
+    if !file_path.ends_with(".go") {
+        return None;
+    }
+    let rest = signature.trim_start().strip_prefix("func")?.trim_start();
+    let rest = rest.strip_prefix('(')?;
+    let receiver = &rest[..rest.find(')')?];
+    // `u *UUID`, `*UUID`, `u UUID[T]`, `UUID`: the type is the last token.
+    let ty = receiver.split_whitespace().last()?;
+    let ty = ty.trim_start_matches('*');
+    let ty = ty.split('[').next().unwrap_or(ty);
+    // A qualified receiver (`pkg.T`) is not legal Go; keep the last segment
+    // defensively.
+    let ty = ty.rsplit('.').next().unwrap_or(ty);
+    (!ty.is_empty() && ty.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(ty)
+}
+
 /// How closely a `file::name` qualifier names a symbol's file: an exact
 /// repo-relative path beats a path suffix, which beats a suffix without the
 /// extension (`conftest` for `tests/conftest.py`, the file-stem match).
@@ -634,6 +659,35 @@ pub struct Contract {
 #[cfg(test)]
 mod tests {
     use super::{Repo, SymbolKind};
+
+    #[test]
+    fn go_receiver_type_reads_the_receiver_from_the_signature() {
+        use super::go_receiver_type;
+        assert_eq!(
+            go_receiver_type("uuid.go", "func (u UUID) String() string {"),
+            Some("UUID")
+        );
+        assert_eq!(
+            go_receiver_type("a/b.go", "func (g *Greeter) Greet() {"),
+            Some("Greeter")
+        );
+        assert_eq!(
+            go_receiver_type("x.go", "func (l *List[T]) Len() int {"),
+            Some("List")
+        );
+        assert_eq!(
+            go_receiver_type("x.go", "func (UUID) Version() Version {"),
+            Some("UUID")
+        );
+        assert_eq!(
+            go_receiver_type("x.go", "func Parse(s string) (UUID, error) {"),
+            None
+        );
+        assert_eq!(
+            go_receiver_type("x.rs", "func (u UUID) String() string {"),
+            None
+        );
+    }
 
     fn symbol_at(name: &str, file_path: &str) -> super::Symbol {
         super::Symbol {

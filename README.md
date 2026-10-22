@@ -157,7 +157,9 @@ nestweaver setup claude-code --db "$(pwd)/nestweaver.lbug"
 instructions. Use an absolute database path so clients launched from another
 directory still query the same graph. It supports 16 integrations, including Claude Code, Cursor,
 Codex, Gemini CLI, and Copilot CLI. Most config files are written in the repo;
-Windsurf uses its user-level config. Restart or reload your client and check
+Windsurf uses its user-level config, and Cline gets a printed snippet to paste.
+`setup` attempts every tool, lists what it wrote for each, and exits non-zero
+if any tool failed. Restart or reload your client and check
 its tool list to confirm activation. Cursor gets the six-tool lite set; other
 MCP integrations use the full set. For a client you configure manually, launch
 `nestweaver mcp --db /absolute/path/to/nestweaver.lbug` as its stdio server; see
@@ -166,7 +168,8 @@ MCP integrations use the full set. For a client you configure manually, launch
 > The first interactive `index` run from inside your repo also offers setup.
 > The prompt is skipped in CI, scripts, and non-TTY runs; `index --setup`
 > explicitly requests setup at the indexed repo root. Use `setup --force` only
-> when you want to overwrite customized skill/guide files.
+> when you want to overwrite customized skill/guide files or rebind an existing
+> registration to a different `--db` (a changed `--db` is reported otherwise).
 
 ```sh
 # Keep the graph current as you edit (runs until interrupted)
@@ -185,21 +188,24 @@ notes below before using an older database with a new binary.
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
 - For a compatible database, run `nestweaver stale-check --db <db>`. The
-  current resolver generation is **11**; any other generation requires
+  current resolver generation is **12**; any other generation requires
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - **This release needs a forced re-index of every repository.** It moves the
-  resolver generation to 11 and the parsed cache to 7 (generation 10 never
-  shipped, so one forced re-index covers both): run
-  `nestweaver index --repo <path> --force` for each repo. `stale-check` exits 2
-  until you do.
+  resolver generation from 11 to 12 and the parsed cache from 7 to 8, because
+  Go, Python, Kotlin/Java import resolution and method-call resolution changed:
+  run `nestweaver index --repo <path> --force` once for each repo.
+  `stale-check` exits 2 and `dead-code` refuses until you do; `blast-radius`
+  misses the new edges. The filemeta and resolution-deps sidecars also move
+  from 4 to 5, so the first `index` after upgrading is a full rebuild either
+  way.
 - New databases do not need migration. Vaults do not carry a code resolver
   generation; see the detailed notes for separate Markdown derivation changes.
 
 <details>
 <summary>Detailed migration notes and changes for scripts and server clients</summary>
 
-**`RESOLVER_GENERATION` is 11. Every graph indexed by another generation must be
+**`RESOLVER_GENERATION` is 12. Every graph indexed by another generation must be
 re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
@@ -237,8 +243,23 @@ Generation 11 (nw-787, nw-789) scopes a nested JS/TS `function` declaration to
 where it is visible, stops a bare JS/TS call binding a method or accessor,
 scopes a Python `def` nested in a function to that function, and gives a nested
 class's members `MEMBER_OF` their own class (parsed cache 7). Graphs indexed at
-generation 9 or 10 need the same forced re-index. All these kinds of staleness have the same remedy and the
-same symptom list. Until you re-index:
+generation 9 or 10 need the same forced re-index.
+
+Generation 12 resolves imports by package instead of by file name, and
+resolves more method calls (parsed cache 8):
+
+| Change | Effect on the graph |
+| --- | --- |
+| Go imports read `go.mod`, `go.work` and local `replace` lines, map an import to every non-test file of the package, and honour import aliases | Cross-package calls in a real Go module resolve; they did not before |
+| Go methods carry their receiver type (`MEMBER_OF` edges), and every build-tag variant of a function is a callee | Typed Go method calls resolve, and `Type::method` names look up |
+| Python `from . import mod`, `from pkg import mod as m`, `import pkg.mod as m` and aliased re-exports through `__init__` bind the submodule or definition | Those calls gain edges |
+| Kotlin and Java imports resolve through the declared package (any file of it, wildcard imports, nested classes), not a file named after the symbol | Imports of classes in differently named files resolve |
+| A method called on a call or `new` receiver (`new K().m()`, `K.make().m()`, chains) resolves through the declared return type; a method on an untyped expression links only when its name is unique in the repository | More method calls gain edges, conservatively |
+| `new Foo()` links the class in Java, C#, PHP, C++, Scala, Groovy and Dart; Rust trait default methods and turbofish calls resolve; a bare TS/JS `@decorator` references its function | Constructors, trait defaults and decorators are no longer unreachable |
+| Duplicate JS/TS `this.x =` properties collapse to one symbol, and a bodiless Rust `mod x;` no longer owns the lines below it | Fewer duplicate symbols and no false `IMPORTS` edges |
+
+All these kinds of staleness have the same remedy and the same symptom list.
+Until you re-index:
 
 - **Rankings are stale.** `hubs`, `bridges`, `repo-map`, `clusters`, and every
   PageRank-ordered result are computed over edges the old resolver wrote.
@@ -346,6 +367,25 @@ Also changing behaviour in this release, in ways a script may notice:
 
 | Change | What to do |
 | --- | --- |
+| **Re-index required.** `RESOLVER_GENERATION` moves from 11 to 12 and the parsed cache from 7 to 8 (Go, Python, Kotlin/Java import resolution; method calls on call or `new` receivers; `new Foo()` edges; see the generation 12 table above). The filemeta and resolution-deps sidecars move from 4 to 5, so the first index after upgrading rebuilds in full | Run `nestweaver index --repo <path> --force` once per repo; until then `stale-check` exits 2, `dead-code` refuses and `blast-radius` misses the new edges |
+| `affected-tests` diffs one repository. With `--base-ref` it is the indexed repo checked out at the working directory's git root; with `--files` it is the only indexed repo, and when several are indexed the new `--repo <name or UID>` is required (exit **64** otherwise). Repo-relative paths resolve only in that repo, and `--json` names it. MCP `affected_tests` takes `repo` the same way and refuses `files`/`changed_files` together with `base_ref` (it used to ignore `base_ref`) | Pass `--repo` (MCP `repo`) when more than one repo is indexed; send either changed files or a base ref, not both |
+| `daemon status` exits **69** when the daemon is unhealthy (running but unreachable, or an owner it cannot verify). `setup` attempts every tool and exits non-zero if any failed. `remove-repo` with an ambiguous name exits **3**. An empty query argument exits **64**, and so do `pre-push-impact` with a bad `--format` or `--min-severity`, `list-features` without `--config` and `interactions show` with no arguments. `memory consolidate --apply` with nothing to apply exits 0. A database error under `--json` prints a JSON envelope | Treat 69 as "restart the daemon" (`nestweaver daemon --db <db> restart`), 64 as a usage error |
+| An explicit `read-symbols --root` (MCP `root`) must be inside an indexed repository or vault, or a linked worktree of one. A body read never follows a symlink out of the repository, and the web `/source` route walks from the repo root without following symlinks | Omit `--root`, or point it at the indexed checkout |
+| Git runs isolated for every repository NestWeaver reads, including `pre-push-impact --local-changes`, the code watcher and `blast-radius`. The repository's `core.fsmonitor`, hooks, clean/smudge/process filters, textconv and external-diff drivers, `core.askPass` and signature verification never run; a repository whose driver configuration cannot be listed is refused. A file a repo-local filter (for example Git LFS installed with `--local`) would have normalised may now show as modified in change detection | Nothing to change for normal repositories; expect LFS-tracked files to appear modified where a filter used to hide the difference |
+| Git metadata a repository borrows from another (a forged `.git/commondir`, a gitfile into another repo) is refused, and such a layout never takes the other repo's identity. `/proc`, `/sys`, `/dev` (at any depth) and other system roots are refused as repo or vault roots, and an instance id containing `/`, `\` or `..` is rejected | Index the real checkout, not a path through a pseudo-filesystem |
+| An unreadable source in a language that cannot carry API contracts is skipped and disclosed (`read_error` row, `coverage_status: "degraded"`) instead of failing the index or watcher batch. An unreadable JS/TS/Java/Kotlin source still fails closed, because skipping a controller would publish an incomplete contract set. A file that vanishes mid-scan is a deletion. A malformed OpenAPI spec that never published contracts is skipped and disclosed instead of failing every index | Gate on `coverage_status` / `--fail-on-skip`; fix the named file's permissions |
+| Edits to `.gitignore`, `.ignore` and `.git/info/exclude` are reconciled: newly hidden sources leave the graph and newly visible ones are indexed, at watcher time and at startup. Global-excludes patterns with a slash are anchored at the repo root. A watcher that cannot publish, an interrupted vault refresh and an interrupted embedding pass now show in `brain status` until they finish | Nothing to change |
+| An incremental index that was killed part-way leaves a per-repo "publication incomplete" record: `stale-check` reports the repo `incomplete` and the next index rebuilds it in full. A full index whose bulk-load checkpoint fails now fails instead of reporting success. A daemon whose database file was deleted or replaced refuses writes | Re-run `nestweaver index --repo <path>` for a repo `stale-check` reports `incomplete` |
+| Client-supplied lists and values are capped and stated in each MCP tool's `inputSchema`: context `seeds` at most 256 (duplicates collapsed), `kinds` 32, repo/tag filters 100 (1000 for `hub_nodes`/`bridge_nodes`), file lists 1000, `count_patterns.patterns` 64. `set_extension`: uid 1 KiB, key 256 bytes, value 64 KiB of JSON, no control characters, `last_indexed_at` reserved, node and property counts capped. `brain_add_source` names: 1-255 characters with no control characters (CLI and store too; an already-stored bad name is listed escaped and can be removed by path or UID). MCP stdio frames are capped at 64 MiB | Split oversized requests; read the limits from `tools/list` |
+| `brain_remove_source` refuses a target that matches sources of different kinds (a repo and a vault sharing a name) or several sources, with `candidates`; repo URLs match exactly (no suffix match). It also accepts the derived repo name the other tools use. `prune_stale` removes a source only when its root is not found; an unreadable root is kept with a warning | Retry with a UID from `candidates` |
+| Metadata writes (`set_extension`, `unset_extension`, `interactions forget`) wait at most `NESTWEAVER_METADATA_WRITE_WAIT_SECS` (default 15) for the write lock, then answer `write-busy`; a cancelled request is never applied. MCP `count_patterns` has one `max_millis` budget for the whole call (default 10 s), shared by all patterns, and marks a pattern it cut `truncated: true` with lower-bound counts | Retry a `write-busy` answer; raise `max_millis` for a large pattern set |
+| `brain_context` and `brain_search` rank an exact-case symbol match first and apply repo filters before the result cap. `regex_search` without a trigram index finds what `count_patterns` finds. `blast_radius` gives the same risk on identical calls. Concise MCP rows keep `uid` and location, so they are larger | Nothing to change; budget for slightly larger concise responses |
+| New response fields: `missing_sections` (`note_get`), `did_you_mean_by_target` (`read_symbols`), `changed_symbol_count`, `proposals_already_applied` (`brain_memory_consolidate`, whose `limit` is now applied before any proposal moves), `refresh_vault_paths`, `truncated` on pattern counts, and `publication_in_progress`. `note get`, `backlinks` and MCP `note_get` resolve a path-qualified title without `.md`; `[[Note#^id]]` block references resolve | Read the new fields where useful; they are additive |
+| `contracts diff` reports parameter and response-status changes, and `--fail-on-breaking` fails on them | Review the newly reported changes before gating |
+| The CLI sends the daemon absolute `--config`, root and `backup save` paths, and the daemon refuses relative ones. `watch-stop` no longer starts a daemon. Tracing respects `--no-color`, `NO_COLOR` and non-TTY stderr, and an invalid numeric `NESTWEAVER_*` value warns once instead of being silently ignored. Terminal control sequences from indexed content are escaped when stdout is a terminal. Secret env var values no longer appear in `--help` | Nothing to change |
+| `backup save --force` refuses a destination that is the live database or one of its files (also through a symlink or hard link), and `backup restore --force` replaces only a NestWeaver data directory. `config validate` checks that fusion weights sum to 1.0, rejects duplicate repos and caps the file size | Pick a backup path outside the database's files |
+| `setup` was checked against each tool's documented config location: VS Code and Copilot get `.vscode/mcp.json` under `servers`; Continue gets `.continue/mcpServers/nestweaver.json`; Kiro `.kiro/settings/mcp.json`; Cline gets a printed snippet; Aider's invalid `repo-map:` line is gone. Hook commands quote an absolute `--db`. A changed `--db` is reported and `--force` rebinds it. `setup` refuses to write through a symlinked directory outside the project. The Claude Code hooks (shipped and installed) now read `tool_input` and return `hookSpecificOutput`, so they actually fire; re-running `setup claude-code` repairs an older install | Re-run `nestweaver setup` after upgrading |
+| `hooks --install` takes `--db` (written into the hook as an absolute path) and never writes through a symlink; `--uninstall` restores the newest backup | Pass `--db` when the database is not `./nestweaver.lbug` |
 | Interaction memory (`--track-interactions`) is now a re-rank, not part of the walk. A node the query's walk reached is scaled by at most +5% by how often agents used it; a node the seed cannot reach stays out, however often it was used. Results a query only showed no longer count toward the three-session floor, and the end-of-session success signal reinforces only results the agent then opened (B3). Before this, interacted nodes were teleport targets, so `context` could list dozens of unrelated symbols | Optionally run `nestweaver interactions clear` once to drop sessions recorded under the old rules, whose shown-only results still carry a floor |
 | MCP `brain_impact` sends its dependents once, as `impact_nodes`; the duplicate `nodes` list is gone from MCP (the CLI `--json` keeps both). A cut made to fit the output budget is disclosed in `output_budget.cuts`, and `truncated_by_limit` is set only when `limit` was the cause (M3) | Read `impact_nodes` |
 | A repo filter that names no repo (`hubs --repo nosuch`, every `--repo` listed below) writes `"error": "not found"` in `--json`, the word every other not-found envelope uses; it was `"not_found"`. `status` still reads `"not_found"` (B6) | Branch on `status`, or on `error == "not found"` |
@@ -375,7 +415,7 @@ Also changing behaviour in this release, in ways a script may notice:
 | `daemon gc` also prunes the authority registry (`~/.local/state/nestweaver/authority`), which grew one lock record per database scope ever locked (nw-811). It removes records whose database, publication root or operation journal is gone, and empty records from earlier releases that are older than 24h, unheld and match no live database; a record some process holds is never removed. `--dry-run` reports what would go and changes nothing (it skips the launch-agent and directory sweeps). `--db X` limits the prune to X's records and leaves the older empty records alone. A registry gc cannot sweep is a warning, not a failure | Run `nestweaver daemon gc --dry-run` to preview, then `nestweaver daemon gc` |
 | A watcher pass over a file with a class keeps its `MEMBER_OF` edges and resolves `this.m()` / `self.m()` as `type_aware`, as a fresh index does. Before, it dropped every `MEMBER_OF` edge of the edited file, so `dead-code` on a watcher-maintained graph could list constructors | Nothing to change; graphs kept by an older watcher regain the edges on the file's next edit or a `--force` index |
 | A code watcher keeps running when a committed batch's evidence cannot be saved. It notifies the committed graph and discloses the outstanding repair, retaining replay paths in memory across retries. Successfully persisted replay debt also survives restart; startup repairs imports across bounded source batches. | Restore access to the reported evidence files and let the watcher retry. If replay debt itself could not be persisted, keep the watcher running until repair completes; after interruption, run `nestweaver index --repo <path> --force` to rebuild missing evidence and relationships. |
-| **Rebuild required.** LadybugDB 0.21 (this release ships 0.21.1) changes how text keys are hashed and its on-disk format marker did not change, so NestWeaver now refuses a database built by an earlier version before opening it: exit **1**, `nestweaver::db_rebuild_required`, the exact rebuild command, no daemon started, no byte changed. Snapshot format is now **4**; older snapshots are refused, and `backup restore` of a pre-upgrade archive warns that the result needs a rebuild | Stop the daemon, run `nestweaver backup save <file>` (it reads the old database read-only and marks the archive as pre-upgrade), then `nestweaver publication rebuild --config <instance.toml>`; the old database stays in place until the new one validates. To roll back, reinstall the previous version and restore your backup. Do not open a rebuilt database with an older NestWeaver. See `docs/guide/publication-rebuild.md` |
+| **Rebuild required.** LadybugDB 0.21 (0.21.2 as of 12.2.x) changes how text keys are hashed and its on-disk format marker did not change, so NestWeaver now refuses a database built by an earlier version before opening it: exit **1**, `nestweaver::db_rebuild_required`, the exact rebuild command, no daemon started, no byte changed. Snapshot format is now **4**; older snapshots are refused, and `backup restore` of a pre-upgrade archive warns that the result needs a rebuild | Stop the daemon, run `nestweaver backup save <file>` (it reads the old database read-only and marks the archive as pre-upgrade), then `nestweaver publication rebuild --config <instance.toml>`; the old database stays in place until the new one validates. To roll back, reinstall the previous version and restore your backup. Do not open a rebuilt database with an older NestWeaver. See `docs/guide/publication-rebuild.md` |
 | A daemon killed by a fatal signal (SIGSEGV, SIGBUS, SIGABRT, SIGILL) while answering is now named. A database with damaged index pages can open under LadybugDB 0.21 and fault on a later lookup; the command used to print a bare `transport error … broken pipe`, and the respawned daemon reported a healthy `brain status`. The command now exits **1** with `nestweaver::daemon_engine_crashed` and the recovery, MCP tool calls return the same message with `isError: true`, and `brain status` prints a warning (`--json`: a `warnings[]` entry of kind `daemon_unclean_exit` with `exit`, `signal`, `at_unix`, `pid`, `count`). A daemon killed from outside (`kill -9`, the OOM killer) is reported as `exited_unexpectedly`, with no claim about the storage engine. `daemon stop` (with or without `--force`), Ctrl-C on a foreground `daemon run` and an idle exit leave no warning, and the warning clears when a daemon next shuts down cleanly. Nothing in the database is changed | Restore the most recent backup with `nestweaver backup restore <archive>`, or rebuild with `nestweaver publication rebuild --config <instance.toml>`. Do not retry the request that crashed: it will crash the daemon again. See [Troubleshooting](docs/server-mode.md#the-daemon-crashed-while-answering) |
 | Renaming a registered vault with `--name` (`brain add <root> --name X`, `brain refresh <root> --name X`, `brain watch`, MCP `brain_add_source`) is now refused, exit 1, when another root's vault already holds that name (case-insensitively), with the same message and remedy as registering a new root under it. It used to succeed and leave two vaults answering to one name. Without `--name`, `brain refresh`, `brain watch`, `brain add` and MCP `brain_add_source` now keep a registered vault's stored name instead of renaming it to its directory's (a new vault is still named after its directory) | Pick a free `--name`, or remove the other vault first |
 | `brain context --kinds` and `--intent`, and `context --intent`, now refuse a value outside their fixed vocabulary at parse time with exit **64** and a message naming the valid values (they exited 1 with an internal error). MCP `brain_context`, `regex_search` and `count_patterns` report an unknown kind as an invalid argument | Fix the flag value; the message lists the accepted ones |
@@ -517,9 +557,8 @@ nestweaver --version
 
 Alternatively, select the GitHub Release archive for your platform, verify its
 matching SHA-256 file, then install it as described in
-[INSTALL.md](INSTALL.md#pre-built-cli-recommended). Starting with
-the release that contains this change, both macOS CLI archives are built with
-Metal support. The default `accelerator = "auto"` therefore requires Metal in
+[INSTALL.md](INSTALL.md#pre-built-cli-recommended). Both macOS CLI
+archives are built with Metal support. The default `accelerator = "auto"` therefore requires Metal in
 those builds and reports a Metal initialization or inference-probe failure
 instead of retrying on CPU. To opt out explicitly, set `accelerator = "cpu"` in
 the `[embedding]` section of your instance configuration. Builds without Metal
@@ -591,7 +630,7 @@ The first build compiles LadybugDB from source and may take several minutes.
 | `investigate` | Orient on a topic in one call |
 | `investigate-expand` | Drill into investigate bundle entries — full body plus immediate neighbours |
 | `investigate-hydrate` | Fill in bodies/summaries for all un-hydrated entries of a bundle |
-| `affected-tests` | Select tests for changed files (tiered; carries a `recommendation` CI directive — `run-full-suite` on any degraded run or when changed files have unrecognized extensions like Makefile/CI YAML/`.sql`) |
+| `affected-tests` | Select tests for changed files in one repository (tiered; carries a `recommendation` CI directive — `run-full-suite` on any degraded run or when changed files have unrecognized extensions like Makefile/CI YAML/`.sql`). `--repo <name or UID>` names the repository; it is required with `--files` when several repos are indexed (exit 64 otherwise). `--base-ref` diffs against the working tree, not the merge-base |
 | `repo-map` | Generate a token-budgeted map of the repository structure |
 | `summary` | Hierarchical code summaries at symbol, file, or cluster level |
 
@@ -719,7 +758,7 @@ dead:
 | Command | Description |
 |---------|-------------|
 | `mcp` | Start the MCP server (43 tools; 36 in direct read-only mode; 6 with `--lite`; auto-starts daemon) |
-| `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`; `run --server` for server mode) |
+| `daemon` | Manage the background daemon (`start`, `stop`, `status`, `restart`, `gc`; `run --server` for server mode). `daemon status` exits 69 when the daemon is running but unhealthy |
 | `connect` | Connect to an upstream NestWeaver server (federated read/impact) |
 | `server` | Server management utilities (`init-tls`, `backup`, `status`) |
 | `ui` | Launch the interactive web UI |
@@ -727,7 +766,7 @@ dead:
 | `generate-guide` | Generate tool-specific instruction files (skill, cursor-rule, agents-md, claude-md) |
 | `completions` | Generate shell completions (bash, zsh, fish, powershell) |
 | `embed` | Generate vector embeddings for symbols, notes, and headings using a local model (Metal-accelerated) or external API. Reports an eligibility plan before embedding and exits successfully without loading the model when nothing is eligible; `--force` re-embeds everything |
-| `pull` | Pull a snapshot from a remote storage backend |
+| `pull` | Pull repository source into a local workspace (sparse checkout by default; `--full`, `--pinned`, `--ephemeral`) |
 | `config validate` | Validate an instance config without creating files or contacting services (`--json` for a machine-readable result) |
 | `diagnostics capabilities` | Report embedding and Metal compile/runtime capabilities, including whether Metal was selected or fell back (`--json`) |
 | `instance` | Manage instance configuration. `abort-migration` clears a wedged migration journal so the daemon can boot |
@@ -743,8 +782,8 @@ dead:
 | `admin` | Subagent guidance instructions |
 | `interactions` | Manage interaction memory (`status`, `show`, `clear`, and `forget <uid>` to drop one node's memory while leaving the rest intact) |
 | `extensions` | Read back the annotations agents write via the `set_extension` MCP tool (`list`, and `unset` to remove one property from one node) |
-| `hooks` | Install/remove the local pre-push blast-radius check (`--install`, `--strict`, `--uninstall`) |
-| `pre-push-impact` | Analyse local changes against the org-wide graph — what `hooks` runs, and runnable directly (alias `ppi`) |
+| `hooks` | Install/remove the local pre-push blast-radius check (`--install`, `--strict`, `--uninstall`, `--db`) |
+| `pre-push-impact` | Analyse local changes against the org-wide graph (alias `ppi`). The `hooks` pre-push check runs `pr-impact`, not this command |
 | `format-comment` | Format impact analysis results as a PR/MR comment, for CI to post |
 
 </details>
@@ -754,7 +793,7 @@ dead:
 Get "confidence before you push" from the same hardened blast-radius analysis CI runs — locally, on your machine:
 
 ```sh
-nestweaver hooks --install
+nestweaver hooks --install --db "$(pwd)/nestweaver.lbug"
 ```
 
 This writes a `.git/hooks/pre-push` that runs `nestweaver pr-impact` against the merge-base before every push. It is **advisory by default**: it **never blocks** your push (fail-open), stays **silent on a trivial change**, and prints a concise banner — the gate verdict, the top affected symbols, and a coverage caveat when the analysis was incomplete — only when there's something to review. A degraded/incomplete run never blocks, because an incomplete traversal can't be trusted to have found the risk.

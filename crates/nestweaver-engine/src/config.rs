@@ -1050,6 +1050,11 @@ pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
 /// Empty IDs are rejected because every graph write must have an owning
 /// instance. "default" and ordinary names (`a-b_c`, `my.instance`) remain
 /// valid.
+///
+/// The id is also a directory name (`<data dir>/nestweaver/<instance>/snapshot`,
+/// `snapshot-<instance>`), so path separators, control characters and the
+/// `.`/`..` components are rejected: `instance_id = "../../evil"` must not
+/// name a directory outside the data directory.
 pub fn validate_instance_id(instance_id: &str) -> Result<(), anyhow::Error> {
     if instance_id.is_empty() {
         anyhow::bail!("invalid instance_id: value must not be empty");
@@ -1058,6 +1063,21 @@ pub fn validate_instance_id(instance_id: &str) -> Result<(), anyhow::Error> {
         anyhow::bail!(
             "invalid instance_id {instance_id:?}: character {bad:?} is not allowed \
              (colons and whitespace break graph uids like `repo:<instance>:<hash>`)"
+        );
+    }
+    if let Some(bad) = instance_id
+        .chars()
+        .find(|c| matches!(c, '/' | '\\') || c.is_control())
+    {
+        anyhow::bail!(
+            "invalid instance_id {instance_id:?}: character {bad:?} is not allowed \
+             (the instance id names a directory)"
+        );
+    }
+    if matches!(instance_id, "." | "..") {
+        anyhow::bail!(
+            "invalid instance_id {instance_id:?}: `.` and `..` are not allowed \
+             (the instance id names a directory)"
         );
     }
     Ok(())
@@ -1286,7 +1306,7 @@ impl InstanceConfig {
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Self, anyhow::Error> {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = read_bounded_config(path)?;
         let mut config = Self::from_toml_str(&contents)?;
         if let Some(db) = config.db.as_deref() {
             config.db = Some(
@@ -1297,6 +1317,27 @@ impl InstanceConfig {
         }
         Ok(config)
     }
+}
+
+/// Largest instance config read, in bytes. A real config is a few KiB; the
+/// bound exists so `--config /dev/zero` (or a mistyped multi-GB file) fails
+/// promptly instead of reading until memory runs out.
+pub const MAX_INSTANCE_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_bounded_config(path: &std::path::Path) -> Result<String, anyhow::Error> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_INSTANCE_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INSTANCE_CONFIG_BYTES {
+        anyhow::bail!(
+            "{} is larger than {} MiB, which no instance config is; refusing to read it",
+            path.display(),
+            MAX_INSTANCE_CONFIG_BYTES / (1024 * 1024)
+        );
+    }
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", path.display()))
 }
 
 // File configuration paths follow the canonical config's directory; raw TOML
@@ -2052,10 +2093,21 @@ url = "https://github.com/example/repo"
     // ordinary logical names.
     #[test]
     fn validate_instance_id_rules() {
-        for valid in ["default", "kory-brain", "my.instance-01_ok"] {
+        for valid in ["default", "kory-brain", "my.instance-01_ok", "a..b"] {
             assert!(validate_instance_id(valid).is_ok(), "valid id: {valid:?}");
         }
-        for invalid in ["", "a:b", "has space", "has\ttab"] {
+        for invalid in [
+            "",
+            "a:b",
+            "has space",
+            "has\ttab",
+            "../../evil",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "esc\u{1b}[2J",
+        ] {
             assert!(
                 validate_instance_id(invalid).is_err(),
                 "invalid id: {invalid:?}"

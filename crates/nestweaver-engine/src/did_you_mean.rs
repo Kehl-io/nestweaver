@@ -265,9 +265,8 @@ fn file_member_suggestions(
             .then_with(|| a.start_line.cmp(&b.start_line))
             .then_with(|| a.name.cmp(&b.name))
     });
-    let uids: Vec<&str> = members.iter().map(|s| s.uid.as_str()).collect();
     let containers = store
-        .container_chains(&uids, 1)
+        .symbol_container_chains(&members, 1)
         .map_err(|e| anyhow::anyhow!("container_chains: {e}"))?;
     if let Some(class) = spec.qualifiers.get(1..).and_then(<[&str]>::last) {
         let in_class: Vec<Symbol> = members
@@ -317,10 +316,12 @@ fn format_suggestions(
 ) -> Result<Vec<String>, anyhow::Error> {
     // One container level is enough for the suggestion to resolve: the
     // lookup matches a container chain from its innermost end.
+    // QA #5: a Go method's receiver counts as its container, so the
+    // suggestion is `uuid.go::UUID::String`, which names one method, rather
+    // than an ambiguous `uuid.go::String`.
     let containers = if qualified {
-        let uids: Vec<&str> = symbols.iter().map(|s| s.uid.as_str()).collect();
         store
-            .container_chains(&uids, 1)
+            .symbol_container_chains(symbols, 1)
             .map_err(|e| anyhow::anyhow!("container_chains: {e}"))?
     } else {
         Default::default()

@@ -74,6 +74,14 @@ pub struct BrokenLink {
     /// it then reads 0, and [`BrokenLink::is_ambiguous`] stays false.
     #[serde(default)]
     pub candidate_count: usize,
+    /// For an unresolved `[[Note#anchor]]` whose note part names an existing
+    /// note: the anchor (`Section One`, `^blk1`) that note does not have. The
+    /// link is broken because of the heading or block, not the note, and
+    /// saying "no such note" sends the reader looking for the wrong thing.
+    ///
+    /// `#[serde(default)]` for a reply from a daemon older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_anchor: Option<String>,
 }
 
 impl BrokenLink {
@@ -165,6 +173,12 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
         // advice read "fix this broken link by linking to itself" (nw-100).
         let (suggestions, suggested_total) =
             suggest_targets(&r.wikilink_text, &notes, max_suggestions, &r.source_uid);
+        // Computed before the literal moves `wikilink_text` out of `r`.
+        let anchor = if r.current_target_uid.is_empty() {
+            missing_anchor(&r.wikilink_text, &notes)
+        } else {
+            None
+        };
         out.push(BrokenLink {
             source_uid: r.source_uid,
             source_path: r.source_path,
@@ -172,6 +186,7 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
             confidence: r.confidence,
             suggested_target_uids: suggestions,
             suggested_total,
+            missing_anchor: anchor,
             resolved_target_uid: if r.current_target_uid.is_empty() {
                 None
             } else {
@@ -181,6 +196,30 @@ pub fn broken_links(store: &GraphStore, max_suggestions: usize) -> Result<Vec<Br
         });
     }
     Ok(out)
+}
+
+/// The anchor of an unresolved `[[Note#anchor]]` link whose note part names
+/// an existing note by filename stem, path or title (case-insensitive), so
+/// the anchor alone is what failed to resolve.
+fn missing_anchor(text: &str, notes: &[NoteLite]) -> Option<String> {
+    let (note, anchor) = text.split_once('#')?;
+    let note = note.trim().to_lowercase();
+    let anchor = anchor.trim();
+    if note.is_empty() || anchor.is_empty() {
+        return None;
+    }
+    let note = note.strip_suffix(".md").unwrap_or(&note);
+    notes
+        .iter()
+        .any(|candidate| {
+            let path = candidate.file_path.replace('\\', "/").to_lowercase();
+            let path = path.strip_suffix(".md").unwrap_or(&path);
+            note_stem(&candidate.file_path) == note
+                || candidate.title.to_lowercase() == note
+                || path == note
+                || path.ends_with(&format!("/{note}"))
+        })
+        .then(|| anchor.to_string())
 }
 
 /// Rank note UIDs by how well their title matches `text` (case-insensitive

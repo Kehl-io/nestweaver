@@ -114,10 +114,7 @@ pub(crate) const RPC_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration:
 /// transport and scheduling; anything beyond means the daemon is not honouring
 /// its own deadline. Otherwise the generous default applies.
 pub(crate) fn daemon_rpc_timeout(args: &serde_json::Value) -> Option<std::time::Duration> {
-    if let Some(seconds) = std::env::var(RPC_TIMEOUT_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-    {
+    if let Some(seconds) = nestweaver_schema::env::env_parse::<u64>(RPC_TIMEOUT_ENV) {
         // An explicit 0 opts out entirely, for debugging a slow daemon.
         return (seconds > 0).then(|| std::time::Duration::from_secs(seconds));
     }
@@ -732,6 +729,14 @@ pub(crate) fn pattern_count_from_tool_json(
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default(),
+        truncated: c
+            .get("truncated")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        truncation_reason: c
+            .get("truncation_reason")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
     })
 }
 

@@ -30,8 +30,8 @@ const SERVER_INSTRUCTIONS: &str = "\
 NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find for indexed repos.
 
 ## Quick Reference
-- Explore a topic: brain_context (seed with symbol/file name, filter by repo/tags)
-- Find a symbol: brain_search (keyword search across code + notes)
+- Explore a topic: brain_context (seed with a symbol name, note title or tag; for a repo-relative file path use code_context)
+- Find a symbol: brain_search (keyword search across code + notes; no repo/tag/path filters)
 - Check impact before changing code: brain_impact or blast_radius
 - Trace execution flow: flow_trace (forward call graph)
 - Read a symbol's source: read_symbols (cheaper than reading whole files)
@@ -44,7 +44,7 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 
 ## Query Efficiency
 - Always query the graph before reading source files
-- Filter with repos, tags, path_prefix, kinds for precision
+- Filters differ per tool; read its schema. brain_context takes repos, kinds, tags, path_prefix
 - Use response_format 'concise' unless you need full bodies
 - Cut answers say so (truncated*, body_truncated, output_budget.cuts); narrow the query rather than raising limit
 - In subagents/scripts: use CLI (nestweaver search --json) instead of MCP for fewer tokens
@@ -52,7 +52,7 @@ NestWeaver is a code intelligence knowledge graph. Use it instead of grep/find f
 ## Do NOT
 - grep or find in indexed repos — use brain_search or regex_search
 - Read entire files — use read_symbols for specific symbol spans
-- Re-index manually — use stale_check to verify, the daemon handles re-indexing
+- Assume the index is current — run stale_check and follow its remedy (only a running watcher re-indexes on its own)
 
 ## Server Mode
 When connected to a NestWeaver server (not a local daemon):
@@ -474,7 +474,7 @@ fn dispatch_method_daemon_cancellable(
         other => Frame::Error(error(
             id,
             error_code::METHOD_NOT_FOUND,
-            format!("method not implemented: {other}"),
+            crate::tools::method_not_implemented_message(other),
         )),
     }
 }
@@ -773,7 +773,7 @@ fn dispatch_method_cancellable(
         other => Frame::Error(error(
             id,
             error_code::METHOD_NOT_FOUND,
-            format!("method not implemented: {other}"),
+            crate::tools::method_not_implemented_message(other),
         )),
     }
 }
@@ -967,6 +967,46 @@ mod tests {
             "{} bytes",
             SERVER_INSTRUCTIONS.len()
         );
+    }
+
+    /// QA: the instructions told agents to seed `brain_context` with a FILE
+    /// name (it does not expand paths), to filter `brain_search` (it takes no
+    /// repo/tag/path filters), and that "the daemon handles re-indexing" (only
+    /// a watcher does). Each claim must match what the tools accept.
+    #[test]
+    fn server_instructions_do_not_promise_what_the_tools_lack() {
+        for wrong in [
+            "symbol/file name",
+            "the daemon handles re-indexing",
+            "Filter with repos, tags, path_prefix, kinds",
+        ] {
+            assert!(!SERVER_INSTRUCTIONS.contains(wrong), "{wrong}");
+        }
+        for needle in ["code_context", "stale_check and follow its remedy"] {
+            assert!(SERVER_INSTRUCTIONS.contains(needle), "{needle}");
+        }
+        let listed = tools::tool_list(false);
+        let schema = |name: &str| {
+            listed["tools"]
+                .as_array()
+                .and_then(|tools| tools.iter().find(|tool| tool["name"] == name))
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} schema"))
+        };
+        let context = schema("brain_context");
+        for filter in ["repos", "kinds", "tags", "path_prefix"] {
+            assert!(
+                context["inputSchema"]["properties"].get(filter).is_some(),
+                "instructions name brain_context filter {filter} the schema lacks"
+            );
+        }
+        let search = schema("brain_search");
+        for filter in ["repos", "tags", "path_prefix"] {
+            assert!(
+                search["inputSchema"]["properties"].get(filter).is_none(),
+                "brain_search gained {filter}; update SERVER_INSTRUCTIONS"
+            );
+        }
     }
 
     fn make_request(method: &str, id: u64, params: Value) -> protocol::Request {

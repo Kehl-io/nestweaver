@@ -108,6 +108,10 @@ pub struct HybridSearchConfig {
     /// Maximum number of top semantic hits injected as PPR seeds.
     /// Sourced from `[embedding].semantic_seed_limit`.
     pub semantic_seed_limit: usize,
+    /// When set, bare-name and qualified symbol seeds resolve only among
+    /// symbols whose `repo_uid` is in this set, BEFORE the per-seed cap.
+    /// Callers with a `repos` filter pass its resolved UIDs here.
+    pub seed_scope_repo_uids: Option<std::collections::HashSet<String>>,
 }
 
 impl Default for HybridSearchConfig {
@@ -122,6 +126,7 @@ impl Default for HybridSearchConfig {
             seed_resolution: nestweaver_store::SeedResolutionConfig::default(),
             always_blend_semantic: true,
             semantic_seed_limit: 5,
+            seed_scope_repo_uids: None,
         }
     }
 }
@@ -3449,6 +3454,15 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         }
     }
 
+    let mut lookups = SeedLookups::new(store, db_path);
+    // QA (#2): a `repos` scope must narrow seed resolution BEFORE the
+    // `SEED_NAME_MATCH_LIMIT` cut. Filtering only the finished result let
+    // five out-of-scope `Parse` matches fill the page and then be removed,
+    // reporting `total: 0` for a repo that defines `Parse`.
+    let seed_scope = config.seed_scope_repo_uids.as_ref();
+    let in_seed_scope = |symbol: &nestweaver_schema::Symbol| {
+        seed_scope.is_none_or(|uids| uids.contains(&symbol.repo_uid))
+    };
     for raw in inputs {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -3515,7 +3529,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
 
         // Tag form: leading '#' or bare lookup against Tag.name.
         if let Some(tag_name) = trimmed.strip_prefix('#') {
-            if let Some(uid) = lookup_tag_uid(store, tag_name)? {
+            if let Some(uid) = lookups.tag_uid(tag_name)? {
                 seed_uids.push(uid);
                 resolved_inputs.push(trimmed.to_string());
                 continue;
@@ -3524,7 +3538,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             continue;
         }
 
-        if let Some(note_uids) = resolve_brain_note_seeds(store, trimmed)? {
+        if let Some(note_uids) = lookups.note_seeds(trimmed)? {
             seed_uids.extend(note_uids);
             resolved_inputs.push(trimmed.to_string());
             continue;
@@ -3535,9 +3549,10 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         // `context` and `impact`. A qualifier that names nothing is a miss:
         // a substring search would ignore it and seed the wrong symbols.
         if nestweaver_schema::QualifiedSpec::parse(trimmed).is_some() {
-            let qualified = store
+            let mut qualified = store
                 .lookup_symbols_by_spec(trimmed)
                 .map_err(|e| anyhow::anyhow!(e))?;
+            qualified.retain(|symbol| in_seed_scope(symbol));
             if !qualified.is_empty() {
                 seed_name_tally.record_exact(qualified.len());
                 seed_uids.extend(qualified.into_iter().map(|s| s.uid));
@@ -3557,8 +3572,14 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         // reported `semantic_seed_count: 5` for a name with 200+ definitions
         // and nothing distinguished that from a name with five — the count was
         // computed by this very call and dropped one frame later.
-        let symbol_page = store
-            .search_symbols_by_name_page(trimmed, SEED_NAME_MATCH_LIMIT, &config.seed_resolution)
+        let symbol_page = lookups
+            .symbols()?
+            .search_page_filtered(
+                trimmed,
+                SEED_NAME_MATCH_LIMIT,
+                &config.seed_resolution,
+                &in_seed_scope,
+            )
             .map_err(|e| anyhow::anyhow!(e))?;
         if !symbol_page.symbols.is_empty() {
             seed_name_tally.record(&symbol_page);
@@ -3570,14 +3591,20 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         }
 
         // Last resort: tag without #.
-        if let Some(uid) = lookup_tag_uid(store, trimmed)? {
+        if let Some(uid) = lookups.tag_uid(trimmed)? {
             seed_uids.push(uid);
             resolved_inputs.push(trimmed.to_string());
             continue;
         }
 
         // Try project name lookup.
-        if let Ok(Some(project)) = store.lookup_project_by_name(trimmed) {
+        let project_needle = trimmed.to_lowercase();
+        let named_project = lookups
+            .projects()
+            .iter()
+            .find(|p| p.name.to_lowercase() == project_needle)
+            .cloned();
+        if let Some(project) = named_project {
             let mut project_resolved = false;
             if let Ok(note_uids) = store.list_project_note_uids(&project.uid)
                 && !note_uids.is_empty()
@@ -3598,15 +3625,18 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
         }
 
         // Try project alias lookup via the extension sidecar.
-        if let Some(db_path) = db_path {
-            let ext_store = crate::extensions::load_extensions(db_path);
+        if db_path.is_some() {
             let needle = trimmed.to_lowercase();
-            let all_projects = store.list_projects().unwrap_or_default();
+            lookups.projects();
+            lookups.extensions();
+            let ext_store = lookups.extensions.as_ref();
+            let all_projects = lookups.projects.as_deref().unwrap_or_default();
             let alias_matches: Vec<_> = all_projects
                 .iter()
                 .filter(|p| {
-                    if let Some(serde_json::Value::Array(aliases)) =
-                        ext_store.get(&p.uid).and_then(|m| m.get("aliases"))
+                    if let Some(serde_json::Value::Array(aliases)) = ext_store
+                        .and_then(|ext| ext.get(&p.uid))
+                        .and_then(|m| m.get("aliases"))
                     {
                         aliases
                             .iter()
@@ -3649,7 +3679,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
             if let Some(canonicals) = alias_to_canonical.get(&key) {
                 let mut resolved_via_alias = false;
                 for canonical in canonicals {
-                    if let Some(canon_matches) = resolve_brain_note_seeds(store, canonical)? {
+                    if let Some(canon_matches) = lookups.note_seeds(canonical)? {
                         tracing::debug!(
                             alias = trimmed,
                             canonical = %canonical,
@@ -4404,26 +4434,26 @@ fn note_path_matches(file_path: &str, query: &str) -> bool {
 }
 
 fn notes_matching_title(
-    store: &GraphStore,
+    notes: &[nestweaver_schema::Note],
     title: &str,
-) -> Result<Vec<nestweaver_schema::Note>, anyhow::Error> {
+) -> Vec<nestweaver_schema::Note> {
     let needle = title.to_lowercase();
-    let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(notes
-        .into_iter()
+    notes
+        .iter()
         .filter(|n| n.title.to_lowercase() == needle)
-        .collect())
+        .cloned()
+        .collect()
 }
 
 fn notes_matching_path(
-    store: &GraphStore,
+    notes: &[nestweaver_schema::Note],
     path: &str,
-) -> Result<Vec<nestweaver_schema::Note>, anyhow::Error> {
-    let notes = store.list_notes(None).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(notes
-        .into_iter()
+) -> Vec<nestweaver_schema::Note> {
+    notes
+        .iter()
         .filter(|n| note_path_matches(&n.file_path, path))
-        .collect())
+        .cloned()
+        .collect()
 }
 
 fn ambiguous_notes_error(input: &str, notes: &[nestweaver_schema::Note]) -> anyhow::Error {
@@ -4438,35 +4468,111 @@ fn ambiguous_notes_error(input: &str, notes: &[nestweaver_schema::Note]) -> anyh
     )
 }
 
-/// Unique note title or vault-relative path becomes a seed. Two+ title
-/// matches refuse instead of silently unioning every homonym.
-fn resolve_brain_note_seeds(
-    store: &GraphStore,
-    trimmed: &str,
-) -> Result<Option<Vec<String>>, anyhow::Error> {
-    if looks_like_note_path(trimmed) {
-        let path_hits = notes_matching_path(store, trimmed)?;
-        match path_hits.len() {
-            0 => {}
-            1 => return Ok(Some(path_hits.into_iter().map(|n| n.uid).collect())),
-            _ => return Err(ambiguous_notes_error(trimmed, &path_hits)),
-        }
-    }
-    let title_hits = notes_matching_title(store, trimmed)?;
-    match title_hits.len() {
-        0 => Ok(None),
-        1 => Ok(Some(title_hits.into_iter().map(|n| n.uid).collect())),
-        _ => Err(ambiguous_notes_error(trimmed, &title_hits)),
-    }
+/// Per-call memo of the whole-table reads seed resolution falls back on.
+///
+/// QA (#12): every unresolved seed re-listed every note, every tag (twice),
+/// every project and re-read the extensions sidecar, ~90 ms per seed, so the
+/// 256-seed cap cost ~24 s. Each table is now read at most once per call and
+/// shared by every seed, which makes the cap cheap without changing what
+/// any single seed resolves to.
+struct SeedLookups<'a> {
+    store: &'a GraphStore,
+    db_path: Option<&'a std::path::Path>,
+    notes: Option<Vec<nestweaver_schema::Note>>,
+    tags: Option<Vec<nestweaver_schema::Tag>>,
+    projects: Option<Vec<nestweaver_schema::Project>>,
+    extensions: Option<crate::extensions::ExtensionStore>,
+    symbols: Option<nestweaver_store::SymbolNameTable>,
 }
 
-fn lookup_tag_uid(store: &GraphStore, name: &str) -> Result<Option<String>, anyhow::Error> {
-    let needle = name.trim().to_lowercase();
-    if needle.is_empty() {
-        return Ok(None);
+impl<'a> SeedLookups<'a> {
+    fn new(store: &'a GraphStore, db_path: Option<&'a std::path::Path>) -> Self {
+        Self {
+            store,
+            db_path,
+            notes: None,
+            tags: None,
+            projects: None,
+            extensions: None,
+            symbols: None,
+        }
     }
-    let tags = store.list_tags(None).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(tags.into_iter().find(|t| t.name == needle).map(|t| t.uid))
+
+    fn notes(&mut self) -> Result<&[nestweaver_schema::Note], anyhow::Error> {
+        if self.notes.is_none() {
+            self.notes = Some(
+                self.store
+                    .list_notes(None)
+                    .map_err(|e| anyhow::anyhow!(e))?,
+            );
+        }
+        Ok(self.notes.as_deref().unwrap_or_default())
+    }
+
+    fn tag_uid(&mut self, name: &str) -> Result<Option<String>, anyhow::Error> {
+        let needle = name.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        if self.tags.is_none() {
+            self.tags = Some(self.store.list_tags(None).map_err(|e| anyhow::anyhow!(e))?);
+        }
+        Ok(self
+            .tags
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|t| t.name == needle)
+            .map(|t| t.uid.clone()))
+    }
+
+    fn projects(&mut self) -> &[nestweaver_schema::Project] {
+        if self.projects.is_none() {
+            self.projects = Some(self.store.list_projects().unwrap_or_default());
+        }
+        self.projects.as_deref().unwrap_or_default()
+    }
+
+    fn extensions(&mut self) -> Option<&crate::extensions::ExtensionStore> {
+        let db_path = self.db_path?;
+        if self.extensions.is_none() {
+            self.extensions = Some(crate::extensions::load_extensions(db_path));
+        }
+        self.extensions.as_ref()
+    }
+
+    fn symbols(&mut self) -> Result<&nestweaver_store::SymbolNameTable, anyhow::Error> {
+        if self.symbols.is_none() {
+            self.symbols = Some(
+                self.store
+                    .symbol_name_table()
+                    .map_err(|e| anyhow::anyhow!(e))?,
+            );
+        }
+        self.symbols
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("symbol name table unavailable"))
+    }
+
+    /// Unique note title or vault-relative path becomes a seed. Two+ title
+    /// matches refuse instead of silently unioning every homonym.
+    fn note_seeds(&mut self, trimmed: &str) -> Result<Option<Vec<String>>, anyhow::Error> {
+        let notes = self.notes()?;
+        if looks_like_note_path(trimmed) {
+            let path_hits = notes_matching_path(notes, trimmed);
+            match path_hits.len() {
+                0 => {}
+                1 => return Ok(Some(path_hits.into_iter().map(|n| n.uid).collect())),
+                _ => return Err(ambiguous_notes_error(trimmed, &path_hits)),
+            }
+        }
+        let title_hits = notes_matching_title(notes, trimmed);
+        match title_hits.len() {
+            0 => Ok(None),
+            1 => Ok(Some(title_hits.into_iter().map(|n| n.uid).collect())),
+            _ => Err(ambiguous_notes_error(trimmed, &title_hits)),
+        }
+    }
 }
 
 /// Per container seed (nw-609), PER CONTAINER -- two `vlt:` seeds get this
@@ -5714,6 +5820,78 @@ mod seed_resolution_disclosure_tests {
         );
         assert_eq!(result.seeds_truncated, None);
         assert_eq!(result.seed_resolution_limit, None);
+    }
+
+    /// QA #12: 256 seeds cost ~24 s because every unresolved seed re-read
+    /// the notes, tags, projects and the symbol table. One call now reads the
+    /// symbol table once however many seeds it resolves.
+    #[test]
+    fn brain_context_reads_the_symbol_table_once_for_many_seeds() {
+        let store = store_with_validate_definitions(3);
+        let mut seeds: Vec<String> = (0..40).map(|i| format!("no_such_seed_{i}")).collect();
+        seeds.push("validate1".to_string());
+        let before = nestweaver_store::symbol_table_fetches_on_this_thread();
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &seeds,
+            None,
+            &HybridSearchConfig::default(),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let fetches = nestweaver_store::symbol_table_fetches_on_this_thread() - before;
+        assert!(
+            fetches <= 2,
+            "symbol table fetched {fetches} times for 41 seeds"
+        );
+        assert!(
+            result.seeds.iter().any(|seed| seed.uid == "sym:v1"),
+            "{:?}",
+            result.seeds
+        );
+        assert_eq!(result.unresolved_seeds.len(), 40);
+    }
+
+    /// QA #2: a repo scope narrows bare-name seed resolution BEFORE the
+    /// per-seed cap, so out-of-scope matches cannot fill the cap and leave
+    /// the scoped repo's own definition unresolved.
+    #[test]
+    fn a_repo_scope_applies_before_the_seed_cap() {
+        let store = GraphStore::in_memory().unwrap();
+        for i in 0..(SEED_NAME_MATCH_LIMIT + 3) {
+            store
+                .insert_symbol(&symbol(&format!("other{i}"), "Parse"))
+                .unwrap();
+        }
+        let mut mine = symbol("zz_mine", "Parse");
+        mine.repo_uid = "repo:uuid".to_string();
+        store.insert_symbol(&mine).unwrap();
+        let config = HybridSearchConfig {
+            seed_scope_repo_uids: Some(std::collections::HashSet::from(["repo:uuid".to_string()])),
+            ..HybridSearchConfig::default()
+        };
+        let result = build_brain_context_hybrid_with_aliases(
+            &store,
+            &["Parse".to_string()],
+            None,
+            &config,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.seeds.iter().any(|seed| seed.uid == "sym:zz_mine"),
+            "{:?}",
+            result.seeds
+        );
+        assert_eq!(result.seed_matches_total, Some(1));
     }
 
     #[test]

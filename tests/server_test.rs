@@ -3137,6 +3137,26 @@ async fn server_backup_rpc_produces_snapshot() {
         .expect("connect to daemon gRPC");
     let mut client = NestWeaverDaemonClient::new(channel);
 
+    // A relative destination would resolve in the daemon's working
+    // directory, not the caller's: refused, nothing written.
+    let mut relative = tonic::Request::new(BackupRequest {
+        output_path: "snap-relative.nwsnap.zst".to_string(),
+        include_clones: false,
+        overwrite: false,
+    });
+    relative
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {admin}").parse().unwrap());
+    let refused = client
+        .backup(relative)
+        .await
+        .expect_err("a relative output_path must be refused");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("must be absolute"),
+        "{refused:?}"
+    );
+
     let out = dir.path().join("snap.nwsnap.zst");
     let mut req = tonic::Request::new(BackupRequest {
         output_path: out.to_string_lossy().into_owned(),

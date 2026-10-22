@@ -109,7 +109,8 @@ pub struct CachedFileMeta {
 /// Map from repo-relative path to cached file metadata.
 pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 
-/// Sidecar format version. v4 moves with the resolution-deps sidecar so an
+/// Sidecar format version. v5 moves with resolution-deps v5 (import-target
+/// dependency rows). v4 moves with the resolution-deps sidecar so an
 /// upgrade that must re-resolve unresolved imports also rebuilds filemeta.
 /// v3 = nanosecond mtimes (nw-200). v2 = per-repo
 /// keying (nw-022). v1 (implicit, unversioned flat map) fails deserialization
@@ -125,7 +126,7 @@ pub type FileMetaCache = HashMap<String, CachedFileMeta>;
 /// Paired with `resolution_cache::CACHE_VERSION`: bumping one requires
 /// bumping the other (both sidecars must be invalidated together), enforced
 /// by `resolution_cache::tests::cache_version_moves_with_filemeta_version`.
-pub const FILEMETA_VERSION: u32 = 4;
+pub const FILEMETA_VERSION: u32 = 5;
 
 /// On-disk shape of `<db>.filemeta.json`: change-detection metadata keyed by
 /// repo uid, then repo-relative path. Two repos sharing one DB can never
@@ -1574,6 +1575,7 @@ fn rebuild_full_index_write_set_from_disk(
         )?;
     }
     let contract_plan_result = if *set.files_unchanged == 0 {
+        let published = published_spec_sources(store, set.r_uid);
         prepare_contract_derivation(
             reader,
             set.r_uid,
@@ -1581,9 +1583,15 @@ fn rebuild_full_index_write_set_from_disk(
             set.handler_files,
             set.all_symbols,
             true,
+            published.as_ref(),
         )
     } else {
-        prepare_incremental_contract_derivation(reader, set.r_uid, set.repo_url)
+        prepare_incremental_contract_derivation(
+            reader,
+            set.r_uid,
+            set.repo_url,
+            published_spec_sources(store, set.r_uid).as_ref(),
+        )
     };
     *contract_plan = match contract_plan_result {
         Ok(plan) => plan,
@@ -2070,6 +2078,11 @@ pub enum IndexPublicationRecovery {
         /// `nestweaver index --repo <path> --force` is the repair for that,
         /// and it is a different question from this reconciliation.
         was_cancelled_run: bool,
+        /// Repos whose publication started and never reached its last write.
+        /// Recovery reconciles ranks and the generation; it cannot restore
+        /// the rows the dead writer never committed. These repos read as
+        /// `incomplete` in stale-check until an index rebuilds them in full.
+        incomplete_repos: Vec<String>,
     },
 }
 
@@ -2127,6 +2140,7 @@ impl IndexPublicationRecovery {
                 abandoned_writer_pid,
                 generation,
                 was_cancelled_run,
+                incomplete_repos,
             } => {
                 let who = match abandoned_writer_pid {
                     Some(pid) => format!("marker pid {pid} (diagnostic only)"),
@@ -2138,7 +2152,7 @@ impl IndexPublicationRecovery {
                      recomputed against the committed graph and saved, all before the marker \
                      was cleared"
                 );
-                if *was_cancelled_run {
+                let base = if *was_cancelled_run {
                     format!(
                         "{base}. That publication was left dirty deliberately by a run that \
                          committed AFTER cancellation, so the graph itself may be incomplete — \
@@ -2146,6 +2160,16 @@ impl IndexPublicationRecovery {
                     )
                 } else {
                     base
+                };
+                if incomplete_repos.is_empty() {
+                    base
+                } else {
+                    format!(
+                        "{base}. The interrupted writer had not finished publishing {}, so \
+                         that graph may be partial; it reads as `incomplete` in stale-check \
+                         and the next `nestweaver index` of it rebuilds it in full",
+                        incomplete_repos.join(", ")
+                    )
                 }
             }
         }
@@ -2393,10 +2417,20 @@ fn recover_abandoned_index_publication_with_io_and_marker_hook(
         true,
     )?;
 
+    // Ranks and the generation are reconciled; rows the dead writer never
+    // committed are not. Name the repos that still owe a full rebuild rather
+    // than reporting the recovery as if the graph were whole.
+    let incomplete_repos = store
+        .list_publication_incomplete_repos()
+        .unwrap_or_else(|error| {
+            tracing::warn!("listing publication-incomplete repos failed: {error}");
+            Vec::new()
+        });
     Ok(IndexPublicationRecovery::Recovered {
         abandoned_writer_pid: pid,
         generation: store.graph_generation(),
         was_cancelled_run,
+        incomplete_repos,
     })
 }
 
@@ -4499,6 +4533,9 @@ struct IndexResolution {
     /// Importer rel-path → unresolved import specifiers, for files this pass
     /// actually resolved. Empty when resolution was skipped. nw-806.
     unresolved_imports: HashMap<String, HashSet<String>>,
+    /// Importer rel-path → files its resolved import specifiers name, for
+    /// the same files. Recorded as dependency rows.
+    import_targets: HashMap<String, HashSet<String>>,
 }
 
 struct PrepareIndexResolution<'a> {
@@ -4515,6 +4552,9 @@ struct PrepareIndexResolution<'a> {
     /// stale file nodes. A recreated import target is in here; a modification
     /// of a file that already had a node is not.
     added_files: &'a std::collections::HashSet<String>,
+    /// Files the store held that left the tree in this pass. Their dependents
+    /// lost the edges into them and must be re-resolved too.
+    removed_files: &'a std::collections::HashSet<String>,
     files_unchanged: usize,
     resolution_deps: Option<&'a crate::resolution_cache::ResolutionDeps>,
 }
@@ -4626,6 +4666,7 @@ fn prepare_index_resolution(
         file_languages,
         actually_changed_files,
         added_files,
+        removed_files,
         files_unchanged,
         resolution_deps,
     } = prep;
@@ -4639,16 +4680,10 @@ fn prepare_index_resolution(
     resolve_pb.set_message("Resolving cross-file references...");
     resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let workspace_ctx = if file_languages.values().any(|language| {
-        matches!(
-            language,
-            Language::JavaScript
-                | Language::TypeScript
-                | Language::Vue
-                | Language::Svelte
-                | Language::Astro
-        )
-    }) {
+    let workspace_ctx = if file_languages
+        .values()
+        .any(|language| language_uses_workspace_context(*language))
+    {
         discover_workspace_context_with(|rel_path| {
             reader
                 .read_file(rel_path)
@@ -4658,16 +4693,26 @@ fn prepare_index_resolution(
         Default::default()
     };
 
-    let skip_resolution = actually_changed_files.is_empty()
+    // A deletion changes its dependents' export view just as an edit does, so
+    // it seeds the dependency expansion too (it is then dropped from the
+    // filter: a file that left the tree has nothing to resolve).
+    let changed_or_removed: std::collections::HashSet<String> = actually_changed_files
+        .union(removed_files)
+        .cloned()
+        .collect();
+    let skip_resolution = changed_or_removed.is_empty()
         && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
 
     let resolve_filter = if !skip_resolution
-        && !actually_changed_files.is_empty()
+        && !changed_or_removed.is_empty()
         && files_unchanged > 0
         && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid))
     {
         let deps = resolution_deps.as_ref().unwrap();
-        let mut affected = deps.affected_files_for_repo(r_uid, actually_changed_files);
+        let mut affected = deps.affected_files_for_repo(r_uid, &changed_or_removed);
+        for removed in removed_files {
+            affected.remove(removed);
+        }
         // nw-806. Dependency rows only name files that already resolved.
         // After a delete, the importer's row no longer names the deleted
         // file; the specifier lives on the unresolved sidecar. Seed the same
@@ -4680,8 +4725,17 @@ fn prepare_index_resolution(
         // that parse is included: publication deletes outgoing edges for every
         // filter member, and naming the importer earlier drops edges this
         // pass cannot rebuild.
-        let seeded =
+        let mut seeded =
             unresolved_importers_of_added_files(reader, deps, r_uid, added_files, file_languages);
+        // Dependents reached through dependency rows obey the same rule: an
+        // unchanged one with a cold parsed cache is not in the resolver view,
+        // and naming it in the filter would delete edges nothing rebuilds.
+        seeded.extend(
+            affected
+                .iter()
+                .filter(|path| !actually_changed_files.contains(path.as_str()))
+                .cloned(),
+        );
         let included = include_missing_seeded_importer_parses(
             reader,
             parsed_files_for_resolver,
@@ -4804,8 +4858,17 @@ fn prepare_index_resolution(
     // nw-806: remember specifiers that did not resolve so a later added file
     // can find the importers. Only files this pass resolved are recorded;
     // everyone else keeps the sidecar entry they already have.
-    let unresolved_imports = if skip_resolution {
-        HashMap::new()
+    //
+    // The same walk records which files each importer's specifiers DO name.
+    // Those become dependency rows beside the edge-derived ones, so a change
+    // to an imported file's export surface re-resolves its importers even
+    // when no edge reached it yet (a symbol added to a module whose import
+    // previously bound nothing; a barrel whose re-export target moved).
+    let ImportSurvey {
+        unresolved: unresolved_imports,
+        targets: import_targets,
+    } = if skip_resolution {
+        ImportSurvey::default()
     } else {
         let only = resolve_filter.clone().unwrap_or_else(|| {
             resolver_view
@@ -4813,7 +4876,7 @@ fn prepare_index_resolution(
                 .map(|(path, _, _)| path.clone())
                 .collect()
         });
-        unresolved_imports_for_resolved_files(&resolver_view, file_languages, &workspace_ctx, &only)
+        import_survey_for_resolved_files(&resolver_view, file_languages, &workspace_ctx, &only)
     };
     let resolution = IndexResolution {
         skip_resolution,
@@ -4822,6 +4885,7 @@ fn prepare_index_resolution(
         inferred_cross_repo_edges,
         member_of_edges,
         unresolved_imports,
+        import_targets,
     };
     tracing::info!(
         edges_resolved = resolution.edges_count(),
@@ -4875,6 +4939,44 @@ fn index_into_store(
         None,
         || Ok::<_, anyhow::Error>(()),
     )
+}
+
+/// The filemeta entries this store can vouch for.
+///
+/// The sidecar lives beside the database but nothing ties it to the graph it
+/// describes: a database deleted (or restored from an older copy) under a
+/// surviving sidecar made every file classify `Unchanged`, so the index wrote
+/// nothing and reported an empty graph as complete. An entry is kept only when
+/// the store holds that file with the same content hash the entry records;
+/// every other file is treated as new and parsed. On an intact store this is
+/// the identity filter — every filemeta entry is written beside its File node.
+fn bind_filemeta_to_store(
+    store: &GraphStore,
+    r_uid: &str,
+    cache: &FileMetaCache,
+) -> Result<FileMetaCache, anyhow::Error> {
+    if cache.is_empty() {
+        return Ok(FileMetaCache::new());
+    }
+    let stored: HashMap<String, String> = store
+        .list_file_hashes_by_repo(r_uid)
+        .context("list indexed file hashes to validate the filemeta cache")?
+        .into_iter()
+        .collect();
+    let bound: FileMetaCache = cache
+        .iter()
+        .filter(|(path, meta)| stored.get(path.as_str()) == Some(&meta.content_hash))
+        .map(|(path, meta)| (path.clone(), meta.clone()))
+        .collect();
+    if bound.len() != cache.len() {
+        tracing::warn!(
+            repo_uid = %r_uid,
+            cached = cache.len(),
+            in_store = bound.len(),
+            "filemeta sidecar describes files the graph does not hold; re-parsing them"
+        );
+    }
+    Ok(bound)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4940,10 +5042,30 @@ where
             "resolution deps empty for repo; bypassing filemeta cache to force a full replacement"
         );
     }
-    let filemeta_cache = if reidentify_old_uid.is_some() || deps_empty_for_repo {
+    // A previous publication of this repo died between its store
+    // transactions (see `REPO_PUBLICATION_INCOMPLETE_PREFIX`): the committed
+    // graph may be partial while the sidecars already describe the new files,
+    // so an incremental pass would trust exactly the state that is wrong.
+    // Rebuild the repo in full; the debt is retired when that run lands.
+    let publication_debt = store
+        .repo_publication_incomplete(&r_uid)
+        .context("read publication-incomplete debt")?;
+    if publication_debt && filemeta_cache.is_some() {
+        tracing::warn!(
+            repo_uid = %r_uid,
+            "a previous index of this repository was interrupted mid-publication; \
+             bypassing the filemeta cache to rebuild its graph in full"
+        );
+    }
+    let bound_filemeta;
+    let filemeta_cache = if reidentify_old_uid.is_some() || deps_empty_for_repo || publication_debt
+    {
         None
+    } else if let Some(cache) = filemeta_cache {
+        bound_filemeta = bind_filemeta_to_store(store, &r_uid, cache)?;
+        Some(&bound_filemeta)
     } else {
-        filemeta_cache
+        None
     };
 
     // ── Phase 1: Scan files ───────────────────────────────────────────────
@@ -5490,6 +5612,7 @@ where
     spec_files.sort();
     handler_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     let contract_plan_result = if files_unchanged == 0 {
+        let published = published_spec_sources(store, &r_uid);
         prepare_contract_derivation(
             reader,
             &r_uid,
@@ -5497,9 +5620,15 @@ where
             &handler_files,
             &all_symbols,
             true,
+            published.as_ref(),
         )
     } else {
-        prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
+        prepare_incremental_contract_derivation(
+            reader,
+            &r_uid,
+            repo_url,
+            published_spec_sources(store, &r_uid).as_ref(),
+        )
     };
 
     // nw-812: type environments are CPU-throttled parse-pool work. Build
@@ -5660,6 +5789,17 @@ where
         // by disk path — so unrelated repos can never be caught by this delete.
         // Detected before the parse phase (see above) so the filemeta cache was
         // already bypassed for this pass.
+        //
+        // Every graph write from here on (the re-identify prune included)
+        // spans several store transactions. Commit the debt first so a process
+        // killed between them leaves a durable record that this repo's graph
+        // may be partial; the run's last write retires it. An error between
+        // the two also leaves it, deliberately: proving that every earlier
+        // transaction rolled back is harder than one spare full rebuild.
+        graph_mutation_attempted.set(true);
+        store
+            .set_repo_publication_incomplete(&r_uid, "index graph write")
+            .context("record publication-incomplete debt")?;
         if let Some(old_uid) = &reidentify_old_uid {
             graph_mutation_attempted.set(true);
             tracing::info!(
@@ -5746,6 +5886,7 @@ where
         // back — the same treatment the incremental and watcher paths get.
         let mut reindex_deleted_uids: Vec<String> = Vec::new();
         let mut reindex_deleted_files: Vec<String> = Vec::new();
+        let mut removed_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         if !force_reindex && existing_repo.is_some() {
             // Incremental: only delete the specific files we're about to re-insert.
             for file in &all_files {
@@ -5773,6 +5914,7 @@ where
                             reindex_deleted_files.push(path.clone());
                         }
                         let _ = store.delete_file_node(f_uid);
+                        removed_files.insert(path.clone());
                         // nw-055 (P1b): a vanished file is a genuine deletion. Count
                         // it so the index-time PageRank guard fires on a delete-only
                         // re-index (files_count == 0) instead of leaving surviving
@@ -5841,6 +5983,7 @@ where
                 file_languages: &file_languages,
                 actually_changed_files: &actually_changed_files,
                 added_files: &added_files,
+                removed_files: &removed_files,
                 files_unchanged,
                 resolution_deps: resolution_deps.as_deref(),
             },
@@ -5948,7 +6091,11 @@ where
                     })
                 })
                 .collect();
-            let mut file_deps: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+            let mut file_deps: HashMap<String, std::collections::HashSet<String>> = resolution
+                .import_targets
+                .iter()
+                .map(|(file, targets)| (file.clone(), targets.clone()))
+                .collect();
             for edge in &resolution.insertable_edges {
                 if let (Some(src_file), Some(tgt_file)) = (
                     symbol_file_index.get(&edge.source_uid),
@@ -6051,10 +6198,12 @@ where
         drop(contract_txn);
         let (contracts_derived, contracts_status) = match contract_apply {
             Ok(count) => {
-                if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
-                    tracing::warn!("clearing contract derivation marker failed: {error}");
-                }
-                (count, crate::blast_radius::AnalysisStatus::Complete)
+                let status = if settle_contract_derivation_marker(store, &r_uid, &contract_plan) {
+                    crate::blast_radius::AnalysisStatus::Complete
+                } else {
+                    crate::blast_radius::AnalysisStatus::Degraded
+                };
+                (count, status)
             }
             Err(error) => {
                 if let Err(marker_error) =
@@ -6087,6 +6236,9 @@ where
         store
             .set_repo_index_policy(&r_uid, &reader.eligibility_fingerprint())
             .context("persist indexed reader eligibility")?;
+        store
+            .clear_repo_publication_incomplete(&r_uid)
+            .context("retire publication-incomplete debt")?;
 
         // ── Summary ───────────────────────────────────────────────────────────
         let elapsed = started.elapsed();
@@ -6623,10 +6775,15 @@ fn collect_contract_derivation_inputs(
     Ok((spec_files, handler_files, all_symbols, skipped_files))
 }
 
+/// `published_spec_sources`: see [`prepare_contract_derivation`]. Index
+/// routes pass the store's published spec sources so a never-published,
+/// unparseable spec is skipped (QA #9) on every non-forced `index`, not only
+/// on a full replacement; `None` keeps every spec fail-closed.
 fn prepare_incremental_contract_derivation(
     reader: &dyn crate::content_reader::ContentReader,
     r_uid: &str,
     repo_url: &str,
+    published_spec_sources: Option<&HashSet<String>>,
 ) -> Result<ContractDerivationPlan, anyhow::Error> {
     let (spec_files, handler_files, all_symbols, skipped_files) =
         collect_contract_derivation_inputs(reader, r_uid, repo_url, true)?;
@@ -6637,6 +6794,7 @@ fn prepare_incremental_contract_derivation(
         &handler_files,
         &all_symbols,
         true,
+        published_spec_sources,
     )?;
     plan.skipped_files.extend(skipped_files);
     Ok(plan)
@@ -6758,6 +6916,7 @@ where
         &handler_files,
         &all_symbols,
         true,
+        None,
     )?;
     plan.skipped_files.extend(skipped_files);
     after_plan();
@@ -6811,15 +6970,59 @@ fn empty_contract_plan() -> ContractDerivationPlan {
         input_hashes: std::collections::BTreeMap::new(),
         observed_input_hashes: std::collections::BTreeMap::new(),
         skipped_files: Vec::new(),
+        unparsed_specs: Vec::new(),
     }
 }
 
 pub(crate) struct ContractDerivationPlan {
+    /// Recognized specs that failed to parse and were skipped because they had
+    /// never published a contract. Non-empty means the contract graph is
+    /// incomplete: the repo is marked contract-derivation-failed (degraded)
+    /// rather than clean, so drift does not read "declares none".
+    pub(crate) unparsed_specs: Vec<String>,
     contracts: Vec<nestweaver_schema::Contract>,
     edges: Vec<nestweaver_schema::ResolvedEdge>,
     pub(crate) input_hashes: std::collections::BTreeMap<String, String>,
     pub(crate) observed_input_hashes: std::collections::BTreeMap<String, String>,
     pub(crate) skipped_files: Vec<SkippedFile>,
+}
+
+/// After a successful contract apply: clear the contract-derivation-failed
+/// marker, unless the plan skipped unparseable specs, in which case the
+/// marker names them so consumers report the repo's contracts as degraded.
+/// Returns whether the contract graph is complete.
+fn settle_contract_derivation_marker(
+    store: &GraphStore,
+    r_uid: &str,
+    plan: &ContractDerivationPlan,
+) -> bool {
+    if plan.unparsed_specs.is_empty() {
+        if let Err(error) = store.clear_contract_derivation_failed(r_uid) {
+            tracing::warn!("clearing contract derivation marker failed: {error}");
+        }
+        return true;
+    }
+    let reason = format!(
+        "contract spec(s) could not be parsed and were skipped: {}",
+        plan.unparsed_specs.join(", ")
+    );
+    if let Err(error) = store.set_contract_derivation_failed(r_uid, &reason) {
+        tracing::warn!("recording contract derivation failure failed: {error}");
+    }
+    false
+}
+
+/// Source paths that already published contracts for `r_uid`. A full index
+/// may skip an unparseable spec only when it is absent from this set; `None`
+/// (the listing failed) keeps every spec fail-closed.
+fn published_spec_sources(store: &GraphStore, r_uid: &str) -> Option<HashSet<String>> {
+    match store.list_contracts(Some(r_uid)) {
+        Ok(contracts) => Some(contracts.into_iter().map(|c| c.source_path).collect()),
+        Err(error) => {
+            tracing::warn!("listing published contracts for {r_uid} failed: {error}");
+            None
+        }
+    }
 }
 
 /// Prepare contract rows and implementation edges without mutating the graph.
@@ -6831,6 +7034,7 @@ fn prepare_contract_derivation(
     handler_files: &[HandlerFileData],
     all_symbols: &[nestweaver_schema::Symbol],
     strict: bool,
+    published_spec_sources: Option<&HashSet<String>>,
 ) -> Result<ContractDerivationPlan, anyhow::Error> {
     use nestweaver_schema::{EdgeType, ResolvedEdge};
 
@@ -6838,6 +7042,9 @@ fn prepare_contract_derivation(
     let mut all_contracts = ContractSet::new();
     let mut input_hashes = std::collections::BTreeMap::new();
     let mut skipped_files = Vec::new();
+    // Specs skipped as unparseable (QA #9); the run reports contracts as
+    // degraded while any remain.
+    let mut unparsed_specs: Vec<String> = Vec::new();
     // (contract_uid, "<package>.<Service>/<Rpc>") for every declared gRPC method.
     let mut declared_grpc: Vec<(String, String)> = Vec::new();
     let repo_path = reader.root();
@@ -6864,6 +7071,9 @@ fn prepare_contract_derivation(
                 ));
                 continue;
             }
+            // Deleted since the scan (checkout, rebase): a deletion, not a
+            // failure. Every other read error still fails strict mode.
+            Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => continue,
             Err(error) if strict => {
                 return Err(error).with_context(|| format!("read watched contract spec {rel}"));
             }
@@ -6882,9 +7092,34 @@ fn prepare_contract_derivation(
         }
         let parsed_specs = if strict {
             input_hashes.insert(rel.clone(), crate::hash::blake3_hex(&source));
-            crate::contracts::parse_spec_file_strict(&rel, &source)
-                .map_err(anyhow::Error::msg)
-                .with_context(|| format!("parse watched contract spec {rel}"))?
+            match crate::contracts::parse_spec_file_strict(&rel, &source) {
+                Ok(parsed) => parsed,
+                // QA #9: one malformed `openapi.yaml` anywhere in a repo used
+                // to fail the whole index, including the FIRST one. Strictness
+                // exists to protect contracts already published from a spec
+                // (a half-saved file must not clear them); a spec that never
+                // produced any has nothing to protect, so it is skipped and
+                // disclosed as degraded coverage instead.
+                Err(error)
+                    if published_spec_sources
+                        .is_some_and(|published| !published.contains(&rel)) =>
+                {
+                    tracing::warn!("skipping unparseable contract spec {rel}: {error}");
+                    // `new` caps the reason: a parser error can be long and
+                    // quote source text.
+                    skipped_files.push(SkippedFile::new(
+                        rel.clone(),
+                        SkipReasonCode::ParseError,
+                        format!("contract spec could not be parsed: {error}"),
+                    ));
+                    unparsed_specs.push(rel);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::msg(error))
+                        .with_context(|| format!("parse watched contract spec {rel}"));
+                }
+            }
         } else {
             crate::contracts::parse_spec_file(&rel, &source)
         };
@@ -6918,6 +7153,8 @@ fn prepare_contract_derivation(
         // truncated signature if the file is unreadable.
         let base_source = match reader.read_file(Path::new(&hf.rel_path)) {
             Ok(source) => source,
+            // Deleted since the parse: its handlers are gone with it.
+            Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => continue,
             Err(error) if strict => {
                 return Err(error).with_context(|| format!("read watched handler {}", hf.rel_path));
             }
@@ -6971,9 +7208,19 @@ fn prepare_contract_derivation(
             if input_hashes.contains_key(rel_path) {
                 continue;
             }
-            let source = reader
-                .read_file(Path::new(rel_path))
-                .with_context(|| format!("read watched gRPC candidate {rel_path}"))?;
+            let source = match reader.read_file(Path::new(rel_path)) {
+                Ok(source) => source,
+                // A source deleted between its parse and this re-read is a
+                // deletion, consistent with the scan and parse phases: it has
+                // no content to hash. Any other read error still fails closed.
+                Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("read watched gRPC candidate {rel_path}"));
+                }
+            };
             input_hashes.insert(rel_path.to_string(), crate::hash::blake3_hex(&source));
         }
     }
@@ -6996,6 +7243,9 @@ fn prepare_contract_derivation(
             // every source file in the repo.
             let source = match reader.read_file(Path::new(rel_path)) {
                 Ok(source) => source,
+                Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+                    continue;
+                }
                 Err(error) if strict => {
                     return Err(error)
                         .with_context(|| format!("read watched gRPC handler {rel_path}"));
@@ -7043,6 +7293,7 @@ fn prepare_contract_derivation(
         input_hashes,
         observed_input_hashes: std::collections::BTreeMap::new(),
         skipped_files,
+        unparsed_specs,
     })
 }
 
@@ -7900,8 +8151,12 @@ fn incremental_index_with_name_and_io_and_authority(
         );
         let prepared_files = prepare_incremental_files(&reader, &changes)
             .context("rebuild incremental source files after publication lease")?;
-        let contract_plan = match prepare_incremental_contract_derivation(&reader, &r_uid, repo_url)
-        {
+        let contract_plan = match prepare_incremental_contract_derivation(
+            &reader,
+            &r_uid,
+            repo_url,
+            published_spec_sources(&store, &r_uid).as_ref(),
+        ) {
             Ok(plan) => plan,
             Err(error) => {
                 if let Err(marker_error) =
@@ -8174,9 +8429,7 @@ fn incremental_index_with_name_and_io_and_authority(
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
-    if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
-        tracing::warn!("clearing contract derivation marker failed: {error}");
-    }
+    settle_contract_derivation_marker(&store, &r_uid, &contract_plan);
     persist_unresolved_imports(
         &reader,
         &store,
@@ -8387,7 +8640,12 @@ where
         &removed_files,
         &mut rdeps,
     );
-    let contract_plan_result = prepare_incremental_contract_derivation(reader, &r_uid, repo_url);
+    let contract_plan_result = prepare_incremental_contract_derivation(
+        reader,
+        &r_uid,
+        repo_url,
+        published_spec_sources(store, &r_uid).as_ref(),
+    );
     let mut prepared_files = prepare_incremental_files(reader, &changes)
         .context("prepare server incremental source files")?;
 
@@ -8442,8 +8700,12 @@ where
             );
             prepared_files = prepare_incremental_files(reader, &changes)
                 .context("rebuild server incremental source files after publication yield")?;
-            contract_plan = match prepare_incremental_contract_derivation(reader, &r_uid, repo_url)
-            {
+            contract_plan = match prepare_incremental_contract_derivation(
+                reader,
+                &r_uid,
+                repo_url,
+                published_spec_sources(store, &r_uid).as_ref(),
+            ) {
                 Ok(plan) => plan,
                 Err(error) => {
                     if let Err(marker_error) =
@@ -8701,9 +8963,7 @@ where
         .commit_transaction(&txn)
         .with_context(|| "commit incremental transaction")?;
     drop(txn);
-    if let Err(error) = store.clear_contract_derivation_failed(&r_uid) {
-        tracing::warn!("clearing contract derivation marker failed: {error}");
-    }
+    settle_contract_derivation_marker(store, &r_uid, &contract_plan);
     if let Some(db_path) = store.db_path() {
         persist_unresolved_imports(
             reader,
@@ -9239,14 +9499,7 @@ fn write_prepared_incremental_file_txn(
     let lang = nestweaver_parser::detect_language(abs_path)
         .unwrap_or(nestweaver_schema::Language::JavaScript);
 
-    let workspace_ctx = if matches!(
-        lang,
-        nestweaver_schema::Language::JavaScript
-            | nestweaver_schema::Language::TypeScript
-            | nestweaver_schema::Language::Vue
-            | nestweaver_schema::Language::Svelte
-            | nestweaver_schema::Language::Astro
-    ) {
+    let workspace_ctx = if language_uses_workspace_context(lang) {
         discover_workspace_context_with(|p| {
             reader
                 .read_file(p)
@@ -9367,26 +9620,57 @@ pub(crate) fn extend_rdeps_for_added_files(
     let Some(db_path) = db_path else {
         return;
     };
-    // Added paths are a subset of `changed`. A delete-only batch has nothing
-    // for an unresolved specifier to start naming.
-    if changed.is_empty() {
+    if changed.is_empty() && removed.is_empty() {
         return;
     }
     let deps = crate::resolution_cache::ResolutionDeps::load(&crate::sidecar_path(
         db_path,
         ".resolution_deps.bin",
     ));
+    let Ok(listed) = store.list_files_by_repo(r_uid) else {
+        tracing::warn!("listing files for unresolved-import re-resolution failed");
+        return;
+    };
+    let existing: HashSet<String> = listed.into_iter().map(|(_, path)| path).collect();
+
+    // Importers recorded in the dependency sidecar. The live-graph walk in
+    // `collect_reverse_dep_files` only sees importers that already hold an
+    // edge into a changed file; one whose import named the file but bound
+    // nothing yet (the symbol is being added now), or reached it only through
+    // a barrel, has no such edge. Index runs record those import targets as
+    // dependency rows, so the importer is found here instead.
+    let seeds: HashSet<String> = changed.union(removed).cloned().collect();
+    let sidecar_dependents: Vec<String> = deps
+        .affected_files_for_repo(r_uid, &seeds)
+        .into_iter()
+        .filter(|path| !seeds.contains(path) && existing.contains(path) && !rdeps.contains(path))
+        .collect();
+    if rdeps.len() + sidecar_dependents.len() > MAX_DIRECT_DEPENDENTS {
+        tracing::warn!(
+            recorded = sidecar_dependents.len(),
+            ceiling = MAX_DIRECT_DEPENDENTS,
+            "sidecar importers exceed the re-resolution ceiling; run `nestweaver index` to \
+             re-resolve them"
+        );
+    } else if !sidecar_dependents.is_empty() {
+        tracing::info!(
+            count = sidecar_dependents.len(),
+            "re-resolving importers recorded in the dependency sidecar"
+        );
+        rdeps.extend(sidecar_dependents);
+    }
+
+    // Added paths are a subset of `changed`. A delete-only batch has nothing
+    // for an unresolved specifier to start naming.
+    if changed.is_empty() {
+        return;
+    }
     let Some(unresolved) = deps.unresolved_for_repo(r_uid) else {
         return;
     };
     if unresolved.is_empty() {
         return;
     }
-    let Ok(listed) = store.list_files_by_repo(r_uid) else {
-        tracing::warn!("listing files for unresolved-import re-resolution failed");
-        return;
-    };
-    let existing: HashSet<String> = listed.into_iter().map(|(_, path)| path).collect();
     let added: HashSet<String> = changed
         .iter()
         .filter(|path| !existing.contains(*path))
@@ -9442,8 +9726,16 @@ pub(crate) fn persist_unresolved_imports(
         match store.list_files_by_repo(r_uid) {
             Ok(listed) => {
                 let known: HashSet<String> = listed.into_iter().map(|(_, file)| file).collect();
-                for (file, specifiers) in unresolved_imports_on_disk(reader, &known, &refresh) {
+                let survey = import_survey_on_disk(reader, &known, &refresh);
+                for (file, specifiers) in survey.unresolved {
                     deps.set_unresolved_for_repo(r_uid, file, specifiers);
+                }
+                // Keep the import-target rows current for files this batch
+                // re-resolved, so a later edit of a target finds them. Merged
+                // into the existing row: this pass does not know the edge
+                // targets, and an extra row only widens a later re-resolve.
+                for (file, targets) in survey.targets {
+                    deps.add_deps_for_repo(r_uid, file, targets);
                 }
             }
             Err(error) => {
@@ -9456,7 +9748,7 @@ pub(crate) fn persist_unresolved_imports(
     }
 }
 
-fn language_uses_workspace_context(language: Language) -> bool {
+pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
     matches!(
         language,
         Language::JavaScript
@@ -9464,6 +9756,8 @@ fn language_uses_workspace_context(language: Language) -> bool {
             | Language::Vue
             | Language::Svelte
             | Language::Astro
+            // `go.mod` / `go.work` map Go import paths onto directories.
+            | Language::Go
     )
 }
 
@@ -9510,6 +9804,80 @@ fn unresolved_importers_of_added_files(
     importers_of_added_paths(reader, unresolved, added, &known)
 }
 
+/// One seeded importer parsed for the resolver view.
+struct SeededImporterParse {
+    rel_path: String,
+    symbols: Vec<RawSymbol>,
+    references: Vec<RawReference>,
+    retained: Option<String>,
+    type_env: Option<nestweaver_resolver::types::TypeEnvironment>,
+}
+
+/// Read and parse one seeded importer. `None` (logged) leaves its edges in
+/// place: the caller only names a file in the resolve filter once it parsed.
+fn parse_seeded_importer(
+    reader: &dyn crate::content_reader::ContentReader,
+    file_languages: &HashMap<String, Language>,
+    rel_path: &str,
+) -> Option<SeededImporterParse> {
+    let Some(language) = file_languages
+        .get(rel_path)
+        .copied()
+        .or_else(|| detect_language(Path::new(rel_path)))
+    else {
+        tracing::warn!(
+            file = %rel_path,
+            "seeded importer has no detected language; leaving its edges in place"
+        );
+        return None;
+    };
+    let Ok(source) = reader.read_file(Path::new(rel_path)) else {
+        tracing::warn!(
+            file = %rel_path,
+            "seeded importer could not be read; leaving its edges in place"
+        );
+        return None;
+    };
+    let Ok(parsed) = parse_source(&reader.root().join(rel_path), &source) else {
+        tracing::warn!(
+            file = %rel_path,
+            "seeded importer could not be parsed; leaving its edges in place"
+        );
+        return None;
+    };
+    if parsed.unparsable_skip(rel_path.to_string()).is_some() {
+        tracing::warn!(
+            file = %rel_path,
+            "seeded importer was unparsable; leaving its edges in place"
+        );
+        return None;
+    }
+    let env = nestweaver_resolver::types::TypeEnvironment::build(
+        &source,
+        language,
+        &parsed.symbols,
+        &parsed.type_bindings,
+    );
+    let type_env = (env.binding_count() > 0 || env.has_scoped_call_assignments()).then_some(env);
+    // Same retention rule as a normal parse: JS/TS keep source for
+    // decorator recovery; other languages keep it under 2 MB.
+    const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
+    let retained = if matches!(language, Language::TypeScript | Language::JavaScript)
+        || source.len() <= SOURCE_RETENTION_CAP
+    {
+        Some(source)
+    } else {
+        None
+    };
+    Some(SeededImporterParse {
+        rel_path: rel_path.to_string(),
+        symbols: parsed.symbols,
+        references: parsed.references,
+        retained,
+        type_env,
+    })
+}
+
 /// Parse seeded importers that are missing from `parsed_files` into that view.
 ///
 /// nw-806. Filemeta can classify an untouched importer as Unchanged when the
@@ -9528,72 +9896,30 @@ fn include_missing_seeded_importer_parses(
     file_languages: &HashMap<String, Language>,
     seeded: &HashSet<String>,
 ) -> HashSet<String> {
+    use rayon::prelude::*;
     let mut present: HashSet<String> = parsed_files
         .iter()
         .map(|(path, _, _, _)| path.clone())
         .collect();
-    for rel_path in seeded {
-        if present.contains(rel_path) {
-            continue;
+    let missing: Vec<&String> = seeded
+        .iter()
+        .filter(|path| !present.contains(path.as_str()))
+        .collect();
+    // Import-target rows can name many dependents of a widely imported
+    // module, so a cold parsed cache makes this the bulk of the pass: read
+    // and parse on the parse pool, as the scan phase does.
+    let parsed: Vec<SeededImporterParse> = crate::parse_pool::install_parse_pool(|| {
+        missing
+            .par_iter()
+            .filter_map(|rel_path| parse_seeded_importer(reader, file_languages, rel_path))
+            .collect()
+    });
+    for seed in parsed {
+        if let Some(env) = seed.type_env {
+            type_envs.insert(seed.rel_path.clone(), env);
         }
-        let Some(language) = file_languages
-            .get(rel_path)
-            .copied()
-            .or_else(|| detect_language(Path::new(rel_path)))
-        else {
-            tracing::warn!(
-                file = %rel_path,
-                "seeded importer has no detected language; leaving its edges in place"
-            );
-            continue;
-        };
-        let Ok(source) = reader.read_file(Path::new(rel_path)) else {
-            tracing::warn!(
-                file = %rel_path,
-                "seeded importer could not be read; leaving its edges in place"
-            );
-            continue;
-        };
-        let Ok(parsed) = parse_source(&reader.root().join(rel_path), &source) else {
-            tracing::warn!(
-                file = %rel_path,
-                "seeded importer could not be parsed; leaving its edges in place"
-            );
-            continue;
-        };
-        if parsed.unparsable_skip(rel_path.clone()).is_some() {
-            tracing::warn!(
-                file = %rel_path,
-                "seeded importer was unparsable; leaving its edges in place"
-            );
-            continue;
-        }
-        let env = nestweaver_resolver::types::TypeEnvironment::build(
-            &source,
-            language,
-            &parsed.symbols,
-            &parsed.type_bindings,
-        );
-        if env.binding_count() > 0 || env.has_scoped_call_assignments() {
-            type_envs.insert(rel_path.clone(), env);
-        }
-        // Same retention rule as a normal parse: JS/TS keep source for
-        // decorator recovery; other languages keep it under 2 MB.
-        const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
-        let retained = if matches!(language, Language::TypeScript | Language::JavaScript)
-            || source.len() <= SOURCE_RETENTION_CAP
-        {
-            Some(source)
-        } else {
-            None
-        };
-        parsed_files.push((
-            rel_path.clone(),
-            parsed.symbols,
-            parsed.references,
-            retained,
-        ));
-        present.insert(rel_path.clone());
+        present.insert(seed.rel_path.clone());
+        parsed_files.push((seed.rel_path, seed.symbols, seed.references, seed.retained));
     }
     seeded
         .iter()
@@ -9619,6 +9945,7 @@ fn importers_of_added_paths(
     }
     let workspace = workspace_context_for_languages(reader, by_lang.keys().copied());
     let known: HashSet<&str> = known_files.iter().map(String::as_str).collect();
+    let targets = nestweaver_resolver::imports::ImportTargets::new(&known);
     let mut seeded = HashSet::new();
     for (language, importers) in by_lang {
         for importer in importers {
@@ -9626,10 +9953,10 @@ fn importers_of_added_paths(
                 continue;
             };
             let names_added = specs.iter().any(|specifier| {
-                nestweaver_resolver::imports::resolved_import_path(
-                    &importer, specifier, &known, language, &workspace,
-                )
-                .is_some_and(|target| target != importer && added.contains(&target))
+                targets
+                    .paths(&importer, specifier, language, &workspace)
+                    .into_iter()
+                    .any(|target| target != importer && added.contains(&target))
             });
             if names_added {
                 seeded.insert(importer);
@@ -9639,11 +9966,11 @@ fn importers_of_added_paths(
     seeded
 }
 
-fn unresolved_imports_on_disk(
+fn import_survey_on_disk(
     reader: &dyn crate::content_reader::ContentReader,
     known_files: &HashSet<String>,
     refresh: &HashSet<String>,
-) -> HashMap<String, HashSet<String>> {
+) -> ImportSurvey {
     let mut languages = HashMap::new();
     let mut references = HashMap::new();
     let mut parsed = HashSet::new();
@@ -9662,24 +9989,36 @@ fn unresolved_imports_on_disk(
         references.insert(rel.clone(), parsed_file.references);
     }
     let workspace = workspace_context_for_languages(reader, languages.values().copied());
-    unresolved_import_specifiers(&references, known_files, &languages, &workspace, &parsed)
+    survey_import_specifiers(&references, known_files, &languages, &workspace, &parsed)
 }
 
-/// Unresolved import specifiers for `only`, resolved against `known_files`.
-/// An empty set means the file was resolved and every import specifier hit a
-/// known file — callers use that to clear a stale entry.
+/// Per importer: the specifiers that did not resolve, and the files the ones
+/// that did resolve name.
+#[derive(Default)]
+struct ImportSurvey {
+    unresolved: HashMap<String, HashSet<String>>,
+    /// Importer → files its import specifiers resolve to (itself excluded).
+    /// A barrel's `export * from "./x"` is an import reference too, so this
+    /// also names the targets a re-export forwards.
+    targets: HashMap<String, HashSet<String>>,
+}
+
+/// Survey the import specifiers of `only`, resolved against `known_files`.
+/// An empty unresolved set means the file was resolved and every import
+/// specifier hit a known file — callers use that to clear a stale entry.
 ///
 /// Resolves each specifier directly. Building an import graph would walk an
 /// export map for every known path, including files this batch did not parse.
-fn unresolved_import_specifiers(
+fn survey_import_specifiers(
     references: &HashMap<String, Vec<RawReference>>,
     known_files: &HashSet<String>,
     languages: &HashMap<String, Language>,
     workspace: &nestweaver_resolver::WorkspaceContext,
     only: &HashSet<String>,
-) -> HashMap<String, HashSet<String>> {
+) -> ImportSurvey {
     let known: HashSet<&str> = known_files.iter().map(String::as_str).collect();
-    let mut out = HashMap::new();
+    let import_targets = nestweaver_resolver::imports::ImportTargets::new(&known);
+    let mut survey = ImportSurvey::default();
     for path in only {
         let Some(language) = languages.get(path) else {
             continue;
@@ -9688,6 +10027,7 @@ fn unresolved_import_specifiers(
             continue;
         };
         let mut specs = HashSet::new();
+        let mut targets = HashSet::new();
         for reference in file_refs {
             let specifier = match reference.kind {
                 nestweaver_parser::ReferenceKind::Import
@@ -9698,29 +10038,33 @@ fn unresolved_import_specifiers(
                 }
                 _ => None,
             };
-            if let Some(specifier) = specifier.filter(|specifier| !specifier.is_empty())
-                && nestweaver_resolver::imports::resolved_import_path(
-                    path, specifier, &known, *language, workspace,
-                )
-                .is_none()
-            {
+            let Some(specifier) = specifier.filter(|specifier| !specifier.is_empty()) else {
+                continue;
+            };
+            // Every file the specifier names: a Go import names its whole
+            // package, so a symbol added to any file of it concerns the
+            // importer (the same set `importers_of_added_paths` consults).
+            let named = import_targets.paths(path, specifier, *language, workspace);
+            if named.is_empty() {
                 specs.insert(specifier.to_string());
             }
+            targets.extend(named.into_iter().filter(|target| target != path));
         }
-        out.insert(path.clone(), specs);
+        survey.unresolved.insert(path.clone(), specs);
+        survey.targets.insert(path.clone(), targets);
     }
-    out
+    survey
 }
 
 /// Specifiers that failed to resolve for files in `only` that this pass
 /// actually parsed. Known paths include every scanned file, not only the
 /// parsed subset, so an unchanged target is not recorded as unresolved.
-fn unresolved_imports_for_resolved_files(
+fn import_survey_for_resolved_files(
     resolver_view: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
     file_languages: &HashMap<String, Language>,
     workspace: &nestweaver_resolver::WorkspaceContext,
     only: &HashSet<String>,
-) -> HashMap<String, HashSet<String>> {
+) -> ImportSurvey {
     let known_files: HashSet<String> = file_languages.keys().cloned().collect();
     let mut references = HashMap::new();
     for (path, _symbols, file_refs) in resolver_view {
@@ -9728,7 +10072,7 @@ fn unresolved_imports_for_resolved_files(
             references.insert(path.clone(), file_refs.clone());
         }
     }
-    unresolved_import_specifiers(&references, &known_files, file_languages, workspace, only)
+    survey_import_specifiers(&references, &known_files, file_languages, workspace, only)
 }
 
 /// `pub(crate)` so the live code watcher (`watch_code.rs`) can run the same
@@ -13434,6 +13778,7 @@ mod tests {
                 abandoned_writer_pid: Some(replacement_pid),
                 generation: canonical + 2,
                 was_cancelled_run: true,
+                incomplete_repos: Vec::new(),
             }
         );
         assert!(!marker_path.exists());
@@ -14844,6 +15189,7 @@ function hello(name) { return "Hello " + name; }
             input_hashes: std::collections::BTreeMap::new(),
             observed_input_hashes: std::collections::BTreeMap::new(),
             skipped_files: Vec::new(),
+            unparsed_specs: Vec::new(),
         };
         let transaction = store.begin_transaction().unwrap();
         apply_contract_derivation_on(&transaction, repo_a, &plan).unwrap();
@@ -15468,6 +15814,7 @@ function hello(name) { return "Hello " + name; }
             input_hashes: std::collections::BTreeMap::new(),
             observed_input_hashes: std::collections::BTreeMap::new(),
             skipped_files: Vec::new(),
+            unparsed_specs: Vec::new(),
         };
         let transaction = store.begin_transaction().unwrap();
         let err = apply_contract_derivation_on(&transaction, &repo_uid, &invalid_plan)
@@ -15700,6 +16047,112 @@ function hello(name) { return "Hello " + name; }
                 .is_clean(),
             "a successful re-index must clear the degradation marker"
         );
+    }
+
+    /// QA #9: a malformed spec that never published contracts is a disclosed
+    /// skip on the FIRST index, not a failure of the whole repository. The
+    /// healthy spec beside it still derives its contracts.
+    #[test]
+    fn first_index_skips_an_unparseable_spec_that_published_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        write_shared_route_repo(&src);
+        fs::create_dir_all(src.join("docs")).unwrap();
+        fs::write(src.join("docs/openapi.yaml"), "openapi: [malformed").unwrap();
+
+        let (first, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123")
+                .expect("an unparseable, never-published spec must not fail the first index");
+        assert!(
+            first.contracts_derived > 0,
+            "the healthy spec still derives"
+        );
+        assert!(
+            first.skipped_files.iter().any(|skipped| {
+                skipped.path == "docs/openapi.yaml"
+                    && skipped.reason_code == SkipReasonCode::ParseError
+            }),
+            "the skip must be disclosed: {:?}",
+            first.skipped_files
+        );
+        assert!(
+            store
+                .list_contracts(None)
+                .unwrap()
+                .iter()
+                .all(|contract| contract.source_path != "docs/openapi.yaml")
+        );
+    }
+
+    /// QA #9 (review): a malformed spec added to an ALREADY-indexed repo is
+    /// skipped on the incremental derivation route too, and the repo's
+    /// contracts read as degraded rather than clean.
+    #[test]
+    fn incremental_index_skips_an_unparseable_new_spec_and_reports_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        write_shared_route_repo(&src);
+        let (_first, store) =
+            index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
+        let repo_uid = store
+            .list_contracts(None)
+            .unwrap()
+            .first()
+            .expect("first index derives a contract")
+            .repo_uid
+            .clone();
+
+        fs::create_dir_all(src.join("docs")).unwrap();
+        fs::write(src.join("docs/openapi.yaml"), "openapi: [malformed").unwrap();
+        let second = reindex_into(&store, &src, "def456")
+            .expect("a never-published malformed spec must not fail a non-forced index");
+        assert!(
+            second
+                .skipped_files
+                .iter()
+                .any(|skipped| skipped.path == "docs/openapi.yaml"
+                    && skipped.reason_code == SkipReasonCode::ParseError),
+            "{:?}",
+            second.skipped_files
+        );
+        assert_eq!(
+            second.contracts_status,
+            crate::blast_radius::AnalysisStatus::Degraded
+        );
+        assert_eq!(
+            store.contract_derivation_failures(Some(&repo_uid)).unwrap(),
+            vec![repo_uid.clone()],
+            "drift must not read the repo as clean"
+        );
+        assert!(
+            !crate::contracts::drift_for_store(&store, Some(&repo_uid))
+                .unwrap()
+                .is_clean()
+        );
+
+        // Fixing the spec clears the degradation.
+        fs::remove_file(src.join("docs/openapi.yaml")).unwrap();
+        let healed = reindex_into(&store, &src, "ghi789").unwrap();
+        assert_eq!(
+            healed.contracts_status,
+            crate::blast_radius::AnalysisStatus::Complete
+        );
+    }
+
+    /// QA #9: a pathologically nested spec is refused in one linear pass
+    /// rather than handed to the YAML parser.
+    #[test]
+    fn deeply_nested_spec_is_refused_quickly() {
+        let depth = 20_000;
+        let mut spec = String::from("openapi: 3.0.0\npaths: ");
+        spec.push_str(&"{a: ".repeat(depth));
+        spec.push('1');
+        spec.push_str(&"}".repeat(depth));
+        let started = std::time::Instant::now();
+        let error = crate::contracts::parse_spec_file_strict("openapi.yaml", &spec)
+            .expect_err("a 20k-deep document must be refused");
+        assert!(error.contains("nesting"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     /// A malformed recognized spec fails before graph/SHA publication, retains
@@ -20953,6 +21406,72 @@ module.exports = { check, plain };\n";
         );
     }
 
+    /// QA (#513 follow-up): a source deleted AFTER its parse but before strict
+    /// contract derivation re-reads it failed the whole index with "prepare
+    /// strict contract derivation: read watched gRPC candidate m50.py: stat …:
+    /// No such file or directory". That re-read must treat NotFound as the
+    /// deletion every other phase already treats it as.
+    #[test]
+    fn a_source_deleted_after_parse_does_not_fail_strict_contract_derivation() {
+        struct DeleteAfterFirstRead {
+            inner: crate::content_reader::FilesystemReader,
+            victim: PathBuf,
+        }
+        impl crate::content_reader::ContentReader for DeleteAfterFirstRead {
+            fn read_file(&self, rel_path: &Path) -> anyhow::Result<String> {
+                let source = self.inner.read_file(rel_path)?;
+                if rel_path == Path::new("m50.py") {
+                    // The parse got its bytes; the file is gone for every
+                    // later read.
+                    let _ = fs::remove_file(&self.victim);
+                }
+                Ok(source)
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                self.inner.list_files()
+            }
+            fn file_meta_nanos(&self, rel_path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                self.inner.file_meta_nanos(rel_path)
+            }
+            fn root(&self) -> &Path {
+                self.inner.root()
+            }
+            fn version_id(&self) -> &str {
+                self.inner.version_id()
+            }
+            fn max_source_file_bytes(&self) -> u64 {
+                self.inner.max_source_file_bytes()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("kept.py"), "def kept():\n    pass\n").unwrap();
+        fs::write(dir.path().join("m50.py"), "def m50():\n    pass\n").unwrap();
+        let reader = DeleteAfterFirstRead {
+            inner: crate::content_reader::FilesystemReader::new(dir.path()),
+            victim: dir.path().join("m50.py"),
+        };
+        let store = GraphStore::in_memory().unwrap();
+        index_into_store(
+            &reader,
+            &store,
+            "test",
+            "https://example.test/deleted-after-parse",
+            "sha",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a file deleted after its parse must not abort strict contract derivation");
+        assert!(
+            !dir.path().join("m50.py").exists(),
+            "the hook must have run"
+        );
+        assert_eq!(store.lookup_symbols_by_name("kept").unwrap().len(), 1);
+    }
+
     /// nw-355, the incremental half. `prepare_incremental_file` had the same
     /// `SourceTooLarge`-only downcast and then a bare `?`, which
     /// `prepare_incremental_files` propagates and `:5458` wraps as "prepare
@@ -22861,5 +23380,285 @@ impl Counter {
             r2.symbols_count, r1.symbols_count,
             "warm index should have same symbol count as cold index (from parsed cache)"
         );
+    }
+
+    // ── Incremental == full (QA durability round) ───────────────────────────
+
+    /// Every resolved symbol edge as `(source uid, target uid, type)`, sorted.
+    fn resolved_edge_set(db_path: &Path) -> Vec<(String, String, String)> {
+        let store = GraphStore::open_or_create(db_path).unwrap();
+        let mut edges: Vec<_> = store
+            .load_typed_edges()
+            .unwrap()
+            .into_iter()
+            .map(|(source, target, edge_type, _, _)| (source, target, edge_type))
+            .collect();
+        edges.sort();
+        edges.dedup();
+        edges
+    }
+
+    /// Index `repo` incrementally into `db`, then from scratch into a fresh
+    /// database, and assert both graphs hold the same resolved edges.
+    fn assert_incremental_matches_full(dir: &Path, repo: &Path, db: &Path, url: &str, step: &str) {
+        let incremental = index_directory(repo, db, "test", url, step).unwrap();
+        assert!(
+            incremental.files_unchanged > 0,
+            "{step}: the run under test must stay on the incremental path"
+        );
+        let full_db = dir.join(format!("full-{step}.lbug"));
+        index_directory(repo, &full_db, "test", url, step).unwrap();
+        assert_eq!(
+            resolved_edge_set(db),
+            resolved_edge_set(&full_db),
+            "{step}: incremental index must publish the same edges as a full index"
+        );
+    }
+
+    /// QA: `pkg/b.py` imports `foo` from `pkg.a` before `foo` exists. Adding
+    /// `def foo` to the (modified, not added) `a.py` published 0 edges
+    /// incrementally while `--force` published the call: the importer had no
+    /// edge into `a.py`, so no dependency row named it. Renaming foo -> bar ->
+    /// foo exercises the same gap in both directions.
+    #[test]
+    fn incremental_index_reresolves_importers_of_a_modified_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("inc.lbug");
+        fs::create_dir_all(repo.join("pkg")).unwrap();
+        fs::write(repo.join("pkg/__init__.py"), "").unwrap();
+        fs::write(repo.join("pkg/a.py"), "def other():\n    return 0\n").unwrap();
+        fs::write(
+            repo.join("pkg/b.py"),
+            "from pkg.a import foo\n\n\ndef caller():\n    return foo(1)\n",
+        )
+        .unwrap();
+        fs::write(repo.join("pkg/c.py"), "def untouched():\n    return 2\n").unwrap();
+        let url = "https://example.test/modified-module-importers";
+        index_directory(&repo, &db, "test", url, "s0").unwrap();
+
+        let a =
+            |name: &str| format!("def other():\n    return 0\n\n\ndef {name}(x):\n    return x\n");
+        fs::write(repo.join("pkg/a.py"), a("foo")).unwrap();
+        assert_incremental_matches_full(dir.path(), &repo, &db, url, "s1");
+        // UIDs are hashed, so the edge is identified by type: `caller` is the
+        // only symbol that calls anything.
+        assert!(
+            resolved_edge_set(&db)
+                .iter()
+                .any(|(_, _, edge_type)| edge_type == "CALLS"),
+            "the call into the new symbol must be published: {:?}",
+            resolved_edge_set(&db)
+        );
+        fs::write(repo.join("pkg/a.py"), a("bar")).unwrap();
+        assert_incremental_matches_full(dir.path(), &repo, &db, url, "s2");
+        fs::write(repo.join("pkg/a.py"), a("foo")).unwrap();
+        assert_incremental_matches_full(dir.path(), &repo, &db, url, "s3");
+    }
+
+    /// QA (repos/inc2): `main.ts` reaches `greet` through a barrel
+    /// (`util/index.ts`: `export * from "./strings"`). Renaming the barrel's
+    /// target and updating the barrel lost the hello -> greet edge on every
+    /// later incremental index.
+    #[test]
+    fn incremental_index_keeps_edges_through_a_barrel_whose_target_is_renamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("inc.lbug");
+        fs::create_dir_all(repo.join("src/util")).unwrap();
+        fs::write(
+            repo.join("src/util/strings.ts"),
+            "export function greet(name: string): string { return name; }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/util/index.ts"),
+            "export * from \"./strings\";\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/main.ts"),
+            "import { greet } from \"./util\";\nexport function hello(): string { return greet(\"x\"); }\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/other.ts"),
+            "export function other(): number { return 1; }\n",
+        )
+        .unwrap();
+        let url = "https://example.test/barrel-rename";
+        index_directory(&repo, &db, "test", url, "s0").unwrap();
+        // UIDs are hashed; `hello -> greet` is the only call in the repo.
+        let calls_greet = |db: &Path| {
+            resolved_edge_set(db)
+                .iter()
+                .any(|(_, _, edge_type)| edge_type == "CALLS")
+        };
+        assert!(calls_greet(&db), "precondition: hello -> greet resolves");
+
+        fs::rename(
+            repo.join("src/util/strings.ts"),
+            repo.join("src/util/text.ts"),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("src/util/index.ts"),
+            "export * from \"./text\";\n",
+        )
+        .unwrap();
+        assert_incremental_matches_full(dir.path(), &repo, &db, url, "s1");
+        assert!(calls_greet(&db), "hello -> greet must survive the rename");
+
+        // A later incremental run over an unchanged tree must not lose it.
+        fs::write(
+            repo.join("src/other.ts"),
+            "export function other(): number { return 2; }\n",
+        )
+        .unwrap();
+        assert_incremental_matches_full(dir.path(), &repo, &db, url, "s2");
+        assert!(calls_greet(&db));
+    }
+
+    /// QA: with the daemon stopped, `rm g.lbug g.lbug.wal` left the filemeta
+    /// sidecar behind; the next index classified every file Unchanged, wrote
+    /// nothing, and reported an empty graph as complete.
+    #[test]
+    fn a_filemeta_sidecar_without_its_database_does_not_skip_the_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("g.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("a.py"), "def alpha():\n    return beta()\n").unwrap();
+        fs::write(repo.join("b.py"), "def beta():\n    return 1\n").unwrap();
+        let url = "https://example.test/orphan-sidecar";
+        index_directory(&repo, &db, "test", url, "s0").unwrap();
+        let filemeta = crate::sidecar_path(&db, ".filemeta.json");
+        assert!(filemeta.exists(), "precondition: the sidecar was written");
+
+        // Remove the database (and nothing else).
+        let _ = fs::remove_file(&db);
+        let _ = fs::remove_dir_all(&db);
+        let _ = fs::remove_file(crate::sidecar_path(&db, ".wal"));
+        assert!(filemeta.exists());
+
+        let result = index_directory(&repo, &db, "test", url, "s0").unwrap();
+        assert_eq!(
+            result.files_unchanged, 0,
+            "nothing in the new store vouches for a file"
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.lookup_symbols_by_name("alpha").unwrap().len(), 1);
+        assert_eq!(store.lookup_symbols_by_name("beta").unwrap().len(), 1);
+    }
+
+    /// A filemeta entry the store does not vouch for (the store lost that
+    /// file's rows, or holds an older copy of them) re-parses that file
+    /// instead of classifying it Unchanged.
+    #[test]
+    fn a_filemeta_entry_the_store_does_not_hold_is_reparsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("g.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+        fs::write(repo.join("b.py"), "def beta():\n    return 1\n").unwrap();
+        let url = "https://example.test/store-lost-a-file";
+        index_directory(&repo, &db, "test", url, "s0").unwrap();
+        let r_uid = repo_uid("test", url);
+        {
+            let store = GraphStore::open_or_create(&db).unwrap();
+            store.delete_symbols_in_file(&r_uid, "a.py").unwrap();
+            store
+                .delete_file_node(&nestweaver_schema::file_uid(&r_uid, "a.py"))
+                .unwrap();
+            assert!(store.lookup_symbols_by_name("alpha").unwrap().is_empty());
+        }
+
+        let result = index_directory(&repo, &db, "test", url, "s0").unwrap();
+        assert_eq!(
+            result.files_unchanged, 1,
+            "b.py is vouched for; a.py is not"
+        );
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.lookup_symbols_by_name("alpha").unwrap().len(), 1);
+        assert_eq!(store.lookup_symbols_by_name("beta").unwrap().len(), 1);
+    }
+
+    /// QA HIGH: a publication killed between its store transactions left a
+    /// partial graph that recovery reported as recovered and stale-check as
+    /// up to date. The debt row committed before the first write survives
+    /// that death: the repo reads `incomplete`, recovery names it, and the
+    /// next index rebuilds the repo in full and retires the debt.
+    #[test]
+    fn an_interrupted_publication_is_disclosed_and_rebuilt_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("g.lbug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(
+            repo.join("a.py"),
+            "from b import beta\n\n\ndef alpha():\n    return beta()\n",
+        )
+        .unwrap();
+        fs::write(repo.join("b.py"), "def beta():\n    return 1\n").unwrap();
+        fs::write(repo.join("c.py"), "def gamma():\n    return 1\n").unwrap();
+        let url = "https://example.test/interrupted-publication";
+        index_directory(&repo, &db, "test", url, "s0").unwrap();
+        let r_uid = repo_uid("test", url);
+        let complete = resolved_edge_set(&db);
+        {
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let repo_row = store.lookup_repo(&r_uid).unwrap().unwrap();
+            assert!(
+                !store.repo_index_incomplete(&repo_row).unwrap(),
+                "a finished index owes nothing"
+            );
+            // What a writer killed mid-publication leaves: its debt row, and a
+            // graph missing writes it never committed.
+            store
+                .set_repo_publication_incomplete(&r_uid, "index graph write")
+                .unwrap();
+            store
+                .delete_resolved_edges_for_file(&r_uid, "a.py")
+                .unwrap();
+            assert!(store.repo_index_incomplete(&repo_row).unwrap());
+            assert_eq!(
+                store.list_publication_incomplete_repos().unwrap(),
+                vec![r_uid.clone()]
+            );
+        }
+        assert_ne!(
+            resolved_edge_set(&db),
+            complete,
+            "precondition: edges were lost"
+        );
+
+        let rebuilt = index_directory(&repo, &db, "test", url, "s0").unwrap();
+        assert_eq!(rebuilt.files_unchanged, 0, "the debt forces a full rebuild");
+        assert_eq!(resolved_edge_set(&db), complete);
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let repo_row = store.lookup_repo(&r_uid).unwrap().unwrap();
+        assert!(!store.repo_index_incomplete(&repo_row).unwrap());
+    }
+
+    #[test]
+    fn recovery_names_repos_whose_publication_did_not_finish() {
+        let described = IndexPublicationRecovery::Recovered {
+            abandoned_writer_pid: Some(42),
+            generation: 7,
+            was_cancelled_run: false,
+            incomplete_repos: vec!["repo:abc".to_string()],
+        }
+        .describe();
+        assert!(described.contains("repo:abc"), "{described}");
+        assert!(described.contains("incomplete"), "{described}");
+        let clean = IndexPublicationRecovery::Recovered {
+            abandoned_writer_pid: Some(42),
+            generation: 7,
+            was_cancelled_run: false,
+            incomplete_repos: Vec::new(),
+        }
+        .describe();
+        assert!(!clean.contains("partial"), "{clean}");
     }
 }

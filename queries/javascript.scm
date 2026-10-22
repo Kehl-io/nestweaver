@@ -162,3 +162,12 @@
 ; Property read: obj.field
 (member_expression
   property: (property_identifier) @name) @reference.read_access
+
+; Bare decorators: `@log` applies (calls) `log` with the decorated member.
+; `@log(...)` is already a call_expression; the bare form produced no
+; reference, so `dead-code` reported `log` unused. A member form (`@a.b`) is
+; left out: the decorator node has no receiver field, so it would arrive as a
+; bare call to `b`.
+(decorator
+  (identifier) @name) @reference.call
+

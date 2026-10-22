@@ -4,7 +4,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// Sidecar format version. v4 records unresolved import specifiers beside
+/// Sidecar format version. v5 adds import-target rows to each file's deps
+/// (the files its import specifiers name, not only the files its resolved
+/// edges reach), so a v4 slice under-reports importers and must be rebuilt
+/// once. v4 records unresolved import specifiers beside
 /// resolved deps. A v3 file has no such slice; loading it with an empty
 /// default would look like "nothing failed to resolve" and a later create of
 /// the target would not re-resolve the importer. v3 therefore fails the
@@ -26,7 +29,7 @@ use serde::{Deserialize, Serialize};
 /// Paired with `index::FILEMETA_VERSION`: bumping one requires bumping the
 /// other (both sidecars must be invalidated together), enforced by
 /// `tests::cache_version_moves_with_filemeta_version`.
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 5;
 
 /// Maximum number of transitive reverse-dependency hops expanded when deciding
 /// which files to re-resolve after a change. Shared by the local cache-based
@@ -109,6 +112,22 @@ impl ResolutionDeps {
             .entry(r_uid.to_string())
             .or_default()
             .insert(file_path.into(), depends_on);
+    }
+
+    /// Add `depends_on` to `file_path`'s existing record within `r_uid`'s
+    /// slice (creating it when absent). Never touches another repo's slice.
+    pub fn add_deps_for_repo(
+        &mut self,
+        r_uid: &str,
+        file_path: impl Into<String>,
+        depends_on: HashSet<String>,
+    ) {
+        self.repos
+            .entry(r_uid.to_string())
+            .or_default()
+            .entry(file_path.into())
+            .or_default()
+            .extend(depends_on);
     }
 
     /// Return changed files PLUS any file WITHIN `r_uid`'s slice whose resolved

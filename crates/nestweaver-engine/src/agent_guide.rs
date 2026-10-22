@@ -541,7 +541,7 @@ pub fn generate_guide_with_tools(
         out.push_str("This codebase is indexed by NestWeaver. Available MCP tools:\n\n");
         out.push_str("| Tool | Use when |\n");
         out.push_str("|------|----------|\n");
-        out.push_str("| `brain_context` | Exploring unfamiliar code — seeds from symbols, files, or note titles |\n");
+        out.push_str("| `brain_context` | Exploring unfamiliar code — seeds are symbol names, note titles or tags (use `code_context` for a file path) |\n");
         out.push_str("| `brain_search` | Finding symbols or notes by keyword |\n");
         out.push_str("| `note_get` | Reading a vault note's full content |\n");
         out.push_str("| `backlinks` | Finding what links TO a note |\n");
@@ -762,7 +762,7 @@ pub fn generate_skill_with_tools(
     out.push_str("3. If you need to know what depends on it (callers), use `brain_impact`.\n\n");
 
     out.push_str("### Starting work on a task\n\n");
-    out.push_str("1. `brain_context` with task-related keywords as seeds (e.g. `[\"authentication\", \"login\"]`). This returns the most structurally relevant symbols and notes.\n");
+    out.push_str("1. `brain_context` seeded with the NAMES involved in the task — symbols, note titles or tags (e.g. `[\"LoginHandler\", \"SessionStore\"]`). This returns the most structurally relevant symbols and notes. Free-text keywords are not seeds: find the names with `brain_search` first, or send a question to `investigate`.\n");
     out.push_str("2. If a project exists for this area, use `project_context` instead for project-scoped results.\n");
     out.push_str("3. Drill into specific notes with `note_get` when `brain_context` surfaces a relevant title.\n\n");
 
@@ -776,7 +776,7 @@ pub fn generate_skill_with_tools(
     out.push_str("### Exploring architecture\n\n");
     out.push_str("1. `brain_guide` for the full architecture overview.\n");
     out.push_str("2. `clusters` to see functional communities of tightly-connected symbols.\n");
-    out.push_str("3. `brain_context` with broad seeds (module names, directory prefixes) for targeted exploration.\n\n");
+    out.push_str("3. `brain_context` seeded with module or type names for targeted exploration; add `path_prefix` to restrict it to a directory (a directory is not a seed).\n\n");
 
     out.push_str("### Working with vault notes\n\n");
     out.push_str("1. `brain_search` with keywords to find relevant notes.\n");
@@ -806,7 +806,7 @@ pub fn generate_skill_with_tools(
     out.push_str("### Other tips\n\n");
     out.push_str("- The `summary` field on investigate entries is the first non-empty line of the body (capped at 200 chars), not an LLM-generated summary. Use it for quick scanning, not for understanding content.\n");
     out.push_str("- Use `response_format: \"concise\"` on `brain_context` and `brain_search` when you only need titles and kinds (good for scanning many results).\n");
-    out.push_str("- Filter with `kinds`, `repos`, `path_prefix`, or `tags` to narrow results before they consume your token budget.\n\n");
+    out.push_str("- Filter `brain_context` with `kinds`, `repos`, `path_prefix`, or `tags` to narrow results before they consume your token budget (`brain_search` takes no filters).\n\n");
 
     // ── Query patterns ───────────────────────────────────────────────────
     out.push_str("## Graph query patterns\n\n");
@@ -815,7 +815,7 @@ pub fn generate_skill_with_tools(
     out.push_str(
         "- **Symbol name**: `seeds: [\"handleLogin\"]` — best for function-level exploration\n",
     );
-    out.push_str("- **Multiple seeds**: `seeds: [\"auth\", \"session\", \"token\"]` — broader topic exploration; PPR walks from all seeds simultaneously\n");
+    out.push_str("- **Multiple seeds**: `seeds: [\"LoginHandler\", \"SessionStore\", \"issue_token\"]` — broader topic exploration; PPR walks from all seeds simultaneously. Every seed is still a name: a bare topic word such as `auth` resolves to nothing or to noise\n");
     out.push_str("- **File path**: seed `code_context` or `nestweaver context` with a repo-relative path such as `src/auth/handler.rs`. `brain_context` does not expand file paths.\n");
     out.push_str("- **Note title**: `seeds: [\"Architecture Decision Records\"]` — anchor on vault knowledge\n");
     out.push_str("- **Tag**: `seeds: [\"#deprecated\"]` — all nodes with that tag\n");
@@ -832,7 +832,7 @@ pub fn generate_skill_with_tools(
 
     out.push_str("### Tuning retrieval\n\n");
     out.push_str("- Increase `token_budget` (default 2000) for broader context\n");
-    out.push_str("- Adjust `weight_ppr` / `weight_bm25` to balance structural vs. textual relevance (defaults: 0.7 / 0.3)\n");
+    out.push_str("- Adjust `weight_ppr` / `weight_bm25` / `weight_semantic` to balance structural, textual and semantic relevance (defaults: 0.40 / 0.25 / 0.35, set by `[embedding]` in the instance config; the semantic leg is skipped until `nestweaver embed` has run)\n");
     out.push_str("- Set `recency_weight: 0.7` to boost recently-modified notes\n");
     out.push_str("- Use `since: \"2026-01-01T00:00:00Z\"` to filter out old notes\n\n");
 
@@ -974,8 +974,8 @@ fn render_dynamic_tool_tables(out: &mut String, tool_docs: &[ToolDocEntry]) {
                 } else {
                     tool.key_params.join(", ")
                 };
-                // Truncate purpose to first ~120 chars for table readability
-                let purpose_short: String = tool.purpose.chars().take(120).collect();
+                // ~120 chars for table readability, cut on a word boundary.
+                let purpose_short = short_purpose(&tool.purpose, 120);
                 out.push_str(&format!(
                     "| `{}` | {} | {} |\n",
                     tool.name, purpose_short, params
@@ -984,6 +984,26 @@ fn render_dynamic_tool_tables(out: &mut String, tool_docs: &[ToolDocEntry]) {
             out.push('\n');
         }
     }
+}
+
+/// A tool purpose shortened to at most `max_chars` characters for a table
+/// cell. QA #11: a hard character cut published fragments such as "Retur"
+/// into every generated guide. A purpose that fits is returned whole; one
+/// whose first sentence fits is cut there; otherwise the cut falls on the
+/// last word boundary and is marked with an ellipsis.
+fn short_purpose(purpose: &str, max_chars: usize) -> String {
+    let purpose = purpose.trim();
+    if purpose.chars().count() <= max_chars {
+        return purpose.to_string();
+    }
+    let window: String = purpose.chars().take(max_chars).collect();
+    if let Some(end) = window.find(". ") {
+        return window[..=end].to_string();
+    }
+    let cut = window
+        .rfind(char::is_whitespace)
+        .map_or(window.as_str(), |space| &window[..space]);
+    format!("{}\u{2026}", cut.trim_end_matches([',', ';', ':', ' ']))
 }
 
 /// Render the legacy hardcoded tool tables (used when no dynamic metadata is available).
@@ -1287,6 +1307,27 @@ pub fn generate_agents_md_with_rules(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_purpose_never_cuts_mid_word() {
+        use super::short_purpose;
+        assert_eq!(short_purpose("Short one.", 120), "Short one.");
+        let long = "Find notes and symbols by keyword. Returns ranked rows with UIDs for every follow-up call an agent may want to make later on.";
+        assert_eq!(
+            short_purpose(long, 60),
+            "Find notes and symbols by keyword."
+        );
+        let no_sentence = "Trace reverse dependencies of a symbol to understand what might break if it changes and Returns confidence";
+        assert_eq!(
+            short_purpose(no_sentence, 100),
+            "Trace reverse dependencies of a symbol to understand what might break if it changes and Returns\u{2026}"
+        );
+        // A cut inside the word keeps the whole word out rather than "Retur".
+        assert_eq!(
+            short_purpose(no_sentence, 92),
+            "Trace reverse dependencies of a symbol to understand what might break if it changes and\u{2026}"
+        );
+    }
+
     use super::*;
 
     const SECRET_CONFIG: &str = r#"
@@ -1442,6 +1483,30 @@ external_refs = [{ label = "Board", url = "https://secret.example/board", ref_ty
         assert!(skill.contains("description: |"));
         assert!(skill.contains("Do NOT use for simple text search"));
         assert!(skill.contains("brain_context"));
+    }
+
+    /// The SKILL.md stated weight defaults of 0.7 / 0.3 (the real compiled
+    /// defaults are 0.40 / 0.25 / 0.35) and seeded `brain_context` with free
+    /// text, contradicting its own rule that seeds are names.
+    #[test]
+    fn generate_skill_states_real_weights_and_name_seeds() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let skill = generate_skill(&store, None).unwrap();
+        let defaults = crate::query::HybridSearchConfig::default();
+        let stated = format!(
+            "{:.2} / {:.2} / {:.2}",
+            defaults.weight_ppr, defaults.weight_bm25, defaults.weight_semantic
+        );
+        assert!(skill.contains(&stated), "SKILL.md must state {stated}");
+        assert!(!skill.contains("0.7 / 0.3"));
+        for free_text in [
+            "[\"auth\", \"session\", \"token\"]",
+            "[\"authentication\", \"login\"]",
+            "directory prefixes)",
+            "seeds from symbols, files,",
+        ] {
+            assert!(!skill.contains(free_text), "{free_text}");
+        }
     }
 
     #[test]

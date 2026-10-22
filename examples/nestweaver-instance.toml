@@ -178,7 +178,7 @@ max_source_file_bytes = 2097152
 # [[mcp_servers]]
 # name = "confluence"
 # command = "npx"
-# args = ["-y", "@anthropic/confluence-mcp"]
+# args = ["-y", "<your-confluence-mcp-package>"]
 #
 # [mcp_servers.env]
 # CONFLUENCE_URL = "https://yoursite.atlassian.net"

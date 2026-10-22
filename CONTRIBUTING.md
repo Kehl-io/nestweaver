@@ -185,8 +185,9 @@ describes. This is the invocation CI runs and the one PR bodies report clean.
 # Run tests for a single crate — use the recipe, not bare `cargo test -p`
 just test-crate nestweaver-parser
 
-# Run a specific test (keep --all-features — see below)
-cargo test -p nestweaver-store --all-features -- ranking::tests::pagerank
+# Run a specific test. nestweaver-store has no features of its own; for a
+# crate that does, pass the features `just test-crate` prints (see below)
+cargo test -p nestweaver-store -- ranking::tests::pagerank
 
 # Build release binary
 cargo build --release
@@ -220,20 +221,26 @@ This cost two implementers and a reviewer real time during PR #245, each briefly
 treating the gap as a discrepancy in the suite rather than a feature-set
 difference.
 
-`just test-crate` passes `--all-features`. That is deliberate, and not the same
-as naming the features by hand: every feature unification can activate on a
-package is one of that package's own features, so `--all-features` is provably a
-**superset** of the unified set and can never cover less. Hand-maintained lists
-are guesswork — `--features embed` is the obvious guess and leaves
-`nestweaver-mcp` at 154, because what it actually needs is `daemon`
-(`nestweaver-daemon` depends on it as `features = ["daemon"]`).
+`just test-crate` starts from all of the package's own features rather than a
+hand-written list: every feature unification can activate on a package is one
+of that package's own features, so that set is a **superset** of the unified
+set and can never cover less. Hand-maintained lists are guesswork —
+`--features embed` is the obvious guess and leaves `nestweaver-mcp` at 154,
+because what it actually needs is `daemon` (`nestweaver-daemon` depends on it
+as `features = ["daemon"]`).
 
-Two packages are exempt and run plain: `nestweaver-embed` and the root
-`nestweaver`. Both reach `metal = ["candle-core/metal", …]`, which pulls `objc2`
-and fails to compile on Linux.
+The recipe reads the feature list from `cargo metadata` and passes it with
+`--no-default-features`, leaving out two kinds of feature:
 
+- off macOS, `metal` and every feature that enables it, directly or
+  transitively (`nestweaver-embed`, the root `nestweaver` and
+  `nestweaver-daemon` have one), because `metal` pulls `objc2`, which does not
+  compile on Linux;
+- everywhere, the CI-only `ci-direct-tests`.
+
+Without `python3` it falls back to a plain `cargo test -p <crate>` and says so.
 Without `just` installed, the equivalent is `cargo test -p <crate>
---all-features` for any crate other than those two.
+--no-default-features --features <the package's features minus those>`.
 
 One consequence worth expecting either way: switching a working tree between
 `-p` and `--workspace` re-resolves features, which re-fingerprints the build and

@@ -62,6 +62,152 @@ impl Drop for RpcIndexActivity {
 /// reports `Timeout`. On a client disconnect the request future is dropped
 /// before any `Status` is returned, so that path never surfaces here.
 fn dispatch_err_to_status(tool_name: &str, e: anyhow::Error) -> Status {
+    bound_status(dispatch_err_to_status_unbounded(tool_name, e))
+}
+
+/// Longest gRPC status message the daemon sends, in bytes before
+/// percent-encoding (which can triple it).
+const MAX_STATUS_MESSAGE_BYTES: usize = 2048;
+/// Largest gRPC status details payload the daemon sends, in bytes before
+/// base64 (which adds a third).
+const MAX_STATUS_DETAILS_BYTES: usize = 4096;
+/// Longest single string inside a details envelope.
+const MAX_STATUS_DETAIL_STRING_BYTES: usize = 256;
+
+/// Keep a status inside the HTTP/2 header budget.
+///
+/// A unary error travels as headers, and hyper refuses a header list at or
+/// above 16 KiB with a connection-level PROTOCOL_ERROR. Every error that
+/// echoed a long argument (a 2 MB `note_get` uid, a `flow_trace` name, a
+/// `brain_diff` `since_sha`) therefore did not fail alone: the GOAWAY tore
+/// down the shared connection and every concurrent request on it failed with
+/// "operation was canceled". The message is cut in the MIDDLE so its head
+/// (the failure class) and tail (the CLI's "not found" verdict) both survive;
+/// the details envelope keeps its keys and only its strings are bounded, so a
+/// client still classifies it. Code and metadata are never changed.
+fn bound_status(status: Status) -> Status {
+    let message_fits = status.message().len() <= MAX_STATUS_MESSAGE_BYTES;
+    let details_fit = status.details().len() <= MAX_STATUS_DETAILS_BYTES;
+    if message_fits && details_fit {
+        return status;
+    }
+    let message =
+        nestweaver_mcp::tools::elide_middle_utf8(status.message(), MAX_STATUS_MESSAGE_BYTES);
+    let details = if details_fit {
+        status.details().to_vec()
+    } else {
+        bound_status_details(status.details())
+    };
+    Status::with_details_and_metadata(
+        status.code(),
+        message,
+        details.into(),
+        status.metadata().clone(),
+    )
+}
+
+/// Bound a JSON details envelope. Its strings are cut first; if it still does
+/// not fit (or is not JSON), it is dropped rather than sent: the code, the
+/// metadata error code and the bounded message still classify the failure.
+fn bound_status_details(details: &[u8]) -> Vec<u8> {
+    let Ok(mut envelope) = serde_json::from_slice::<serde_json::Value>(details) else {
+        return Vec::new();
+    };
+    nestweaver_mcp::tools::bound_json_strings(&mut envelope, MAX_STATUS_DETAIL_STRING_BYTES);
+    match serde_json::to_vec(&envelope) {
+        Ok(bytes) if bytes.len() <= MAX_STATUS_DETAILS_BYTES => bytes,
+        _ => Vec::new(),
+    }
+}
+
+/// Transport backstop for [`bound_status`]: a status built by any handler (not
+/// only the tool dispatch) cannot carry an oversized `grpc-message` /
+/// `grpc-status-details-bin` HEADER.
+///
+/// Scope: this sees statuses sent as response headers — every unary failure
+/// and a stream that fails before its first message (trailers-only). A stream
+/// that fails mid-way sends its status in the body's trailers, which this
+/// layer does not rewrite; the streaming handlers build those statuses
+/// themselves and must keep them bounded.
+fn bound_grpc_response<B>(mut response: http::Response<B>) -> http::Response<B> {
+    let headers = response.headers_mut();
+    let header_len = |name: &http::HeaderName| headers.get(name).map_or(0, |value| value.len());
+    // Encoded sizes: percent-encoding can triple the message, base64 grows
+    // details by a third. Only a status that could be over budget is decoded.
+    if header_len(&Status::GRPC_MESSAGE) <= MAX_STATUS_MESSAGE_BYTES
+        && header_len(&Status::GRPC_STATUS_DETAILS) <= MAX_STATUS_DETAILS_BYTES
+    {
+        return response;
+    }
+    let Some(status) = Status::from_header_map(headers) else {
+        return response;
+    };
+    let bounded = bound_status(Status::with_details(
+        status.code(),
+        status.message().to_string(),
+        status.details().to_vec().into(),
+    ));
+    let mut encoded = http::HeaderMap::new();
+    headers.remove(Status::GRPC_MESSAGE);
+    headers.remove(Status::GRPC_STATUS_DETAILS);
+    if bounded.add_header(&mut encoded).is_ok() {
+        for name in [Status::GRPC_MESSAGE, Status::GRPC_STATUS_DETAILS] {
+            if let Some(value) = encoded.remove(&name) {
+                headers.insert(name, value);
+            }
+        }
+    }
+    response
+}
+
+/// Default bound on how long a metadata write waits for the write gate.
+const DEFAULT_METADATA_WRITE_WAIT_SECS: u64 = 15;
+/// Machine-readable code stamped on a write refused because the gate stayed
+/// busy for the whole bounded wait.
+pub const WRITE_BUSY_CODE: &str = "write-busy";
+
+/// `NESTWEAVER_METADATA_WRITE_WAIT_SECS` (default 15, at most 3600): how long
+/// `set_extension` / `unset_extension` / `forget_interaction` wait for the
+/// write gate before answering "busy, retry". `0` refuses at once when busy.
+fn metadata_write_wait() -> Duration {
+    // An unparsable value warns once, naming the variable, then falls back.
+    let secs = nestweaver_schema::env::env_parse::<u64>("NESTWEAVER_METADATA_WRITE_WAIT_SECS")
+        .unwrap_or(DEFAULT_METADATA_WRITE_WAIT_SECS)
+        .min(3600);
+    Duration::from_secs(secs)
+}
+
+/// The structured "busy, retry" refusal for a bounded write wait. Nothing was
+/// written, which the message says, so a caller may simply retry.
+fn write_busy_status(label: &str, gate: &WriteGate, waited: Duration) -> Status {
+    let holder = gate
+        .holder_snapshot()
+        .map(|(what, held)| format!("held by `{what}` for {}s", held.as_secs()))
+        .unwrap_or_else(|| "held by another writer".to_string());
+    let mut status = Status::resource_exhausted(format!(
+        "tool {label} failed: busy: the daemon write lock is {holder} and did not free within \
+         {}s, so nothing was written. Retry once that operation finishes (`brain status` shows \
+         write_holder), or raise NESTWEAVER_METADATA_WRITE_WAIT_SECS to wait longer.",
+        waited.as_secs()
+    ));
+    if let Ok(value) = WRITE_BUSY_CODE.parse::<MetadataValue<_>>() {
+        status.metadata_mut().insert(
+            nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+            value,
+        );
+    }
+    status
+}
+
+type GrpcResponseMap = fn(http::Response<tonic::body::Body>) -> http::Response<tonic::body::Body>;
+
+/// The layer both gRPC listeners (UDS and TCP) install; see
+/// [`bound_grpc_response`].
+fn grpc_status_bound_layer() -> tower::util::MapResponseLayer<GrpcResponseMap> {
+    tower::util::MapResponseLayer::new(bound_grpc_response::<tonic::body::Body> as GrpcResponseMap)
+}
+
+fn dispatch_err_to_status_unbounded(tool_name: &str, e: anyhow::Error) -> Status {
     if e.chain()
         .any(|cause| cause.is::<nestweaver_mcp::tools::RepositoryScopeRefused>())
     {
@@ -469,6 +615,53 @@ mod dispatch_err_to_status_tests {
                 .and_then(|v| v.to_str().ok()),
             Some(nestweaver_mcp::tools::TOOL_TARGET_NOT_FOUND_CODE)
         );
+    }
+
+    /// A lookup miss that echoes a 2 MB uid keeps its code, its metadata
+    /// error code and its not-found envelope, but every part of the status is
+    /// bounded so the header list fits; the CLI's "not found" tail survives.
+    #[test]
+    fn a_huge_lookup_miss_is_bounded_and_keeps_its_classification() {
+        let uid = "A".repeat(2_000_000);
+        let error = nestweaver_mcp::tools::target_not_found(
+            format!("failed to look up note with uid '{uid}': not found"),
+            "uid",
+            serde_json::json!(uid),
+            &[],
+        );
+        let status = dispatch_err_to_status("note_get", error);
+        assert!(status.message().len() <= MAX_STATUS_MESSAGE_BYTES);
+        assert!(
+            status
+                .message()
+                .starts_with("tool note_get failed: failed to look up note")
+        );
+        assert!(
+            status.message().ends_with("': not found"),
+            "{}",
+            status.message()
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                .and_then(|v| v.to_str().ok()),
+            Some(nestweaver_mcp::tools::TOOL_TARGET_NOT_FOUND_CODE)
+        );
+        let envelope = nestweaver_mcp::tools::envelope_from_status_details(status.details())
+            .expect("the bounded envelope is still a not-found envelope");
+        assert_eq!(envelope["status"], "not_found");
+        assert!(envelope["uid"].as_str().unwrap().len() <= MAX_STATUS_DETAIL_STRING_BYTES);
+        let header_list = grpc_status_header_list_size(&status);
+        assert!(header_list <= 16 * 1024, "{header_list} bytes");
+
+        // The transport backstop bounds a status no handler bounded.
+        let raw = Status::not_found(format!("missing '{}'", "é".repeat(500_000)));
+        let response = bound_grpc_response(raw.into_http::<tonic::body::Body>());
+        let bounded = Status::from_header_map(response.headers()).unwrap();
+        assert_eq!(bounded.code(), tonic::Code::NotFound);
+        assert!(bounded.message().len() <= MAX_STATUS_MESSAGE_BYTES);
+        assert!(bounded.message().ends_with("éé'"));
     }
 
     /// Uncompressed header-list size, per RFC 7540: name + value + 32 per field.
@@ -2295,6 +2488,39 @@ fn disclose_semantic_degradation(value: &mut serde_json::Value, embedding_state:
     };
     if !arr.iter().any(|v| v.as_str() == Some("semantic")) {
         arr.push(serde_json::json!("semantic"));
+    }
+}
+
+/// A marker left by an embedding pass that died (see
+/// `nestweaver_engine::embed_pass_marker`): `embedding_status.interrupted_pass`
+/// carries the coverage, and a warning says the vectors are incomplete. The
+/// model is still usable, so this is not a `degraded_components` entry.
+fn disclose_interrupted_embed_pass(value: &mut serde_json::Value, db_path: &Path) {
+    let pass_active = value["embedding_status"]["pass_active"]
+        .as_bool()
+        .unwrap_or(false);
+    let index_live = value["embedding_status"]["index_live"]
+        .as_u64()
+        .unwrap_or(0);
+    let Some(interrupted) = nestweaver_engine::embed_pass_marker::interrupted_pass_json(
+        db_path,
+        pass_active,
+        index_live,
+    ) else {
+        value["embedding_status"]["interrupted_pass"] = serde_json::Value::Null;
+        return;
+    };
+    let message = serde_json::json!({
+        "kind": "embedding_pass_interrupted",
+        "warning": interrupted["message"].clone(),
+    });
+    value["embedding_status"]["interrupted_pass"] = interrupted;
+    match value
+        .get_mut("warnings")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(warnings) => warnings.push(message),
+        None => value["warnings"] = serde_json::json!([message]),
     }
 }
 
@@ -4160,6 +4386,58 @@ impl DaemonService {
         tokio::task::spawn_blocking(move || {
             let _ownership = MutationWorkerOwnership {
                 _write_lease: write_gate.blocking_lock(label),
+                _connection_guard: guard,
+            };
+            task()
+        })
+        .await
+        .map_err(|error| Status::internal(format!("{label} task panicked: {error}")))?
+    }
+
+    /// [`Self::run_unary_mutation`] for small metadata writes
+    /// (`set_extension`, `unset_extension`, `forget_interaction`): the wait
+    /// for the write gate is BOUNDED by [`metadata_write_wait`].
+    ///
+    /// These writes take milliseconds, but the gate is also held for an
+    /// entire index. Waiting on it unboundedly parked the caller for the
+    /// whole index; an MCP session dispatches serially, so every later read
+    /// on that session parked too, and a write whose client had long since
+    /// given up (or been killed) was applied minutes later. Now the caller
+    /// gets a prompt `RESOURCE_EXHAUSTED` "busy, retry" naming the holder.
+    ///
+    /// The gate is acquired on the REQUEST future, before any blocking
+    /// worker exists. A request cancelled or disconnected while waiting drops
+    /// that future, and with it the acquisition, so its write is never
+    /// applied. Once the lease is held it moves into the worker exactly as in
+    /// `run_unary_mutation`, so an admitted write still finishes and keeps
+    /// its ownership even if the client then disconnects.
+    async fn run_metadata_mutation<T, F>(&self, label: &'static str, task: F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, Status> + Send + 'static,
+    {
+        self.run_mutation_with_bounded_wait(label, metadata_write_wait(), task)
+            .await
+    }
+
+    async fn run_mutation_with_bounded_wait<T, F>(
+        &self,
+        label: &'static str,
+        wait: Duration,
+        task: F,
+    ) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, Status> + Send + 'static,
+    {
+        let guard = ConnectionGuard::write(&self.state)?;
+        let write_gate = self.state.write_gate.clone();
+        let Ok(lease) = tokio::time::timeout(wait, write_gate.lock(label)).await else {
+            return Err(write_busy_status(label, &write_gate, wait));
+        };
+        tokio::task::spawn_blocking(move || {
+            let _ownership = MutationWorkerOwnership {
+                _write_lease: lease,
                 _connection_guard: guard,
             };
             task()
@@ -7385,6 +7663,15 @@ impl NestWeaverDaemon for DaemonService {
         if req.output_path.trim().is_empty() {
             return Err(Status::invalid_argument("output_path is required"));
         }
+        // A relative path would resolve against the daemon's CWD, not the
+        // caller's, and write the archive somewhere the caller never named.
+        if !std::path::Path::new(&req.output_path).is_absolute() {
+            return Err(Status::invalid_argument(format!(
+                "output_path must be absolute, got '{}': the daemon cannot resolve a path \
+                 relative to the caller's working directory",
+                req.output_path
+            )));
+        }
         let config = nestweaver_engine::BackupConfig {
             db_path: self.state.db_path.clone(),
             output_path: std::path::PathBuf::from(&req.output_path),
@@ -8308,6 +8595,10 @@ impl NestWeaverDaemon for DaemonService {
                 repo_path.display()
             )));
         }
+        // A `.git` borrowing another repository's metadata would mint that
+        // repository's identity and replace its graph.
+        nestweaver_engine::ensure_own_git_metadata(&repo_path)
+            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
         let state = self.state.clone();
         let force = req.force;
         // Three-state trigram policy. A plain bool could not distinguish "the
@@ -8365,9 +8656,7 @@ impl NestWeaverDaemon for DaemonService {
         // response stream open forever.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let index_timeout = std::time::Duration::from_secs(
-            std::env::var("NESTWEAVER_INDEX_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
+            nestweaver_schema::env::env_parse::<u64>("NESTWEAVER_INDEX_TIMEOUT_SECS")
                 .filter(|s| *s > 0)
                 .unwrap_or(1800),
         );
@@ -8442,7 +8731,7 @@ impl NestWeaverDaemon for DaemonService {
             // (and collide with) its parent repo's identity.
             let repo_url = nestweaver_engine::mint_repo_identity(&repo_path);
 
-            let indexed_sha = std::process::Command::new("git")
+            let indexed_sha = nestweaver_engine::git_cmd::isolated_git()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(&repo_path)
                 .output()
@@ -8818,6 +9107,18 @@ impl NestWeaverDaemon for DaemonService {
         }
         let req = request.into_inner();
         let vault_path = PathBuf::from(&req.vault_path);
+        // The refusal `index_repo` applies: a vault is a specific folder,
+        // never a system root, a home directory or a pseudo-filesystem.
+        let resolved = vault_path
+            .canonicalize()
+            .unwrap_or_else(|_| vault_path.clone());
+        if is_unsafe_index_root(&resolved) {
+            return Err(Status::invalid_argument(format!(
+                "refusing to index vault '{}': system roots, home directories and \
+                 pseudo-filesystems are not sources; pass a specific folder",
+                resolved.display()
+            )));
+        }
         // A defaulted name is resolved by the engine: a registered vault
         // keeps its stored name, a new one takes its directory's.
         let vault_name = if req.vault_name_defaulted {
@@ -10475,6 +10776,7 @@ impl NestWeaverDaemon for DaemonService {
                 .unwrap_or_default()
                 .to_string();
             disclose_semantic_degradation(&mut value, &embedding_state);
+            disclose_interrupted_embed_pass(&mut value, &self.state.db_path);
             value["search_status"] = search_status_json(&search_capability_status(&self.state));
             // Daemon-side witness counter in the `cache` block (the
             // `hit_rate_pct` session-counter precedent): an adopted client
@@ -10845,38 +11147,55 @@ impl NestWeaverDaemon for DaemonService {
         // Errors are wrapped in the standard `tool <name> failed:` format (see
         // dispatch_err_to_status) so MCP clients don't mislabel tool argument
         // errors as gRPC transport failures.
-        self.run_unary_mutation("set_extension", move || {
-            let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "tool set_extension failed: invalid JSON in args_json: {e}"
-                ))
-            })?;
-            let uid = args.get("uid").and_then(|v| v.as_str()).ok_or_else(|| {
+        //
+        // Arguments are parsed and validated BEFORE the write gate: an invalid
+        // request must answer InvalidArgument at once, not "busy" after the
+        // bounded wait, and must not count as an active write in the drain.
+        let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
+            Status::invalid_argument(format!(
+                "tool set_extension failed: invalid JSON in args_json: {e}"
+            ))
+        })?;
+        let uid = args
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
                 Status::invalid_argument("tool set_extension failed: 'uid' must be a string")
-            })?;
-            let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+            })?
+            .to_string();
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
                 Status::invalid_argument("tool set_extension failed: 'key' must be a string")
-            })?;
-            let value = args.get("value").cloned().ok_or_else(|| {
-                Status::invalid_argument("tool set_extension failed: 'value' is required")
-            })?;
-            nestweaver_engine::extensions::validate_extension_property(key, &value).map_err(
-                |problem| Status::invalid_argument(format!("tool set_extension failed: {problem}")),
+            })?
+            .to_string();
+        let value = args.get("value").cloned().ok_or_else(|| {
+            Status::invalid_argument("tool set_extension failed: 'value' is required")
+        })?;
+        nestweaver_engine::extensions::validate_extension_write(&uid, &key, &value).map_err(
+            |problem| Status::invalid_argument(format!("tool set_extension failed: {problem}")),
+        )?;
+
+        self.run_metadata_mutation("set_extension", move || {
+            let (uid, key) = (uid.as_str(), key.as_str());
+            let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
+            nestweaver_engine::extensions::set_property_capped(&mut store, uid, key, value.clone())
+                .map_err(|problem| {
+                    Status::resource_exhausted(format!("tool set_extension failed: {problem}"))
+                })?;
+            let bytes = nestweaver_engine::extensions::serialize_extensions_capped(&store)
+                .map_err(|problem| {
+                    Status::resource_exhausted(format!("tool set_extension failed: {problem}"))
+                })?;
+            nestweaver_engine::extensions::write_extensions_serialized(&db_path, &bytes).map_err(
+                |e| Status::internal(format!("tool set_extension failed: save_extensions: {e:#}")),
             )?;
 
-            let mut store = nestweaver_engine::extensions::load_extensions(&db_path);
-            nestweaver_engine::extensions::set_property(&mut store, uid, key, value.clone());
-            nestweaver_engine::extensions::save_extensions(&db_path, &store).map_err(|e| {
-                Status::internal(format!("tool set_extension failed: save_extensions: {e:#}"))
-            })?;
-
-            let result_json = serde_json::json!({
-                "uid": uid,
-                "key": key,
-                "value": value,
-                "status": "saved",
-            })
-            .to_string();
+            // The write is committed. The response is bounded so it cannot be
+            // what fails: a large value is acknowledged by size, not echoed.
+            let result_json =
+                nestweaver_engine::extensions::set_extension_response(uid, key, &value).to_string();
             Ok::<_, Status>(JsonResponse { result_json })
         })
         .await
@@ -10905,19 +11224,34 @@ impl NestWeaverDaemon for DaemonService {
         let req = r.into_inner();
         let db_path = self.state.db_path.clone();
 
-        self.run_unary_mutation("unset_extension", move || {
-            let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "tool unset_extension failed: invalid JSON in args_json: {e}"
-                ))
-            })?;
-            let uid = args.get("uid").and_then(|v| v.as_str()).ok_or_else(|| {
+        // Validated before the write gate, like set_extension.
+        let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
+            Status::invalid_argument(format!(
+                "tool unset_extension failed: invalid JSON in args_json: {e}"
+            ))
+        })?;
+        let uid = args
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
                 Status::invalid_argument("tool unset_extension failed: 'uid' must be a string")
-            })?;
-            let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+            })?
+            .to_string();
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
                 Status::invalid_argument("tool unset_extension failed: 'key' must be a string")
-            })?;
+            })?
+            .to_string();
+        // No UID length check here, on purpose: removing an oversized
+        // entry written before the limit existed must stay possible.
+        nestweaver_engine::extensions::refuse_reserved_extension_key(&key).map_err(|problem| {
+            Status::invalid_argument(format!("tool unset_extension failed: {problem}"))
+        })?;
 
+        self.run_metadata_mutation("unset_extension", move || {
+            let (uid, key) = (uid.as_str(), key.as_str());
             let removed = nestweaver_engine::remove_extension_key_durable(&db_path, uid, key)
                 .map_err(|e| Status::internal(format!("tool unset_extension failed: {e:#}")))?;
 
@@ -10955,7 +11289,7 @@ impl NestWeaverDaemon for DaemonService {
         let req = r.into_inner();
         let db_path = self.state.db_path.clone();
 
-        self.run_unary_mutation("forget_interaction", move || {
+        self.run_metadata_mutation("forget_interaction", move || {
             let args: serde_json::Value = serde_json::from_str(&req.args_json).map_err(|e| {
                 Status::invalid_argument(format!(
                     "tool forget_interaction failed: invalid JSON in args_json: {e}"
@@ -11000,40 +11334,11 @@ impl NestWeaverDaemon for DaemonService {
                         "tool query_extensions failed: extension liveness: {error:#}"
                     ))
                 })?;
-            if let Some(uid) = args.get("uid").and_then(|value| value.as_str()) {
-                return Ok(serde_json::json!({
-                    "uid": uid,
-                    "properties": nestweaver_engine::get_all_properties(&extensions, uid),
-                }));
-            }
-            let key = args
-                .get("key")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| {
-                    Status::invalid_argument(
-                        "tool query_extensions failed: provide either 'uid' or both 'key' and 'value'",
-                    )
-                })?;
-            let value = args.get("value").cloned().ok_or_else(|| {
-                Status::invalid_argument(
-                    "tool query_extensions failed: 'value' is required when 'key' is given",
-                )
-            })?;
-            let results: Vec<_> = nestweaver_engine::query_by_property(&extensions, key, &value)
-                .into_iter()
-                .map(|uid| {
-                    serde_json::json!({
-                        "uid": uid,
-                        "properties": extensions.get(uid).cloned().unwrap_or_default(),
-                    })
-                })
-                .collect();
-            Ok(serde_json::json!({
-                "key": key,
-                "value": value,
-                "count": results.len(),
-                "results": results,
-            }))
+            nestweaver_engine::extensions::query_extensions_payload(&extensions, &args).map_err(
+                |problem| {
+                    Status::invalid_argument(format!("tool query_extensions failed: {problem}"))
+                },
+            )
         })
         .await
         .map_err(|error| {
@@ -11193,7 +11498,15 @@ impl NestWeaverDaemon for DaemonService {
             // `entry_points` without a coordinated upgrade.
             let summary =
                 nestweaver_engine::query::service_summary(&state.store, name, instance, repo)
-                    .map_err(|e| Status::internal(format!("service_summary failed: {e:#}")))?;
+                    .map_err(|e| {
+                        // An unresolved `--repo` keeps its class and candidates
+                        // in the status details, like every other repo filter.
+                        if nestweaver_mcp::tools::repo_filter_failure(&e).is_some() {
+                            dispatch_err_to_status("service_summary", e)
+                        } else {
+                            Status::internal(format!("service_summary failed: {e:#}"))
+                        }
+                    })?;
             match summary {
                 Some(summary) => serde_json::to_string(&summary)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}"))),
@@ -12000,6 +12313,7 @@ impl NestWeaverDaemon for DaemonService {
             let store = self.state.store.clone();
             let progress = Arc::clone(&self.state.embed_progress);
             let progress_scope = scope.clone();
+            let marker_db_path = self.state.db_path.clone();
 
             self.run_unary_mutation("embed", move || {
                 let discarded_embeddings = if repair_identity {
@@ -12056,6 +12370,32 @@ impl NestWeaverDaemon for DaemonService {
                 // pass measured in hours.
                 let plan = plan_embeddings(&store, &progress_scope, force)?;
                 progress.set_total(plan.eligible);
+                // Vectors since the last checkpoint die with the process. The
+                // marker outlives such a death so `brain status` can say the
+                // pass is incomplete; any exit this process survives drops it.
+                // Nothing left to embed: whatever an interrupted pass this
+                // scope covers set out to do is done, so retire its marker.
+                if plan.eligible == 0 {
+                    nestweaver_engine::embed_pass_marker::retire_if_covered(
+                        &marker_db_path,
+                        &progress_scope,
+                    );
+                }
+                let _pass_marker = (plan.eligible > 0).then(|| {
+                    nestweaver_engine::embed_pass_marker::begin(
+                        &marker_db_path,
+                        &nestweaver_engine::embed_pass_marker::EmbedPassRecord {
+                            scope: progress_scope.clone(),
+                            started_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|elapsed| elapsed.as_secs())
+                                .unwrap_or(0),
+                            planned: plan.eligible,
+                            already_embedded: plan.skipped,
+                            pid: std::process::id(),
+                        },
+                    )
+                });
                 tracing::info!(
                     scope = %progress_scope,
                     force,
@@ -12484,8 +12824,25 @@ fn is_unsafe_index_root(path: &std::path::Path) -> bool {
         "/tmp",
         "/volumes",
         "/dev",
+        "/proc",
+        "/sys",
+        "/run",
+        "/boot",
+        "/root",
+        "/lib",
+        "/lib64",
+        "/snap",
     ];
     if dangerous.iter().any(|d| p == *d) {
+        return true;
+    }
+    // Kernel and device pseudo-filesystems hold no sources at any depth, and
+    // walking them reads live process memory maps, environments and devices
+    // (`/proc/self` canonicalizes to `/proc/<pid>`).
+    if ["/proc/", "/sys/", "/dev/"]
+        .iter()
+        .any(|prefix| p.starts_with(prefix))
+    {
         return true;
     }
     if let Some(home) = std::env::var_os("HOME") {
@@ -15090,6 +15447,24 @@ pub async fn run_server(
         };
         match opened {
             Ok(s) => s,
+            // A damaged file is not a lock conflict, and retrying it never
+            // helps: say so instead of the lock guess and the engine's own
+            // "may be checkpointing; please retry later".
+            Err(nestweaver_store::StoreError::Corruption(corruption)) => {
+                let detail = format!("{}: {}", corruption.kind, corruption.detail)
+                    .replace(
+                        " The database may be checkpointing; please retry later.",
+                        "",
+                    )
+                    .replace("The database may be checkpointing; please retry later.", "");
+                anyhow::bail!(
+                    "failed to open database at {}: it is damaged ({}). This is not \
+                     transient; retrying or restarting the daemon will not help. Restore it \
+                     from a backup (`nestweaver backup restore`) or rebuild it.",
+                    db_path.display(),
+                    detail.trim_end()
+                );
+            }
             Err(e) => {
                 return Err(e).with_context(|| {
                     format!(
@@ -16486,7 +16861,8 @@ pub async fn run_server(
                 tonic::service::interceptor::InterceptedService::new(svc.clone(), interceptor);
 
             let tcp_task = tokio::spawn(async move {
-                let mut builder = tonic::transport::Server::builder();
+                let mut builder =
+                    tonic::transport::Server::builder().layer(grpc_status_bound_layer());
                 let shutdown = async move {
                     let _ = tcp_shutdown_rx.changed().await;
                 };
@@ -17040,6 +17416,7 @@ pub async fn run_server(
     }
     let mut uds_serve = tokio::spawn(
         tonic::transport::Server::builder()
+            .layer(grpc_status_bound_layer())
             .add_service(uds_svc)
             .serve_with_incoming_shutdown(uds_stream, async move {
                 let _ = shutdown_rx.changed().await;
@@ -24648,6 +25025,39 @@ repos = ["alpha"]
         }
     }
 
+    /// `brain_add_source /proc/self` registered `file:///proc/<pid>`.
+    #[test]
+    fn is_unsafe_index_root_refuses_pseudo_filesystems_at_any_depth() {
+        use std::path::Path;
+        for bad in [
+            "/proc",
+            "/proc/self",
+            "/proc/1234",
+            "/proc/1234/root",
+            "/sys",
+            "/sys/kernel",
+            "/dev/shm",
+            "/run",
+            "/boot",
+            "/root",
+        ] {
+            assert!(
+                is_unsafe_index_root(Path::new(bad)),
+                "{bad:?} must be refused"
+            );
+        }
+        let self_proc = Path::new("/proc/self")
+            .canonicalize()
+            .unwrap_or_else(|_| "/proc/self".into());
+        assert!(is_unsafe_index_root(&self_proc), "{self_proc:?}");
+        for ok in ["/home/user/proc", "/srv/sys/app", "/home/user/dev/proc"] {
+            assert!(
+                !is_unsafe_index_root(Path::new(ok)),
+                "{ok:?} must be allowed"
+            );
+        }
+    }
+
     #[test]
     fn is_unsafe_index_root_handles_macos_firmlink_and_case() {
         use std::path::Path;
@@ -30693,6 +31103,308 @@ external_model = "unavailable-test-model"
         });
         req.extensions_mut().insert(crate::auth::IsAdmin(true));
         service.set_extension(req).await.expect("an ordinary set");
+    }
+
+    fn admin_json_request(args: serde_json::Value) -> Request<JsonRequest> {
+        let mut req = Request::new(JsonRequest {
+            args_json: args.to_string(),
+        });
+        req.extensions_mut().insert(crate::auth::IsAdmin(true));
+        req
+    }
+
+    /// A metadata write that cannot get the write gate within its bound
+    /// answers a structured "busy, retry" naming the holder, and its work
+    /// never runs — not even once the gate frees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_metadata_write_behind_a_long_holder_answers_busy_and_writes_nothing() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let held = state.write_gate.lock("index_repo").await;
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = ran.clone();
+
+        let started = std::time::Instant::now();
+        let status = service
+            .run_mutation_with_bounded_wait(
+                "set_extension",
+                std::time::Duration::from_millis(200),
+                move || {
+                    ran_in_task.store(true, Ordering::Release);
+                    Ok::<_, Status>(())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the wait must be bounded"
+        );
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+        assert_eq!(
+            status
+                .metadata()
+                .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some(WRITE_BUSY_CODE)
+        );
+        assert!(
+            status
+                .message()
+                .starts_with("tool set_extension failed: busy")
+        );
+        assert!(
+            status.message().contains("`index_repo`"),
+            "{}",
+            status.message()
+        );
+        assert!(status.message().contains("nothing was written"));
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "a refused write must never run"
+        );
+    }
+
+    /// An invalid metadata write is refused before the write gate: while an
+    /// index holds the gate it must answer InvalidArgument at once, not "busy"
+    /// after the bounded wait, and never count as an active write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invalid_metadata_write_is_refused_without_waiting_for_the_gate() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let _held = state.write_gate.lock("index_repo").await;
+        let started = std::time::Instant::now();
+        let set = service
+            .set_extension(admin_json_request(serde_json::json!({
+                "uid": "vlt:default:x", "key": "last_indexed_at", "value": "x"
+            })))
+            .await
+            .unwrap_err();
+        assert_eq!(set.code(), tonic::Code::InvalidArgument, "{set:?}");
+        let unset = service
+            .unset_extension(admin_json_request(serde_json::json!({
+                "uid": "vlt:default:x", "key": "last_indexed_at"
+            })))
+            .await
+            .unwrap_err();
+        assert_eq!(unset.code(), tonic::Code::InvalidArgument, "{unset:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "validation must not wait for the gate"
+        );
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+    }
+
+    /// A client that gives up (cancel, disconnect, kill) while its write is
+    /// still queued behind the gate must not have that write applied later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_queued_set_extension_is_never_applied() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        let held = state.write_gate.lock("index_repo").await;
+
+        let request = tokio::spawn(async move {
+            service
+                .set_extension(admin_json_request(
+                    serde_json::json!({ "uid": "sym:x", "key": "owner", "value": "late" }),
+                ))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.write_gate.waiting() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the write must queue behind the holder");
+        request.abort();
+        let _ = request.await;
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            nestweaver_engine::extensions::load_extensions(&state.db_path).is_empty(),
+            "a write whose request was cancelled while queued must not be applied"
+        );
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+        assert_eq!(state.write_gate.waiting(), 0);
+    }
+
+    /// QA: a 2 MB uid was saved and then reported as a failure (its echo
+    /// overflowed the MCP output budget), after which every key/value
+    /// `query_extensions` failed. Reserved internal keys could be clobbered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_extension_bounds_uids_reserves_internal_keys_and_never_echoes_large_values() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+
+        for args in [
+            serde_json::json!({ "uid": "A".repeat(2_000_000), "key": "owner", "value": 1 }),
+            serde_json::json!({ "uid": "sym:\u{1}x", "key": "owner", "value": 1 }),
+            serde_json::json!({ "uid": "vlt:default:x", "key": "last_indexed_at", "value": "x" }),
+        ] {
+            let status = service
+                .set_extension(admin_json_request(args))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+            assert!(
+                status.message().len() < 512,
+                "the refusal must not echo the uid"
+            );
+        }
+        let status = service
+            .unset_extension(admin_json_request(
+                serde_json::json!({ "uid": "vlt:default:x", "key": "last_indexed_at" }),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert!(
+            nestweaver_engine::extensions::load_extensions(&state.db_path).is_empty(),
+            "refused writes write nothing"
+        );
+
+        let large = "v".repeat(60_000);
+        let saved = service
+            .set_extension(admin_json_request(
+                serde_json::json!({ "uid": "sym:x", "key": "blob", "value": large }),
+            ))
+            .await
+            .expect("a large-but-legal value is saved")
+            .into_inner();
+        let saved: serde_json::Value = serde_json::from_str(&saved.result_json).unwrap();
+        assert_eq!(saved["status"], "saved");
+        assert!(saved.get("value").is_none(), "{saved}");
+        assert_eq!(saved["value_echo_omitted"], true);
+
+        // A legacy oversized entry (written before the uid limit) must not
+        // break key/value queries; it is omitted and counted.
+        let mut store = nestweaver_engine::extensions::load_extensions(&state.db_path);
+        nestweaver_engine::extensions::set_property(
+            &mut store,
+            &"L".repeat(2_000_000),
+            "team",
+            serde_json::json!("core"),
+        );
+        nestweaver_engine::extensions::set_property(
+            &mut store,
+            "sym:y",
+            "team",
+            serde_json::json!("core"),
+        );
+        nestweaver_engine::extensions::save_extensions(&state.db_path, &store).unwrap();
+        let answer = service
+            .query_extensions(Request::new(JsonRequest {
+                args_json: serde_json::json!({ "key": "team", "value": "core" }).to_string(),
+            }))
+            .await
+            .expect("query_extensions survives a legacy oversized entry")
+            .into_inner();
+        let answer: serde_json::Value = serde_json::from_str(&answer.result_json).unwrap();
+        assert_eq!(
+            answer["count"],
+            1,
+            "{}",
+            &answer.to_string()[..200.min(answer.to_string().len())]
+        );
+        assert_eq!(answer["results"][0]["uid"], "sym:y");
+        assert_eq!(answer["oversized_entries_omitted"], 1);
+    }
+
+    /// QA: an error echoing a long input (a 2 MB `flow_trace` name) overflowed
+    /// the HTTP/2 header limit; the GOAWAY failed every concurrent request on
+    /// the connection with "operation was canceled". Over a real socket, the
+    /// huge lookup now fails ALONE, with a structured not-found, while
+    /// concurrent requests on the same channel succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_error_echoing_huge_input_fails_alone_over_a_real_connection() {
+        let state = test_state_with_writer();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("bound.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+        let svc = tonic::service::interceptor::InterceptedService::new(
+            NestWeaverDaemonServer::new(DaemonService::new(state.clone()))
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024),
+            crate::auth::uds_admin_interceptor,
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .layer(grpc_status_bound_layer())
+                .add_service(svc)
+                .serve_with_incoming(incoming),
+        );
+
+        let path = sock.clone();
+        let channel = tonic::transport::Endpoint::try_from("http://[::]:50051")
+            .unwrap()
+            .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+                let path = path.clone();
+                async move {
+                    let stream = tokio::net::UnixStream::connect(path).await?;
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                }
+            }))
+            .await
+            .unwrap();
+        let client =
+            nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
+                .max_decoding_message_size(256 * 1024 * 1024)
+                .max_encoding_message_size(256 * 1024 * 1024);
+
+        let huge = "Z".repeat(2_000_000);
+        let mut lookups = Vec::new();
+        for _ in 0..3 {
+            let mut huge_client = client.clone();
+            let symbol = huge.clone();
+            lookups.push(tokio::spawn(async move {
+                huge_client
+                    .flow_trace(JsonRequest {
+                        args_json: serde_json::json!({ "symbol": symbol }).to_string(),
+                    })
+                    .await
+            }));
+        }
+        let mut healthy = Vec::new();
+        for _ in 0..8 {
+            let mut other = client.clone();
+            healthy.push(tokio::spawn(async move {
+                other.health_check(HealthCheckRequest {}).await
+            }));
+        }
+        for lookup in lookups {
+            let status = lookup.await.unwrap().unwrap_err();
+            assert_ne!(status.code(), tonic::Code::Unknown, "{status:?}");
+            assert_ne!(status.code(), tonic::Code::Cancelled, "{status:?}");
+            assert!(
+                status.message().len() <= MAX_STATUS_MESSAGE_BYTES,
+                "{} bytes",
+                status.message().len()
+            );
+            assert!(
+                status.message().starts_with("tool flow_trace failed:"),
+                "{}",
+                status.message()
+            );
+            assert!(status.details().len() <= MAX_STATUS_DETAILS_BYTES);
+        }
+        for check in healthy {
+            check
+                .await
+                .unwrap()
+                .expect("a concurrent request on the same connection must be unaffected");
+        }
+        let mut after = client.clone();
+        after
+            .health_check(HealthCheckRequest {})
+            .await
+            .expect("the connection survives");
+        server.abort();
     }
 
     /// nw-462: the DELETE must hold the gate exactly as the WRITE does.

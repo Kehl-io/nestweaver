@@ -29,7 +29,7 @@ nestweaver context processPayment
 nestweaver setup
 ```
 
-`index` takes `--repo`. `search` matches symbol names. `context` returns the symbols around a name, a UID, or a repo-relative file path. `setup` writes the MCP config for the agent it detects. Cursor gets six tools (`--lite`); other agents get the full set of 43.
+`index` takes `--repo`. `search` matches symbol names. `context` returns the symbols around a name, a UID, or a repo-relative file path. `setup` writes the MCP config for the agent it detects. Cursor gets six tools (`--lite`); other MCP-capable agents get the full set of 43.
 
 The database defaults to `./nestweaver.lbug` in the current directory. Pass `--db` when you query from somewhere else.
 
@@ -64,7 +64,7 @@ If optional dependencies were skipped, `nestweaver` exits 1 and names the platfo
 
 ## After you upgrade
 
-The current resolver generation is **11**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
+The current resolver generation is **12**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
 
 ```sh
 nestweaver stale-check

@@ -12,6 +12,12 @@ cp examples/minimal-instance.toml nestweaver-instance.toml
 nestweaver config validate nestweaver-instance.toml
 ```
 
+`config validate` parses the file and also checks what parsing alone does not:
+the `[embedding]` retrieval weights must be non-negative and sum to 1.0, and no
+two `[[repos]]` entries may share a `name` (case-insensitive) or a `url`. A
+violation exits 1 (`--json`: `"valid": false`). A config file larger than 4 MiB
+is refused on every route.
+
 It contains every required setting and no repository declarations:
 
 ```toml
@@ -164,7 +170,8 @@ auto_repair_cache = true # default; set false to require an explicit `nestweaver
 # external_endpoint = "https://api.openai.com"
 # external_model = "text-embedding-3-small"
 
-# Retrieval fusion weights (must sum to 1.0)
+# Retrieval fusion weights (must sum to 1.0, each non-negative; the runtime
+# blends them as given, so `nestweaver config validate` reports a violation)
 weight_ppr = 0.40         # graph structure (Personalized PageRank)
 weight_bm25 = 0.25        # text match
 weight_semantic = 0.35    # embedding similarity
@@ -319,11 +326,12 @@ it is a durable per-brain policy, and `nestweaver setup` regenerates every
 on the next setup run, leaving the feature unreachable through the supported
 install path. Setting it here reaches every generated registration at once.
 
-Note this is not only telemetry: the recorded scores feed PPR personalization,
-so enabling it changes retrieval output. The blend is deliberately capped (an
-exploration floor limits interaction history to a small fraction of the
-personalization mass, with sublinear scoring, time decay, and invalidation on
-content change), but treat it as a ranking change rather than pure logging.
+Note this is not only telemetry: the recorded scores re-rank results, so
+enabling it changes retrieval output. The effect is deliberately capped: the
+walk itself is personalized on the seeds alone, and after it converges a node
+the seed already reached is scaled by at most `1 + w` by how often agents used
+it. A node the seed cannot reach is never added, however often it was used.
+Treat it as a ranking change rather than pure logging.
 
 For a generated MCP registration to see any of this, it must be started with
 `--config`. `nestweaver setup` emits that automatically.
@@ -357,6 +365,15 @@ url = "https://github.com/myorg/backend"
 sparse = false        # optional: disable sparse checkout (default: true)
 pin_sha = "abc123"    # optional: pin to a specific commit
 ```
+
+Other optional `[[repos]]` keys:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `use_git_activity` | on | `false` stops git-activity recency from rescaling this repo's CodeRank (for a vendored or generated repo where commit recency is noise). Only applies when a `<db>.gitactivity.json` sidecar exists (`index --with-git-activity`). |
+| `unskip` | `[]` | Directory NAMES (not globs) from the built-in skip list (`public`, `vendor`, `dist`, …) to re-admit for this repo. A name matches that path component at any depth, so `unskip = ["public"]` re-admits every `public/`. The opposite of `exclude`. |
+| `branch` | default branch | Server mode: the branch the server fetches. See [Server Mode](../server-mode.md). |
+| `poll` | adaptive | Server mode: a fixed polling interval (for example `"2m"`) instead of the adaptive one. See [Server Mode](../server-mode.md). |
 
 > **A path must appear here to be WATCHABLE, not just to be indexed.**
 >
@@ -417,8 +434,7 @@ Notes:
   offending glob, not a silently dropped rule — a typo that quietly indexed a
   vendored tree is the failure this is guarding against.
 - **Excludes apply to every index route** — full, incremental, and the
-  first-index fallback — so a `--no-daemon` run and a daemon run index the same
-  files.
+  first-index fallback — so every route indexes the same files.
 - **Changing `exclude` needs a re-index** of that repo. Previously-indexed files
   are not retroactively removed by editing the config alone.
 
@@ -586,6 +602,75 @@ redefine core properties).
 extra_node_properties = { Symbol = { team_owner = "string", deprecated = "bool" } }
 ```
 
+#### `[response]` — Inline bodies in context answers
+
+```toml
+[response]
+inline_body_threshold = 0.75   # default
+inline_max_body_tokens = 800   # default
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `inline_body_threshold` | `0.75` | Minimum normalized relevance (0.0–1.0) a result must reach before its body is embedded inline. |
+| `inline_max_body_tokens` | `800` | Per-body cap in estimated tokens (characters / 4). |
+
+#### `[limits]` — Default page size
+
+```toml
+[limits]
+default_result_limit = 100
+```
+
+`default_result_limit` (1–1000) replaces the built-in page size a command uses
+when `--limit` / `limit` is not passed. Unset, each command keeps its own
+default: `search` 10, `brain search` 20, `brain context` 30, and 50 for the
+commands whose builtin is the general result limit.
+
+#### `[cache]` — MCP response cache
+
+```toml
+[cache]
+max_size_mb = 256   # default
+```
+
+Total size in MiB of the MCP response cache before least-recently-used entries
+are evicted.
+
+#### `[seed_resolution]` — Seed candidate scoring
+
+Controls how candidate seeds are scored before the graph walk, so a production
+symbol wins over a same-named test mirror.
+
+```toml
+[seed_resolution]
+kind_priority = ["Class", "Interface", "Function"]
+
+[[seed_resolution.path_deboost]]
+prefix = "/playwright/"   # substring of the "/"-prefixed, lowercased path
+factor = 0.2
+
+[[seed_resolution.path_deboost]]
+suffix = ".stories.tsx"   # case-sensitive path suffix
+factor = 0.3
+```
+
+- `path_deboost` rules multiply a candidate's score when its `file_path`
+  matches `prefix` (substring) or `suffix` (one of the two per rule). A factor
+  below 1.0 deboosts and above 1.0 boosts; factors are clamped to 0.0–10.0 and
+  several matching rules multiply.
+- Without a `[seed_resolution]` section a built-in list deboosts common test
+  directories (`/playwright/`, `/__tests__/`, `/tests/`, `/fixtures/`, …).
+  **A `[seed_resolution]` section replaces that list:** list every rule you
+  want, including the built-in ones you still need.
+- `kind_priority` breaks ties between equally scored candidates, earlier kinds
+  first. The default order is `Class`, `Interface`, `TypeAlias`, `Method`,
+  `Function`, `Constant`, `Property`, `Variable`, `Module`, `Enum`, `Trait`,
+  `Extension`.
+
+Server-only sections (`[server]`, `[server.indexing]`, `[[upstream]]`) are
+documented in [Server Mode](../server-mode.md).
+
 ### Change detection
 
 Indexing skips a file when its cached metadata proves it has not changed. That
@@ -653,8 +738,8 @@ max_note_bytes = 2097152        # 2 MiB
 The accepted range for both keys is 1 KiB through a fixed 64 MiB safety
 ceiling; invalid values fail config loading rather than being clamped.
 This policy applies to every markdown walk: daemon vault-repo workers,
-`brain add` / `brain refresh` (daemon and `--no-daemon`), `brain watch`,
-publication materialization, and MCP `brain_add`. A configless `brain
+`brain add` / `brain refresh`, `brain watch`,
+publication materialization, and MCP `brain_add_source`. A configless `brain
 watch` / `brain add` against a running daemon inherits that daemon's
 `max_note_bytes` (zero on the RPC means inherit, matching
 `max_source_file_bytes`). Naming `--config` sends that file's value.
@@ -732,8 +817,9 @@ Consequences worth knowing:
 - **An index no longer refreshes trigrams implicitly.** Explicit intent still
   wins: `index --with-trigrams` and `--rebuild-trigrams` refresh inline, which
   is what CI and scripted reindex want. `--no-trigrams` still forces none.
-- **The direct (`--local` / `--no-daemon`) path still refreshes inline**, because
-  no daemon exists there to drain for it.
+- **The CI-only direct-store test build still refreshes inline**, because no
+  daemon exists there to drain for it. Release binaries always go through the
+  daemon.
 - **The file watchers need no trigram handling at all.** They mutate, the
   mutation enqueues, the loop drains. Refreshing per watcher batch would run a
   punishing duty cycle: refresh cost is dominated by fixed overhead (measured
@@ -921,6 +1007,13 @@ Deferring auto-checkpoints reduces exposure to a separate upstream defect: the
 string-corruption trigger needs several checkpoint-separated segments, so
 deferring during a bulk load makes it less likely. Corruption is detected and
 reported rather than silently returned in either case.
+
+> **Deferring checkpoints trades durability for that.** A full index loads
+> symbols with a bulk `COPY`, and the engine makes copied rows durable only
+> through the checkpoint that follows it; the write-ahead log holds no row
+> records for them. With auto-checkpoints deferred, those rows stay
+> non-durable until a later checkpoint, and a crash before then loses them.
+> Defer only on a database you can rebuild with a forced re-index.
 
 ## Daemon, watcher, and MCP server coexistence
 

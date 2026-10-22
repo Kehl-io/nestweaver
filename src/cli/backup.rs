@@ -32,6 +32,12 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                 None
             };
 
+            // Absolute, lexically (a symlink at the destination is replaced,
+            // not followed): the daemon route resolves a relative path in the
+            // daemon's working directory, not the caller's.
+            let output = std::path::absolute(&output).with_context(|| {
+                format!("failed to resolve backup destination {}", output.display())
+            })?;
             let config = nestweaver_engine::BackupConfig {
                 db_path: db_path.clone(),
                 output_path: output,
@@ -923,6 +929,9 @@ pub(crate) fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyh
         } => {
             // Resolve snapshot directory and backend from args/config/instance registry.
             let (snap_dir, backend_name, b_path) = if let Some(inst_id) = instance {
+                // The id names a directory below; a registry written before
+                // ids were validated may still hold `../..`.
+                nestweaver_engine::validate_instance_id(&inst_id)?;
                 // Load from registry → instance config
                 let registry = nestweaver_engine::registry::Registry::load_or_create(
                     &default_registry_path(),

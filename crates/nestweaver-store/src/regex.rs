@@ -244,6 +244,13 @@ pub struct RegexStageTimings {
 pub const SCAN_BUDGET_NOTE: &str = "Pattern matched no candidates within the scan budget. Results may exist beyond \
      the scanned range.";
 
+/// Disclosure attached when no trigram index narrowed the search: every
+/// scope was scanned directly, and `stale_index` is false only because there
+/// is no index to be stale.
+pub const NO_TRIGRAM_INDEX_NOTE: &str = "No trigram index is available (stale_index does not apply); \
+     every scope was scanned directly. Enable `[indexing] with_trigrams = true` or run \
+     `index --with-trigrams` for faster searches.";
+
 impl RegexSearchResult {
     /// Attach [`SCAN_BUDGET_NOTE`] when this result is empty only because the
     /// scan was cut short. Idempotent, and never overwrites an existing note.
@@ -288,7 +295,21 @@ pub struct PatternCount {
     pub scanned_candidates: usize,
     #[serde(default)]
     pub timings: RegexStageTimings,
+    /// True when the counts are LOWER BOUNDS: the call's time budget ran out
+    /// before this pattern's corpus was fully counted (or before the pattern
+    /// was reached at all). `false` means the counts are exact.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Why `truncated` is set (`deadline`). Absent when the counts are exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<RegexTruncationReason>,
 }
+
+/// Default wall-clock budget for one `count_patterns` call, shared by all of
+/// its patterns. Each pattern without a usable trigram is a full corpus scan,
+/// so without a budget 64 patterns of `.` ran for 46.8s and kept burning CPU
+/// after the client had gone.
+pub const COUNT_PATTERNS_DEFAULT_MAX_MILLIS: u64 = 10_000;
 
 /// Work performed by an incremental trigram refresh.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -411,6 +432,32 @@ struct Candidate {
 struct CandidateLimits<'a> {
     cancel: Option<&'a std::sync::Arc<std::sync::atomic::AtomicBool>>,
     max_candidates: usize,
+    /// QA #3: when set, a scanned node is admitted as a candidate only if
+    /// this regex matches its text. The scan collectors already read whole
+    /// tables, so the candidate cap saved no I/O; it only discarded every
+    /// node past the first `max_candidates`, and with no trigram index a
+    /// match ordered late was never verified (`[]`, `candidate_cap`) while
+    /// `count_patterns` found it. Filtering at admission makes the cap count
+    /// MATCHING nodes instead of arbitrary ones.
+    prefilter: Option<&'a regex::Regex>,
+    /// Nodes the prefilter evaluated and REJECTED. Admitted nodes are
+    /// verified (and counted) again by the verification loop, and a matching
+    /// node turned away by the cap was never admitted, so only rejections
+    /// are added to `scanned_candidates`.
+    rejected: Option<&'a std::cell::Cell<usize>>,
+}
+
+impl CandidateLimits<'_> {
+    fn admits(&self, text: &str) -> bool {
+        let Some(re) = self.prefilter else {
+            return true;
+        };
+        let matched = re.is_match(text);
+        if !matched && let Some(rejected) = self.rejected {
+            rejected.set(rejected.get().saturating_add(1));
+        }
+        matched
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1059,6 +1106,8 @@ impl GraphStore {
                     CandidateLimits {
                         cancel: None,
                         max_candidates: usize::MAX,
+                        prefilter: None,
+                        rejected: None,
                     },
                 )?
                 .0;
@@ -1499,6 +1548,9 @@ impl GraphStore {
                 let Some(candidate) = section_candidate(s, &path, scope_uid, &headings) else {
                     continue;
                 };
+                if !limits.admits(&candidate.text) {
+                    continue;
+                }
                 if out.len() >= limits.max_candidates {
                     return Ok((out, Some(RegexTruncationReason::CandidateCap)));
                 }
@@ -1520,6 +1572,9 @@ impl GraphStore {
                 if let Some(prefix) = path_prefix
                     && !n.file_path.starts_with(prefix)
                 {
+                    continue;
+                }
+                if !limits.admits(&n.title) {
                     continue;
                 }
                 if out.len() >= limits.max_candidates {
@@ -1553,6 +1608,9 @@ impl GraphStore {
                 if let Some(prefix) = path_prefix
                     && !n.file_path.starts_with(prefix)
                 {
+                    continue;
+                }
+                if !limits.admits(&raw) {
                     continue;
                 }
                 if out.len() >= limits.max_candidates {
@@ -1594,6 +1652,9 @@ impl GraphStore {
                     continue;
                 }
                 let location = format!("{}:{}", sym.file_path, sym.start_line);
+                if !limits.admits(&sym.signature) {
+                    continue;
+                }
                 if out.len() >= limits.max_candidates {
                     return Ok((out, Some(RegexTruncationReason::CandidateCap)));
                 }
@@ -1668,6 +1729,9 @@ impl GraphStore {
                     {
                         continue;
                     }
+                    if !limits.admits(&symbol.signature) {
+                        continue;
+                    }
                     if candidates.len() >= limits.max_candidates {
                         return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                     }
@@ -1702,6 +1766,9 @@ impl GraphStore {
                     {
                         continue;
                     }
+                    if !limits.admits(&note.title) {
+                        continue;
+                    }
                     if candidates.len() >= limits.max_candidates {
                         return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                     }
@@ -1730,6 +1797,9 @@ impl GraphStore {
                         continue;
                     };
                     if path_prefix.is_some_and(|prefix| !note.file_path.starts_with(prefix)) {
+                        continue;
+                    }
+                    if !limits.admits(raw) {
                         continue;
                     }
                     if candidates.len() >= limits.max_candidates {
@@ -1796,6 +1866,9 @@ impl GraphStore {
                     else {
                         continue;
                     };
+                    if !limits.admits(&candidate.text) {
+                        continue;
+                    }
                     if candidates.len() >= limits.max_candidates {
                         return Ok((candidates, Some(RegexTruncationReason::CandidateCap)));
                     }
@@ -2269,6 +2342,9 @@ impl GraphStore {
         check_cancel()?;
         let hydration_started = Instant::now();
         let mut hydration_stop = None;
+        // Scanned (non-posting) nodes are matched at admission; see
+        // `CandidateLimits::prefilter`.
+        let prefilter_rejected = std::cell::Cell::new(0usize);
         let (mut candidates, hydrated_candidates) = if planning_deadline {
             (Vec::new(), 0)
         } else {
@@ -2283,6 +2359,8 @@ impl GraphStore {
                         CandidateLimits {
                             cancel,
                             max_candidates: candidate_cap,
+                            prefilter: Some(&re),
+                            rejected: Some(&prefilter_rejected),
                         },
                     )?;
                     let (mut hydrated, hydrated_stop) = self.load_candidates_by_uid(
@@ -2294,6 +2372,8 @@ impl GraphStore {
                         CandidateLimits {
                             cancel,
                             max_candidates: candidate_cap.saturating_sub(candidates.len()),
+                            prefilter: None,
+                            rejected: None,
                         },
                     )?;
                     hydration_stop = stronger_truncation(fallback_stop, hydrated_stop);
@@ -2315,6 +2395,8 @@ impl GraphStore {
                         CandidateLimits {
                             cancel,
                             max_candidates: candidate_cap,
+                            prefilter: Some(&re),
+                            rejected: Some(&prefilter_rejected),
                         },
                     )?;
                     hydration_stop = stop;
@@ -2477,6 +2559,9 @@ impl GraphStore {
             }
         }
         let verification_ms = elapsed_millis(verification_started);
+        // Nodes the admission prefilter rejected were evaluated by the real
+        // regex too; count them so `scanned_candidates` reports the work done.
+        scanned_candidates = scanned_candidates.saturating_add(prefilter_rejected.get());
 
         // The verification loop ran over everything COLLECTION handed it
         // without itself hitting a limit — but collection may not have
@@ -2529,6 +2614,19 @@ impl GraphStore {
             note: None,
         }
         .with_scan_budget_note();
+        // QA #3: `stale_index: false` beside `ready_scopes: 0` read as "the
+        // index is fine". With no index at all it is merely inapplicable, so
+        // say what actually happened.
+        if plan
+            .as_ref()
+            .is_some_and(|plan| !plan.has_index && !plan.dirty_scopes.is_empty())
+        {
+            let disclosure = NO_TRIGRAM_INDEX_NOTE;
+            response.note = Some(match response.note {
+                Some(note) => format!("{note} {disclosure}"),
+                None => disclosure.into(),
+            });
+        }
         if plan
             .as_ref()
             .is_some_and(|plan| !plan.scope_population_complete)
@@ -2556,7 +2654,35 @@ impl GraphStore {
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
     ) -> Result<Vec<PatternCount>, StoreError> {
-        self.count_patterns_with_planning_cap(patterns, path_prefix, kinds, CANDIDATE_CAP)
+        self.count_patterns_cancellable(patterns, path_prefix, kinds, None, None)
+    }
+
+    /// [`Self::count_patterns`] under a wall-clock budget and cooperative
+    /// cancellation.
+    ///
+    /// `max_millis` (default [`COUNT_PATTERNS_DEFAULT_MAX_MILLIS`]) bounds the
+    /// WHOLE call, shared across patterns. When it runs out, the pattern being
+    /// counted and every pattern not yet reached come back `truncated: true`
+    /// with `truncation_reason: deadline`, and their counts are lower bounds —
+    /// never a confident short count. A tripped `cancel` (client disconnect or
+    /// RPC timeout) returns `StoreError::Cancelled` instead, so a partial
+    /// answer nobody is waiting for is neither computed nor cached.
+    pub fn count_patterns_cancellable(
+        &self,
+        patterns: &[String],
+        path_prefix: Option<&str>,
+        kinds: Option<&[String]>,
+        max_millis: Option<u64>,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Vec<PatternCount>, StoreError> {
+        self.count_patterns_with_planning_cap(
+            patterns,
+            path_prefix,
+            kinds,
+            CANDIDATE_CAP,
+            max_millis.unwrap_or(COUNT_PATTERNS_DEFAULT_MAX_MILLIS),
+            cancel,
+        )
     }
 
     // Small-budget regression seam; public behavior keeps the original cap.
@@ -2566,26 +2692,64 @@ impl GraphStore {
         path_prefix: Option<&str>,
         kinds: Option<&[String]>,
         planning_cap: usize,
+        deadline_ms: u64,
+        cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<PatternCount>, StoreError> {
+        let check_cancel = || {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                Err(StoreError::Cancelled(CancelReason::Timeout))
+            } else {
+                Ok(())
+            }
+        };
+        let call_started = Instant::now();
         let mut out = Vec::new();
         for pattern in patterns {
+            check_cancel()?;
             let started = Instant::now();
             let re = compile_pattern(pattern)?;
+            if elapsed_millis(call_started) >= deadline_ms {
+                // The budget is spent: report the pattern as not counted
+                // rather than as a confident zero.
+                out.push(PatternCount {
+                    pattern: pattern.clone(),
+                    total_matches: 0,
+                    files_matched: 0,
+                    top_files: Vec::new(),
+                    stale_index: false,
+                    ready_scopes: 0,
+                    dirty_scopes: 0,
+                    error_scopes: 0,
+                    posting_hits: 0,
+                    hydrated_candidates: 0,
+                    scanned_candidates: 0,
+                    timings: RegexStageTimings::default(),
+                    truncated: true,
+                    truncation_reason: Some(RegexTruncationReason::Deadline),
+                });
+                continue;
+            }
 
             // Optional trigram narrowing.
             let planning_started = Instant::now();
             let clauses = required_trigram_clauses(pattern);
+            // Every phase measures the SHARED call budget from `call_started`.
             let plan = match &clauses {
                 Some(clauses) => self.regex_v3_candidate_uids(
                     clauses,
-                    started,
-                    u64::MAX,
-                    None,
+                    call_started,
+                    deadline_ms,
+                    cancel,
                     planning_cap,
                     false,
                 )?,
                 None => None,
             };
+            check_cancel()?;
+            // A planner that ran out of budget returns no plan; that must not
+            // silently become an unbudgeted full scan below.
+            let mut deadline_hit =
+                clauses.is_some() && plan.is_none() && elapsed_millis(call_started) >= deadline_ms;
             let planning_ms = elapsed_millis(planning_started);
             let stale_index = plan
                 .as_ref()
@@ -2595,56 +2759,70 @@ impl GraphStore {
             let mut total: u64 = 0;
             let mut scanned_candidates = 0usize;
             let hydration_started = Instant::now();
-            let (candidates, hydrated_candidates) = match &plan {
-                Some(plan) => {
-                    let mut candidates = self
-                        .collect_candidates_for_scopes(
+            let limits = || CandidateLimits {
+                cancel,
+                max_candidates: usize::MAX,
+                prefilter: None,
+                rejected: None,
+            };
+            // Any other collector stop (rows it could not decode) means the
+            // corpus was short: the counts are lower bounds and say so.
+            let mut corpus_stop: Option<RegexTruncationReason> = None;
+            let (candidates, hydrated_candidates) = if deadline_hit {
+                (Vec::new(), 0)
+            } else {
+                match &plan {
+                    Some(plan) => {
+                        let (mut candidates, fallback_stop) = self.collect_candidates_for_scopes(
                             &plan.dirty_scopes,
                             path_prefix,
                             kinds,
-                            started,
-                            u64::MAX,
-                            CandidateLimits {
-                                cancel: None,
-                                max_candidates: usize::MAX,
-                            },
-                        )?
-                        .0;
-                    let hydrated = self
-                        .load_candidates_by_uid(
+                            call_started,
+                            deadline_ms,
+                            limits(),
+                        )?;
+                        let (hydrated, hydrated_stop) = self.load_candidates_by_uid(
                             &plan.matching_ready_uids,
                             path_prefix,
                             kinds,
-                            started,
-                            u64::MAX,
-                            CandidateLimits {
-                                cancel: None,
-                                max_candidates: usize::MAX,
-                            },
-                        )?
-                        .0;
-                    let hydrated_candidates = hydrated.len();
-                    candidates.extend(hydrated);
-                    (candidates, hydrated_candidates)
+                            call_started,
+                            deadline_ms,
+                            limits(),
+                        )?;
+                        deadline_hit |=
+                            stops_on_deadline(fallback_stop) || stops_on_deadline(hydrated_stop);
+                        corpus_stop = stronger_truncation(fallback_stop, hydrated_stop);
+                        let hydrated_candidates = hydrated.len();
+                        candidates.extend(hydrated);
+                        (candidates, hydrated_candidates)
+                    }
+                    None => {
+                        let (candidates, stop) = self.collect_candidates(
+                            path_prefix,
+                            kinds,
+                            call_started,
+                            deadline_ms,
+                            limits(),
+                        )?;
+                        deadline_hit |= stops_on_deadline(stop);
+                        corpus_stop = stop;
+                        (candidates, 0)
+                    }
                 }
-                None => (
-                    self.collect_candidates(
-                        path_prefix,
-                        kinds,
-                        started,
-                        u64::MAX,
-                        CandidateLimits {
-                            cancel: None,
-                            max_candidates: usize::MAX,
-                        },
-                    )?
-                    .0,
-                    0,
-                ),
             };
+            check_cancel()?;
             let hydration_ms = elapsed_millis(hydration_started);
             let verification_started = Instant::now();
-            for c in &candidates {
+            for (index, c) in candidates.iter().enumerate() {
+                // Checked every 64 candidates: cheap relative to a regex scan,
+                // and frequent enough that a disconnect stops the work.
+                if index % 64 == 0 {
+                    check_cancel()?;
+                    if elapsed_millis(call_started) >= deadline_ms {
+                        deadline_hit = true;
+                        break;
+                    }
+                }
                 scanned_candidates += 1;
                 // nw-300: `is_match` is a boolean, so `total` counted NODES
                 // that contained at least one match and reported that under a
@@ -2692,10 +2870,23 @@ impl GraphStore {
                     verification_ms,
                     total_ms: elapsed_millis(started),
                 },
+                truncated: deadline_hit || corpus_stop.is_some(),
+                truncation_reason: if deadline_hit {
+                    Some(RegexTruncationReason::Deadline)
+                } else {
+                    corpus_stop
+                },
             });
         }
         Ok(out)
     }
+}
+
+/// Whether a candidate collector stopped because the wall-clock budget ran
+/// out. `count_patterns` gathers without a candidate cap; any other stop it
+/// can meet (undecodable rows) is reported separately as a short corpus.
+fn stops_on_deadline(stop: Option<RegexTruncationReason>) -> bool {
+    matches!(stop, Some(RegexTruncationReason::Deadline))
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -2903,8 +3094,13 @@ mod tests {
             2,
             "both collected candidates actually match the pattern: {result:?}"
         );
+        // The fixture has no trigram index, so the no-index disclosure is
+        // expected; the empty-result scan-budget hedge must not appear.
         assert!(
-            result.note.is_none(),
+            result
+                .note
+                .as_deref()
+                .is_none_or(|note| !note.contains(SCAN_BUDGET_NOTE)),
             "results are non-empty, so no scan-budget hedge note applies: {result:?}"
         );
     }
@@ -4041,10 +4237,54 @@ mod tests {
         assert!(complete[0].ready_scopes >= 8);
         assert!(complete[0].dirty_scopes >= 1);
         let small = store
-            .count_patterns_with_planning_cap(&patterns, None, None, 2)
+            .count_patterns_with_planning_cap(&patterns, None, None, 2, u64::MAX, None)
             .unwrap();
         assert_eq!(small[0].total_matches, complete[0].total_matches);
         assert_eq!(small[0].files_matched, complete[0].files_matched);
+    }
+
+    /// count_patterns had no deadline and no cancellation: 64 patterns of `.`
+    /// ran 46.8s and kept burning CPU after the client disconnected. A spent
+    /// budget now yields honestly truncated lower bounds; a tripped cancel
+    /// flag stops the call outright.
+    #[test]
+    fn count_patterns_honours_its_budget_and_cancellation() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        let patterns = ["authenticateUser".to_string(), ".".to_string()];
+
+        let complete = store.count_patterns(&patterns, None, None).unwrap();
+        assert!(complete.iter().all(|count| !count.truncated));
+        assert!(
+            complete
+                .iter()
+                .all(|count| count.truncation_reason.is_none())
+        );
+        assert!(complete[0].total_matches > 0);
+
+        let spent = store
+            .count_patterns_with_planning_cap(&patterns, None, None, CANDIDATE_CAP, 0, None)
+            .unwrap();
+        assert_eq!(spent.len(), 2, "every pattern is still reported");
+        for count in &spent {
+            assert!(count.truncated, "{count:?}");
+            assert_eq!(
+                count.truncation_reason,
+                Some(RegexTruncationReason::Deadline)
+            );
+        }
+        let json = serde_json::to_value(&spent[0]).unwrap();
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["truncation_reason"], "deadline");
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let error = store
+            .count_patterns_cancellable(&patterns, None, None, None, Some(&cancel))
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Cancelled(_)),
+            "a cancelled count must not return a partial answer: {error}"
+        );
     }
 
     #[test]
@@ -4065,7 +4305,7 @@ mod tests {
             "manual section + three symbol occurrences"
         );
         let bounded_plan = store
-            .count_patterns_with_planning_cap(&patterns, None, None, 1)
+            .count_patterns_with_planning_cap(&patterns, None, None, 1, u64::MAX, None)
             .unwrap();
         assert_eq!(
             bounded_plan[0].total_matches, 4,
@@ -4091,7 +4331,7 @@ mod tests {
             "one section and one symbol occurrence"
         );
         let bounded_plan = store
-            .count_patterns_with_planning_cap(&patterns, None, None, 1)
+            .count_patterns_with_planning_cap(&patterns, None, None, 1, u64::MAX, None)
             .unwrap();
         assert_eq!(
             bounded_plan[0].total_matches, 2,
@@ -4429,6 +4669,64 @@ mod tests {
     #[test]
     fn compile_pattern_accepts_normal_pattern() {
         assert!(compile_pattern(r"fn\s+\w+\(").is_ok());
+    }
+
+    /// QA #3: with no trigram index the bounded MCP work cap (2000) kept the
+    /// first 2000 scanned nodes and verified only those, so a match ordered
+    /// later came back `[]` / `candidate_cap` while `count_patterns` found
+    /// it. Admission now matches the regex, so the cap counts matches.
+    #[test]
+    fn capped_scan_without_trigram_index_still_finds_a_late_match() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let symbol = |uid: String, signature: String| Symbol {
+            uid,
+            name: "f".to_string(),
+            kind: SymbolKind::Function,
+            repo_uid: "repo:1".to_string(),
+            file_path: "src/pad.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            signature,
+            summary: None,
+            content_hash: "h".to_string(),
+            embedding: None,
+            pagerank_score: None,
+            is_entry_point: false,
+            entry_point_kind: None,
+            visibility: Visibility::Inferred,
+            type_info: None,
+            framework_hint: None,
+            canonical_id: None,
+        };
+        for i in 0..50 {
+            store
+                .insert_symbol(&symbol(format!("sym:pad:{i}"), format!("fn filler_{i}()")))
+                .unwrap();
+        }
+        store
+            .insert_symbol(&symbol("sym:zz".into(), "fn late_needle()".into()))
+            .unwrap();
+        let res = store
+            .regex_search_cancellable_with_candidate_cap(
+                "late_needle",
+                None,
+                None,
+                Some(10),
+                Some(600_000),
+                None,
+                10,
+            )
+            .unwrap();
+        assert_eq!(res.results.len(), 1, "{res:?}");
+        assert!(!res.truncated, "{res:?}");
+        assert!(res.scanned_candidates >= 51, "{res:?}");
+        assert!(
+            res.note
+                .as_deref()
+                .is_some_and(|note| note.contains("No trigram index")),
+            "an absent index must be disclosed: {res:?}"
+        );
     }
 
     #[test]

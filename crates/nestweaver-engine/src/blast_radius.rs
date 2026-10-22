@@ -3,7 +3,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1542,7 +1541,9 @@ fn parse_name_only_z(output: &[u8]) -> Result<Vec<PathBuf>> {
 /// When `base_ref` is provided, resolves it to a commit OID and diffs against
 /// that OID. Otherwise diffs against HEAD (showing unstaged + staged changes).
 pub fn changed_files_from_git(repo_path: &Path, base_ref: Option<&str>) -> Result<Vec<PathBuf>> {
-    let mut cmd = Command::new("git");
+    // Against the working tree, `diff` runs the repository's clean filters
+    // unless `isolated_git_in` disables them.
+    let mut cmd = crate::git_cmd::isolated_git_in(repo_path)?;
     cmd.arg("diff").arg("--name-only").arg("-z");
 
     if let Some(base) = base_ref {
@@ -1566,6 +1567,18 @@ pub fn changed_files_from_git(repo_path: &Path, base_ref: Option<&str>) -> Resul
 mod tests {
     use super::*;
     use crate::cluster_dispatch::CommunityInfo;
+    use std::process::Command;
+
+    /// Listing working-tree changes never runs a repository's clean filters.
+    #[test]
+    fn changed_files_from_git_runs_no_repository_attribute_programs() {
+        let repo = crate::git_cmd::hostile_repo::hostile_repo();
+        let files = changed_files_from_git(repo.path(), None).unwrap();
+        assert_eq!(files.len(), 3, "{files:?}");
+        let files = changed_files_from_git(repo.path(), Some("HEAD")).unwrap();
+        assert_eq!(files.len(), 3, "{files:?}");
+        assert_eq!(repo.ran(), Vec::<String>::new());
+    }
 
     /// Build options preserving a test's prior target_repo/max_depth/data-edge
     /// intent, with no result cap.

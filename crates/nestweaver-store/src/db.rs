@@ -986,6 +986,23 @@ pub enum ReopenOutcome {
     Reopened,
 }
 
+/// `(device, inode)` of `path`, or `None` when it cannot be stat'ed or the
+/// platform has no inode identity.
+fn backing_file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// GraphStore wraps a LadybugDB database for storing and querying the code knowledge graph.
 ///
 /// Each method creates a fresh Connection internally, which is the simplest safe pattern
@@ -1056,6 +1073,12 @@ pub struct GraphStore {
     /// sidecar so `graph_generation` can be loaded on open and persisted on
     /// mutation without callers having to thread the path through.
     pub(crate) db_path: Option<PathBuf>,
+    /// `(device, inode)` of `db_path` as this handle opened it (unix only).
+    /// A database file deleted or replaced under a running process kept
+    /// receiving writes through the open handle — into an unlinked inode — and
+    /// every one reported success. Publications compare it against the path
+    /// first (see [`GraphStore::verify_backing_file`]).
+    backing_identity: Mutex<Option<(u64, u64)>>,
     /// Private filesystem namespace for rebuildable sidecars owned by an
     /// in-memory graph. Keeping the TempDir alive makes in-memory stores use
     /// the same regex-v3 implementation as persistent stores without creating
@@ -1355,9 +1378,7 @@ const _: () = {
 };
 
 fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    nestweaver_schema::env::env_parse::<u64>(key)
 }
 
 /// The address-space bound EVERY open needs, write-capable or not.
@@ -1432,7 +1453,7 @@ fn engine_max_threads() -> u64 {
 /// every store open in the binary reads. That is the whole property the test
 /// this replaces was reaching for.
 fn parse_max_threads(raw: Option<&str>) -> u64 {
-    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1)
+    nestweaver_schema::env::parse_env_value::<u64>("NESTWEAVER_LBUG_MAX_THREADS", raw).unwrap_or(1)
 }
 
 fn hardened_system_config() -> lbug::SystemConfig {
@@ -1457,6 +1478,13 @@ fn hardened_system_config() -> lbug::SystemConfig {
     // alone.
     if let Ok(v) = std::env::var("NESTWEAVER_LBUG_AUTO_CHECKPOINT") {
         let on = !matches!(v.trim(), "0" | "false" | "off");
+        if !matches!(v.trim(), "0" | "false" | "off" | "1" | "true" | "on") {
+            nestweaver_schema::env::warn_invalid_env_once(
+                "NESTWEAVER_LBUG_AUTO_CHECKPOINT",
+                &v,
+                "expected 0/false/off or 1/true/on (treated as on)",
+            );
+        }
         cfg = cfg.auto_checkpoint(on);
     }
     #[cfg(test)]
@@ -2214,6 +2242,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            backing_identity: Mutex::new(backing_file_identity(path)),
             regex_ephemeral_root: None,
             regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
@@ -2311,6 +2340,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            backing_identity: Mutex::new(backing_file_identity(path)),
             regex_ephemeral_root: None,
             regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
@@ -2393,6 +2423,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            backing_identity: Mutex::new(backing_file_identity(path)),
             regex_ephemeral_root: None,
             regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
@@ -2611,6 +2642,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: Some(path.to_path_buf()),
+            backing_identity: Mutex::new(backing_file_identity(path)),
             regex_ephemeral_root: None,
             regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
@@ -2693,6 +2725,7 @@ impl GraphStore {
             git_activity_cache: Mutex::new(None),
             git_activity_weight: Mutex::new(crate::ranking::DEFAULT_GIT_ACTIVITY_WEIGHT),
             db_path: None,
+            backing_identity: Mutex::new(None),
             regex_ephemeral_root: Some(regex_ephemeral_root),
             regex_reader_pool: std::sync::Arc::new(Default::default()),
             ppr_graph_cache: Mutex::new(None),
@@ -3126,6 +3159,9 @@ impl GraphStore {
     /// mutex guard, so moving the synchronous work to a blocking worker thread
     /// remains safe.
     pub fn acquire_index_publication_lease(&self) -> Result<IndexPublicationLease<'_>, StoreError> {
+        // Every graph publisher (index, watcher batch, vault refresh) comes
+        // through here before its first write.
+        self.verify_backing_file()?;
         let mut state = self
             .index_publication_lease
             .state
@@ -3565,6 +3601,39 @@ impl GraphStore {
     /// (`None` for in-memory stores). Lets callers locate sidecars.
     pub fn db_path(&self) -> Option<&Path> {
         self.db_path.as_deref()
+    }
+
+    /// Refuse to write when the database file this handle opened is no longer
+    /// the file at its path: deleted (`rm`, `rm -rf` of its directory) or
+    /// replaced (a restore, a copy over it). Writes through the open handle
+    /// would land in an orphaned inode, be reported as successful, and vanish
+    /// when the process exits. In-memory stores, and platforms without inode
+    /// identity, always pass.
+    pub fn verify_backing_file(&self) -> Result<(), StoreError> {
+        let (Some(path), Some(opened)) = (
+            self.db_path.as_deref(),
+            *self
+                .backing_identity
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        ) else {
+            return Ok(());
+        };
+        match backing_file_identity(path) {
+            Some(current) if current == opened => Ok(()),
+            Some(_) => Err(StoreError::Database(format!(
+                "database file {} was replaced while this process held the previous one open; \
+                 refusing to write to the orphaned copy. Restart the daemon to open the current \
+                 file",
+                path.display()
+            ))),
+            None => Err(StoreError::Database(format!(
+                "database file {} was deleted while this process held it open; refusing to \
+                 write to the orphaned copy, which would be lost at exit. Restart the daemon \
+                 (and re-index) to recreate it",
+                path.display()
+            ))),
+        }
     }
 
     /// Whether an indexing writer durably marked graph publication incomplete.
@@ -5289,6 +5358,10 @@ impl GraphStore {
             }
         };
         *cell = Some(db);
+        *self
+            .backing_identity
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = backing_file_identity(&path);
         *self
             .db
             .last_reopen_error
@@ -10617,5 +10690,50 @@ mod wal_recovery_arm_tests {
                 "the disclosure itself must not re-classify as corruption: {disclosure}"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod backing_file_tests {
+    use super::GraphStore;
+
+    /// QA: a daemon whose database directory was `rm -rf`'d kept writing to
+    /// the unlinked inode and reported success. A publication now refuses.
+    #[test]
+    fn a_deleted_database_file_refuses_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        store.verify_backing_file().unwrap();
+        drop(store.acquire_index_publication_lease().unwrap());
+
+        std::fs::remove_file(&db).unwrap();
+        let error = store.verify_backing_file().unwrap_err().to_string();
+        assert!(error.contains("was deleted"), "{error}");
+        let error = store
+            .acquire_index_publication_lease()
+            .expect_err("an orphaned store must not publish")
+            .to_string();
+        assert!(error.contains("orphaned"), "{error}");
+    }
+
+    #[test]
+    fn a_replaced_database_file_refuses_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.lbug");
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let copy = dir.path().join("copy.lbug");
+        std::fs::copy(&db, &copy).unwrap();
+        std::fs::rename(&copy, &db).unwrap();
+        let error = store.verify_backing_file().unwrap_err().to_string();
+        assert!(error.contains("was replaced"), "{error}");
+    }
+
+    #[test]
+    fn an_in_memory_store_always_passes() {
+        GraphStore::in_memory()
+            .unwrap()
+            .verify_backing_file()
+            .unwrap();
     }
 }

@@ -3753,6 +3753,10 @@ fn setup_does_not_overwrite_existing_skill_file() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
+        // `--all` includes Windsurf, whose config is GLOBAL
+        // (~/.codeium/windsurf/mcp_config.json): keep it inside the tempdir so
+        // the test (and `--force`) never rebinds the developer's real entry.
+        .env("HOME", dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
@@ -3791,6 +3795,10 @@ fn setup_force_overwrites_existing_skill_file() {
             "--force",
         ])
         .current_dir(dir.path())
+        // `--all` includes Windsurf, whose config is GLOBAL
+        // (~/.codeium/windsurf/mcp_config.json): keep it inside the tempdir so
+        // the test (and `--force`) never rebinds the developer's real entry.
+        .env("HOME", dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
@@ -3817,6 +3825,10 @@ fn setup_does_not_overwrite_existing_cursor_rule() {
     std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
+        // `--all` includes Windsurf, whose config is GLOBAL
+        // (~/.codeium/windsurf/mcp_config.json): keep it inside the tempdir so
+        // the test (and `--force`) never rebinds the developer's real entry.
+        .env("HOME", dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
@@ -3853,6 +3865,10 @@ fn setup_strips_deprecated_args_from_existing_config() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_nestweaver"))
         .args(["setup", "--db", db_path.to_str().unwrap(), "--all"])
         .current_dir(dir.path())
+        // `--all` includes Windsurf, whose config is GLOBAL
+        // (~/.codeium/windsurf/mcp_config.json): keep it inside the tempdir so
+        // the test (and `--force`) never rebinds the developer's real entry.
+        .env("HOME", dir.path())
         .env("NESTWEAVER_NO_DAEMON", "1")
         .env("NESTWEAVER_ALLOW_NO_DAEMON", "1")
         .output()
@@ -10818,7 +10834,7 @@ fn the_refusals_remedy_runs_on_the_very_file_that_triggered_it() {
         .success();
     let printed = String::from_utf8_lossy(&dry.get_output().stdout).to_string();
     let delta: serde_json::Value = serde_json::from_str(&printed).unwrap();
-    assert_eq!(delta["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(delta["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
     assert_eq!(
         std::fs::read_to_string(&settings).unwrap(),
         original,
@@ -10839,7 +10855,7 @@ fn the_refusals_remedy_runs_on_the_very_file_that_triggered_it() {
     let after: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(after["env"]["MY_API_KEY"], "sk-live-do-not-lose-me");
-    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
 }
 
 /// Well-formed JSON that NestWeaver does not own survives — in both shapes it
@@ -10890,7 +10906,7 @@ fn install_hook_preserves_every_key_it_does_not_own() {
         .collect();
     assert_eq!(
         matchers,
-        vec!["Edit", "Task"],
+        vec!["Edit", "Task|Agent"],
         "the user's own matcher is not NestWeaver's to move or drop"
     );
 
@@ -10986,7 +11002,7 @@ fn install_hook_replaces_the_settings_file_instead_of_truncating_it_in_place() {
     let after: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(after["env"]["MY_API_KEY"], "sk-live-do-not-lose-me");
-    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
 
     let leftovers: Vec<_> = std::fs::read_dir(dir.path().join(".claude"))
         .unwrap()
@@ -11042,7 +11058,7 @@ fn install_hook_follows_a_symlinked_settings_file_into_a_dotfiles_repo() {
         "the user's key must survive the merge: {after}"
     );
     assert_eq!(
-        after["hooks"]["PreToolUse"][0]["matcher"], "Task",
+        after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent",
         "the hook must land in the file the link names: {after}"
     );
     assert!(
@@ -11120,7 +11136,7 @@ fn install_hook_refuses_a_dangling_symlinked_settings_file() {
         .success();
     let after: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&missing).unwrap()).unwrap();
-    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
 }
 
 /// Unparseable input is a refusal, not an empty object.
@@ -13101,11 +13117,31 @@ fn read_symbols_unreadable_root_is_exit_1_not_a_missing_target() {
     assert_eq!(code, Some(2), "{payload}");
     assert_eq!(payload["not_found"][0], "nw539NoSuchSymbolXYZ", "{payload}");
 
-    // nw-706: a READABLE --root holding none of the indexed files (the wrong
-    // tree) is the same state, with its own reason.
+    // A READABLE --root outside every indexed repository and vault is now
+    // refused before anything is read from it: the root decides which
+    // directory symbol spans are read from, so an arbitrary one would read
+    // lines of any host file at an indexed relative path. Still exit 1, and
+    // the refusal names the root.
     let wrong_tree = dir.path().join("elsewhere");
     std::fs::create_dir_all(&wrong_tree).unwrap();
-    let (code, payload, _) = read("nw539ReadTarget", Some(&wrong_tree));
+    std::fs::write(
+        wrong_tree.join("main.js"),
+        "function nw539ReadTarget() {}\n",
+    )
+    .unwrap();
+    let (code, payload, output) = read("nw539ReadTarget", Some(&wrong_tree));
+    assert_eq!(code, Some(1), "{payload}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not inside an indexed repository")
+            && stderr.contains(&wrong_tree.display().to_string()),
+        "{stderr}"
+    );
+    // nw-706: a readable root INSIDE the indexed repository that holds none
+    // of its files (the wrong subtree) keeps its own reason.
+    let wrong_subtree = repo_dir.join("empty");
+    std::fs::create_dir_all(&wrong_subtree).unwrap();
+    let (code, payload, _) = read("nw539ReadTarget", Some(&wrong_subtree));
     assert_eq!(code, Some(1), "{payload}");
     assert_eq!(payload["error"], "unreadable_root", "{payload}");
     assert_eq!(
@@ -15135,7 +15171,9 @@ fn brain_context_repo_filter_keeps_its_failure_class() {
 fn investigate_repo_scope_keeps_its_failure_class() {
     let dir = tempfile::tempdir().unwrap();
     let (db, exact) = two_web_apps(dir.path());
-    let root = dir.path().to_path_buf();
+    // An explicit --root must lie inside an indexed repository (or be a
+    // worktree of one); the directory holding both repos is not.
+    let root = exact.clone();
     assert_repo_filter_classes(&db, exact.to_str().unwrap(), "", |repo| {
         vec![
             "investigate".to_string(),
@@ -16601,5 +16639,139 @@ fn brain_add_refuses_a_control_character_name_before_touching_the_database() {
     assert!(
         !db_path.exists(),
         "nothing may be written for a refused name"
+    );
+}
+
+/// An isolated command for the QA fix-round tests below: every root a daemon
+/// lookup could touch points into `scratch`.
+fn qa_isolated_cmd(scratch: &std::path::Path) -> Command {
+    let mut cmd = nestweaver_cmd();
+    cmd.env_remove("NESTWEAVER_DB")
+        .env("HOME", scratch.join("home"))
+        .env("XDG_STATE_HOME", scratch.join("state"))
+        .env("XDG_RUNTIME_DIR", scratch.join("runtime"))
+        .env("XDG_CONFIG_HOME", scratch.join("config"))
+        .env("XDG_DATA_HOME", scratch.join("data"))
+        .env("XDG_CACHE_HOME", scratch.join("cache"))
+        .env("NESTWEAVER_SOCK_FALLBACK_DIR", scratch.join("fallback"));
+    cmd
+}
+
+/// A file that passes the read-path admission (`LBUG` header) without a real
+/// graph behind it: enough for commands that must refuse or no-op first.
+fn qa_fake_lbug(dir: &std::path::Path) -> std::path::PathBuf {
+    let db = dir.join("fake.lbug");
+    let mut bytes = b"LBUG".to_vec();
+    bytes.resize(4096, 0);
+    std::fs::write(&db, bytes).unwrap();
+    db
+}
+
+/// QA (LOW): `watch-stop` with no daemon running AUTOSTARTED one. Stopping
+/// must not start anything: no daemon means no watcher, exit 0.
+#[test]
+fn watch_stop_without_a_daemon_does_not_start_one() {
+    let scratch = tempfile::tempdir().unwrap();
+    let db = qa_fake_lbug(scratch.path());
+    let output = qa_isolated_cmd(scratch.path())
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .args(["watch-stop", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("No daemon is running"), "{stderr}");
+    assert!(
+        !scratch.path().join("state").join("nestweaver").exists()
+            || std::fs::read_dir(scratch.path().join("state").join("nestweaver"))
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.path().join("daemon.log").exists()),
+        "no daemon may have been started"
+    );
+}
+
+/// QA (LOW): `interactions clear --db /nonexistent` exited 0.
+#[test]
+fn interactions_clear_on_a_missing_database_fails() {
+    let scratch = tempfile::tempdir().unwrap();
+    qa_isolated_cmd(scratch.path())
+        .args(["interactions", "clear", "--db"])
+        .arg(scratch.path().join("nope.lbug"))
+        .assert()
+        .failure()
+        .stderr(contains("not found"));
+}
+
+/// QA (LOW): `--json` failures for an unusable database printed nothing on
+/// stdout. They now carry an envelope a script can branch on.
+#[test]
+fn json_database_problems_write_an_envelope_on_stdout() {
+    let scratch = tempfile::tempdir().unwrap();
+    let not_a_db = scratch.path().join("text.lbug");
+    std::fs::write(&not_a_db, "not a database at all").unwrap();
+    for db in [
+        scratch.path().join("nope.lbug"),
+        not_a_db,
+        scratch.path().to_path_buf(),
+    ] {
+        let output = qa_isolated_cmd(scratch.path())
+            .args(["search", "anything", "--json", "--db"])
+            .arg(&db)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{}", db.display());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "{}: stdout is not one JSON envelope ({e}): {stdout:?}",
+                db.display()
+            )
+        });
+        assert_eq!(envelope["error"], "database unavailable", "{envelope}");
+        assert!(envelope["message"].as_str().is_some_and(|m| !m.is_empty()));
+    }
+}
+
+/// QA (LOW): `NESTWEAVER_DB=` (empty) resolved to the path "" instead of
+/// counting as unset.
+#[test]
+fn an_empty_nestweaver_db_counts_as_unset() {
+    let scratch = tempfile::tempdir().unwrap();
+    let output = qa_isolated_cmd(scratch.path())
+        .current_dir(scratch.path())
+        .env("NESTWEAVER_DB", "")
+        .args(["interactions", "clear"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nestweaver.lbug"),
+        "an empty NESTWEAVER_DB must fall back to the default database: {stderr}"
+    );
+}
+
+/// QA (LOW): an invalid tuning variable was ignored without a word, and
+/// tracing output carried ANSI colour into a pipe.
+#[test]
+fn an_invalid_tuning_variable_is_named_in_a_plain_warning() {
+    let scratch = tempfile::tempdir().unwrap();
+    let db = qa_fake_lbug(scratch.path());
+    let output = qa_isolated_cmd(scratch.path())
+        .env("NESTWEAVER_LBUG_MAX_DB_SIZE", "lots")
+        .args(["instance", "identity", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("NESTWEAVER_LBUG_MAX_DB_SIZE") && stderr.contains("lots"),
+        "the ignored value must be named: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "non-TTY stderr must carry no ANSI: {stderr:?}"
     );
 }

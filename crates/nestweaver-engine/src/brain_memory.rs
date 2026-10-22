@@ -699,6 +699,17 @@ pub struct ConsolidationManifest {
     /// callers report it next to the returned list.
     #[serde(skip)]
     pub proposals_discovered: usize,
+    /// QA #6: discovered proposals whose source file is already gone — a
+    /// previous apply moved it and the graph has not been re-indexed since.
+    /// They are neither returned nor applied, so `proposals_discovered`
+    /// always equals returned + deferred + this. Not serialized.
+    #[serde(skip)]
+    pub proposals_already_applied: usize,
+    /// Vault roots whose graph no longer matches disk because of a
+    /// consolidation (moved now, or by an earlier apply). Re-indexing them
+    /// stops already-applied moves from being proposed again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refresh_vault_paths: Vec<String>,
 }
 
 const CONSOLIDATION_JOURNAL_VERSION: u32 = 1;
@@ -746,6 +757,8 @@ struct ApplyProposalsOutcome {
     apply_errors: bool,
     summaries: Vec<String>,
     proposals: Vec<ConsolidationProposal>,
+    /// Vault roots in which this run moved a note.
+    moved_vault_roots: std::collections::BTreeSet<PathBuf>,
 }
 
 /// Number of distinct idea-note referrers a daily log needs to be promoted.
@@ -791,6 +804,8 @@ pub fn memory_consolidate_limited(
             proposals: vec![],
             warnings,
             proposals_discovered: 0,
+            proposals_already_applied: 0,
+            refresh_vault_paths: Vec::new(),
         });
     }
 
@@ -904,6 +919,39 @@ pub fn memory_consolidate_limited(
             .then(a.promote_to.cmp(&b.promote_to))
     });
     let proposals_discovered = proposals.len();
+    // QA #6: a stale graph re-proposed every move it had already applied, in
+    // dry runs and applies alike, and the apply then returned none of them
+    // (`proposals_total: 1, returned: 0, deferred: 0`). A proposal whose
+    // source file is already gone is set aside BEFORE the limit and counted.
+    let mut refresh_vaults: std::collections::BTreeSet<String> = Default::default();
+    let vault_roots: HashMap<String, String> = store
+        .list_vaults(None)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .into_iter()
+        .map(|vault| (vault.uid, vault.root_path))
+        .collect();
+    let mut proposals_already_applied = 0usize;
+    proposals.retain(|proposal| {
+        let Some(root) = meta
+            .get(proposal.source_uid.as_str())
+            .and_then(|note| vault_roots.get(&note.vault_uid))
+        else {
+            return true;
+        };
+        if !consolidation_source_absent(Path::new(root), &proposal.source_path) {
+            return true;
+        }
+        proposals_already_applied += 1;
+        refresh_vaults.insert(root.clone());
+        false
+    });
+    if proposals_already_applied > 0 {
+        warnings.push(format!(
+            "{proposals_already_applied} proposal(s) were already applied: their source notes \
+             are gone from disk but still in the graph. Re-index the vault to stop them being \
+             proposed: nestweaver brain refresh <vault-path>"
+        ));
+    }
     if let Some(limit) = limit {
         proposals.truncate(limit);
     }
@@ -912,6 +960,12 @@ pub fn memory_consolidate_limited(
         match apply_proposals(store, &proposals, &notes) {
             Ok(outcome) => {
                 warnings.extend(outcome.summaries);
+                refresh_vaults.extend(
+                    outcome
+                        .moved_vault_roots
+                        .iter()
+                        .map(|root| root.to_string_lossy().into_owned()),
+                );
                 if outcome.all_succeeded && outcome.had_work {
                     warnings.push(
                         "Re-index the vault to update the graph: \
@@ -926,6 +980,8 @@ pub fn memory_consolidate_limited(
                     proposals: outcome.proposals,
                     warnings,
                     proposals_discovered,
+                    proposals_already_applied,
+                    refresh_vault_paths: refresh_vaults.into_iter().collect(),
                 });
             }
             Err(e) => {
@@ -937,6 +993,8 @@ pub fn memory_consolidate_limited(
                     proposals,
                     warnings,
                     proposals_discovered,
+                    proposals_already_applied,
+                    refresh_vault_paths: refresh_vaults.into_iter().collect(),
                 });
             }
         }
@@ -949,7 +1007,30 @@ pub fn memory_consolidate_limited(
         proposals,
         warnings,
         proposals_discovered,
+        proposals_already_applied,
+        refresh_vault_paths: refresh_vaults.into_iter().collect(),
     })
+}
+
+/// Whether a proposal's source note is positively absent from its vault —
+/// the mark of a consolidation an earlier apply already performed. Any path
+/// that fails validation, or a stat error other than not-found, reads as
+/// present, so the proposal is left for apply to report.
+fn consolidation_source_absent(vault_root: &Path, source_path: &str) -> bool {
+    let Ok(root) = validate_vault_root(vault_root) else {
+        return false;
+    };
+    let Ok(relative) = validate_vault_relative_path(Path::new(source_path)) else {
+        return false;
+    };
+    validated_vault_path(&root, &relative, "consolidation source")
+        .ok()
+        .is_some_and(|source| {
+            matches!(
+                std::fs::symlink_metadata(&source),
+                Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
 }
 
 /// Recover every incomplete vault-local journal, then execute newly discovered
@@ -1076,6 +1157,7 @@ fn apply_proposals(
     let mut summaries = obsolete;
     let mut all_ok = true;
     let mut had_work = false;
+    let mut moved_vault_roots = std::collections::BTreeSet::new();
     let mut result_proposals: Vec<_> = proposals
         .iter()
         .filter(|proposal| {
@@ -1162,6 +1244,7 @@ fn apply_proposals(
 
         match apply_consolidation_journal(entry) {
             Ok(rewrite_count) => {
+                moved_vault_roots.insert(entry.vault_root.clone());
                 let source = entry.vault_root.join(&entry.journal.source_path);
                 let destination = entry.vault_root.join(&entry.journal.destination_path);
                 summaries.push(format!(
@@ -1202,6 +1285,7 @@ fn apply_proposals(
         apply_errors,
         summaries,
         proposals: result_proposals,
+        moved_vault_roots,
     })
 }
 
@@ -2908,6 +2992,56 @@ mod tests {
             0,
             "an absorbed receipt must be retired, not retained forever"
         );
+    }
+
+    /// QA #6: on a graph not re-indexed since an apply, the move it made is
+    /// neither re-proposed nor silently dropped: it is counted as already
+    /// applied and its vault is named for a refresh.
+    #[test]
+    fn an_already_applied_move_is_counted_not_reproposed() {
+        let (_dir, root) = make_vault(&[
+            (
+                "_logs/2025-01-01.md",
+                "# Log Jan 1\n\nA recurring idea worth promoting.\n",
+            ),
+            (
+                "_ideas/idea-a.md",
+                "# Idea A\n\nSee [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-b.md",
+                "# Idea B\n\nRefs [[_logs/2025-01-01]].\n",
+            ),
+            (
+                "_ideas/idea-c.md",
+                "# Idea C\n\nAlso [[_logs/2025-01-01]].\n",
+            ),
+        ]);
+        let (_res, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        let first = memory_consolidate_limited(&store, true, 4_000_000_000.0, Some(50)).unwrap();
+        assert!(first.applied, "{:?}", first.warnings);
+        assert_eq!(first.proposals_already_applied, 0);
+        assert!(
+            !first.refresh_vault_paths.is_empty(),
+            "the moved vault is named"
+        );
+
+        for apply in [false, true] {
+            let stale =
+                memory_consolidate_limited(&store, apply, 4_000_000_000.0, Some(50)).unwrap();
+            assert!(
+                stale.proposals.is_empty(),
+                "apply={apply}: {:?}",
+                stale.proposals
+            );
+            assert_eq!(stale.proposals_discovered, 1, "apply={apply}");
+            assert_eq!(stale.proposals_already_applied, 1, "apply={apply}");
+            assert_eq!(
+                stale.refresh_vault_paths,
+                [store.list_vaults(None).unwrap()[0].root_path.clone()],
+                "apply={apply}"
+            );
+        }
     }
 
     fn prepared_log_promotion_journal(store: &GraphStore, root: &Path) -> ConsolidationJournal {

@@ -15,7 +15,7 @@ Or manually create `.junie/mcp/mcp.json`:
   "mcpServers": {
     "nestweaver": {
       "command": "nestweaver",
-      "args": ["mcp", "--db", "./nestweaver.lbug"]
+      "args": ["mcp", "--db", "/absolute/path/to/nestweaver.lbug"]
     }
   }
 }

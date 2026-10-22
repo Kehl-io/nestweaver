@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6331
 expression: parsed
 ---
 path: src/main.ts
@@ -16,7 +17,7 @@ symbols:
     type_info:
       declared_type: ~
       parameter_types: []
-      return_type: "void {} }"
+      return_type: void
     parent_name: ~
     scope_chain: ~
   - name: query
@@ -31,7 +32,7 @@ symbols:
     type_info:
       declared_type: ~
       parameter_types: []
-      return_type: "void {}"
+      return_type: void
     parent_name: Store
     scope_chain: Store
   - name: Service
@@ -82,7 +83,10 @@ symbols:
     is_entry_point: false
     entry_point_kind: ~
     visibility: Private
-    type_info: ~
+    type_info:
+      declared_type: ~
+      parameter_types: []
+      return_type: void
     parent_name: Service
     scope_chain: Service
   - name: shadow

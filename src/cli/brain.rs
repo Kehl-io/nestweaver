@@ -265,7 +265,10 @@ pub(crate) fn run_brain(
 
         BrainCommands::List { json, db, config } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            let value = if let Some(value) = try_hybrid_json_rpc(
+            // `_checked`: this caller passes an explicit `--config`, which the
+            // unchecked wrapper debug-asserts against (a debug build panicked
+            // on `brain list --config` whenever a daemon served it).
+            let value = if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
@@ -3644,6 +3647,19 @@ pub(crate) fn daemon_runtime_status_lines(status: &serde_json::Value) -> Vec<Str
 pub(crate) fn vault_derivation_status_lines(status: &serde_json::Value) -> Vec<String> {
     let derivation = status.get("vault_derivation");
     let mut lines = Vec::new();
+    if let Some(foreign) = derivation.and_then(|derivation| derivation.get("foreign_records")) {
+        let instance = foreign
+            .get("daemon_instance")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        lines.push(format!(
+            "Vault derivation DEGRADED: the Markdown link records belong to a different \
+             instance than the running daemon's ({instance}), so link-graph tools refuse every \
+             vault. If the daemon was started with a --config whose instance_id differs from \
+             this database's, run `nestweaver daemon stop`, then `nestweaver daemon start \
+             --reset` (or --config naming the matching instance)."
+        ));
+    }
     if let Some(running) = derivation
         .and_then(|derivation| derivation.get("in_progress"))
         .filter(|running| running.is_object())
@@ -3766,6 +3782,23 @@ mod vault_derivation_status_tests {
         assert!(lines[0].contains("phase: refreshing notes"), "{}", lines[0]);
         assert!(lines[0].contains("4000 note(s)"), "{}", lines[0]);
         assert!(lines[0].contains("running 12s"), "{}", lines[0]);
+    }
+
+    /// QA: records stamped under another instance (a daemon autostarted by a
+    /// one-off `--config` naming a different instance_id) made every
+    /// link-graph read fail with ForeignRecord while status showed nothing.
+    #[test]
+    fn foreign_records_get_a_degraded_line_naming_the_fix() {
+        let status = serde_json::json!({
+            "vault_derivation": {
+                "foreign_records": { "daemon_instance": "other", "instance_stated_by_config": true }
+            }
+        });
+        let lines = vault_derivation_status_lines(&status);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("DEGRADED"), "{}", lines[0]);
+        assert!(lines[0].contains("(other)"), "{}", lines[0]);
+        assert!(lines[0].contains("daemon start --reset"), "{}", lines[0]);
     }
 
     /// Counterweight: no Blocked vault, no line.

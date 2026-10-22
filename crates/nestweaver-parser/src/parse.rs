@@ -1255,10 +1255,39 @@ fn extract_java_style_type_info(sig: &str) -> Option<TypeInfo> {
     None
 }
 
+/// Byte index of the `)` closing the `(` at `open`, or `None`.
+fn matching_paren(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in text[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A signature's text after the return-type marker, ending where a body,
+/// expression body, `where` clause or a bodiless declaration's `;` begins. The signature is the
+/// declaration's first line, so a one-line declaration carries its whole body
+/// (`static make(): K { return new K(); }`); the body is not part of the type.
+fn return_type_text(after_marker: &str) -> &str {
+    let end = after_marker
+        .find(['{', '=', ';'])
+        .unwrap_or(after_marker.len())
+        .min(after_marker.find(" where").unwrap_or(after_marker.len()));
+    after_marker[..end].trim().trim_end_matches(':').trim()
+}
+
 fn extract_rust_type_info(sig: &str) -> Option<TypeInfo> {
     if let Some(arrow_pos) = sig.find("->") {
-        let return_type = sig[arrow_pos + 2..].trim();
-        let return_type = return_type.trim_end_matches('{').trim();
+        let return_type = return_type_text(&sig[arrow_pos + 2..]);
         if !return_type.is_empty() {
             return Some(TypeInfo {
                 declared_type: None,
@@ -1271,11 +1300,20 @@ fn extract_rust_type_info(sig: &str) -> Option<TypeInfo> {
 }
 
 fn extract_go_type_info(sig: &str) -> Option<TypeInfo> {
-    // "func greet(name string) string {"
-    if let Some(close_paren) = sig.rfind(')') {
-        let after = sig[close_paren + 1..].trim();
-        let return_type = after.trim_end_matches('{').trim();
-        if !return_type.is_empty() && !return_type.starts_with('{') {
+    // "func greet(name string) string {", "func (i *Impl) Add(a, b int) int {".
+    // The parameter list is the first one after the optional receiver; the
+    // LAST `)` of a one-line declaration can sit inside its body.
+    let rest = sig.trim_start();
+    let rest = rest.strip_prefix("func").unwrap_or(rest).trim_start();
+    let rest = if rest.starts_with('(') {
+        &rest[matching_paren(rest, 0)? + 1..]
+    } else {
+        rest
+    };
+    if let Some(close_paren) = rest.find('(').and_then(|open| matching_paren(rest, open)) {
+        let after = &rest[close_paren + 1..];
+        let return_type = after[..after.find('{').unwrap_or(after.len())].trim();
+        if !return_type.is_empty() {
             return Some(TypeInfo {
                 declared_type: None,
                 parameter_types: Vec::new(),
@@ -1292,8 +1330,7 @@ fn extract_annotated_type_info(sig: &str) -> Option<TypeInfo> {
     // Swift: "func greet(name: String) -> String"
     // Dart: "String greet(String name)"
     if let Some(arrow_pos) = sig.find("->") {
-        let return_type = sig[arrow_pos + 2..].trim();
-        let return_type = return_type.trim_end_matches('{').trim();
+        let return_type = return_type_text(&sig[arrow_pos + 2..]);
         if !return_type.is_empty() {
             return Some(TypeInfo {
                 declared_type: None,
@@ -1302,11 +1339,13 @@ fn extract_annotated_type_info(sig: &str) -> Option<TypeInfo> {
             });
         }
     }
-    // Check for ): Type pattern (TypeScript/Kotlin)
-    if let Some(close_paren) = sig.rfind(')') {
+    // Check for ): Type pattern (TypeScript/Kotlin). The parameter list is
+    // the first one; the LAST `)` of a one-line declaration can sit inside
+    // its body (`static make(): K { return new K(); }`).
+    if let Some(close_paren) = sig.find('(').and_then(|open| matching_paren(sig, open)) {
         let after = sig[close_paren + 1..].trim();
         if let Some(rest) = after.strip_prefix(':') {
-            let return_type = rest.trim().trim_end_matches('{').trim();
+            let return_type = return_type_text(rest);
             if !return_type.is_empty() {
                 return Some(TypeInfo {
                     declared_type: None,
@@ -1322,8 +1361,10 @@ fn extract_annotated_type_info(sig: &str) -> Option<TypeInfo> {
 fn extract_python_type_info(sig: &str) -> Option<TypeInfo> {
     // "def greet(name: str) -> str:"
     if let Some(arrow_pos) = sig.find("->") {
-        let return_type = sig[arrow_pos + 2..].trim();
-        let return_type = return_type.trim_end_matches(':').trim();
+        // A one-line `def make() -> K: return K()` carries its body after
+        // the colon; an annotation never contains one.
+        let after = &sig[arrow_pos + 2..];
+        let return_type = after[..after.find(':').unwrap_or(after.len())].trim();
         if !return_type.is_empty() {
             return Some(TypeInfo {
                 declared_type: None,
@@ -1357,6 +1398,120 @@ fn extract_type_info(signature: &str, lang: Language) -> Option<TypeInfo> {
 }
 
 // ── parent name extraction ────────────────────────────────────────────────
+
+/// The receiver type of a Go method: `Impl` for `func (i *Impl) Add()`,
+/// `List` for `func (l List[T]) Len()`.
+///
+/// A Go method is declared outside its type, so `find_parent_name`'s
+/// enclosing-container walk never found one: every Go method had no
+/// `parent_name`, so a typed receiver (`i.Add()`, `New(1).Add()`) had no
+/// method to match and Go member calls resolved to nothing.
+fn go_method_receiver_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let parameter = receiver
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "parameter_declaration")?;
+    let mut ty = parameter.child_by_field_name("type")?;
+    loop {
+        ty = match ty.kind() {
+            "pointer_type" | "parenthesized_type" => ty.named_child(0)?,
+            "generic_type" => ty.child_by_field_name("type")?,
+            "type_identifier" => break,
+            _ => return None,
+        };
+    }
+    ty.utf8_text(source).ok().map(str::to_string)
+}
+
+/// Whether a JS/TS `this.x = …` assignment's nearest enclosing method is the
+/// class constructor.
+fn js_assignment_in_constructor(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "method_definition" => {
+                return parent
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                    == Some("constructor");
+            }
+            "class_body" | "class_declaration" | "class" | "program" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
+}
+
+/// `queries/typescript.scm` mints a `Property` for every `this.x = …`
+/// assignment, and the symbol dedupe is keyed on `(name, line)`, so a field
+/// assigned in three methods became three `Property` symbols, plus a fourth
+/// when the class also declared it. One property is one symbol:
+///
+/// - when the class declares the member (a field declaration, accessor or
+///   method of that name), every assignment-minted duplicate is dropped and
+///   the declaration's line stands;
+/// - otherwise (a plain JS class with no field declarations) one symbol is
+///   kept: the first assignment in the constructor, else the first assignment.
+///
+/// Assignments outside any class (`parent_name` is `None`) are left alone:
+/// without an owner there is nothing to group them by.
+fn dedupe_js_assignment_properties(symbols: &mut Vec<RawSymbol>, assignments: &[(usize, bool)]) {
+    if assignments.is_empty() {
+        return;
+    }
+    let minted: std::collections::HashMap<usize, bool> = assignments.iter().copied().collect();
+    let declared: std::collections::HashSet<(&str, &str)> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(index, symbol)| {
+            !minted.contains_key(index)
+                && matches!(symbol.kind, SymbolKind::Property | SymbolKind::Method)
+        })
+        .filter_map(|(_, symbol)| Some((symbol.parent_name.as_deref()?, symbol.name.as_str())))
+        .collect();
+    // The kept assignment per (class, name): constructor first, then source order.
+    let mut keep: std::collections::HashMap<(&str, &str), (bool, u32, usize)> =
+        std::collections::HashMap::new();
+    for (&index, &in_constructor) in &minted {
+        let symbol = &symbols[index];
+        let Some(owner) = symbol.parent_name.as_deref() else {
+            continue;
+        };
+        let key = (owner, symbol.name.as_str());
+        if declared.contains(&key) {
+            continue;
+        }
+        let rank = (!in_constructor, symbol.start_line, index);
+        keep.entry(key)
+            .and_modify(|best| {
+                if rank < *best {
+                    *best = rank;
+                }
+            })
+            .or_insert(rank);
+    }
+    let dropped: std::collections::HashSet<usize> = minted
+        .keys()
+        .copied()
+        .filter(|&index| {
+            let symbol = &symbols[index];
+            symbol.parent_name.as_deref().is_some_and(|owner| {
+                keep.get(&(owner, symbol.name.as_str()))
+                    .is_none_or(|(_, _, kept)| *kept != index)
+            })
+        })
+        .collect();
+    if dropped.is_empty() {
+        return;
+    }
+    let mut index = 0;
+    symbols.retain(|_| {
+        let retain = !dropped.contains(&index);
+        index += 1;
+        retain
+    });
+}
 
 /// Walk the tree-sitter AST parent chain from `node` to find the enclosing
 /// class, struct, impl, trait, or interface. Returns the parent type/class name
@@ -1550,6 +1705,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let mut references: Vec<RawReference> = Vec::new();
     let mut seen_symbols: std::collections::HashSet<(String, u32)> =
         std::collections::HashSet::new();
+    // JS/TS `this.x = …` assignments minted as properties: (index into
+    // `symbols`, whether the assignment sits in a constructor). Deduplicated
+    // per class after the capture loop; see `dedupe_js_assignment_properties`.
+    let mut assignment_properties: Vec<(usize, bool)> = Vec::new();
     // nw-435: names called by a Python or bash call/command with no enclosing
     // `function_definition` (and, for Python, no enclosing `lambda`) ancestor —
     // see `is_top_level_reference` below. Collected during the capture loop,
@@ -1911,6 +2070,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 let parent_name = if matches!(kind, SymbolKind::Method | SymbolKind::Property) {
                     if commonjs_object_methods.contains(&node.start_byte()) {
                         Some("module.exports".into())
+                    } else if lang == Language::Go && node.kind() == "method_declaration" {
+                        go_method_receiver_type(node, source_bytes)
                     } else {
                         find_parent_name(&node, source_bytes)
                     }
@@ -1918,6 +2079,15 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     None
                 };
                 let scope_chain = extract_scope_chain(node, source, lang_str);
+                if matches!(lang, Language::JavaScript | Language::TypeScript)
+                    && kind == SymbolKind::Property
+                    && node.kind() == "assignment_expression"
+                {
+                    assignment_properties.push((
+                        symbols.len(),
+                        js_assignment_in_constructor(node, source_bytes),
+                    ));
+                }
                 symbols.push(RawSymbol {
                     name,
                     kind,
@@ -2034,9 +2204,19 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 //   Ruby:      call > receiver (direct field)
                 //   PHP:       member_call_expression > object
                 let receiver = if kind == ReferenceKind::Call {
+                    // A Rust turbofish (`x.parse::<T>()`, `Type::f::<T>()`)
+                    // wraps the callee in a `generic_function`; the receiver
+                    // lives on the wrapped node, exactly as without the
+                    // type arguments.
+                    let function = node.child_by_field_name("function").map(|f| {
+                        if f.kind() == "generic_function" {
+                            f.child_by_field_name("function").unwrap_or(f)
+                        } else {
+                            f
+                        }
+                    });
                     // Strategy 1: function child contains a member/field/selector/attribute node
-                    let from_function_child = node
-                        .child_by_field_name("function")
+                    let from_function_child = function
                         .and_then(|f| {
                             let k = f.kind();
                             if k.contains("field")
@@ -2087,7 +2267,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         && from_direct_object.is_none()
                         && from_receiver_field.is_none()
                     {
-                        node.child_by_field_name("function")
+                        function
                             .filter(|f| {
                                 let k = f.kind();
                                 k.contains("scoped") || k.contains("qualified")
@@ -2181,6 +2361,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
         }
     }
 
+    dedupe_js_assignment_properties(&mut symbols, &assignment_properties);
+
     // Preserve exact import bindings as well as package exclusions.
     if matches!(lang, Language::JavaScript | Language::TypeScript) {
         collect_js_import_bindings(
@@ -2193,6 +2375,9 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
     if lang == Language::Python {
         collect_python_import_bindings(tree.root_node(), source_bytes, &mut references);
+    }
+    if lang == Language::Go {
+        annotate_go_import_names(tree.root_node(), source_bytes, &mut references);
     }
 
     // nw-151: recover calls written inside Rust macro bodies.
@@ -5815,6 +6000,30 @@ fn collect_python_import_bindings(
     while let Some(statement) = stack.pop() {
         let mut cursor = statement.walk();
         stack.extend(statement.named_children(&mut cursor));
+        if statement.kind() == "import_statement" {
+            // `import pkg.helpers as ph` binds `ph` to the whole module.
+            let mut cursor = statement.walk();
+            for binding in statement.children_by_field_name("name", &mut cursor) {
+                if binding.kind() != "aliased_import" {
+                    continue;
+                }
+                let (Some(module), Some(local)) = (
+                    binding.child_by_field_name("name"),
+                    binding.child_by_field_name("alias"),
+                ) else {
+                    continue;
+                };
+                references.push(RawReference {
+                    scope: None,
+                    name: local.utf8_text(source).unwrap_or("").into(),
+                    kind: ReferenceKind::ImportAlias,
+                    start_line: local.start_position().row as u32 + 1,
+                    context: module.utf8_text(source).unwrap_or("").into(),
+                    receiver: Some("*".into()),
+                });
+            }
+            continue;
+        }
         if statement.kind() != "import_from_statement" {
             continue;
         }
@@ -5843,6 +6052,46 @@ fn collect_python_import_bindings(
                 context: specifier.into(),
                 receiver: Some(original.utf8_text(source).unwrap_or("").into()),
             });
+        }
+    }
+}
+
+/// Record a Go import's explicit package name as its reference `receiver`.
+///
+/// `import c "example.com/app/calc"` binds the qualifier `c`, `.` makes the
+/// package's names usable bare, and `_` binds nothing. Without the name the
+/// resolver can only assume the package's own name, so `c.New` would never
+/// reach `calc`.
+fn annotate_go_import_names(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    references: &mut [RawReference],
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() != "import_spec" {
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+            continue;
+        }
+        let (Some(name), Some(path)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("path"),
+        ) else {
+            continue;
+        };
+        let (Ok(name), Ok(path)) = (name.utf8_text(source), path.utf8_text(source)) else {
+            continue;
+        };
+        let specifier = strip_quotes(path);
+        let lines = node.start_position().row as u32 + 1..=node.end_position().row as u32 + 1;
+        if let Some(reference) = references.iter_mut().find(|reference| {
+            reference.kind == ReferenceKind::Import
+                && lines.contains(&reference.start_line)
+                && reference.name == specifier
+                && reference.receiver.is_none()
+        }) {
+            reference.receiver = Some(name.to_string());
         }
     }
 }
@@ -14805,5 +15054,120 @@ export function G(a) {\n\
                 "{path} is sloppy"
             );
         }
+    }
+
+    #[test]
+    fn ts_this_assignments_do_not_duplicate_a_declared_property() {
+        let source = "export class Calculator {\n  private total = 0;\n  constructor() { this.total = 1; }\n  plus(n: number) { this.total = this.total + n; }\n  reset() { this.total = 0; }\n}\n";
+        let parsed = parse_source(Path::new("calc.ts"), source).unwrap();
+        let totals: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "total")
+            .map(|symbol| (symbol.kind, symbol.start_line))
+            .collect();
+        assert_eq!(totals, vec![(SymbolKind::Property, 2)], "{totals:?}");
+    }
+
+    #[test]
+    fn js_class_without_field_declarations_keeps_one_assigned_property() {
+        let source = "class Counter {\n  bump() { this.count = this.count + 1; }\n  constructor() { this.count = 0; }\n  reset() { this.count = 0; }\n}\n";
+        let parsed = parse_source(Path::new("counter.js"), source).unwrap();
+        let counts: Vec<_> = parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "count")
+            .map(|symbol| (symbol.kind, symbol.start_line, symbol.parent_name.clone()))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![(SymbolKind::Property, 3, Some("Counter".to_string()))],
+            "the constructor's assignment is the declaration: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn ts_bare_decorator_is_a_call_reference() {
+        let source = "function log(target: any, key: string) {}\nexport class C {\n  @log\n  plus(n: number): number { return n; }\n}\n";
+        let parsed = parse_source(Path::new("c.ts"), source).unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.kind == ReferenceKind::Call
+                    && reference.name == "log"
+                    && reference.start_line == 3
+                    && reference.receiver.is_none()),
+            "{:#?}",
+            parsed.references
+        );
+    }
+
+    #[test]
+    fn go_method_parent_is_its_receiver_type() {
+        let source = "package calc\n\ntype Impl struct{ base int }\n\nfunc (i *Impl) Add(a, b int) int { return i.base + a + b }\n\nfunc (l List[T]) Len() int { return 0 }\n\nfunc New(b int) *Impl { return &Impl{base: b} }\n";
+        let parsed = parse_source(Path::new("calc/calc.go"), source).unwrap();
+        let symbol = |name: &str| parsed.symbols.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(symbol("Add").parent_name.as_deref(), Some("Impl"));
+        assert_eq!(symbol("Len").parent_name.as_deref(), Some("List"));
+        assert_eq!(symbol("New").parent_name, None);
+        assert_eq!(
+            symbol("New")
+                .type_info
+                .as_ref()
+                .and_then(|info| info.return_type.as_deref()),
+            Some("*Impl"),
+            "a one-line body is not part of the return type"
+        );
+    }
+
+    #[test]
+    fn one_line_declarations_keep_only_the_declared_return_type() {
+        let ts = parse_source(
+            Path::new("a.ts"),
+            "export class K {\n  m1(): K { return this; }\n  static make(): K { return new K(); }\n}\n",
+        )
+        .unwrap();
+        let rust = parse_source(
+            Path::new("src/lib.rs"),
+            "pub struct Dog;\nimpl Dog {\n    pub fn new() -> Self { Dog }\n}\n",
+        )
+        .unwrap();
+        let python = parse_source(Path::new("m.py"), "def make() -> K: return K()\n").unwrap();
+        let bodiless =
+            parse_source(Path::new("decl.ts"), "export function speak(): Foo;\n").unwrap();
+        let ret = |symbols: &[RawSymbol], name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.type_info.as_ref())
+                .and_then(|info| info.return_type.clone())
+        };
+        assert_eq!(ret(&ts.symbols, "m1").as_deref(), Some("K"));
+        assert_eq!(ret(&ts.symbols, "make").as_deref(), Some("K"));
+        assert_eq!(ret(&rust.symbols, "new").as_deref(), Some("Self"));
+        assert_eq!(ret(&python.symbols, "make").as_deref(), Some("K"));
+        assert_eq!(
+            ret(&bodiless.symbols, "speak").as_deref(),
+            Some("Foo"),
+            "a bodiless declaration's `;` is not part of the type"
+        );
+    }
+
+    #[test]
+    fn rust_turbofish_method_call_keeps_its_receiver() {
+        let source =
+            "fn f(x: &str) { let _ = x.parse::<u32>(); generic::<u8>(1); T::make::<u8>(); }\n";
+        let parsed = parse_source(Path::new("src/lib.rs"), source).unwrap();
+        let call = |name: &str| {
+            parsed
+                .references
+                .iter()
+                .find(|reference| reference.kind == ReferenceKind::Call && reference.name == name)
+                .map(|reference| reference.receiver.clone())
+        };
+        assert_eq!(call("parse"), Some(Some("x".to_string())));
+        assert_eq!(call("generic"), Some(None));
+        assert_eq!(call("make"), Some(Some("T".to_string())));
     }
 }

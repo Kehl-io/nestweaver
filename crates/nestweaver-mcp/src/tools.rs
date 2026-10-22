@@ -22,17 +22,17 @@ use nestweaver_engine::{
     generate_skill_with_tools, generate_summaries, get_all_properties, get_last_indexed_at,
     investigate, investigate_expand, investigate_hydrate, load_alias_sidecar, load_clusters,
     load_extensions, memory_consolidate_limited, memory_lint, memory_related, orphan_documents,
-    parse_iso8601_to_epoch, populate_inline_bodies, query_by_property, render_text, topic_clusters,
+    parse_iso8601_to_epoch, populate_inline_bodies, render_text, topic_clusters,
     truncate_to_budget_keeping_first,
 };
 use nestweaver_schema::SymbolKind;
 use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
 use nestweaver_store::{GraphStore, SearchLogicalIdentity, TantivyIndex};
 use serde_json::{Value, json};
-// In non-daemon builds, brain_add_source and set_extension write directly using
-// these primitives; in daemon builds those writes route through the daemon.
+// In non-daemon builds, brain_add_source writes directly using
+// this primitive; in daemon builds that write routes through the daemon.
 #[cfg(not(feature = "daemon"))]
-use nestweaver_engine::{index_markdown_directory_with_note_limits, save_extensions, set_property};
+use nestweaver_engine::index_markdown_directory_with_note_limits;
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -939,6 +939,138 @@ pub(crate) fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     bounded
 }
 
+/// Longest method name a JSON-RPC "method not implemented" error echoes.
+const MAX_METHOD_NAME_IN_ERROR_BYTES: usize = 128;
+
+/// The -32601 message for an unknown JSON-RPC method. The name is caller
+/// input: a 1 MB method name used to come back as a 1 MB error.
+pub fn method_not_implemented_message(method: &str) -> String {
+    format!(
+        "method not implemented: {}",
+        truncate_utf8_bytes(method, MAX_METHOD_NAME_IN_ERROR_BYTES)
+    )
+}
+
+/// Bound a string that may echo caller input, keeping its HEAD and its TAIL
+/// and replacing the middle with `…[N of M bytes elided]…`.
+///
+/// Both ends matter in an error message: the head names the failure class
+/// (`failed to look up note with uid '…`) and the tail often carries the
+/// verdict (`…': not found`) that a client classifies on. Truncating only the
+/// end would cut exactly the part the CLI reads. UTF-8 safe; a value already
+/// within `max_bytes` is returned unchanged. The result never exceeds
+/// `max_bytes` once `max_bytes` is large enough to hold the marker itself
+/// (about 40 bytes); below that it degrades to [`truncate_utf8_bytes`].
+pub fn elide_middle_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let total = value.len();
+    // The marker's width depends on the elided count, which depends on the
+    // marker's width; size it for the widest count it can hold.
+    let marker_width = format!("…[{total} of {total} bytes elided]…").len();
+    if max_bytes < marker_width + 2 {
+        return truncate_utf8_bytes(value, max_bytes);
+    }
+    let keep = max_bytes - marker_width;
+    let mut head_end = keep.div_ceil(2);
+    while head_end > 0 && !value.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = total - (keep - keep.div_ceil(2));
+    while tail_start < total && !value.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let elided = tail_start - head_end;
+    format!(
+        "{}…[{elided} of {total} bytes elided]…{}",
+        &value[..head_end],
+        &value[tail_start..]
+    )
+}
+
+/// Bound every string inside a JSON value with [`elide_middle_utf8`].
+///
+/// Used where a structured envelope travels somewhere with a hard size limit
+/// (gRPC status details ride in an HTTP/2 header): the envelope keeps its
+/// shape and keys, so a client can still classify it, while any field that
+/// echoes caller input is cut to `max_string_bytes`.
+pub fn bound_json_strings(value: &mut Value, max_string_bytes: usize) {
+    match value {
+        Value::String(text) if text.len() > max_string_bytes => {
+            *text = elide_middle_utf8(text, max_string_bytes);
+        }
+        Value::Array(items) => {
+            for item in items {
+                bound_json_strings(item, max_string_bytes);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                bound_json_strings(item, max_string_bytes);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod echo_bound_tests {
+    use super::*;
+
+    #[test]
+    fn elision_keeps_both_ends_and_states_what_it_cut() {
+        let long = format!(
+            "failed to look up note with uid '{}': not found",
+            "A".repeat(2_000_000)
+        );
+        let bounded = elide_middle_utf8(&long, 512);
+        assert!(bounded.len() <= 512, "{} bytes", bounded.len());
+        assert!(bounded.starts_with("failed to look up note with uid 'AAA"));
+        assert!(bounded.ends_with("': not found"), "{bounded}");
+        assert!(bounded.contains(&format!("of {} bytes elided]", long.len())));
+        assert_eq!(elide_middle_utf8("short", 512), "short");
+    }
+
+    #[test]
+    fn elision_is_utf8_safe_at_every_width() {
+        let wide = "\u{10000}é".repeat(5_000);
+        for max in [0, 1, 7, 40, 41, 64, 100, 513, 1024] {
+            let bounded = elide_middle_utf8(&wide, max);
+            assert!(
+                bounded.len() <= max.max(3),
+                "max {max}: {} bytes",
+                bounded.len()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_method_name_is_not_echoed_in_full() {
+        let message = method_not_implemented_message(&"m".repeat(1_000_000));
+        assert!(message.len() < 200, "{} bytes", message.len());
+        assert!(message.starts_with("method not implemented: mmm"));
+        assert_eq!(
+            method_not_implemented_message("resources/list"),
+            "method not implemented: resources/list"
+        );
+    }
+
+    #[test]
+    fn json_strings_are_bounded_in_place_and_the_shape_survives() {
+        let mut envelope = json!({
+            "status": "not_found",
+            "uid": "x".repeat(10_000),
+            "did_you_mean": ["y".repeat(10_000), "short"],
+        });
+        bound_json_strings(&mut envelope, 256);
+        assert_eq!(envelope["status"], "not_found");
+        assert!(envelope["uid"].as_str().unwrap().len() <= 256);
+        assert!(envelope["did_you_mean"][0].as_str().unwrap().len() <= 256);
+        assert_eq!(envelope["did_you_mean"][1], "short");
+    }
+}
+
 /// Guidance for an argument sent to the WRONG tool, keyed by (tool, property).
 ///
 /// nw-408. `investigate_hydrate` carried this text INSIDE its handler, as a
@@ -1580,7 +1712,7 @@ fn compact_tool_description(name: &str) -> &'static str {
             "Run a Rust regex over indexed section text, note titles and symbol signatures. Bounded by a candidate cap and time budget; truncation_reason names the bound."
         }
         "count_patterns" => {
-            "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. Same index as regex_search."
+            "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. A max_millis cut marks a pattern truncated."
         }
         "brain_broken_links" => {
             "Unresolved and ambiguous vault wikilinks with repair suggestions; low_confidence lists fuzzy resolutions apart. Read the population counts, not the page."
@@ -2085,7 +2217,7 @@ mod tool_schema_validation_tests {
             ),
             (
                 "count_patterns",
-                "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. Same index as regex_search.",
+                "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. A max_millis cut marks a pattern truncated.",
             ),
             (
                 "brain_broken_links",
@@ -2193,7 +2325,8 @@ mod tool_schema_validation_tests {
                 }
             }
         }
-        assert_eq!(documented_arguments, 234);
+        // 235: count_patterns gained a documented `max_millis` budget.
+        assert_eq!(documented_arguments, 235);
         assert!(crate::output_budget::escaped_size(&page) <= crate::output_budget::CATALOGUE_BYTES);
         let envelope = json!({"jsonrpc":"2.0", "id":2, "result":page});
         assert!(crate::output_budget::escaped_size(&envelope) < 40_960);
@@ -4270,7 +4403,10 @@ pub fn dispatch_cancellable(
     //
     // `brain_status` is excluded on purpose: it is the diagnostic that REPORTS
     // this condition, so it must answer immediately rather than block on it.
-    if name != "brain_status" {
+    // `note_get` too: it ranks nothing and proves its own read consistent
+    // across a publication, so waiting would only add latency to every call
+    // made during an index.
+    if name != "brain_status" && name != "note_get" {
         wait_out_index_publication(store, cancel);
     }
 
@@ -4662,7 +4798,7 @@ fn dispatch_tool_arm(
         "get_summary" => tool_get_summary(store, args),
         "read_symbols" => tool_read_symbols(store, args),
         "regex_search" => tool_regex_search(store, args, cancel),
-        "count_patterns" => tool_count_patterns(store, args),
+        "count_patterns" => tool_count_patterns(store, args, cancel),
         "brain_broken_links" => tool_brain_broken_links(store, args),
         "brain_orphan_documents" => tool_brain_orphan_documents(store, args),
         "brain_topic_clusters" => tool_brain_topic_clusters(store, args),
@@ -4910,7 +5046,54 @@ fn response_cache_key(
     // this is the narrower guarantee that a manifest change nothing bumped
     // for — an external edit, a restore, a half-written file — still cannot
     // be served past.
-    mix_visibility_cache_key(key, manifest_sidecar_cache_salt(db_path))
+    let key = mix_visibility_cache_key(key, manifest_sidecar_cache_salt(db_path));
+    // QA #1: `blast_radius` (and hubs/bridges/get_summary/affected_tests)
+    // read DERIVED sidecars — clusters, summaries, co-change and git
+    // activity — that are written by their own commands without bumping the
+    // graph generation. Without this salt a `blast_radius` computed before
+    // `clusters` ran was served after it: (0 clusters, medium) and
+    // (10 clusters, high) for the same query, depending on cache age.
+    mix_visibility_cache_key(key, derived_sidecar_cache_salt(db_path))
+}
+
+/// Sidecars written outside indexing whose content changes tool answers.
+const DERIVED_CACHE_SIDECARS: &[&str] = &[
+    ".clusters.json",
+    ".summaries.json",
+    ".cochange.json",
+    ".gitactivity.json",
+];
+
+/// Salt over the IDENTITY of each derived sidecar: absent, or present with a
+/// given length, modification time and (on Unix) inode. Metadata rather than
+/// bytes because a clusters sidecar lists every symbol and this runs on every
+/// cacheable call; every writer replaces the file atomically (new inode) or
+/// rewrites it (new mtime/length), so each write moves the salt. All absent
+/// contributes 0, the value the key had before this salt existed.
+fn derived_sidecar_cache_salt(db_path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut any = false;
+    for suffix in DERIVED_CACHE_SIDECARS {
+        let path = nestweaver_engine::sidecar_path(db_path, suffix);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        any = true;
+        suffix.hash(&mut hasher);
+        meta.len().hash(&mut hasher);
+        if let Ok(modified) = meta.modified()
+            && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            since.as_nanos().hash(&mut hasher);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            meta.ino().hash(&mut hasher);
+        }
+    }
+    if any { hasher.finish() } else { 0 }
 }
 
 /// Salt folded into every cacheable tool's key so a response cannot outlive
@@ -5470,10 +5653,7 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let explicit_root = args
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from);
+    let explicit_root = arg_root_opt(store, &args)?;
     let fallback_root = explicit_root
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -5680,8 +5860,7 @@ fn try_read_symbols_from_bare(
         merged.qualifier_ignored.extend(partial.qualifier_ignored);
         merged.truncated = merged.truncated || partial.truncated;
     }
-    merged.did_you_mean =
-        nestweaver_engine::read_symbols::not_found_suggestions(store, &merged.not_found);
+    nestweaver_engine::read_symbols::attach_not_found_suggestions(store, &mut merged);
 
     Some(merged)
 }
@@ -6143,7 +6322,7 @@ fn tool_regex_search(
 fn tool_schema_regex_search() -> Value {
     json!({
         "name": "regex_search",
-        "description": "Run a Rust regex against indexed text (section bodies and their heading lines, note titles, frontmatter, symbol signatures) with database-bound, per-scope acceleration and final Rust-regex verification. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output names ready/dirty/error scopes, posting hits, hydrated and verified candidate counts, exact truncation reason, and planning/hydration/verification timings\n- scanned_fallback means one or more scopes were safely scanned; stale_index means an existing shard was unavailable or stale, never that matches were dropped\n\nLimitations:\n- MCP candidate cap of 2000 or time budget (default 2000ms) may truncate results; truncation_reason distinguishes the bound\n- Does not search binary files or unindexed content",
+        "description": "Run a Rust regex against indexed text (section bodies and their heading lines, note titles, frontmatter, symbol signatures) with database-bound, per-scope acceleration and final Rust-regex verification. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Use for exact pattern matching; for fuzzy/semantic lookup use brain_search instead\n- Output names ready/dirty/error scopes, posting hits, hydrated and verified candidate counts, exact truncation reason, and planning/hydration/verification timings\n- scanned_fallback means one or more scopes were safely scanned; stale_index means an existing shard was unavailable or stale, never that matches were dropped\n\nLimitations:\n- MCP candidate cap of 2000 (counted over nodes that match; scanned nodes that do not match never consume it) or time budget (default 2000ms) may truncate results; truncation_reason distinguishes the bound. With no trigram index every scope is scanned and the note says so\n- Does not search binary files or unindexed content",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6177,7 +6356,11 @@ fn tool_schema_regex_search() -> Value {
 
 /// F4: counts-only companion to regex_search. Counts matches per pattern across
 /// indexed text and reports the busiest files.
-fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+fn tool_count_patterns(
+    store: &GraphStore,
+    args: Value,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<Value, anyhow::Error> {
     const MAX_PATTERNS: usize = 64;
     let patterns = parse_string_array(&args, "patterns")
         .filter(|p| !p.is_empty())
@@ -6197,16 +6380,28 @@ fn tool_count_patterns(store: &GraphStore, args: Value) -> Result<Value, anyhow:
     let kinds = parse_string_array(&args, "kinds");
     validate_regex_kinds(kinds.as_deref())?;
 
+    let max_millis = args.get("max_millis").and_then(|v| v.as_u64());
+
     let counts = store
-        .count_patterns(&patterns, path_prefix, kinds.as_deref())
+        .count_patterns_cancellable(&patterns, path_prefix, kinds.as_deref(), max_millis, cancel)
         .map_err(|e| anyhow!("count_patterns: {e}"))?;
-    Ok(json!({ "patterns": serde_json::to_value(counts)? }))
+    let truncated = counts.iter().any(|count| count.truncated);
+    let mut payload = json!({ "patterns": serde_json::to_value(counts)? });
+    if truncated {
+        payload["truncated"] = json!(true);
+        payload["truncation_reason"] = json!("deadline");
+        payload["retry_guidance"] = json!(
+            "The time budget ran out: patterns marked truncated report lower-bound counts. \
+             Narrow path_prefix or kinds, pass fewer patterns, or raise max_millis."
+        );
+    }
+    Ok(payload)
 }
 
 fn tool_schema_count_patterns() -> Value {
     json!({
         "name": "count_patterns",
-        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts occurrences (non-overlapping, leftmost-first), the same thing `grep -o | wc -l` counts\n- Kinds are Section, Note, Symbol, and Frontmatter\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)",
+        "description": "Count regex matches across indexed text without returning the matches themselves — useful for frequency analysis. ^ and $ are line anchors; (?-m) anchors the whole candidate.\n\nGuidelines:\n- Pass multiple patterns to compare counts in one call\n- Returns per-pattern {pattern, total_matches, files_matched, top_files:[{path,count}], stale_index}\n- For actual match text, use regex_search instead\n\nLimitations:\n- Counts occurrences (non-overlapping, leftmost-first), the same thing `grep -o | wc -l` counts\n- Kinds are Section, Note, Symbol, and Frontmatter\n- Same trigram/fallback behavior as regex_search (stale_index flags a bypassed stale posting table)\n- One time budget (max_millis, default 10000ms) covers all patterns; a pattern cut by it is truncated:true with lower-bound counts",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -6223,7 +6418,8 @@ fn tool_schema_count_patterns() -> Value {
                     "maxItems": MAX_KIND_FILTERS,
                     "items": { "type": "string" },
                     "description": "Restrict to these node kinds: Section, Note, Symbol, Frontmatter (case-insensitive). At most 32 entries."
-                }
+                },
+                "max_millis": { "type": "integer", "minimum": 1, "maximum": 600000, "description": "Wall-clock budget in milliseconds for the whole call, shared by all patterns (1-600000). Default 10000." }
             },
             "required": ["patterns"]
         }
@@ -6279,7 +6475,16 @@ fn tool_schema_brain_broken_links() -> Value {
 }
 
 fn tool_brain_orphan_documents(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let vault = args.get("vault").and_then(|v| v.as_str());
+    // QA #11: a vault NAME (or a typo) silently matched nothing and reported
+    // zero orphans. Resolve it like `brain_context.vaults`: UID, name or root
+    // path, and an unknown or ambiguous entry is an error.
+    let vault_uid = match args.get("vault").and_then(|v| v.as_str()) {
+        Some(selector) => resolve_vault_filter(store, &[selector.to_string()])?
+            .into_iter()
+            .next(),
+        None => None,
+    };
+    let vault = vault_uid.as_deref();
     let path_prefix = args.get("path_prefix").and_then(|v| v.as_str());
     let allowlist = parse_string_array(&args, "allowlist").unwrap_or_default();
     let limit = read_limit(
@@ -6305,7 +6510,7 @@ fn tool_schema_brain_orphan_documents() -> Value {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "vault": { "type": "string", "description": "Restrict to this vault UID." },
+                "vault": { "type": "string", "description": "Restrict to this vault: its UID, name or root path. An unknown or ambiguous vault is an error." },
                 "path_prefix": { "type": "string", "description": "Restrict to notes whose file path starts with this prefix." },
                 "allowlist": {
                     "type": "array",
@@ -6513,8 +6718,21 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
     )?;
     // The limit is applied BEFORE apply: it used to apply every proposal and
     // then trim the list, so `limit: 1` moved notes the response never named.
-    let consolidation = memory_consolidate_limited(store, apply, now_epoch_secs(), Some(limit))?;
+    let mut consolidation =
+        memory_consolidate_limited(store, apply, now_epoch_secs(), Some(limit))?;
     let total = consolidation.proposals_discovered;
+    let already_applied = consolidation.proposals_already_applied;
+    // QA #6: the remediation names the tool an MCP agent can call, not the
+    // CLI. `brain_add_source` on an indexed vault re-indexes it through the
+    // daemon with its full bookkeeping (search, code links, publication).
+    for warning in &mut consolidation.warnings {
+        if warning.contains("nestweaver brain refresh <vault-path>") {
+            *warning = warning.replace(
+                "nestweaver brain refresh <vault-path>",
+                "call brain_add_source with each path in refresh_vault_paths",
+            );
+        }
+    }
     let mut manifest = serde_json::to_value(consolidation)?;
     if let Some(obj) = manifest.as_object_mut() {
         let returned = obj
@@ -6526,7 +6744,13 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
         // Discovered but past the limit: neither returned nor applied.
         obj.insert(
             "proposals_deferred".to_string(),
-            json!(total.saturating_sub(limit)),
+            json!(total.saturating_sub(already_applied).saturating_sub(limit)),
+        );
+        // Discovered, but an earlier apply already performed them; the graph
+        // has not been re-indexed since (see refresh_vault_paths).
+        obj.insert(
+            "proposals_already_applied".to_string(),
+            json!(already_applied),
         );
     }
     Ok(manifest)
@@ -6535,7 +6759,7 @@ fn tool_brain_memory_consolidate(store: &GraphStore, args: Value) -> Result<Valu
 fn tool_schema_brain_memory_consolidate() -> Value {
     json!({
         "name": "brain_memory_consolidate",
-        "description": "Propose promotions of vault notes up memory tiers (daily logs to ideas to project files). DRY-RUN by default.\n\nGuidelines:\n- Set apply:true to execute moves; default is safe dry-run\n- Promotes daily logs referenced by 3+ idea notes (>14 days old) and ideas referenced by both sync.md and status.md\n- Returns proposals with source paths, destinations, and evidence\n\nLimitations:\n- Only proposes promotions along the predefined tier path\n- Requires specific vault structure (_logs/, _ideas/) to detect candidates",
+        "description": "Propose promotions of vault notes up memory tiers (daily logs to ideas to project files). DRY-RUN by default.\n\nGuidelines:\n- Set apply:true to execute moves; default is safe dry-run\n- Promotes daily logs referenced by 3+ idea notes (>14 days old) and ideas referenced by both sync.md and status.md\n- Returns proposals with source paths, destinations, and evidence\n- After an apply the graph still names the moved notes until the vault is re-indexed: call brain_add_source with each path in refresh_vault_paths. Proposals an earlier apply already performed are counted in proposals_already_applied, not re-proposed\n\nLimitations:\n- Only proposes promotions along the predefined tier path\n- Requires specific vault structure (_logs/, _ideas/) to detect candidates",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -7527,7 +7751,7 @@ fn tool_schema_brain_context() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns names and relationships only; \"detailed\" (default) adds file paths, relevance scores, and UIDs."
+                    "description": "\"concise\" returns uid, kind, title and location per node; \"detailed\" (default) adds relevance scores and inline bodies."
                 },
                 "repos": {
                     "type": "array",
@@ -7565,11 +7789,11 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "weight_ppr": {
                     "type": "number",
-                    "description": "PPR ranking weight for hybrid RRF fusion. Default 0.7."
+                    "description": "PPR ranking weight for hybrid RRF fusion. Default 0.40, or `[embedding] weight_ppr` from the instance config."
                 },
                 "weight_bm25": {
                     "type": "number",
-                    "description": "BM25 text search weight for hybrid RRF fusion. Default 0.3."
+                    "description": "BM25 text search weight for hybrid RRF fusion. Default 0.25, or `[embedding] weight_bm25` from the instance config."
                 },
                 "weight_semantic": {
                     "type": "number",
@@ -7904,11 +8128,21 @@ fn tool_brain_context(
     // Feature F7 (PRF half): opt in to pseudo-relevance-feedback query
     // expansion on the BM25 leg via `prf: true`. Off by default.
     let prf = args.get("prf").and_then(|v| v.as_bool()).unwrap_or(false);
+    // nw-405: resolve the repo scope to CONCRETE UIDs before anything runs,
+    // so an unresolvable entry is one error for the call. QA #2: the scope
+    // also narrows seed resolution itself, before the per-seed cap — a
+    // post-hoc filter let out-of-scope matches fill the cap and then
+    // removed them, answering `total: 0` for a repo that defines the name.
+    let repo_scope = match filter_repos {
+        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
+        None => None,
+    };
     let config = HybridSearchConfig {
         weight_ppr,
         weight_bm25,
         weight_semantic,
         prf,
+        seed_scope_repo_uids: repo_scope.clone(),
         ..defaults
     };
 
@@ -7948,11 +8182,8 @@ fn tool_brain_context(
     // nw-405: resolve the scope arguments to CONCRETE container UIDs before
     // filtering anything. Resolution happens here, outside the per-list
     // closure, so an unresolvable entry is one ERROR for the call rather than
-    // a predicate that silently matches nothing on both lists.
-    let repo_scope = match filter_repos {
-        Some(ref selectors) => Some(resolve_repo_filter(store, selectors, visible)?),
-        None => None,
-    };
+    // a predicate that silently matches nothing on both lists. (`repo_scope`
+    // was resolved above, before seed resolution.)
     let vault_scope = match filter_vaults {
         Some(ref selectors) => Some(resolve_vault_filter(store, selectors)?),
         None => None,
@@ -8144,13 +8375,9 @@ fn tool_brain_context(
         .unwrap_or(false);
     if include_bodies {
         let response_config = configured_response();
-        let root = args
-            .get("root")
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            });
+        let root = arg_root_opt(store, &args)?.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
         let reader_resolver = inline_body_reader_resolver(store);
         populate_inline_bodies(
             store,
@@ -8195,9 +8422,14 @@ fn tool_brain_context(
         .take(cut)
         .map(|n| {
             if concise {
+                // QA #4: concise keeps the identity an agent needs for a
+                // follow-up call (uid) and where to look (location); it drops
+                // only scores and bodies, the same contract as brain_search.
                 json!({
+                    "uid": n.uid,
                     "kind": n.kind,
                     "title": n.title,
+                    "location": n.location,
                 })
             } else {
                 let mut obj = json!({
@@ -8286,8 +8518,10 @@ fn tool_brain_context(
             .map(|n| {
                 if concise {
                     json!({
+                        "uid": n.uid,
                         "kind": n.kind,
                         "title": n.title,
+                        "location": n.location,
                     })
                 } else {
                     json!({
@@ -8418,9 +8652,8 @@ fn budgeted_cut(
 /// arrangement in which the estimate and the renderer cannot disagree.
 pub fn render_cost(n: &nestweaver_engine::BrainNode, concise: bool) -> usize {
     if concise {
-        // Concise renderers emit only {kind, title, location} (brain_context
-        // omits location too, but one conservative model keeps this simple).
-        (n.title.len() + n.kind.len() + n.location.len() + 50).div_ceil(4)
+        // Concise renderers emit {uid, kind, title, location}.
+        (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 50).div_ceil(4)
     } else {
         // UID + title + kind + location + relevance (~10 chars) + JSON overhead
         (n.uid.len() + n.title.len() + n.kind.len() + n.location.len() + 10 + 80).div_ceil(4)
@@ -8991,13 +9224,9 @@ fn tool_brain_search(
         .unwrap_or(false);
     if include_bodies && !concise {
         let response_config = configured_response();
-        let root = args
-            .get("root")
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            });
+        let root = arg_root_opt(store, &args)?.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
         let mut nodes: Vec<nestweaver_engine::BrainNode> = note_results
             .iter()
             .filter_map(|v| {
@@ -10131,7 +10360,7 @@ fn tool_schema_note_get() -> Value {
                     "type": "array",
                     "maxItems": MAX_NOTE_SECTIONS,
                     "items": { "type": "string" },
-                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match. At most 256 headings."
+                    "description": "Optional list of heading names. If provided, returns only those sections instead of the full body. Case-insensitive match. At most 256 headings. Names matching no heading of the note are listed in missing_sections."
                 }
             },
             // nw-410: the either/or requirement, declared where the
@@ -10440,11 +10669,28 @@ fn note_body_window(
 }
 
 fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    // Multiple metadata/window queries must belong to one clean publication.
+    // Multiple metadata/window queries must describe one version of the note.
     // A watcher may finish between stamp rereads; the epoch closes that gap.
+    //
+    // A publication in flight is NOT refused up front any more. note_get
+    // ranks nothing, yet it used to fail for the WHOLE of a long index (the
+    // lease is held throughout), and its "overlaps index publication" text was
+    // then reworded by `classify_index_publication_error` into "ranked queries
+    // are failing closed". It now reads through the window and proves the
+    // answer consistent instead: the note's content hash is re-read after the
+    // metadata queries, and any change to it fails the read (see below).
     let publication_generation = store.graph_generation();
-    if bounded_delivery()
-        && (!store.index_publication_lease_is_unowned() || store.is_index_publication_dirty())
+    let publication_in_flight =
+        || !store.index_publication_lease_is_unowned() || store.is_index_publication_dirty();
+    let publishing_at_start = bounded_delivery() && publication_in_flight();
+    // Read through only a LIVE publication. A marker no writer can finish (a
+    // crashed indexer) may sit over a partially written graph: that still
+    // fails closed, and `classify_index_publication_error` names the repair.
+    if publishing_at_start
+        && store.is_index_publication_dirty()
+        && store.db_path().is_some_and(|db_path| {
+            nestweaver_engine::index_publication::status(db_path).is_wedged()
+        })
     {
         return Err(anyhow!(
             "note read overlaps index publication; retry after publication completes"
@@ -10738,16 +10984,61 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         || outline_text_truncated
         || outline_total > headings.len();
 
-    if bounded_delivery()
-        && (!store.index_publication_lease_is_unowned()
-            || store.is_index_publication_dirty()
-            || store.graph_generation() != publication_generation)
-    {
+    let publishing = publishing_at_start || (bounded_delivery() && publication_in_flight());
+    if bounded_delivery() && store.graph_generation() != publication_generation {
         return Err(anyhow!(
             "note index changed while reading; restart pagination"
         ));
     }
-    Ok(json!({
+    if publishing {
+        // A writer may have replaced this note's rows between the queries
+        // above. The content hash is written with the note, so an unchanged
+        // hash means the outline and sections read belong to the version
+        // being returned.
+        let unchanged = matches!(
+            store.lookup_note(&note.uid),
+            Ok(current) if current.content_hash == note.content_hash
+        );
+        if !unchanged {
+            return Err(anyhow!(
+                "note changed while it was being read during an index run; retry"
+            ));
+        }
+    }
+    // QA #11: `sections: ["Nope"]` returned `body: ""` with nothing saying
+    // the heading does not exist. Report requested sections that match no
+    // heading of this note. Skipped (absent) when the probe was cut, since a
+    // cut probe cannot prove a name absent.
+    let missing_sections: Option<Vec<String>> = match section_filter.as_deref() {
+        Some(names) if !names.is_empty() => {
+            const MISSING_SECTION_PROBE: usize = 1000;
+            let found = store
+                .selected_headings_bounded(&note.uid, names, MISSING_SECTION_PROBE)
+                .map_err(|e| anyhow!("selected_headings_bounded: {e}"))?;
+            (found.len() < MISSING_SECTION_PROBE).then(|| {
+                let found_lower: Vec<String> = found
+                    .iter()
+                    .map(|heading| heading.text.to_lowercase())
+                    .collect();
+                names
+                    .iter()
+                    .filter(|name| {
+                        let wanted = name.to_lowercase();
+                        // The probe returns at most 256 characters of a
+                        // heading; a longer one matched on its full text.
+                        !found_lower.iter().any(|text| {
+                            *text == wanted
+                                || (text.chars().count() >= 256
+                                    && wanted.starts_with(text.as_str()))
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            })
+        }
+        _ => None,
+    };
+    let mut response = json!({
         "uid": note.uid,
         "title": note.title,
         "path": note.file_path,
@@ -10768,7 +11059,16 @@ fn tool_note_get(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         "frontmatter_unavailable": if frontmatter_truncated { Some("output_budget") } else { None },
         "truncated": truncated,
         "retry": if body_truncated { Some("Continue with next_body_offset as body_offset and returned body_version; keep UID/sections unchanged. Metadata and outline remain independently bounded.") } else if truncated { Some("Body is complete or omitted; only metadata/outline are bounded. Read the source file for complete metadata.") } else { None },
-    }))
+    });
+    if let Some(missing) = missing_sections.filter(|missing| !missing.is_empty()) {
+        response["missing_sections"] = json!(missing);
+    }
+    if publishing {
+        // Answered from the live graph while an index publication was in
+        // flight; the note itself was verified unchanged across the read.
+        response["publication_in_progress"] = json!(true);
+    }
+    Ok(response)
 }
 
 // ── 4. backlinks ────────────────────────────────────────────────────────────
@@ -11500,7 +11800,7 @@ pub fn brain_status_json(
             continue;
         }
         // Check git HEAD vs indexed SHA — fast (no network), just reads .git/HEAD
-        if let Ok(output) = std::process::Command::new("git")
+        if let Ok(output) = nestweaver_engine::git_cmd::isolated_git()
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_path)
             .output()
@@ -12288,8 +12588,15 @@ fn match_repo_target<'a>(
         .iter()
         .filter(|r| {
             let r_url = r.url.trim_end_matches('/');
+            // QA #7: the DISPLAY name, derived from the URL when no name is
+            // stored — the name every other tool prints and accepts. The
+            // stored `name` is usually None, so comparing only it refused the
+            // names agents were shown. Still exact (no substring leg), and a
+            // derived name shared with a vault or another repo is refused as
+            // ambiguous by `resolve_remove_target`.
             r.uid == target
-                || r.name.as_deref() == Some(target_trimmed)
+                || (!target_trimmed.is_empty()
+                    && nestweaver_engine::repo_display_name(r) == target_trimmed)
                 || r_url == target_trimmed
                 || r_url == url_target.trim_end_matches('/')
                 || r_url == canonical_target.trim_end_matches('/')
@@ -12365,7 +12672,7 @@ fn resolve_remove_target<'a>(
                 .map(|candidate| match candidate {
                     RemoveTarget::Repo(repo) => format!(
                         "repo '{}' (uid {})",
-                        repo.name.as_deref().unwrap_or(&repo.url),
+                        nestweaver_engine::repo_display_name(repo),
                         repo.uid
                     ),
                     RemoveTarget::Vault(vault) => {
@@ -13134,8 +13441,11 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         1,
         RESULT_LIMIT_MAX,
     )?;
-    let report = nestweaver_engine::contracts::drift_for_store(store, repo)
-        .map_err(|e| anyhow!("drift_for_store: {e}"))?;
+    // `context`, not a re-formatted string: an unresolved repo filter must
+    // stay a typed `RepoFilterUnresolved` so the daemon can send its class
+    // and candidates in the status details.
+    let report =
+        nestweaver_engine::contracts::drift_for_store(store, repo).context("drift_for_store")?;
     // Shared with the CLI's local path so the two serializations cannot drift
     // apart again (they previously disagreed on totals, `clean`, `limit`, and
     // whether truncation happened at all).
@@ -13147,7 +13457,7 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
 fn tool_schema_brain_impact() -> Value {
     json!({
         "name": "brain_impact",
-        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for names only, 'detailed' for full metadata\n- `symbol` may be `path::name`, `Class::method` or `path::Class::method`: the first qualifier narrows by file (exact repo-relative path, `/`-boundary suffix, or that suffix without its extension) and the rest by container, or every qualifier narrows by container; both readings are kept. One matching neither is not_found with `path::name` suggestions. `path::<module>` names a file's top-level code\n- A caller labelled `path::<module>` is that file's top-level code (the module owner)\n- Dependents are returned once, as `impact_nodes` (the CLI's JSON also mirrors them as `nodes`). Rows cut to fit the MCP output budget are counted in `output_budget.cuts`; `truncated_by_limit` is set only when `limit` cut them, so raise `limit` only then\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list (substring matches, then names a small typo away; that file's members for `path::name`) when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
+        "description": "Trace reverse dependencies of a symbol to understand what might break if it changes. Returns confidence-weighted impact scores (0.0-1.0) decaying through the call graph.\n\nGuidelines:\n- Use BEFORE modifying a function, class, or interface\n- Results sorted by impact_score (highest risk first); type-aware resolution follows class hierarchies\n- Use response_format 'concise' for uid/name/location rows, 'detailed' for full metadata\n- `symbol` may be `path::name`, `Class::method` or `path::Class::method`: the first qualifier narrows by file (exact repo-relative path, `/`-boundary suffix, or that suffix without its extension) and the rest by container, or every qualifier narrows by container; both readings are kept. One matching neither is not_found with `path::name` suggestions. `path::<module>` names a file's top-level code\n- A caller labelled `path::<module>` is that file's top-level code (the module owner)\n- Dependents are returned once, as `impact_nodes` (the CLI's JSON also mirrors them as `nodes`). Rows cut to fit the MCP output budget are counted in `output_budget.cuts`; `truncated_by_limit` is set only when `limit` cut them, so raise `limit` only then\n\nLimitations:\n- A bare `symbol` name resolves by EXACT match only, never substring/fuzzy -- a name `brain_search` finds hits for can still be not_found here; the not_found response (`isError: true`, like every lookup tool's miss) carries a bounded `did_you_mean` list (substring matches, then names a small typo away; that file's members for `path::name`) when any exist\n- For forward call chains use flow_trace; for file-level impact use detect_changes or blast_radius\n- For cross-repo impact use cross_repo_contracts\n\nWhen queried through the hybrid client (a local daemon connected to an upstream server), returns two-tier results (local_impact + org_wide_impact) with _meta.sources indicating provenance; a raw MCP connection to a single daemon returns single-tier local results.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -13167,7 +13477,7 @@ fn tool_schema_brain_impact() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns affected symbol names only; \"detailed\" (default) adds file paths, edge types, confidence scores, and depth levels."
+                    "description": "\"concise\" returns uid, name, file_path, start_line, depth and impact_score per affected symbol; \"detailed\" (default) adds edge types and confidence scores."
                 },
                 "cache": { "type": "string", "description": "Set to \"bypass\" to skip the response cache for this call." },
                 "no_cache": { "type": "boolean", "description": "When true, skip the response cache for this call." }
@@ -13323,16 +13633,25 @@ fn tool_brain_impact(
     let limited = nodes.len().min(limit);
     let rows = bounded_mapped_rows(&nodes[..limited], 16_000, |n, bytes| {
         if concise {
+            // QA #4: two overloads or same-named methods rendered as
+            // identical `{"name":"sign"}` rows; uid + file:line keep concise
+            // rows distinguishable and followable.
             #[derive(serde::Serialize)]
             struct Row<'a> {
+                uid: &'a str,
                 name: std::borrow::Cow<'a, str>,
+                file_path: &'a str,
+                start_line: u32,
                 depth: u32,
                 impact_score: f64,
             }
             bounded_metadata(
                 &Row {
+                    uid: &n.uid,
                     // nw-113: an owner reads `path::<module>`, never bare.
                     name: nestweaver_schema::symbol_display_name(&n.name, &n.file_path),
+                    file_path: &n.file_path,
+                    start_line: n.start_line,
                     depth: n.depth,
                     impact_score: n.impact_score,
                 },
@@ -13549,7 +13868,7 @@ fn tool_schema_flow_trace() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns function name chain only; \"detailed\" (default) adds file paths, UIDs, and depth at each node."
+                    "description": "\"concise\" returns uid, name and file_path per node; \"detailed\" (default) adds repo, depth and boundary metadata at each node."
                 }
             },
             "required": ["symbol"],
@@ -14076,7 +14395,12 @@ fn build_flow_tree(
                 // is exponential on a recursive graph, which is why a canonical
                 // expansion exists at all.
                 let mut stub = if opts.concise {
-                    json!({ "name": callee.name, "deduped_ref": callee.uid, "children": [] })
+                    json!({
+                        "uid": callee.uid,
+                        "name": callee.name,
+                        "deduped_ref": callee.uid,
+                        "children": [],
+                    })
                 } else {
                     json!({
                         "uid": callee.uid,
@@ -14150,8 +14474,12 @@ fn build_flow_tree(
         // The label ships in concise mode too: a caller scanning a compact tree
         // is exactly the one who cannot afford to mistake a cross-repo guess for
         // a call.
+        // QA #4: the uid rides along so a concise node can be traced,
+        // read or impacted next without a second name lookup.
         let mut node = json!({
+            "uid": uid,
             "name": name,
+            "file_path": file_path,
             "children": children,
         });
         attach_markers(&mut node);
@@ -14187,7 +14515,7 @@ fn build_flow_tree(
 fn tool_schema_detect_changes() -> Value {
     json!({
         "name": "detect_changes",
-        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- A process whose `affected_symbol_count` is 0 is listed because a member file's top-level code (its `path::<module>` owner, never a changed symbol) changed; it carries `top_level_code_changed: true`\n- A changed file that is only top-level code gets a `changed-file-top-level-only` warning; files that load it only for its side effects are not tracked, so the run is `status: partial` and `gate_state: degraded-unknown`\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
+        "description": "Assess file-level blast radius for a set of changed files. Maps files to symbols, traces transitive dependents, and returns a risk assessment with explicit trust status.\n\nGuidelines:\n- Use BEFORE committing or reviewing changes\n- Pass repo-relative file paths; returns affected symbols, flows, and risk level (low/medium/high, or unknown when a changed file maps to no indexed symbols — never read unknown as low)\n- `risk` and `gate_state` are the verdict `blast_radius` returns for the same files at its default depth (nw-544), so a gate built on either tool agrees; `affected_processes` is detail, not a risk input\n- `affected_symbols`/`affected_symbol_count` are the symbols DEFINED IN the changed files (also reported as `changed_symbol_count`, the name blast_radius uses for the same population); the transitive dependent count is `blast_radius`. blast_radius's own `affected_symbol_count` counts dependents, so the two tools' `affected_symbol_count` values are different populations\n- A process whose `affected_symbol_count` is 0 is listed because a member file's top-level code (its `path::<module>` owner, never a changed symbol) changed; it carries `top_level_code_changed: true`\n- A changed file that is only top-level code gets a `changed-file-top-level-only` warning; files that load it only for its side effects are not tracked, so the run is `status: partial` and `gate_state: degraded-unknown`\n- Gate on `gate_state`, not `status` (nw-467): a run that merely stopped at its configured depth is `status: partial` but `gate_state: ok` — bounded, not broken, and the normal state at the default depth. `degraded-unknown` means stale/errored/refused/cancelled and requires reindexing or manual review\n- For single-symbol impact use brain_impact; for git diff details use brain_diff\n\nLimitations:\n- Static call-graph analysis only — misses runtime/reflection-based dependencies\n- For cross-repo impact use cross_repo_contracts\n- `resolver_stale_repos`, when present, is repo UIDs with generation-mismatched edges that own or are linked to a changed file (a stale repo unrelated to the change is only named in a `resolver-generation-stale-unrelated` warning) — a different population from `stale_check`'s or `hub_nodes`'s own `stale_repos` (same key name, different tools, different meanings — nw-371)",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -14355,6 +14683,7 @@ fn tool_detect_changes_scoped(
             "blast_radius": total,
             "affected_symbols": affected_symbols,
             "affected_symbol_count": total,
+            "changed_symbol_count": total,
             "affected_processes": [],
             "affected_process_count": 0,
             "process_analysis_unavailable": true,
@@ -14456,6 +14785,13 @@ fn tool_detect_changes_scoped(
         // against the array length is how a caller sees what was dropped, and
         // `truncated` says it outright rather than requiring the comparison.
         "affected_symbol_count": impact.affected_symbols.len(),
+        // QA #11: this tool's `affected_symbol_count` counts the symbols
+        // DEFINED IN the changed files — `blast_radius`'s
+        // `changed_symbol_count` — while `blast_radius`'s own
+        // `affected_symbol_count` counts their DEPENDENTS (this tool's
+        // `blast_radius`). The old key stays for compatibility; this one
+        // names the population the same way both tools now can.
+        "changed_symbol_count": impact.affected_symbols.len(),
         "affected_processes": affected_processes,
         "affected_process_count": impact.affected_processes.len(),
         "process_analysis_unavailable": false,
@@ -17925,8 +18261,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         payload["clusters"] = json!(rows);
         payload["total"] = json!(total);
         payload["returned"] = json!(rows.len());
-        payload["truncated"] =
-            json!(rows.len() < total || rows.iter().any(|c| c["members_truncated"] == true));
+        payload["truncated"] = json!(cluster_listing_truncated(&rows, total, cluster_offset));
         payload["graph_generation"] = json!(store.graph_generation());
         payload["cluster_offset"] = json!(cluster_offset);
         payload["next_cluster_offset"] =
@@ -17981,7 +18316,7 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
     let mut payload = json!({"resolution":output.resolution,"cluster_count":output.communities.len(),
         "symbol_count":output.communities.iter().map(|c|c.member_count).sum::<usize>(),
         "modularity":output.modularity,"limit":limit,"graph_generation":store.graph_generation(),"cached":false,
-        "clusters":rows,"total":total,"returned":rows.len(),"truncated":rows.len()<total || rows.iter().any(|c|c["members_truncated"]==true),
+        "clusters":rows,"total":total,"returned":rows.len(),"truncated":cluster_listing_truncated(&rows, total, cluster_offset),
         "cluster_offset":cluster_offset,"next_cluster_offset":if cluster_offset+rows.len()<total && !rows.is_empty() {Some(cluster_offset+rows.len())} else {None}});
     bind_cluster_page(
         &mut payload,
@@ -17990,6 +18325,19 @@ fn tool_clusters(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error
         offset > 0 || cluster_offset > 0,
     )?;
     Ok(payload)
+}
+
+/// Whether a `clusters` listing page left anything out: clusters AFTER this
+/// page, or members cut from a returned cluster. Clusters BEFORE the page
+/// (`cluster_offset`) are not an omission, and a page past the end is empty
+/// and complete. `rows.len() < total` reported an offset past the end as
+/// `truncated: true` beside `next_cluster_offset: null`, a cut with no way
+/// to continue it.
+fn cluster_listing_truncated(rows: &[Value], total: usize, cluster_offset: usize) -> bool {
+    cluster_offset.saturating_add(rows.len()) < total
+        || rows
+            .iter()
+            .any(|cluster| cluster["members_truncated"] == true)
 }
 
 /// `cluster_id` is a lookup by identifier: an id no community has is a miss
@@ -18385,6 +18733,8 @@ fn tool_unset_extension(args: Value) -> Result<Value, anyhow::Error> {
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("'key' must be a string"))?;
+        nestweaver_engine::extensions::refuse_reserved_extension_key(key)
+            .map_err(|problem| anyhow!(problem))?;
         let removed = nestweaver_engine::remove_extension_key_durable(&db_path, uid, key)?;
         Ok(json!({
             "uid": uid,
@@ -18434,19 +18784,19 @@ fn tool_set_extension(args: Value) -> Result<Value, anyhow::Error> {
             .get("value")
             .cloned()
             .ok_or_else(|| anyhow!("'value' is required"))?;
-        nestweaver_engine::extensions::validate_extension_property(key, &value)
+        nestweaver_engine::extensions::validate_extension_write(uid, key, &value)
             .map_err(|problem| anyhow!(problem))?;
 
         let mut store = load_extensions(&db_path);
-        set_property(&mut store, uid, key, value.clone());
-        save_extensions(&db_path, &store)?;
+        nestweaver_engine::extensions::set_property_capped(&mut store, uid, key, value.clone())
+            .map_err(|problem| anyhow!(problem))?;
+        let bytes = nestweaver_engine::extensions::serialize_extensions_capped(&store)
+            .map_err(|problem| anyhow!(problem))?;
+        nestweaver_engine::extensions::write_extensions_serialized(&db_path, &bytes)?;
 
-        Ok(json!({
-            "uid": uid,
-            "key": key,
-            "value": value,
-            "status": "saved",
-        }))
+        Ok(nestweaver_engine::extensions::set_extension_response(
+            uid, key, &value,
+        ))
     }
 }
 
@@ -18510,45 +18860,8 @@ fn tool_query_extensions(args: Value) -> Result<Value, anyhow::Error> {
         .ok_or_else(|| anyhow!("database path not set on server"))?;
 
     let store = load_extensions(&db_path);
-
-    // Single-UID lookup mode.
-    if let Some(uid) = args.get("uid").and_then(|v| v.as_str()) {
-        let props = get_all_properties(&store, uid);
-        return Ok(json!({
-            "uid": uid,
-            "properties": props,
-        }));
-    }
-
-    // Filter-by-key-value mode.
-    let key = args
-        .get("key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("provide either 'uid' or both 'key' and 'value'"))?;
-    let value = args
-        .get("value")
-        .cloned()
-        .ok_or_else(|| anyhow!("'value' is required when 'key' is given"))?;
-
-    let matching_uids = query_by_property(&store, key, &value);
-
-    let results: Vec<Value> = matching_uids
-        .iter()
-        .map(|uid| {
-            let props = store.get(*uid).cloned().unwrap_or_default();
-            json!({
-                "uid": uid,
-                "properties": props,
-            })
-        })
-        .collect();
-
-    Ok(json!({
-        "key": key,
-        "value": value,
-        "count": results.len(),
-        "results": results,
-    }))
+    nestweaver_engine::extensions::query_extensions_payload(&store, &args)
+        .map_err(|problem| anyhow!(problem))
 }
 
 // ── 16. brain_diff ─────────────────────────────────────────────────────────
@@ -18837,7 +19150,7 @@ fn tool_schema_project_context() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "concise",
-                    "description": "'concise' (default) returns kind/title/location per node at a ~1000-token budget — right for orienting at session start, then narrow with brain_context. 'detailed' adds uid + relevance and uses a ~3000-token budget."
+                    "description": "'concise' (default) returns uid/kind/title/location per node at a ~1000-token budget — right for orienting at session start, then narrow with brain_context. 'detailed' adds relevance and uses a ~3000-token budget."
                 },
                 "repos": {
                     "type": "array",
@@ -19592,13 +19905,15 @@ fn tool_project_context(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    // concise drops the machine id (uid) and the relevance score in favor of the semantic
-    // fields an agent orients with (kind/title/location); detailed keeps the full record.
+    // concise drops the relevance score but keeps the uid (QA #4: without it
+    // a concise row cannot be followed up by any other tool); detailed keeps
+    // the full record.
     let render_node = |n: &nestweaver_engine::BrainNode| -> Value {
         #[cfg(test)]
         project_render_observer::rendered();
         let mut row = if concise {
             json!({
+                "uid": n.uid,
                 "kind": n.kind,
                 "title": n.title,
                 "location": n.location,
@@ -20240,7 +20555,7 @@ fn tool_schema_hub_nodes() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns name + total degree only; \"detailed\" (default) adds UIDs, file paths, PageRank scores, and cluster IDs."
+                    "description": "\"concise\" returns uid, name, file_path and total degree; \"detailed\" (default) adds in/out degree, PageRank scores, and cluster IDs."
                 },
                 "repos": {
                     "type": "array",
@@ -20317,7 +20632,9 @@ fn tool_hub_nodes(
         .map(|h| {
             if concise {
                 json!({
+                    "uid": h.uid,
                     "name": h.name,
+                    "file_path": h.file_path,
                     "total_degree": h.total_degree,
                 })
             } else {
@@ -20394,7 +20711,7 @@ fn tool_schema_bridge_nodes() -> Value {
                     "type": "string",
                     "enum": ["concise", "detailed"],
                     "default": "detailed",
-                    "description": "\"concise\" returns name + betweenness score only; \"detailed\" (default) adds UIDs, file paths, and connected community IDs."
+                    "description": "\"concise\" returns uid, name, file_path and betweenness score; \"detailed\" (default) adds connected community IDs."
                 },
                 "repos": {
                     "type": "array",
@@ -20471,7 +20788,9 @@ fn tool_bridge_nodes(
         .map(|b| {
             if concise {
                 json!({
+                    "uid": b.uid,
                     "name": b.name,
+                    "file_path": b.file_path,
                     "betweenness_score": b.betweenness_score,
                 })
             } else {
@@ -20575,6 +20894,22 @@ fn tool_schema_blast_radius() -> Value {
     })
 }
 
+/// QA #1: the engine's "clusters not computed" note names the CLI command.
+/// An MCP agent cannot run that; it can call the `clusters` tool, which
+/// computes and persists the same sidecar. Rewrite the remediation for the
+/// MCP delivery profile only, keeping the descriptor stable.
+fn mcp_cluster_remediation(notifications: &mut [nestweaver_engine::blast_radius::Notification]) {
+    for notification in notifications
+        .iter_mut()
+        .filter(|n| n.descriptor == "clusters-not-computed")
+    {
+        notification.message = "no cluster data for this graph — cluster-based risk is not \
+                                 included; call the `clusters` tool (no `repos` filter) to \
+                                 compute it, then re-run blast_radius"
+            .to_string();
+    }
+}
+
 fn tool_blast_radius(
     store: &GraphStore,
     args: Value,
@@ -20656,6 +20991,9 @@ fn tool_blast_radius(
     let db_path = current_db_path(store).ok();
     let mut result = analyze_blast_radius(store, &files, &options, cancel, db_path.as_deref())
         .context("analyze_blast_radius")?;
+    if bounded_delivery() {
+        mcp_cluster_remediation(&mut result.notifications);
+    }
 
     // R9b: redact the typed result down to the caller's visible repos BEFORE
     // building any output (both the JSON and SARIF paths), so every derived
@@ -20999,7 +21337,7 @@ fn tool_blast_radius(
 fn tool_schema_get_summary() -> Value {
     json!({
         "name": "get_summary",
-        "description": "Generate deterministic architectural summaries at three granularity levels: symbol, file, or cluster. Derived from graph data, no LLM needed.\n\nGuidelines:\n- level 'symbol' = per-function/class with callers/callees (at most 3 module-owner callers `path::<module>`, then `+N more files' top-level code`), 'file' = per-file exports, 'cluster' = community architecture\n- Use target to filter to a specific file, symbol, or cluster name\n- Use token_budget to cap output size for context windows\n\nLimitations:\n- Summaries reflect indexed graph state — may be stale if index is behind HEAD\n- For specific symbol source code use read_symbols; for call chains use flow_trace",
+        "description": "Generate deterministic architectural summaries at four levels: symbol, file, cluster, or hub. Derived from graph data, no LLM needed.\n\nGuidelines:\n- level 'symbol' = per-function/class with callers/callees (at most 3 module-owner callers `path::<module>`, then `+N more files' top-level code`), 'file' = per-file exports, 'cluster' = community architecture, 'hub' = top hub nodes with call-graph shape and role\n- Use target to filter to a specific file, symbol, or cluster name\n- Use token_budget to cap output size for context windows\n\nLimitations:\n- Summaries reflect indexed graph state — may be stale if index is behind HEAD\n- For specific symbol source code use read_symbols; for call chains use flow_trace",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -21543,9 +21881,7 @@ thread_local! {
 fn env_index_publication_wait_ms() -> u64 {
     const DEFAULT_MS: u64 = 3_000;
     const MAX_MS: u64 = 30_000;
-    std::env::var("NESTWEAVER_INDEX_PUBLICATION_WAIT_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
+    nestweaver_schema::env::env_parse::<u64>("NESTWEAVER_INDEX_PUBLICATION_WAIT_MS")
         .unwrap_or(DEFAULT_MS)
         .min(MAX_MS)
 }
@@ -23155,25 +23491,139 @@ mod daemon_index_progress_tests {
     }
 }
 
-/// Resolve the source root for body reads: explicit `root` arg, else cwd.
-fn arg_root(args: &Value) -> std::path::PathBuf {
-    args.get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+/// An explicit `root` for reading source bodies, refused unless it lies inside
+/// an indexed repository's or vault's root, or is a linked worktree of an
+/// indexed repository.
+///
+/// `root` decides which directory symbol spans are read from. Unchecked, any
+/// caller could read lines of any file on the host whose relative path matches
+/// an indexed one.
+pub fn contained_source_root(
+    store: &GraphStore,
+    root: &Path,
+) -> Result<std::path::PathBuf, anyhow::Error> {
+    let refused = || {
+        anyhow!(
+            "root '{}' is not inside an indexed repository or vault; omit root to read each \
+             symbol from its repository",
+            root.display()
+        )
+    };
+    // A root that cannot be resolved (missing, or unreadable) can serve no
+    // bytes; hand it through unchanged so the read reports its
+    // `unreadable_root` diagnostic rather than a containment refusal.
+    let Ok(canonical) = std::fs::canonicalize(root) else {
+        return Ok(root.to_path_buf());
+    };
+    // Likewise a directory that cannot be searched (no execute permission):
+    // nothing below it can be opened. `stat("<dir>/.")` needs exactly that
+    // permission; a readable listing is not required to open known names.
+    if std::fs::metadata(canonical.join(".")).is_err() {
+        return Ok(root.to_path_buf());
+    }
+    let mut roots: Vec<std::path::PathBuf> = store
+        .list_repos(None)?
+        .iter()
+        .filter_map(|repo| repo.local_root().map(std::path::PathBuf::from))
+        .collect();
+    roots.extend(
+        store
+            .list_vaults(None)?
+            .into_iter()
+            .map(|vault| std::path::PathBuf::from(vault.root_path)),
+    );
+    let indexed: Vec<std::path::PathBuf> = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    if indexed.iter().any(|indexed| canonical.starts_with(indexed)) {
+        return Ok(canonical);
+    }
+    // A linked worktree of an indexed repository shares its common directory.
+    // Each indexed root's own checkout is asked for (not assumed to be
+    // `<root>/.git`): an indexed subdirectory of a monorepo, a root that is
+    // itself a linked worktree, and a `--separate-git-dir` checkout all keep
+    // their common directory elsewhere. The candidate must also sit at (or
+    // below) the indexed root's place in its checkout: an indexed vault that
+    // happens to live inside a dotfiles repository at `~` must not admit the
+    // rest of the home directory.
+    let Some(candidate) = git_checkout_position(&canonical) else {
+        return Err(refused());
+    };
+    let admitted = indexed.iter().any(|indexed| {
+        git_checkout_position(indexed).is_some_and(|own| {
+            own.common_dir == candidate.common_dir && candidate.relative.starts_with(&own.relative)
+        })
+    });
+    if admitted {
+        Ok(canonical)
+    } else {
+        Err(refused())
+    }
 }
 
-/// Like [`arg_root`], but returns `None` when `root` was omitted instead of
+/// Where a path sits in its Git checkout: the checkout's canonical common
+/// directory, and the path relative to the checkout's top level.
+struct GitCheckoutPosition {
+    common_dir: std::path::PathBuf,
+    relative: std::path::PathBuf,
+}
+
+/// [`GitCheckoutPosition`] of `path`, asked of an isolated Git. `None` when
+/// `path` is not inside a work tree.
+fn git_checkout_position(path: &Path) -> Option<GitCheckoutPosition> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut command = nestweaver_engine::git_cmd::isolated_git();
+    command.arg("-C").arg(path).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+        "--show-toplevel",
+    ]);
+    let output = nestweaver_engine::git_cmd::run_git_with_timeout_and_output_limit(
+        command,
+        nestweaver_engine::git_cmd::git_net_timeout(),
+        64 * 1024,
+    )
+    .ok()
+    .filter(|output| output.status.success())?;
+    let mut lines = output
+        .stdout
+        .strip_suffix(b"\n")?
+        .split(|byte| *byte == b'\n');
+    let common_dir = std::fs::canonicalize(std::ffi::OsStr::from_bytes(lines.next()?)).ok()?;
+    let toplevel = std::fs::canonicalize(std::ffi::OsStr::from_bytes(lines.next()?)).ok()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    let relative = std::fs::canonicalize(path)
+        .ok()?
+        .strip_prefix(&toplevel)
+        .ok()?
+        .to_path_buf();
+    Some(GitCheckoutPosition {
+        common_dir,
+        relative,
+    })
+}
+
+/// The explicit `root` for source reads, or `None` when it was omitted instead of
 /// defaulting to cwd.
 ///
 /// nw-560: `investigate_expand`/`investigate_hydrate` need to tell "omitted"
 /// from "explicit" apart so they can fall back to each symbol's owning-repo
 /// `local_root` (like `read_symbols`) rather than the server's working
 /// directory, while an explicit `root` still wins outright.
-fn arg_root_opt(args: &Value) -> Option<std::path::PathBuf> {
+///
+/// An explicit `root` must pass [`contained_source_root`].
+fn arg_root_opt(
+    store: &GraphStore,
+    args: &Value,
+) -> Result<Option<std::path::PathBuf>, anyhow::Error> {
     args.get("root")
         .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from)
+        .map(|root| contained_source_root(store, Path::new(root)))
+        .transpose()
 }
 
 fn tool_schema_investigate() -> Value {
@@ -23243,7 +23693,7 @@ fn tool_investigate(
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let root = arg_root(&args);
+    let (root, root_refused) = investigate_body_root(store, &args)?;
     let db_path = current_db_path(store).ok();
     let result = investigate(
         store,
@@ -23256,7 +23706,44 @@ fn tool_investigate(
         embed_model,
     )
     .map_err(|error| investigate_scope_error(store, scope, error))?;
-    Ok(serde_json::to_value(result)?)
+    let mut value = serde_json::to_value(result)?;
+    if let (Some(refused), Some(object)) = (root_refused, value.as_object_mut()) {
+        object.insert("root_not_used".into(), json!(refused));
+    }
+    Ok(value)
+}
+
+/// The root `investigate` inlines bodies from, and why a supplied one was not
+/// used.
+///
+/// The CLI always sends its working directory as `root` (nw-340), so a root
+/// outside every indexed source is the ordinary case of running `investigate`
+/// from elsewhere, not a request to read that directory. It is not refused:
+/// the map is still answered, its bodies are not read from that directory
+/// (an empty root serves nothing — [`FilesystemReader`] cannot resolve it),
+/// and `root_not_used` says why. The CLI's direct route does the same.
+///
+/// [`FilesystemReader`]: nestweaver_engine::content_reader::FilesystemReader
+pub fn investigate_body_root(
+    store: &GraphStore,
+    args: &Value,
+) -> Result<(std::path::PathBuf, Option<String>), anyhow::Error> {
+    let Some(root) = args.get("root").and_then(Value::as_str) else {
+        return Ok((std::env::current_dir().unwrap_or_default(), None));
+    };
+    Ok(investigate_root_or_none(store, Path::new(root)))
+}
+
+/// [`contained_source_root`], or an empty root and the refusal when `root`
+/// lies outside every indexed source.
+pub fn investigate_root_or_none(
+    store: &GraphStore,
+    root: &Path,
+) -> (std::path::PathBuf, Option<String>) {
+    match contained_source_root(store, root) {
+        Ok(root) => (root, None),
+        Err(error) => (std::path::PathBuf::new(), Some(error.to_string())),
+    }
 }
 
 /// 12.1.1 (V4): a scope the caller got wrong is reported as their mistake:
@@ -23322,7 +23809,7 @@ fn tool_investigate_expand(store: &GraphStore, args: Value) -> Result<Value, any
     if targets.is_empty() {
         return Err(anyhow!("'targets' must be a non-empty array"));
     }
-    let root = arg_root_opt(&args);
+    let root = arg_root_opt(store, &args)?;
     let db_path = current_db_path(store)?;
     let result = investigate_expand(store, &db_path, root.as_deref(), bundle_id, &targets)
         .map_err(|error| bundle_not_found(error, bundle_id))?;
@@ -23362,7 +23849,7 @@ fn tool_investigate_hydrate(store: &GraphStore, args: Value) -> Result<Value, an
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let root = arg_root_opt(&args);
+    let root = arg_root_opt(store, &args)?;
     let db_path = current_db_path(store)?;
     let result = investigate_hydrate(store, &db_path, root.as_deref(), bundle_id, token_budget)
         .map_err(|error| bundle_not_found(error, bundle_id))?;
@@ -26155,6 +26642,62 @@ mod cache_dispatch_tests {
         assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
     }
 
+    /// QA #1: `blast_radius` answered (0 clusters, medium) or (10 clusters,
+    /// high) for the same query depending on whether its cached entry
+    /// predated `clusters`. The clusters sidecar is an input outside the
+    /// graph generation and file digest, so writing it must miss the cache.
+    #[test]
+    fn writing_the_clusters_sidecar_invalidates_cached_blast_radius() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let store = GraphStore::open(&db_path).unwrap();
+        let args = json!({ "changed_files": ["main.js"] });
+        let has_missing_cluster_note = |value: &Value| {
+            value["notifications"].as_array().is_some_and(|all| {
+                all.iter()
+                    .any(|n| n["descriptor"] == "clusters-not-computed")
+            })
+        };
+
+        let before = dispatch(&store, None, "blast_radius", args.clone(), None).unwrap();
+        assert!(has_missing_cluster_note(&before), "{before}");
+        let key_before = response_cache_key("blast_radius", &args, &db_path, None, None);
+
+        let clustering = nestweaver_engine::compute_clusters(&store, 0.5).unwrap();
+        nestweaver_engine::save_clusters(&db_path, &clustering, store.graph_generation()).unwrap();
+        assert_ne!(
+            key_before,
+            response_cache_key("blast_radius", &args, &db_path, None, None),
+            "the clusters sidecar must be part of the cache key"
+        );
+
+        let after = dispatch(&store, None, "blast_radius", args, None).unwrap();
+        assert!(
+            !has_missing_cluster_note(&after),
+            "a cached pre-clusters answer was served after clusters ran: {after}"
+        );
+        assert_eq!(CACHE_HITS.with(|c| c.get()), 0);
+    }
+
+    /// The missing-clusters remediation names the MCP tool on the MCP
+    /// profile, not a CLI command an agent cannot run.
+    #[test]
+    fn missing_cluster_remediation_names_the_mcp_tool() {
+        let mut notes = vec![nestweaver_engine::blast_radius::Notification {
+            level: nestweaver_engine::blast_radius::NotificationLevel::Note,
+            message: "run `nestweaver clusters`".to_string(),
+            descriptor: "clusters-not-computed".to_string(),
+        }];
+        mcp_cluster_remediation(&mut notes);
+        assert!(
+            notes[0].message.contains("`clusters` tool"),
+            "{}",
+            notes[0].message
+        );
+        assert!(!notes[0].message.contains("nestweaver clusters"));
+    }
+
     #[test]
     fn dirty_publication_bypasses_response_cache() {
         reset_session();
@@ -26529,6 +27072,22 @@ mod cache_dispatch_tests {
         assert_eq!(result["truncated"], true);
     }
 
+    /// QA #11: `vault` accepts a name like `brain_context.vaults` does, and
+    /// an unknown vault is an error rather than a silent zero.
+    #[test]
+    fn orphan_documents_resolves_a_vault_name_and_refuses_an_unknown_one() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        store.insert_note(&note_fixture("note:lonely")).unwrap();
+        let by_uid = tool_brain_orphan_documents(&store, json!({"vault": "vlt:test"})).unwrap();
+        let by_name = tool_brain_orphan_documents(&store, json!({"vault": "test"})).unwrap();
+        assert_eq!(by_uid["total"], 1, "{by_uid}");
+        assert_eq!(by_name["total"], by_uid["total"], "{by_name}");
+        let error = tool_brain_orphan_documents(&store, json!({"vault": "nope"}))
+            .expect_err("an unknown vault must not answer zero");
+        assert!(error.to_string().contains("nope"), "{error}");
+    }
+
     fn vault_fixture() -> nestweaver_schema::Vault {
         nestweaver_schema::Vault {
             uid: "vlt:test".to_string(),
@@ -26856,6 +27415,38 @@ mod cache_dispatch_tests {
         assert_eq!(result["truncated"], true);
     }
 
+    /// QA #11: a requested section that matches no heading is named in
+    /// `missing_sections` instead of silently yielding an empty body.
+    #[test]
+    fn note_get_names_requested_sections_that_do_not_exist() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_vault(&vault_fixture()).unwrap();
+        let note = note_fixture("note:sections");
+        store.insert_note(&note).unwrap();
+        store
+            .insert_heading(&nestweaver_schema::Heading {
+                uid: "head:sections:intro".into(),
+                note_uid: note.uid.clone(),
+                level: 2,
+                text: "Intro".into(),
+                slug: "intro".into(),
+                start_line: 1,
+                end_line: 3,
+                content_hash: "h".into(),
+                embedding: None,
+            })
+            .unwrap();
+        let result = tool_note_get(
+            &store,
+            json!({"uid": note.uid, "sections": ["intro", "Nope"]}),
+        )
+        .unwrap();
+        assert_eq!(result["missing_sections"], json!(["Nope"]), "{result}");
+        let result =
+            tool_note_get(&store, json!({"uid": note.uid, "sections": ["Intro"]})).unwrap();
+        assert!(result.get("missing_sections").is_none(), "{result}");
+    }
+
     #[test]
     fn correction_budget_note_ordinary_utf8_frontmatter_remains_complete() {
         let store = GraphStore::in_memory().unwrap();
@@ -26987,8 +27578,13 @@ mod cache_dispatch_tests {
         );
     }
 
+    /// note_get ranks nothing, yet it used to refuse for the whole of a live
+    /// index publication (the lease is held for an entire index run), and the
+    /// refusal was then reworded into "ranked queries are failing closed".
+    /// It now reads through the window, verifies the note's content hash is
+    /// unchanged across its queries, and discloses `publication_in_progress`.
     #[test]
-    fn review2_paged_note_refuses_live_publication_even_without_disk_marker() {
+    fn review2_paged_note_reads_through_a_live_publication_with_disclosure() {
         let store = GraphStore::in_memory().unwrap();
         store.insert_vault(&vault_fixture()).unwrap();
         let note = note_fixture("note:publication-paging");
@@ -26999,13 +27595,13 @@ mod cache_dispatch_tests {
             !store.is_index_publication_dirty(),
             "in-memory fixture has no disk marker; exercise actual lease guard"
         );
-        let result = tool_note_get(&store, json!({"uid":note.uid,"include_body":false}));
-        assert!(
-            result.is_err(),
-            "a paged read must not start across a live index publication"
-        );
+        let during = tool_note_get(&store, json!({"uid":note.uid,"include_body":false}))
+            .expect("a non-ranking note read must not fail closed during an index");
+        assert_eq!(during["uid"], json!(note.uid));
+        assert_eq!(during["publication_in_progress"], true, "{during}");
         drop(lease);
-        assert!(tool_note_get(&store, json!({"uid":note.uid,"include_body":false})).is_ok());
+        let after = tool_note_get(&store, json!({"uid":note.uid,"include_body":false})).unwrap();
+        assert!(after.get("publication_in_progress").is_none(), "{after}");
         let _cli = scoped_tool_delivery(nestweaver_schema::ToolDeliveryProfile::FullCli);
         let lease = store.acquire_index_publication_lease().unwrap();
         assert!(
@@ -27753,6 +28349,32 @@ mod cache_dispatch_tests {
             message.contains("not a dirty git working tree"),
             "the message must correct the wrong conclusion the reporter drew: {message}"
         );
+    }
+
+    /// note_get reads through a LIVE publication, but an ABANDONED marker (its
+    /// writer died, the graph may be partially written) still fails closed,
+    /// with the WEDGED remedy.
+    #[test]
+    fn note_get_still_fails_closed_on_an_abandoned_publication() {
+        reset_session();
+        let (_dir, db_path) = index_on_disk();
+        set_current_db_path(db_path.clone());
+        let dead = reaped_child_pid();
+        write_marker(&db_path, dead as u32, None);
+        let store = GraphStore::open(&db_path).unwrap();
+        assert!(store.is_index_publication_dirty());
+
+        let error = dispatch(
+            &store,
+            None,
+            "note_get",
+            json!({"uid": "note:any", "include_body": false}),
+            None,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("WEDGED"), "{message}");
+        assert!(message.contains("nestweaver repair"), "{message}");
     }
 
     #[test]
@@ -30039,6 +30661,73 @@ mod arg_alias_tests {
         assert_eq!(payload["cached"], json!(false));
     }
 
+    /// A `cluster_offset` past the end is an empty, COMPLETE page. It was
+    /// reported `truncated: true` beside `next_cluster_offset: null` — a cut
+    /// with no way to continue it.
+    #[test]
+    fn tool_clusters_offset_past_the_end_is_not_truncated() {
+        let store = cluster_scope_store();
+        let first =
+            tool_clusters(&store, json!({ "resolution": 1.0 })).expect("first clusters page");
+        let past_end = tool_clusters(
+            &store,
+            json!({
+                "resolution": 1.0,
+                "cluster_offset": 10_000,
+                "expected_generation": first["graph_generation"],
+                "page_token": first["page_token"],
+            }),
+        )
+        .expect("a page past the end");
+        assert_eq!(past_end["returned"], 0, "{past_end}");
+        assert_eq!(past_end["truncated"], false, "{past_end}");
+        assert!(past_end["next_cluster_offset"].is_null(), "{past_end}");
+
+        assert!(cluster_listing_truncated(&[json!({})], 3, 0));
+        assert!(!cluster_listing_truncated(&[json!({})], 3, 2));
+        assert!(!cluster_listing_truncated(&[], 3, 5));
+        assert!(cluster_listing_truncated(
+            &[json!({"members_truncated": true})],
+            1,
+            0
+        ));
+    }
+
+    /// QA #11: detect_changes names its symbol population the way
+    /// blast_radius does, beside the legacy key.
+    #[test]
+    fn detect_changes_reports_changed_symbol_count() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&nestweaver_schema::Symbol {
+                uid: "sym:r:src/a.rs:f:1".into(),
+                name: "f".into(),
+                kind: nestweaver_schema::SymbolKind::Function,
+                repo_uid: "repo:r".into(),
+                file_path: "src/a.rs".into(),
+                start_line: 1,
+                end_line: 2,
+                signature: "fn f()".into(),
+                summary: None,
+                content_hash: "h".into(),
+                embedding: None,
+                pagerank_score: None,
+                is_entry_point: false,
+                entry_point_kind: None,
+                visibility: nestweaver_schema::Visibility::Public,
+                type_info: None,
+                framework_hint: None,
+                canonical_id: None,
+            })
+            .unwrap();
+        let result = tool_detect_changes(&store, json!({ "changed_files": ["src/a.rs"] })).unwrap();
+        assert_eq!(result["changed_symbol_count"], 1, "{result}");
+        assert_eq!(
+            result["changed_symbol_count"],
+            result["affected_symbol_count"]
+        );
+    }
+
     #[test]
     fn detect_changes_accepts_changed_files_and_files_alias() {
         let store = GraphStore::in_memory().unwrap();
@@ -30356,9 +31045,13 @@ mod arg_alias_tests {
                 && err.contains("Section, Note, Symbol, Frontmatter"),
             "{err}"
         );
-        let err = tool_count_patterns(&store, json!({ "patterns": ["x"], "kinds": ["Heading"] }))
-            .unwrap_err()
-            .to_string();
+        let err = tool_count_patterns(
+            &store,
+            json!({ "patterns": ["x"], "kinds": ["Heading"] }),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("unknown kind 'Heading'"), "{err}");
         // Case-insensitive valid kinds pass validation (empty results are fine
         // on an empty store).
@@ -32039,8 +32732,12 @@ mod source_management_tests {
             None,
         )];
         // Only an exact uid / name / url / path selects a repo to delete.
-        assert!(match_repo_target(&repos, "nw-fragment-test").is_empty());
+        // QA #7: the bare name IS the repo's display name (derived from its
+        // URL, as every other tool derives it), so it now selects the repo;
+        // a path fragment still does not.
+        assert_eq!(match_repo_target(&repos, "nw-fragment-test").len(), 1);
         assert!(match_repo_target(&repos, "org/nw-fragment-test").is_empty());
+        assert!(match_repo_target(&repos, "fragment-test").is_empty());
         assert_eq!(
             match_repo_target(&repos, "https://github.com/org/nw-fragment-test").len(),
             1
@@ -32078,6 +32775,36 @@ mod source_management_tests {
             Ok(RemoveTarget::Repo(r)) if r.uid == "repo:py:ts"
         ));
         assert!(resolve_remove_target(&repos, &vaults, "py").is_err());
+    }
+
+    /// QA #7: a repo with no stored name is removable by the display name
+    /// other tools derive from its URL, and that derived name colliding with
+    /// a vault name still refuses (#513).
+    #[test]
+    fn remove_target_accepts_the_derived_repo_name_and_keeps_cross_kind_refusal() {
+        let repos = vec![repo(
+            "repo:u:u",
+            "https://github.com/google/uuid",
+            None,
+            None,
+        )];
+        assert!(matches!(
+            resolve_remove_target(&repos, &[], "uuid"),
+            Ok(RemoveTarget::Repo(r)) if r.uid == "repo:u:u"
+        ));
+        let vaults = vec![nestweaver_schema::Vault {
+            uid: "vault:u:u".into(),
+            name: "uuid".into(),
+            root_path: "/nw/x/uuid-vault".into(),
+            instance_id: "test".into(),
+        }];
+        let error = resolve_remove_target(&repos, &vaults, "uuid")
+            .expect_err("a derived repo name equal to a vault name is ambiguous");
+        let text = error.to_string();
+        assert!(
+            text.contains("repo:u:u") && text.contains("vault:u:u"),
+            "{text}"
+        );
     }
 
     #[cfg(feature = "daemon")]
@@ -34287,6 +35014,19 @@ mod repo_visibility_coverage_tests {
             format!("def alphaPublicHelper():\n    pass  # {CANARY}\n"),
         )
         .unwrap();
+        // An explicit root must lie inside an indexed source, so register the
+        // checkout as one; the scoped refusal below must still win.
+        store
+            .insert_repo(&Repo {
+                uid: "repo:inst:checkout".to_string(),
+                url: format!("file://{}", root.path().display()),
+                indexed_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "inst".to_string(),
+                name: Some("checkout".to_string()),
+                root_path: Some(root.path().display().to_string()),
+            })
+            .unwrap();
 
         let read_args = json!({
             "targets": ["sym:alpha:public"],
@@ -37156,6 +37896,98 @@ mod ambiguous_name_contract_tests {
                 ),
             ],
             "{ambiguous}"
+        );
+    }
+
+    /// An explicit `root` decides where symbol bodies are read from, so it
+    /// must lie inside an indexed repository (or be a linked worktree of
+    /// one); any other directory is refused before anything is read.
+    #[test]
+    fn read_symbols_refuses_a_root_outside_indexed_repositories() {
+        use nestweaver_engine::index_directory_in_memory;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("src/util.js"),
+            "function helper(n) { return n; }\n",
+        )
+        .unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        let (_repo, store) =
+            index_directory_in_memory(&repo, "test", "https://example.com/r", "sha").unwrap();
+        let read = |root: &std::path::Path| {
+            tool_read_symbols(
+                &store,
+                json!({ "targets": ["helper"], "root": root.to_string_lossy() }),
+            )
+        };
+
+        let inside = read(&repo).unwrap();
+        assert!(inside.to_string().contains("return n"), "{inside}");
+
+        // Same relative path, unrelated directory: refused, not read.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("src")).unwrap();
+        std::fs::write(
+            outside.path().join("src/util.js"),
+            "function helper(n) { return 'outside-canary'; }\n",
+        )
+        .unwrap();
+        let error = read(outside.path()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not inside an indexed repository"),
+            "{error:#}"
+        );
+
+        // A linked worktree of the indexed repository is still accepted.
+        let worktree = dir.path().join("linked");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let linked = read(&worktree).unwrap();
+        assert!(linked.to_string().contains("return n"), "{linked}");
+
+        // A monorepo subdirectory indexed on its own: the same subdirectory
+        // of a linked worktree is admitted, the rest of the checkout is not.
+        let (_sub, sub_store) =
+            index_directory_in_memory(&repo.join("src"), "test", "https://example.com/s", "sha")
+                .unwrap();
+        let read_sub = |root: &std::path::Path| {
+            tool_read_symbols(
+                &sub_store,
+                json!({ "targets": ["helper"], "root": root.to_string_lossy() }),
+            )
+        };
+        let sub_linked = read_sub(&worktree.join("src")).unwrap();
+        assert!(sub_linked.to_string().contains("return n"), "{sub_linked}");
+        assert!(
+            read_sub(&worktree).is_err(),
+            "above the indexed subdirectory"
         );
     }
 

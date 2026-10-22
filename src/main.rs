@@ -15,16 +15,98 @@ impl std::error::Error for StdoutWriteFailure {
     }
 }
 
+/// [`write_cli_stdout_to`] for a terminal, the case tests pin.
+#[cfg(test)]
 fn write_cli_stdout(
     writer: &mut impl std::io::Write,
     arguments: std::fmt::Arguments<'_>,
     newline: bool,
 ) -> std::io::Result<()> {
-    writer.write_fmt(arguments)?;
+    write_cli_stdout_to(writer, arguments, newline, true)
+}
+
+/// Write CLI output, escaping terminal control sequences when `terminal`.
+///
+/// Indexed content (note titles and bodies, headings, symbol names, file
+/// paths) reaches stdout through here, and any of it can carry terminal
+/// control sequences. They are only dangerous to a terminal: piped and
+/// redirected output (`note get > file`, `export`, scripts) keeps the bytes
+/// as indexed, CRLF line endings and form feeds included.
+fn write_cli_stdout_to(
+    writer: &mut impl std::io::Write,
+    arguments: std::fmt::Arguments<'_>,
+    newline: bool,
+    terminal: bool,
+) -> std::io::Result<()> {
+    if terminal {
+        let text = match arguments.as_str() {
+            Some(text) => std::borrow::Cow::Borrowed(text),
+            None => std::borrow::Cow::Owned(arguments.to_string()),
+        };
+        writer.write_all(terminal_safe(&text).as_bytes())?;
+    } else {
+        writer.write_fmt(arguments)?;
+    }
     if newline {
         writer.write_all(b"\n")?;
     }
     Ok(())
+}
+
+/// `text` with every control character a terminal would act on made visible.
+///
+/// C0 controls other than `\n`, `\t` and a `\r` that ends a CRLF line, DEL
+/// and the C1 controls become `\u00XX`. That neutralizes cursor movement,
+/// screen clears, title and clipboard writes (OSC), hyperlinks and BEL. The
+/// `\u00XX` form is also a JSON string escape for the same character, so JSON
+/// output (where serde already escapes C0, and C1/DEL can only occur inside
+/// strings) decodes to the same values. SGR sequences pass through only when
+/// every parameter is one the CLI's own labels use (reset, bold, dim, normal
+/// intensity, the 16 foreground colours and default foreground): those
+/// change colours and nothing else, while conceal (`8`) or a background
+/// colour could hide text.
+fn terminal_safe(text: &str) -> std::borrow::Cow<'_, str> {
+    fn is_control(c: char) -> bool {
+        (c.is_control() && c != '\n' && c != '\t') || c == '\u{7f}'
+    }
+    fn allowed_sgr(params: &str) -> bool {
+        params.split(';').all(|param| {
+            param.is_empty()
+                || matches!(
+                    param.parse::<u16>(),
+                    Ok(0 | 1 | 2 | 22 | 30..=37 | 39 | 90..=97)
+                )
+        })
+    }
+    if !text.chars().any(is_control) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut safe = String::with_capacity(text.len() + 16);
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if c == '\u{1b}' {
+            let body = &rest[1..];
+            if let Some(params) = body.strip_prefix('[') {
+                let digits = params
+                    .find(|p: char| !(p.is_ascii_digit() || p == ';'))
+                    .unwrap_or(params.len());
+                if params[digits..].starts_with('m') && allowed_sgr(&params[..digits]) {
+                    let length = 2 + digits + 1;
+                    safe.push_str(&rest[..length]);
+                    rest = &rest[length..];
+                    continue;
+                }
+            }
+        }
+        let crlf = c == '\r' && rest[1..].starts_with('\n');
+        if is_control(c) && !crlf {
+            safe.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            safe.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    std::borrow::Cow::Owned(safe)
 }
 
 fn raise_stdout_failure(error: std::io::Error) -> ! {
@@ -59,9 +141,12 @@ fn print_cli_stdout(arguments: std::fmt::Arguments<'_>, newline: bool) {
     if STDOUT_FAILED.load(Ordering::Relaxed) {
         return;
     }
+    // Decided once: whether stdout is a terminal does not change mid-run.
+    static TERMINAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let terminal = *TERMINAL.get_or_init(|| std::io::stdout().is_terminal());
     // TypedStdout converts the otherwise-untyped `io::Error` into the one
     // unwind payload accepted by the process boundary.
-    let _ = write_cli_stdout(&mut TypedStdout, arguments, newline);
+    let _ = write_cli_stdout_to(&mut TypedStdout, arguments, newline, terminal);
 }
 
 // Keep unit-test output on the standard harness capture path. Production CLI
@@ -116,7 +201,7 @@ use nestweaver_engine::{
     record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
     search_symbols, suggest_links,
 };
-use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol, parse_drain_ceiling};
+use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
 
 // ── Exit codes ────────────────────────────────────────────────────────────────
@@ -141,6 +226,12 @@ const EXIT_AMBIGUOUS: i32 = 3;
 /// `nestweaver stale-chekc` from "your graph is stale". The sysexits range
 /// starts at 64 precisely to avoid clashing with codes programs already use.
 const EXIT_USAGE: i32 = 64;
+/// `daemon status` found the daemon unhealthy: something owns the instance
+/// but no client can reach it, or its identity cannot be verified.
+/// `EX_UNAVAILABLE` from `sysexits.h`: the check itself worked (not 1), and
+/// "stopped" (0) and "stuck" must not share a code, because only the second
+/// needs an operator.
+const EXIT_DAEMON_UNHEALTHY: i32 = 69;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// Default `server init-tls --validity-days`.
@@ -1901,6 +1992,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Internal,
     },
     EnvVar {
+        name: "NESTWEAVER_METADATA_WRITE_WAIT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
         name: "NESTWEAVER_METAL_SMOKE_CACHE_DIR",
         role: EnvRole::Internal,
     },
@@ -2090,13 +2185,15 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
                   pr-impact --strict blocked, dead-code refused on a stale graph.\n  \
                   3   ambiguous match (several symbols share the name)\n  \
                   4   unauthorized (pull)      5   unavailable (pull)\n  \
-                  64  usage error — unknown flag, out-of-range value, uncompilable --pattern\n\n\
+                  64  usage error — unknown flag, out-of-range value, a regex pattern that does\n      \
+                  not compile (regex-search / count-patterns)\n  \
+                  69  `daemon status` found the daemon unhealthy (running but unreachable)\n\n\
                   With --json, exit 2 writes {\"error\":\"not found\", ...} to stdout on the read\n      \
                   commands listed above; branch on `error`, not on prose.\n  \
                   NOT UNIVERSAL, and stated precisely because a contract that overreaches is\n      \
                   worse than none: exit 64 from an out-of-range or unknown FLAG is raised by the\n      \
                   argument parser BEFORE --json is read, so it writes to stderr and nothing to\n      \
-                  stdout. Only an uncompilable --pattern reaches the JSON path. Exit 3 emits a\n      \
+                  stdout. Only an uncompilable regex pattern reaches the JSON path. Exit 3 emits a\n      \
                   candidate list, and `impact` keys it \"status\", not \"error\". `read-symbols`\n      \
                   lists misses under \"not_found\" instead. Check the code, then stderr.\n\n\
                   Shell completions:\n  \
@@ -2157,7 +2254,8 @@ struct OutputConfig {
 
 impl OutputConfig {
     fn from_cli(cli: &Cli) -> Self {
-        let color = if cli.no_color || cli.plain || std::env::var("NO_COLOR").is_ok() {
+        let no_color_env = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        let color = if cli.no_color || cli.plain || no_color_env {
             false
         } else {
             std::io::stderr().is_terminal()
@@ -2509,6 +2607,29 @@ fn parse_brain_context_kind(value: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+/// A `project-context --kinds` value. The tool keeps a node whose kind STARTS
+/// WITH the filter (case-insensitive), so `sym` is as valid as `Symbol`; a
+/// value that is a prefix of no kind a result can hold silently emptied the
+/// answer. Refused at parse time instead (exit 64), listing the kinds.
+fn parse_project_context_kind(value: &str) -> Result<String, String> {
+    const KINDS: [&str; 5] = ["Symbol", "Note", "Section", "Tag", "Heading"];
+    let lower = value.to_lowercase();
+    let is_prefix = !lower.is_empty()
+        && KINDS
+            .iter()
+            .any(|kind| kind.to_lowercase().starts_with(&lower));
+    let is_symbol_subkind = lower.len() > "symbol/".len() && lower.starts_with("symbol/");
+    if is_prefix || is_symbol_subkind {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "unknown kind '{value}'; expected a case-insensitive prefix of one of: {} \
+             (or a 'Symbol/<sub-kind>' prefix)",
+            KINDS.join(", ")
+        ))
+    }
+}
+
 /// MCP `project_context.response_format`: only `concise` or `detailed`,
 /// case-insensitive, the same two values the tool accepts. Anything else is a
 /// usage error that names `--detailed`, the CLI flag agents already have.
@@ -2526,6 +2647,26 @@ fn parse_project_context_response_format(value: &str) -> Result<String, String> 
 /// (exit 64) naming the valid intents rather than an internal error.
 fn parse_query_intent(value: &str) -> Result<String, String> {
     value.parse::<QueryIntent>().map(|_| value.to_string())
+}
+
+/// A symbol name, UID or seed: blank is a usage error (exit 64), not a lookup
+/// that fails as "not found" (2) or as an internal error (1).
+fn parse_non_blank_seed(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("an empty symbol name, UID or seed is not allowed".to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+/// `pr-impact --files`: must name at least one file. `--files ""` (or only
+/// commas) used to fail later as exit 1.
+fn parse_changed_files_list(value: &str) -> Result<String, String> {
+    if value.split(',').all(|file| file.trim().is_empty()) {
+        Err("--files must name at least one file (omit it to auto-detect via git diff)".to_string())
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 fn parse_non_blank_query(value: &str) -> Result<String, String> {
@@ -2592,7 +2733,13 @@ fn describe_link_resolution(link: &nestweaver_engine::BrokenLink) -> String {
             format!("AMBIGUOUS — {} notes match", link.candidate_count)
         }
         Some(uid) => format!("resolves to {uid}"),
-        None => "UNRESOLVED — no such note".to_string(),
+        None => match link.missing_anchor.as_deref() {
+            Some(anchor) => match anchor.strip_prefix('^') {
+                Some(block) => format!("UNRESOLVED — the note has no block ^{block}"),
+                None => format!("UNRESOLVED — the note has no heading '{anchor}'"),
+            },
+            None => "UNRESOLVED — no such note".to_string(),
+        },
     }
 }
 
@@ -3414,6 +3561,32 @@ fn print_json_not_found_suggesting(target_key: &str, target: &str, candidates: &
             candidates,
         )
     );
+}
+
+/// How `project-context` reports a lookup miss, on both routes, keyed on the
+/// error's TYPE rather than its text. Any error mentioning "not found" used to
+/// be reported as "Project '<name>' not found", so `--repos <unknown>` blamed
+/// the project. A project miss is the tool's not-found envelope keyed
+/// `project`; an unresolved `--repos` selector reports itself (not found 2,
+/// ambiguous 3, malformed 64). `None` for anything else.
+fn report_project_context_failure(error: &anyhow::Error, name: &str, json: bool) -> Option<i32> {
+    if let Some(envelope) = nestweaver_mcp::tools::not_found_envelope(error)
+        && envelope.get("project").is_some()
+    {
+        // nw-399: a `--json` caller gets the envelope on stdout, not an
+        // empty stream it cannot tell from a crash.
+        let candidates = value_did_you_mean(&envelope);
+        if json {
+            print_json_not_found_suggesting("project", name, &candidates);
+        }
+        eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
+        eprint_did_you_mean(&candidates);
+        return Some(EXIT_NOT_FOUND);
+    }
+    if error_is_unresolved_repo_filter(error) {
+        return Some(report_unresolved_repo_filter(error, json));
+    }
+    None
 }
 
 /// 12.1.1 (V4): how `investigate` reports a failure it can classify, on both
@@ -4340,7 +4513,11 @@ mod blast_radius_exit_code_tests {
 /// cross-repo link rather than an observed call, and omitting the label is what
 /// let fabricated cross-language execution paths read as real ones (nw-111).
 fn render_flow_trace_text(payload: &serde_json::Value) {
-    render_flow_trace_text_to(&mut std::io::stdout().lock(), payload);
+    // Buffered and printed so the text crosses the terminal-safe stdout
+    // boundary like every other command's.
+    let mut text = Vec::new();
+    render_flow_trace_text_to(&mut text, payload);
+    print!("{}", String::from_utf8_lossy(&text));
 }
 
 /// [`render_flow_trace_text`] into any writer, so the text is testable. A
@@ -6479,6 +6656,53 @@ mod daemon_status_renderer_tests {
         }
     }
 
+    /// Indexed text printed by `search`, `note get`, `backlinks`,
+    /// `regex-search` and the rest reaches the terminal through
+    /// `write_cli_stdout`, which must neutralize control sequences a title,
+    /// heading or body can carry.
+    #[test]
+    fn stdout_boundary_escapes_terminal_control_sequences() {
+        let title = "Note\u{1b}]0;pwned\u{7}\u{1b}[2J\u{1b}[H\rspoof\u{9b}31m\u{7f}";
+        let mut written = Vec::new();
+        write_cli_stdout(&mut written, format_args!("  {title}  [note]\tok"), true).unwrap();
+        let written = String::from_utf8(written).unwrap();
+        assert_eq!(
+            written,
+            "  Note\\u001b]0;pwned\\u0007\\u001b[2J\\u001b[H\\u000dspoof\\u009b31m\\u007f  [note]\tok\n"
+        );
+        assert!(
+            !written
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        );
+        // The CLI's own colour labels survive; conceal and background
+        // colours, which can hide text, do not.
+        assert_eq!(
+            terminal_safe("\u{1b}[31mBREAKING\u{1b}[0m \u{1b}[1;33mWARN\u{1b}[m"),
+            "\u{1b}[31mBREAKING\u{1b}[0m \u{1b}[1;33mWARN\u{1b}[m"
+        );
+        assert_eq!(terminal_safe("a\u{1b}[8mb"), "a\\u001b[8mb");
+        assert_eq!(terminal_safe("a\u{1b}[30;40mb"), "a\\u001b[30;40mb");
+        // A CRLF line ending is not a control sequence; a lone CR is.
+        assert_eq!(terminal_safe("a\r\nb\rc"), "a\r\nb\\u000dc");
+        // JSON is unchanged in meaning: the escapes are JSON escapes.
+        let value = serde_json::json!({ "title": "a\u{9b}b\u{7f}c\u{1b}d" });
+        let json = serde_json::to_string(&value).unwrap();
+        let safe = terminal_safe(&json).into_owned();
+        assert!(!safe.chars().any(|c| c.is_control()));
+        let reparsed: serde_json::Value = serde_json::from_str(&safe).unwrap();
+        assert_eq!(reparsed, value);
+        // Plain text is borrowed, not copied.
+        assert!(matches!(
+            terminal_safe("plain\ttext\n"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Output that is not a terminal keeps its bytes.
+        let mut piped = Vec::new();
+        write_cli_stdout_to(&mut piped, format_args!("{title}\r\n\u{c}"), false, false).unwrap();
+        assert_eq!(piped, format!("{title}\r\n\u{c}").into_bytes());
+    }
+
     #[test]
     fn daemon_status_renderer_reaches_typed_stdout_boundary() {
         let output = format_daemon_not_running_status("Daemon is not running.");
@@ -6762,6 +6986,7 @@ enum Commands {
     )]
     Symbol {
         /// Symbol name or UID (use UID to disambiguate)
+        #[arg(value_parser = parse_non_blank_seed)]
         name_or_uid: String,
         #[arg(long, help = "Filter by instance ID")]
         instance: Option<String>,
@@ -7357,7 +7582,7 @@ enum Commands {
     )]
     Context {
         /// Symbol names, UIDs, path::name specs, or file paths to seed from (not required when --feature is set)
-        #[arg(required_unless_present = "feature")]
+        #[arg(required_unless_present = "feature", value_parser = parse_non_blank_seed)]
         seeds: Vec<String>,
         #[arg(long, help = "Feature name from instance config")]
         feature: Option<String>,
@@ -7802,9 +8027,10 @@ enum Commands {
     },
     /// Generate hierarchical code summaries for token-efficient retrieval
     ///
-    /// Creates deterministic, compact summaries at three levels: symbol
-    /// (function/class details), file (exports and imports), and cluster
-    /// (community architecture). No LLM needed -- summaries are derived
+    /// Creates deterministic, compact summaries at four levels: symbol
+    /// (function/class details), file (exports and imports), cluster
+    /// (community architecture), and hub (top hub nodes with call-graph
+    /// shape and role). No LLM needed -- summaries are derived
     /// entirely from graph data.
     #[command(
         after_help = "Examples:\n  nestweaver summary --level symbol\n  nestweaver summary --level file --json\n  nestweaver summary --level cluster --token-budget 2000"
@@ -7967,6 +8193,7 @@ enum Commands {
         #[arg(
             long = "kinds",
             value_delimiter = ',',
+            value_parser = parse_project_context_kind,
             help = "Filter result kinds by case-insensitive prefix, e.g. Symbol,Note (MCP project_context kinds)"
         )]
         kinds: Vec<String>,
@@ -8523,6 +8750,7 @@ enum Commands {
     PrImpact {
         #[arg(
             long,
+            value_parser = parse_changed_files_list,
             help = "Comma-separated list of changed file paths (omit to auto-detect via git diff)"
         )]
         files: Option<String>,
@@ -8710,7 +8938,7 @@ enum Commands {
         /// Server URL (e.g., nestweaver.acme.com:9378)
         url: String,
         /// Bearer token for authentication
-        #[arg(long, env = "NESTWEAVER_TOKEN")]
+        #[arg(long, env = "NESTWEAVER_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Authenticate interactively via device flow (opens a browser).
         /// Implied when no --token / NESTWEAVER_TOKEN is provided.
@@ -8767,6 +8995,13 @@ enum Commands {
         /// change (tune what --strict blocks on via [pr_impact] in the config)
         #[arg(long)]
         strict: bool,
+        /// Database the hook checks against; written into the hook as an
+        /// absolute path
+        #[arg(
+            long,
+            help = "Path to the database file the hook checks [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
     },
 }
 
@@ -8825,7 +9060,7 @@ enum ServerAction {
         #[arg(long)]
         url: String,
         /// Admin bearer token (defaults to the NESTWEAVER_ADMIN_TOKEN env var)
-        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN")]
+        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
 }
@@ -8971,6 +9206,14 @@ enum DaemonAction {
     /// write lock or pidfile lock with no way for a client to reach it. That
     /// third state is repairable and names the owning PID when the kernel
     /// reports one.
+    ///
+    /// Exit codes: 0 running or not running (including a database problem
+    /// reported as a warning) · 1 not running and the database is unusable ·
+    /// 69 unhealthy: running but unreachable, or an owner/endpoint that
+    /// cannot be verified. With --json the state is printed either way.
+    #[command(
+        after_help = "Exit codes:\n  0   running, or not running\n  1   not running and the database cannot be used\n  69  UNHEALTHY: running but unreachable (e.g. a stopped/hung daemon still holds the\n      database), or the owner/endpoint cannot be verified"
+    )]
     Status {
         /// Emit read-only lifecycle evidence as JSON.
         #[arg(long)]
@@ -9047,11 +9290,11 @@ enum DaemonAction {
         tls_key: Option<PathBuf>,
 
         /// Bearer token for query auth
-        #[arg(long, env = "NESTWEAVER_AUTH_TOKEN")]
+        #[arg(long, env = "NESTWEAVER_AUTH_TOKEN", hide_env_values = true)]
         auth_token: Option<String>,
 
         /// Separate admin bearer token
-        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN")]
+        #[arg(long, env = "NESTWEAVER_ADMIN_TOKEN", hide_env_values = true)]
         admin_token: Option<String>,
 
         /// Write actual bound port to this file (for test harness)
@@ -9059,11 +9302,11 @@ enum DaemonAction {
         port_file: Option<PathBuf>,
 
         /// Webhook HMAC secret for verifying push event signatures
-        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET")]
+        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET", hide_env_values = true)]
         webhook_secret: Option<String>,
 
         /// Previous webhook secret (fallback during rotation)
-        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET_OLD")]
+        #[arg(long, env = "NESTWEAVER_WEBHOOK_SECRET_OLD", hide_env_values = true)]
         webhook_secret_old: Option<String>,
 
         /// Path to instance.toml for server config (repos, polling, etc.)
@@ -10254,7 +10497,7 @@ enum AdminCommands {
     },
     /// Install a runtime hook that injects subagent guidance.
     ///
-    /// For the `claude` runtime, adds a PreToolUse hook on the `Task` matcher
+    /// For the `claude` runtime, adds a PreToolUse hook on the `Task|Agent` (subagent) matcher
     /// that runs `nestweaver admin instructions --for-subagent`. Hook JSON
     /// schemas are Claude-Code-specific.
     InstallHook {
@@ -10449,7 +10692,7 @@ enum BackupCommands {
         include_clones: bool,
         #[arg(
             long,
-            help = "Overwrite an existing archive. Without this flag, save leaves that file untouched"
+            help = "Overwrite an existing archive. Without this flag, save leaves that file untouched. Never overwrites the database or one of its files"
         )]
         force: bool,
     },
@@ -10475,7 +10718,7 @@ enum BackupCommands {
         start: bool,
         #[arg(
             long,
-            help = "Replace a non-empty data directory. Without this flag, restore leaves that directory untouched"
+            help = "Replace a non-empty NestWeaver data directory (one holding a *.lbug database or publication.json). Without this flag, restore leaves that directory untouched; any other non-empty directory is refused even with it"
         )]
         force: bool,
     },
@@ -10726,14 +10969,17 @@ fn stop_still_draining_message(pid: i32, waited_secs: u64, serving_reads: bool) 
 /// `stop_env` / `drain_env` are the raw env-var strings (passed in so this is
 /// unit-testable without touching process env).
 fn resolve_stop_grace_secs(stop_env: Option<&str>, drain_env: Option<&str>) -> u64 {
-    if let Some(v) = stop_env.and_then(|s| s.trim().parse::<u64>().ok()) {
+    // An unparsable value is ignored with a one-time warning naming it.
+    if let Some(v) =
+        nestweaver_schema::env::parse_env_value::<u64>("NESTWEAVER_STOP_GRACE_SECS", stop_env)
+    {
         return v;
     }
     // Share the drain-ceiling parse semantics with the daemon/client so a
     // whitespace/format change can't make the CLI derive a different ceiling.
-    let ceiling = drain_env
-        .map(parse_drain_ceiling)
-        .unwrap_or(DEFAULT_DRAIN_CEILING_SECS);
+    let ceiling =
+        nestweaver_schema::env::parse_env_value::<u64>("NESTWEAVER_DRAIN_TIMEOUT_SECS", drain_env)
+            .unwrap_or(DEFAULT_DRAIN_CEILING_SECS);
     ceiling.saturating_add(STOP_GRACE_BUFFER_SECS)
 }
 
@@ -10979,14 +11225,23 @@ fn wholly_inferred_write_message(
     ))
 }
 
+/// `NESTWEAVER_DB`, with an empty or all-whitespace value treated as unset.
+/// `NESTWEAVER_DB=` used to resolve to the path "" and fail every command with
+/// an unhelpful error instead of falling back to the default.
+fn nestweaver_db_env() -> Option<PathBuf> {
+    std::env::var_os("NESTWEAVER_DB")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
+}
+
 fn default_db_path() -> PathBuf {
     default_db_path_with_source().0
 }
 
 /// [`default_db_path`] with the nw-284/S2 provenance retained.
 fn default_db_path_with_source() -> (PathBuf, DbSource) {
-    if let Ok(env_db) = std::env::var("NESTWEAVER_DB") {
-        (PathBuf::from(env_db), DbSource::Env)
+    if let Some(env_db) = nestweaver_db_env() {
+        (env_db, DbSource::Env)
     } else {
         (PathBuf::from("./nestweaver.lbug"), DbSource::CwdLocal)
     }
@@ -11979,7 +12234,7 @@ fn git_hooks_dir(cwd: &Path) -> anyhow::Result<PathBuf> {
 /// Repo worktree root via `git rev-parse --show-toplevel`; None when git
 /// can't answer (already validated by the caller, so a failure is ignored).
 fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = nestweaver_engine::git_cmd::isolated_git()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()
@@ -11999,8 +12254,15 @@ fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
 /// never block a push; strict drops the fail-open shim so `pr-impact`'s configured
 /// block policy (default: a contract-verified breaking change) can exit 2 and
 /// block the push.
-fn nestweaver_pre_push_hook(strict: bool) -> String {
+///
+/// `db` is baked in as an absolute, shell-quoted `--db`. Git runs the hook from
+/// the repository root with no `--db`, so the hook used to fall back to
+/// `./nestweaver.lbug` there: `--strict` then rejected EVERY push with
+/// "Database not found" whenever the graph lived anywhere else, and the
+/// advisory hook's `|| true` hid the same failure, so it never ran.
+fn nestweaver_pre_push_hook(strict: bool, db: &Path) -> String {
     let mode = if strict { "strict" } else { "advisory" };
+    let db_arg = setup::shell_quote(&db.to_string_lossy());
     let mut s = String::new();
     s.push_str("#!/bin/sh\n");
     s.push_str(&format!("# {NESTWEAVER_HOOK_MARKER} ({mode})\n"));
@@ -12017,13 +12279,17 @@ fn nestweaver_pre_push_hook(strict: bool) -> String {
     s.push_str("  exit 0\n");
     s.push_str("fi\n");
     if strict {
-        s.push_str("nestweaver pr-impact --base \"$base\" --strict\n");
+        s.push_str(&format!(
+            "nestweaver pr-impact --base \"$base\" --strict --db {db_arg}\n"
+        ));
     } else {
         // Advisory: swallow ANY failure of the tool itself (missing binary/DB,
         // arg error) so a broken environment can never abort the push. The gate
         // verdict already exits 0 in non-strict mode; `|| true` also covers the
         // pre-verdict failures (127/2/…) that `|| exit $?` would have propagated.
-        s.push_str("nestweaver pr-impact --base \"$base\" || true\n");
+        s.push_str(&format!(
+            "nestweaver pr-impact --base \"$base\" --db {db_arg} || true\n"
+        ));
         s.push_str("exit 0\n");
     }
     s
@@ -12045,9 +12311,43 @@ fn make_executable(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether anything — a file, a directory, or a symbolic link, live or
+/// dangling — occupies `path`. `Path::exists` follows links, so a dangling link
+/// reads as "absent" and the write that follows creates its target.
+fn path_occupied(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Backups `install` has made, oldest first: `pre-push.nestweaver.bak`, then
+/// `.bak.1`, `.bak.2`, … in creation order.
+fn pre_push_backups(hooks_dir: &Path) -> Vec<PathBuf> {
+    let mut backups = Vec::new();
+    let first = hooks_dir.join("pre-push.nestweaver.bak");
+    if path_occupied(&first) {
+        backups.push(first);
+    }
+    let mut numbered: Vec<(u64, PathBuf)> = std::fs::read_dir(hooks_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let n = name
+                .to_str()?
+                .strip_prefix("pre-push.nestweaver.bak.")?
+                .parse::<u64>()
+                .ok()?;
+            Some((n, entry.path()))
+        })
+        .collect();
+    numbered.sort();
+    backups.extend(numbered.into_iter().map(|(_, path)| path));
+    backups
+}
+
 /// Install the advisory (or strict) pre-push blast-radius hook in the current
 /// git repo. Backs up any pre-existing non-nestweaver hook.
-fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
+fn install_pre_push_hook(cwd: &Path, strict: bool, db: &Path) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
     // A custom core.hooksPath can point OUTSIDE the repo — installing a
     // hook there affects other repos, so say so loudly. Only checked when the
@@ -12067,39 +12367,86 @@ fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
             );
         }
     }
+    let db = std::path::absolute(db)
+        .with_context(|| format!("resolving database path {}", db.display()))?;
     std::fs::create_dir_all(&hooks_dir)
         .with_context(|| format!("creating hooks dir {}", hooks_dir.display()))?;
     let hook_path = hooks_dir.join("pre-push");
 
-    if hook_path.exists() {
-        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
-        if !existing.contains(NESTWEAVER_HOOK_MARKER) {
-            // Don't clobber a backup from a previous install — that could destroy
-            // the user's *original* hook. Fall back to a numbered suffix.
-            let mut backup = hooks_dir.join("pre-push.nestweaver.bak");
-            if backup.exists() {
-                let mut n = 1;
-                loop {
-                    let candidate = hooks_dir.join(format!("pre-push.nestweaver.bak.{n}"));
-                    if !candidate.exists() {
-                        backup = candidate;
-                        break;
+    // `symlink_metadata`, not `exists`/`read_to_string`: both FOLLOW a link, so
+    // a dangling `pre-push` link read as "no hook" and the write below created
+    // an executable file wherever the link pointed — outside the repository.
+    // A link is never ours; it is moved aside like any other foreign hook.
+    match std::fs::symlink_metadata(&hook_path) {
+        Ok(meta) if meta.is_dir() => anyhow::bail!(
+            "{} is a directory, not a hook script; remove or rename it and retry",
+            hook_path.display()
+        ),
+        Ok(meta) => {
+            let ours = meta.file_type().is_file()
+                && std::fs::read_to_string(&hook_path)
+                    .unwrap_or_default()
+                    .contains(NESTWEAVER_HOOK_MARKER);
+            if ours {
+                std::fs::remove_file(&hook_path)
+                    .with_context(|| format!("replacing hook {}", hook_path.display()))?;
+            } else {
+                // Don't clobber a backup from a previous install — that could
+                // destroy the user's *original* hook. Fall back to a numbered
+                // suffix.
+                let mut backup = hooks_dir.join("pre-push.nestweaver.bak");
+                if path_occupied(&backup) {
+                    let mut n = 1;
+                    loop {
+                        let candidate = hooks_dir.join(format!("pre-push.nestweaver.bak.{n}"));
+                        if !path_occupied(&candidate) {
+                            backup = candidate;
+                            break;
+                        }
+                        n += 1;
                     }
-                    n += 1;
+                }
+                // `rename` moves the directory entry itself, so a symbolic link
+                // is moved as a link and its target is never touched.
+                std::fs::rename(&hook_path, &backup).with_context(|| {
+                    format!("backing up existing pre-push hook to {}", backup.display())
+                })?;
+                if meta.file_type().is_symlink() {
+                    println!(
+                        "Warning: your pre-push hook was a symbolic link; moved the link (not its target) to {}",
+                        backup.display()
+                    );
+                } else {
+                    println!(
+                        "Warning: backed up your existing pre-push hook to {}",
+                        backup.display()
+                    );
                 }
             }
-            std::fs::rename(&hook_path, &backup).with_context(|| {
-                format!("backing up existing pre-push hook to {}", backup.display())
-            })?;
-            println!(
-                "Warning: backed up your existing pre-push hook to {}",
-                backup.display()
-            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", hook_path.display()));
         }
     }
 
-    std::fs::write(&hook_path, nestweaver_pre_push_hook(strict))
-        .with_context(|| format!("writing hook {}", hook_path.display()))?;
+    // `create_new` refuses to follow or replace anything that appeared at the
+    // path since the check above.
+    {
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o755);
+        }
+        let mut file = options
+            .open(&hook_path)
+            .with_context(|| format!("writing hook {}", hook_path.display()))?;
+        file.write_all(nestweaver_pre_push_hook(strict, &db).as_bytes())
+            .with_context(|| format!("writing hook {}", hook_path.display()))?;
+    }
     make_executable(&hook_path)?;
 
     if strict {
@@ -12129,36 +12476,75 @@ fn install_pre_push_hook(cwd: &Path, strict: bool) -> anyhow::Result<i32> {
         );
         println!("remove it with: nestweaver hooks --uninstall");
     }
+    println!("Database: {}", db.display());
+    if !db.exists() {
+        eprintln!(
+            "warning: database {} does not exist yet. Index it (nestweaver index --repo . --db {}) \
+             or reinstall with --db pointing at your graph; until then the hook {}.",
+            db.display(),
+            db.display(),
+            if strict {
+                "rejects every push"
+            } else {
+                "only reports that the database is missing"
+            }
+        );
+    }
     Ok(EXIT_SUCCESS)
 }
 
-/// Remove the nestweaver pre-push hook and restore any backed-up hook.
+/// Remove the nestweaver pre-push hook and restore the most recent backed-up
+/// hook — the one that was in place when nestweaver's was last installed.
 fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
     let hook_path = hooks_dir.join("pre-push");
-    let backup = hooks_dir.join("pre-push.nestweaver.bak");
 
-    if hook_path.exists() {
-        let existing = std::fs::read_to_string(&hook_path).unwrap_or_default();
-        if existing.contains(NESTWEAVER_HOOK_MARKER) {
-            std::fs::remove_file(&hook_path)
-                .with_context(|| format!("removing hook {}", hook_path.display()))?;
-            println!("Removed the nestweaver pre-push hook.");
-        } else {
-            println!("The pre-push hook was not installed by nestweaver — leaving it untouched.");
-            return Ok(EXIT_SUCCESS);
+    match std::fs::symlink_metadata(&hook_path) {
+        Ok(meta) => {
+            let ours = meta.file_type().is_file()
+                && std::fs::read_to_string(&hook_path)
+                    .unwrap_or_default()
+                    .contains(NESTWEAVER_HOOK_MARKER);
+            if ours {
+                std::fs::remove_file(&hook_path)
+                    .with_context(|| format!("removing hook {}", hook_path.display()))?;
+                println!("Removed the nestweaver pre-push hook.");
+            } else {
+                println!(
+                    "The pre-push hook was not installed by nestweaver — leaving it untouched."
+                );
+                return Ok(EXIT_SUCCESS);
+            }
         }
-    } else {
-        println!("No pre-push hook to remove.");
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("No pre-push hook to remove.");
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", hook_path.display()));
+        }
     }
 
-    if backup.exists() {
-        std::fs::rename(&backup, &hook_path)
+    // The newest backup is the hook that was displaced most recently. The
+    // fixed `pre-push.nestweaver.bak` is the OLDEST, so restoring it whenever
+    // numbered backups also existed brought back the wrong hook.
+    let mut backups = pre_push_backups(&hooks_dir);
+    if let Some(newest) = backups.pop() {
+        std::fs::rename(&newest, &hook_path)
             .with_context(|| format!("restoring previous hook {}", hook_path.display()))?;
         println!(
             "Restored your previous pre-push hook from {}",
-            backup.display()
+            newest.display()
         );
+        if !backups.is_empty() {
+            println!(
+                "Older backups were left in place: {}",
+                backups
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
     Ok(EXIT_SUCCESS)
 }
@@ -12304,8 +12690,8 @@ fn resolve_index_db_path(
         Some(path) => (path, DbSource::Flag),
         None => match cfg.as_ref().and_then(|config| config.db_path()) {
             Some(path) => (path, DbSource::Config),
-            None => match std::env::var("NESTWEAVER_DB").ok() {
-                Some(value) => (PathBuf::from(value), DbSource::Env),
+            None => match nestweaver_db_env() {
+                Some(value) => (value, DbSource::Env),
                 None => (repo_root.join("nestweaver.lbug"), DbSource::RepoLocal),
             },
         },
@@ -14930,18 +15316,78 @@ const LBUG_FILE_MAGIC: &[u8; 4] = b"LBUG";
 /// and whose index region is not still passes here, by construction; see
 /// `nestweaver-store`'s `open_crash_guard` (nw-285) for why a header check
 /// cannot be that guard and must not be mistaken for one.
+/// The `prune-stale` text lines for sources kept because their root could
+/// not be checked (permission denied, I/O error).
+fn prune_stale_skipped_lines(skipped_warnings: &[String]) -> Vec<String> {
+    skipped_warnings
+        .iter()
+        .map(|warning| format!("Warning: kept (root could not be checked): {warning}"))
+        .collect()
+}
+
+/// Whether any socket a daemon for `db_path` would serve on exists. For the
+/// stop-type commands that must attach to a running daemon and never
+/// autostart one.
+fn daemon_socket_present(db_path: &std::path::Path) -> bool {
+    let canonical = std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(&canonical);
+    nestweaver_daemon::lifecycle::daemon_socket_candidates(&instance_id)
+        .iter()
+        .any(|socket| socket.exists())
+}
+
+/// `--db` names something that is not a usable database (a directory, an
+/// unreadable file, a file whose header is not `LBUG`). Typed so `main` can
+/// tell a database problem from any other failure under `--json`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DbAdmissionRefused(String);
+
+/// Under `--json`, the stdout envelope for a command that failed because its
+/// database cannot be used. Those failures printed NOTHING on stdout, so a
+/// `--json` consumer saw an empty stream it could not tell from a crash; every
+/// other classified failure already writes an envelope. `None` when the
+/// failure is not a database problem.
+fn db_problem_json_envelope(
+    admission_refused: bool,
+    report: &miette::Report,
+) -> Option<serde_json::Value> {
+    let typed = admission_refused;
+    let code = report.code().map(|code| code.to_string());
+    let db_code = code
+        .as_deref()
+        .is_some_and(|code| code.starts_with("nestweaver::db_") || code == "nestweaver::empty_db");
+    if !typed && !db_code {
+        return None;
+    }
+    Some(serde_json::json!({
+        "error": "database unavailable",
+        "code": code.unwrap_or_else(|| "nestweaver::db_unusable".to_string()),
+        "message": report.to_string(),
+    }))
+}
+
+/// Whether the command line asked for `--json` (before any `--`).
+fn argv_requests_json() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--json")
+}
+
 fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
     let Some(selected) = selected_existing_database(db_path)? else {
         anyhow::bail!("database not found at {}", db_path.display());
     };
     let db_path = selected.as_path();
     if db_path.is_dir() {
-        anyhow::bail!(
+        return Err(DbAdmissionRefused(format!(
             "{} is a directory, not a NestWeaver database. Point --db at a \
              `.lbug` file, or run `nestweaver index --repo <path> --db <new \
              path>` to create one.",
             db_path.display()
-        );
+        ))
+        .into());
     }
     let mut header = [0u8; 4];
     let read = (|| -> std::io::Result<usize> {
@@ -14950,11 +15396,12 @@ fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         file.read(&mut header)
     })();
     match read {
-        Err(error) => anyhow::bail!(
+        Err(error) => Err(DbAdmissionRefused(format!(
             "{} cannot be read: {error}. Check its permissions, or point --db \
              at a database you can read.",
             db_path.display()
-        ),
+        ))
+        .into()),
         // nw-385. A `--db` that yields NO bytes is REFUSED on the read path,
         // and the exemption this arm replaces is the whole bug.
         //
@@ -14987,12 +15434,13 @@ fn require_openable_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         // the cost nw-309 (see above) exists to eliminate.
         Ok(0) => Err(no_bytes_refusal(db_path)),
         Ok(_) if header == *LBUG_FILE_MAGIC => Ok(()),
-        Ok(_) => anyhow::bail!(
+        Ok(_) => Err(DbAdmissionRefused(format!(
             "{} is not a NestWeaver database (its header is not `LBUG`). \
              Point --db at a `.lbug` file, or run `nestweaver index --repo <path> \
              --db <new path>` to create one.",
             db_path.display()
-        ),
+        ))
+        .into()),
     }
 }
 
@@ -16669,8 +17117,30 @@ macro_rules! cli_stderr_tracing {
                     .add_directive(tracing::Level::WARN.into()),
             )
             .with_writer(BrokenPipeStderr::process)
+            .with_ansi(stderr_tracing_ansi())
             .log_internal_errors(false)
     };
+}
+
+/// `--no-color`/`--plain`, recorded before the stderr subscriber is built.
+static CLI_NO_COLOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether stderr tracing may use ANSI colour: only on a terminal, and never
+/// under `--no-color`, `--plain` or `NO_COLOR`. The subscriber coloured
+/// unconditionally, so a log file or a pipe got escape sequences the rest of
+/// the CLI's output was already careful to omit.
+fn stderr_tracing_ansi() -> bool {
+    use std::io::IsTerminal;
+    tracing_ansi_allowed(
+        std::io::stderr().is_terminal(),
+        CLI_NO_COLOR.load(std::sync::atomic::Ordering::Relaxed),
+        // no-color.org: "present and not an empty string".
+        std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+    )
+}
+
+fn tracing_ansi_allowed(stderr_is_terminal: bool, no_color_flag: bool, no_color_env: bool) -> bool {
+    stderr_is_terminal && !no_color_flag && !no_color_env
 }
 
 fn write_stderr_to(
@@ -16916,6 +17386,10 @@ fn main() {
     );
     #[cfg(target_os = "macos")]
     let forks_into_daemon = false;
+    CLI_NO_COLOR.store(
+        cli.no_color || cli.plain,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if !is_daemon_run && !forks_into_daemon {
         cli_stderr_tracing!().init();
     }
@@ -16979,7 +17453,15 @@ fn main() {
             } else {
                 EXIT_ERROR
             };
+            let admission_refused = e.chain().any(|cause| cause.is::<DbAdmissionRefused>());
             let report = into_diagnostic(e);
+            if argv_requests_json()
+                && let Some(envelope) = db_problem_json_envelope(admission_refused, &report)
+            {
+                // Best effort: a closed stdout must not turn into a panic.
+                let _ =
+                    std::io::Write::write_fmt(&mut std::io::stdout(), format_args!("{envelope}\n"));
+            }
             if let Err(error) = write_stderr(format_args!("{report:?}")) {
                 // The failure message is what hit the closed pipe. Dropping
                 // it must not replace the command's exit code with success.
@@ -17023,7 +17505,13 @@ fn pre_push_changed_file_count(repo_path: &Path, diff: Option<&str>) -> usize {
     if range.starts_with('-') {
         return 0;
     }
-    std::process::Command::new("git")
+    // `git diff` against the working tree runs the repository's fsmonitor and
+    // clean filters, and its config names both: the isolated command runs
+    // neither.
+    let Ok(mut command) = nestweaver_engine::git_cmd::isolated_git_in(repo_path) else {
+        return 0;
+    };
+    command
         .args(["diff", "--name-only", "-z", range, "--"])
         .current_dir(repo_path)
         .output()
@@ -17036,6 +17524,124 @@ fn pre_push_changed_file_count(repo_path: &Path, diff: Option<&str>) -> usize {
                 .filter(|path| !path.is_empty())
                 .count()
         })
+}
+
+#[cfg(test)]
+mod secret_env_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// `--help` prints an env-backed argument's current value unless the
+    /// argument hides it, so `NESTWEAVER_TOKEN=... nestweaver connect --help`
+    /// printed the token. Every secret-looking env argument must hide it.
+    #[test]
+    fn secret_env_arguments_hide_their_values_in_help() {
+        // A big stack: building the very wide `Commands` parser overflows
+        // libtest's default 2 MiB thread stack, which killed the whole
+        // test binary with SIGSEGV.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(secret_env_arguments_hide_their_values_in_help_body)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    fn secret_env_arguments_hide_their_values_in_help_body() {
+        fn walk(command: &clap::Command, path: &str, leaks: &mut Vec<String>) {
+            for arg in command.get_arguments() {
+                let Some(env) = arg.get_env() else { continue };
+                let env = env.to_string_lossy().to_ascii_uppercase();
+                let secret = ["TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL"]
+                    .iter()
+                    .any(|word| env.contains(word));
+                if secret && !arg.is_hide_env_values_set() {
+                    leaks.push(format!("{path} --{} ({env})", arg.get_id()));
+                }
+            }
+            for sub in command.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), leaks);
+            }
+        }
+        let mut leaks = Vec::new();
+        let command = Cli::command();
+        walk(&command, "nestweaver", &mut leaks);
+        assert!(
+            leaks.is_empty(),
+            "secret env values shown in --help: {leaks:?}"
+        );
+        let mut checked = 0;
+        fn count(command: &clap::Command, checked: &mut usize) {
+            *checked += command
+                .get_arguments()
+                .filter(|arg| arg.is_hide_env_values_set())
+                .count();
+            for sub in command.get_subcommands() {
+                count(sub, checked);
+            }
+        }
+        count(&command, &mut checked);
+        assert!(
+            checked >= 6,
+            "the secret arguments were not found: {checked}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pre_push_changed_file_count_tests {
+    use super::pre_push_changed_file_count;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+
+    /// `pre-push-impact --local-changes` diffs the working tree. The
+    /// repository's fsmonitor and clean filter must not run.
+    #[test]
+    fn counts_changes_without_running_repository_programs() {
+        let repo = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        git(root, &["add", "a.rs"]);
+        git(root, &["commit", "-q", "-m", "init"]);
+        let program = markers.path().join("program.sh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nexec cat\n",
+                markers.path().join("ran").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = program.to_str().unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.rs filter=evil\n").unwrap();
+        git(root, &["config", "filter.evil.clean", program]);
+        git(root, &["config", "core.fsmonitor", program]);
+        // Same size, new content: only a content comparison can tell.
+        std::fs::write(root.join("a.rs"), "fn b() {}\n").unwrap();
+
+        assert_eq!(pre_push_changed_file_count(root, None), 1);
+        assert!(
+            !markers.path().join("ran").exists(),
+            "a repository program ran"
+        );
+    }
 }
 
 /// The coverage caveat every incomplete-impact disclosure ends with.
@@ -18049,7 +18655,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     eprintln!("  {} ({})", r.uid, r.name.as_deref().unwrap_or(&r.url));
                 }
                 eprintln!("Re-run with the full UID to disambiguate.");
-                return Ok((EXIT_ERROR, None));
+                // Ambiguous is 3 in the documented exit-code contract.
+                return Ok((EXIT_AMBIGUOUS, None));
             }
 
             let repo = matched[0];
@@ -18109,7 +18716,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     eprintln!("  {} ({})", p.uid, p.name);
                 }
                 eprintln!("Re-run with the full UID to disambiguate.");
-                return Ok((EXIT_ERROR, None));
+                // Ambiguous is 3 in the documented exit-code contract.
+                return Ok((EXIT_AMBIGUOUS, None));
             }
 
             let project = matched[0];
@@ -18240,6 +18848,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             println!("Pruned {total} stale source(s).");
                         }
                         println!("Committed: {}", resp.committed);
+                        // Sources KEPT because their root could not be
+                        // checked: the JSON route reported them, the text
+                        // route silently dropped them.
+                        for line in prune_stale_skipped_lines(&resp.skipped_warnings) {
+                            eprintln!("{line}");
+                        }
                         for failure in &resp.reconciliation_failures {
                             eprintln!(
                                 "Warning: reconciliation {} [{}]: {}",
@@ -21181,6 +21795,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 // History lives beside the graph the daemon serves: follow the
                 // publication CURRENT, not a base left behind by a rebuild.
                 let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
+                // A typo'd `--db` used to report "No interaction data to
+                // clear." and exit 0, indistinguishable from a real clear.
+                if !db_path.exists() {
+                    anyhow::bail!("database not found at {}", db_path.display());
+                }
                 if nestweaver_engine::clear_interaction_sidecar(&db_path) {
                     println!("Interaction memory cleared.");
                 } else {
@@ -22564,11 +23183,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // exists to catch, and it caught this.
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_openable_db(&db_path)?;
+            // Stopping must not START a daemon: with none running there is
+            // no watcher, which is the outcome the caller asked for. `connect`
+            // autostarts, so look for a live socket first and only then attach.
+            if !daemon_socket_present(&db_path) {
+                out.status("No daemon is running, so no watcher was running.");
+                return Ok((EXIT_SUCCESS, None));
+            }
             let rt = tokio::runtime::Runtime::new()?;
-            let mut client = rt.block_on(nestweaver_client::DaemonClient::connect(
-                &db_path,
-                config.as_deref(),
-            ))?;
+            let mut client =
+                rt.block_on(nestweaver_client::DaemonClient::connect_existing(&db_path))?;
             let resp = rt
                 .block_on(async {
                     client
@@ -23585,6 +24209,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 c.scanned_candidates,
                                 c.timings.total_ms,
                             );
+                            if c.truncated {
+                                println!(
+                                    "    (incomplete: the time budget ran out; these counts are lower bounds)"
+                                );
+                            }
                         }
                         // Surface in-band staleness the daemon's stderr
                         // warning can't reach us with.
@@ -23635,6 +24264,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         c.scanned_candidates,
                         c.timings.total_ms,
                     );
+                    if c.truncated {
+                        println!(
+                            "    (incomplete: the time budget ran out; these counts are lower bounds)"
+                        );
+                    }
                 }
                 // Surface in-band staleness (the direct path's own
                 // stderr warning is a once-per-process latch that may already
@@ -23732,8 +24366,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let res = match root.as_deref() {
                 Some(root) => {
+                    // The same containment the daemon's read_symbols applies,
+                    // so both routes refuse a --root outside every indexed
+                    // source (a missing or unsearchable one passes through to
+                    // the unreadable_root diagnostic below).
+                    let contained = nestweaver_mcp::tools::contained_source_root(&store, root)?;
                     let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
-                        root, limits,
+                        &contained, limits,
                     );
                     nestweaver_engine::read_symbols::read_symbols(
                         &store,
@@ -25115,18 +25754,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // failed".
             let daemon_value = match daemon_result {
                 Ok(value) => value,
-                Err(error) if format!("{error:#}").contains("not found") => {
-                    // nw-399: this arm already had the right EXIT code (2) and
-                    // the right remedy on stderr — and emitted zero bytes on
-                    // stdout, so a `--json` caller saw an empty stream and could
-                    // not tell it apart from a crash.
-                    if json {
-                        print_json_not_found("project", &name);
-                    }
-                    eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
-                    return Ok((EXIT_NOT_FOUND, None));
-                }
-                Err(error) => return Err(error),
+                Err(error) => match report_project_context_failure(&error, &name, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
             };
             if let Some(value) = daemon_value {
                 render_project_context_daemon_response(&value, json, token_budget);
@@ -25188,18 +25819,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // not depend on which transport answered.
             let value = match response {
                 Ok(value) => value,
-                Err(error) if format!("{error:#}").contains("not found") => {
-                    // nw-399: this arm already had the right EXIT code (2) and
-                    // the right remedy on stderr — and emitted zero bytes on
-                    // stdout, so a `--json` caller saw an empty stream and could
-                    // not tell it apart from a crash.
-                    if json {
-                        print_json_not_found("project", &name);
-                    }
-                    eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
-                    return Ok((EXIT_NOT_FOUND, None));
-                }
-                Err(error) => return Err(error),
+                Err(error) => match report_project_context_failure(&error, &name, json) {
+                    Some(code) => return Ok((code, None)),
+                    None => return Err(error),
+                },
             };
             render_project_context_daemon_response(&value, json, token_budget);
             Ok((EXIT_SUCCESS, None))
@@ -25272,6 +25895,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
             let root = root.unwrap_or_else(detect_repo_root);
+            // As the daemon's investigate does: a root outside every indexed
+            // source serves no bodies, and the payload says why.
+            let (root, root_not_used) =
+                nestweaver_mcp::tools::investigate_root_or_none(&store, &root);
             // nw-189: "all", not "vault". Both are pass-throughs, but the
             // result echoes this string back, and defaulting to "vault" told a
             // caller who supplied NO scope that their results were
@@ -25298,6 +25925,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Built unconditionally so text and JSON render from the SAME
             // payload, and so the daemon path can reuse the renderer (nw-108).
             let mut payload = serde_json::to_value(&result)?;
+            if let (Some(refused), Some(object)) = (root_not_used, payload.as_object_mut()) {
+                object.insert("root_not_used".into(), serde_json::json!(refused));
+            }
             // nw-670 re-review R1: the direct route stamps what the daemon's
             // MCP seam would have.
             nestweaver_engine::code_links::stamp_code_links_disclosure(&db_path, &mut payload);
@@ -25952,12 +26582,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // root: `git config` walks up to an enclosing repo, and a
             // subdirectory index must not capture (and collide with) its
             // parent repo's identity.
+            nestweaver_engine::ensure_own_git_metadata(&repo_path)?;
             let repo_url = nestweaver_engine::mint_repo_identity(&repo_path);
 
             // Direct-write fallback for test/CI (NESTWEAVER_NO_DAEMON=1).
             out.status(&format!("Indexing {}", repo_path.display()));
 
-            let indexed_sha = std::process::Command::new("git")
+            let indexed_sha = nestweaver_engine::git_cmd::isolated_git()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(&repo_path)
                 .output()
@@ -27814,7 +28445,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         )
                     };
                     let mut waited_ms: u64 = 0;
-                    for _ in 0..(grace_secs * 10) {
+                    // Saturating: a huge NESTWEAVER_STOP_GRACE_SECS overflowed
+                    // `grace_secs * 10` (a panic in debug, a wrapped — possibly
+                    // zero — wait in release).
+                    for _ in 0..grace_secs.saturating_mul(10) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         waited_ms += 100;
                         if unsafe { libc::kill(pid, 0) } != 0 {
@@ -28009,16 +28643,28 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             }
                             _ => ("not_running", "no_observed_owner", None),
                         };
+                        // Absolute: a relative `--db` is meaningless to
+                        // whoever reads this JSON from another directory.
+                        let db_path_abs =
+                            std::path::absolute(&db_path).unwrap_or_else(|_| db_path.clone());
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "state": state, "evidence": evidence, "pid": pid, "endpoint_error": endpoint_error,
-                                "db_path": db_path, "instance_id": instance_id, "socket": socket,
+                                "db_path": db_path_abs, "instance_id": instance_id, "socket": socket,
                                 "supervision": pid.map(nestweaver_daemon::lifecycle::process_supervision).unwrap_or("unknown/unverifiable"),
                                 "next_action": if state == "running_but_unreachable" || state == "unknown" { "Inspect the verified holder. Do not start another writer or remove runtime files." } else { "Use daemon stop/restart for this selected database; a systemd-user owner may restart it until its unit is stopped." }
                             }))?
                         );
-                        return Ok((EXIT_SUCCESS, None));
+                        let unhealthy = matches!(state, "running_but_unreachable" | "unknown");
+                        return Ok((
+                            if unhealthy {
+                                EXIT_DAEMON_UNHEALTHY
+                            } else {
+                                EXIT_SUCCESS
+                            },
+                            None,
+                        ));
                     }
                     if let Some(error) = &endpoint_error {
                         println!(
@@ -28087,6 +28733,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     owner, &db_path, &socket, &pidfile, &log_hint
                                 )
                             );
+                            return Ok((EXIT_DAEMON_UNHEALTHY, None));
                         } else {
                             println!(
                                 "{}",
@@ -28128,7 +28775,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 owner, &db_path, &socket, &pidfile, &log_hint
                             )
                         );
-                        return Ok((EXIT_SUCCESS, None));
+                        return Ok((EXIT_DAEMON_UNHEALTHY, None));
                     }
                     // nw-145 migration: before declaring nothing is running,
                     // check the pre-anchoring identity 6.3.0 would have used.
@@ -28168,7 +28815,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         "{}",
                         format_daemon_not_running_status("Daemon is not running.")
                     );
-                    Ok((EXIT_SUCCESS, None))
+                    // The endpoint failed verification (printed above): the
+                    // same "unknown" state the JSON route reports as unhealthy.
+                    Ok((
+                        if endpoint_error.is_some() {
+                            EXIT_DAEMON_UNHEALTHY
+                        } else {
+                            EXIT_SUCCESS
+                        },
+                        None,
+                    ))
                 }
                 DaemonAction::Gc { .. } => unreachable!("daemon gc returns before db resolution"),
                 DaemonAction::Restart {
@@ -28484,12 +29140,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             install,
             uninstall,
             strict,
+            db,
         } => {
             let cwd = std::env::current_dir().context("resolving current directory")?;
             if uninstall {
                 Ok((uninstall_pre_push_hook(&cwd)?, None))
             } else if install {
-                Ok((install_pre_push_hook(&cwd, strict)?, None))
+                let db_path = db.unwrap_or_else(default_db_path);
+                Ok((install_pre_push_hook(&cwd, strict, &db_path)?, None))
             } else {
                 eprintln!(
                     "Specify --install (optionally with --strict) or --uninstall.\n\
@@ -37404,7 +38062,23 @@ credential_method = "ssh"
         let serialized = serde_json::to_string(&c).unwrap();
         assert_eq!(
             serialized,
-            r#"{"pattern":"foo","total_matches":4,"files_matched":2,"top_files":[{"path":"src/a.rs","count":3},{"path":"src/b.rs","count":1}],"stale_index":true,"ready_scopes":0,"dirty_scopes":0,"error_scopes":0,"posting_hits":0,"hydrated_candidates":0,"scanned_candidates":0,"timings":{"planning_ms":0,"hydration_ms":0,"verification_ms":0,"total_ms":0}}"#
+            r#"{"pattern":"foo","total_matches":4,"files_matched":2,"top_files":[{"path":"src/a.rs","count":3},{"path":"src/b.rs","count":1}],"stale_index":true,"ready_scopes":0,"dirty_scopes":0,"error_scopes":0,"posting_hits":0,"hydrated_candidates":0,"scanned_candidates":0,"timings":{"planning_ms":0,"hydration_ms":0,"verification_ms":0,"total_ms":0},"truncated":false}"#
+        );
+
+        // A budget-cut pattern keeps its truncation disclosure.
+        let cut = serde_json::json!({
+            "pattern": "foo",
+            "total_matches": 1,
+            "files_matched": 1,
+            "top_files": [],
+            "truncated": true,
+            "truncation_reason": "deadline",
+        });
+        let c = pattern_count_from_tool_json(&cut).expect("a cut entry must rebuild");
+        assert!(c.truncated);
+        assert_eq!(
+            c.truncation_reason,
+            Some(nestweaver_store::regex::RegexTruncationReason::Deadline)
         );
 
         // A pre-`stale_index` daemon payload still rebuilds (default false).
@@ -38282,7 +38956,8 @@ mod pr_impact_hook_tests {
         let repo = tmp.path();
         git(repo, &["init", "-q"]);
 
-        let code = install_pre_push_hook(repo, false).expect("install");
+        let code =
+            install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install");
         assert_eq!(code, EXIT_SUCCESS);
 
         let hook = git_hooks_dir(repo).unwrap().join("pre-push");
@@ -38323,7 +38998,7 @@ mod pr_impact_hook_tests {
         let repo = tmp.path();
         git(repo, &["init", "-q"]);
 
-        install_pre_push_hook(repo, true).expect("install");
+        install_pre_push_hook(repo, true, &repo.join("nestweaver.lbug")).expect("install");
         let hook = git_hooks_dir(repo).unwrap().join("pre-push");
         let body = std::fs::read_to_string(&hook).unwrap();
         assert!(
@@ -38351,7 +39026,7 @@ mod pr_impact_hook_tests {
         let hook = hooks_dir.join("pre-push");
         std::fs::write(&hook, "#!/bin/sh\necho custom-hook\n").unwrap();
 
-        install_pre_push_hook(repo, false).expect("install");
+        install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install");
         let backup = hooks_dir.join("pre-push.nestweaver.bak");
         assert!(backup.exists(), "a foreign pre-push must be backed up");
         assert!(
@@ -38413,7 +39088,7 @@ mod pr_impact_hook_tests {
         let real_path = std::env::var("PATH").unwrap_or_default();
         let path = format!("{}:{}", bindir.display(), real_path);
 
-        let script = nestweaver_pre_push_hook(false);
+        let script = nestweaver_pre_push_hook(false, Path::new("/tmp/nestweaver.lbug"));
         // Every failure the tool can exit with — missing DB (1), arg error (2),
         // binary-not-found (127) — must still leave the push un-blocked.
         for code in [1, 2, 127] {
@@ -38456,7 +39131,7 @@ mod pr_impact_hook_tests {
 
         // First foreign hook → backed up to the default `.bak`.
         std::fs::write(&hook, "#!/bin/sh\necho original\n").unwrap();
-        install_pre_push_hook(repo, false).expect("install 1");
+        install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install 1");
         let bak = hooks_dir.join("pre-push.nestweaver.bak");
         assert!(
             std::fs::read_to_string(&bak)
@@ -38468,7 +39143,7 @@ mod pr_impact_hook_tests {
         // Drop a *second* foreign hook in place and reinstall; the original
         // backup must survive and the second goes to a numbered backup.
         std::fs::write(&hook, "#!/bin/sh\necho second\n").unwrap();
-        install_pre_push_hook(repo, false).expect("install 2");
+        install_pre_push_hook(repo, false, &repo.join("nestweaver.lbug")).expect("install 2");
         assert!(
             std::fs::read_to_string(&bak)
                 .unwrap()
@@ -38482,6 +39157,143 @@ mod pr_impact_hook_tests {
                 .contains("echo second"),
             "a second foreign hook must get a numbered backup"
         );
+
+        // Uninstall restores the hook displaced MOST RECENTLY (`.bak.1`), not
+        // the oldest fixed-name `.bak`, and leaves the older one in place.
+        uninstall_pre_push_hook(repo).expect("uninstall");
+        assert!(
+            std::fs::read_to_string(&hook)
+                .unwrap()
+                .contains("echo second"),
+            "uninstall must restore the newest backup"
+        );
+        assert!(!bak1.exists());
+        assert!(
+            std::fs::read_to_string(&bak)
+                .unwrap()
+                .contains("echo original"),
+            "the older backup must survive"
+        );
+    }
+
+    /// The hook ran `pr-impact` with no `--db`, so from the repository root it
+    /// looked for `./nestweaver.lbug`: `--strict` rejected every push whose
+    /// graph lived elsewhere. The resolved database must reach `pr-impact` as
+    /// one verbatim argument, whatever characters its path contains.
+    #[test]
+    #[cfg(unix)]
+    fn hook_passes_the_installed_database_to_pr_impact() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "c0",
+            ],
+        );
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        let pwned = tmp.path().join("PWNED");
+        let db = tmp
+            .path()
+            .join(format!("graphs dir/it's;touch {}.lbug", pwned.display()));
+        for strict in [false, true] {
+            let script = nestweaver_pre_push_hook(strict, &db);
+            let bindir = tmp.path().join("bin");
+            std::fs::create_dir_all(&bindir).unwrap();
+            let record = tmp.path().join("argv");
+            let stub = bindir.join("nestweaver");
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nexit 0\n",
+                    record.display()
+                ),
+            )
+            .unwrap();
+            make_executable(&stub).unwrap();
+            let path = format!(
+                "{}:{}",
+                bindir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(&repo)
+                .env("PATH", &path)
+                .output()
+                .expect("run hook");
+            assert!(out.status.success(), "{out:?}");
+            assert!(!pwned.exists(), "the database path was executed as shell");
+            let argv = std::fs::read_to_string(&record).unwrap();
+            let argv: Vec<&str> = argv.lines().collect();
+            let at = argv.iter().position(|a| *a == "--db").expect("--db passed");
+            assert_eq!(argv[at + 1], db.to_str().unwrap(), "strict={strict}");
+        }
+    }
+
+    /// A dangling `pre-push` symlink read as "no hook" (`exists` follows
+    /// links) and the write created a 0755 file at the link's target — outside
+    /// the repository. The link must be moved aside as a link, nothing created
+    /// at its target, and a regular hook file written in its place.
+    #[test]
+    #[cfg(unix)]
+    fn install_never_writes_through_a_pre_push_symlink() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        let hooks_dir = git_hooks_dir(&repo).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook = hooks_dir.join("pre-push");
+        let outside = tmp.path().join("outside/created-by-install");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &hook).unwrap();
+
+        install_pre_push_hook(&repo, false, &repo.join("nestweaver.lbug")).expect("install");
+
+        assert!(
+            !outside.exists(),
+            "nothing may be created at the link target"
+        );
+        let meta = std::fs::symlink_metadata(&hook).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the hook must be a regular file"
+        );
+        let backup = hooks_dir.join("pre-push.nestweaver.bak");
+        assert!(
+            std::fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the user's link is moved aside as a link"
+        );
+        assert_eq!(std::fs::read_link(&backup).unwrap(), outside);
+
+        // Uninstall puts the link back as it was.
+        uninstall_pre_push_hook(&repo).expect("uninstall");
+        assert_eq!(std::fs::read_link(&hook).unwrap(), outside);
+        assert!(!outside.exists());
     }
 }
 
@@ -43175,7 +43987,9 @@ mod cli_honesty_sweep_tests {
         for exception in [
             "NOT UNIVERSAL",
             "BEFORE --json is read",
-            "uncompilable --pattern",
+            // `regex-search`'s pattern is positional; there is no
+            // `--pattern` flag, which the help used to name.
+            "uncompilable regex pattern",
         ] {
             assert!(
                 help.contains(exception),
@@ -43821,5 +44635,107 @@ mod publication_status_recovery_tests {
             .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_fix_round_tests {
+    use super::*;
+
+    /// QA: `project-context --repos <unknown>` was reported as "Project not
+    /// found" because any error text containing "not found" was. The class
+    /// now comes from the error's type.
+    #[test]
+    fn project_context_classifies_misses_by_type_not_text() {
+        let repo_miss: anyhow::Error = nestweaver_engine::node_scope::RepoFilterUnresolved::new(
+            "nope",
+            &anyhow::anyhow!("repo 'nope' not found"),
+        )
+        .into();
+        assert_eq!(
+            report_project_context_failure(&repo_miss, "proj", false),
+            Some(EXIT_NOT_FOUND)
+        );
+        let project_miss = nestweaver_mcp::tools::target_not_found(
+            "project 'proj' not found",
+            "project",
+            serde_json::json!("proj"),
+            &[],
+        );
+        assert_eq!(
+            report_project_context_failure(&project_miss, "proj", false),
+            Some(EXIT_NOT_FOUND)
+        );
+        // A plain failure that merely says "not found" is not a miss.
+        let other = anyhow::anyhow!("tantivy segment not found");
+        assert_eq!(report_project_context_failure(&other, "proj", false), None);
+    }
+
+    /// QA: `--no-color` and a non-TTY stderr still got ANSI in tracing output.
+    #[test]
+    fn stderr_tracing_colours_only_an_unsuppressed_terminal() {
+        assert!(tracing_ansi_allowed(true, false, false));
+        assert!(!tracing_ansi_allowed(false, false, false), "a pipe or file");
+        assert!(
+            !tracing_ansi_allowed(true, true, false),
+            "--no-color / --plain"
+        );
+        assert!(!tracing_ansi_allowed(true, false, true), "NO_COLOR");
+    }
+
+    /// QA: `prune-stale` text output dropped the sources it KEPT.
+    #[test]
+    fn prune_stale_text_names_the_sources_it_kept() {
+        let lines = prune_stale_skipped_lines(&["repo:a (/x): permission denied".to_string()]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("kept"), "{}", lines[0]);
+        assert!(lines[0].contains("permission denied"), "{}", lines[0]);
+        assert!(prune_stale_skipped_lines(&[]).is_empty());
+    }
+
+    /// QA: an unparsable stop grace silently fell back, and a huge one
+    /// overflowed `grace_secs * 10`.
+    #[test]
+    fn stop_grace_ignores_garbage_and_never_overflows() {
+        assert_eq!(
+            resolve_stop_grace_secs(Some("5m"), None),
+            DEFAULT_DRAIN_CEILING_SECS + STOP_GRACE_BUFFER_SECS
+        );
+        let huge = resolve_stop_grace_secs(Some("18446744073709551615"), None);
+        assert_eq!(huge, u64::MAX);
+        assert_eq!(huge.saturating_mul(10), u64::MAX);
+    }
+
+    #[test]
+    fn project_context_kinds_are_validated_as_prefixes() {
+        for ok in ["Symbol", "sym", "NOTE", "section", "Symbol/Function", "tag"] {
+            assert!(parse_project_context_kind(ok).is_ok(), "{ok}");
+        }
+        for bad in ["bogus", "", "symbol/", "notes"] {
+            let error = parse_project_context_kind(bad).unwrap_err();
+            assert!(error.contains("Symbol, Note, Section"), "{bad}: {error}");
+        }
+        // A big stack: building the very wide `Commands` parser overflows
+        // libtest's default 2 MiB thread stack.
+        let refused = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                [
+                    vec!["nestweaver", "project-context", "p", "--kinds", "bogus"],
+                    vec!["nestweaver", "context", ""],
+                    vec!["nestweaver", "symbol", "  "],
+                    vec!["nestweaver", "pr-impact", "--files", ""],
+                    vec!["nestweaver", "pr-impact", "--files", ",,"],
+                ]
+                .into_iter()
+                .map(|argv| (argv.join(" "), Cli::try_parse_from(argv).is_err()))
+                .collect::<Vec<_>>()
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        for (argv, is_err) in refused {
+            assert!(is_err, "clap must refuse `{argv}` (a usage error, exit 64)");
+        }
     }
 }

@@ -1298,6 +1298,83 @@ pub(crate) fn record_vault_owed_paths(
     });
 }
 
+/// Marks the row [`record_vault_index_interrupted`] writes, so
+/// [`clear_vault_index_interrupted`] removes only its own row.
+const VAULT_INDEX_INTERRUPTED_MARKER: &str = "full vault index did not finish";
+
+/// A full vault index replaces the vault's graph in one transaction, but the
+/// search index is rebuilt from the note bodies ON DISK. A process killed
+/// between the scan and that commit left the graph at its old state while
+/// search could already return the new text, and `brain status` read
+/// current. This row, written durably before the graph write, survives that
+/// death: `brain status` lists it under `reconciliation_pending` until a full
+/// index of the vault lands (or a brain watcher's startup reconciliation,
+/// which replays the disk-vs-graph drift, replaces the vault's debt).
+pub(crate) fn record_vault_index_interrupted(db_path: Option<&Path>, vault_root: &Path) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let path = vault_root.to_string_lossy().into_owned();
+    let reason = format!(
+        "{WATCH_RECONCILIATION_PENDING_REASON}: {VAULT_INDEX_INTERRUPTED_MARKER}; the graph may \
+         predate the notes on disk while search already shows their new text. Run \
+         `nestweaver brain refresh {path}`"
+    );
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let owed = sidecar
+            .reconciliation_pending
+            .entry(path.clone())
+            .or_default();
+        owed.retain(|row| !row.reason.contains(VAULT_INDEX_INTERRUPTED_MARKER));
+        owed.push(SkippedFile::new(
+            path.clone(),
+            SkipReasonCode::Other,
+            reason,
+        ));
+        owed.sort_by(|a, b| a.path.cmp(&b.path));
+        Some(build_skipped_notes_sidecar(
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
+        ))
+    });
+}
+
+/// Retire [`record_vault_index_interrupted`]'s row once a full index of the
+/// vault has committed. Other owed rows stay.
+pub(crate) fn clear_vault_index_interrupted(db_path: Option<&Path>, vault_root: &Path) {
+    let Some(db_path) = db_path else {
+        return;
+    };
+    let key = vault_root.to_string_lossy().into_owned();
+    update_skipped_notes_sidecar(db_path, |mut sidecar| {
+        let owed = sidecar.reconciliation_pending.get_mut(&key)?;
+        let before = owed.len();
+        owed.retain(|row| !row.reason.contains(VAULT_INDEX_INTERRUPTED_MARKER));
+        if owed.len() == before {
+            return None;
+        }
+        if owed.is_empty() {
+            sidecar.reconciliation_pending.remove(&key);
+        }
+        Some(build_skipped_notes_sidecar(
+            sidecar.skipped,
+            sidecar.notes_near_size_limit,
+            sidecar.unindexable_mtimes,
+            sidecar.reconciliation_pending,
+            sidecar.frontmatter_unparsed,
+            sidecar.skipped_truncated,
+            sidecar.near_limit_truncated,
+            None,
+        ))
+    });
+}
+
 /// V1: marks the rows [`record_vault_wikilink_debt`] writes, so
 /// [`clear_vault_wikilink_debt`] removes only its own rows and never another
 /// reason's (owed code links, an owed startup replay).
@@ -2701,6 +2778,27 @@ fn index_markdown_since_with_reader(
     )
 }
 
+/// Refuse a vault name the store would reject, BEFORE the publication marker.
+///
+/// The store refuses a control character in a vault name, but it does so
+/// inside the bulk write, which runs after `begin_graph_mutation_publication`
+/// has made the durable dirty marker. A dropped guard deliberately leaves that
+/// marker, so a rejected `brain add` of a folder named with a control
+/// character wedged every later vault write ("refusing to overwrite a dirty
+/// publication") until a daemon restart. Checking here keeps the refusal a
+/// plain error with nothing published. The name is usually the folder's own
+/// name, so the message says how to give another one.
+fn refuse_unstorable_vault_name(vault_name: &str, vault_root: &Path) -> anyhow::Result<()> {
+    if let Some(problem) = nestweaver_schema::source_name_problem(vault_name) {
+        anyhow::bail!(
+            "invalid vault name {vault_name:?} for {}: {problem}; pass a valid --name \
+             (MCP: `name`) to register this folder under another name",
+            vault_root.display()
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn index_markdown_since_with_reader_mode(
     store: &GraphStore,
@@ -2716,6 +2814,7 @@ fn index_markdown_since_with_reader_mode(
     let v_uid = vault_uid(instance_id, &root_str);
     let vault_name =
         &crate::vault_registration::effective_vault_name(store, &v_uid, vault_name, vault_root);
+    refuse_unstorable_vault_name(vault_name, vault_root)?;
     crate::vault_registration::refuse_new_local_vault(
         store,
         &v_uid,
@@ -3906,6 +4005,7 @@ fn note_context_from_candidate(candidate: &ParsedCandidate) -> NoteContext {
                     .map(|heading| heading.text.to_lowercase())
             })
             .collect(),
+        block_ids: Some(note_block_ids(&candidate.parsed)),
     }
 }
 
@@ -3955,6 +4055,7 @@ fn note_context_from_stored(note: &Note, headings: Vec<Heading>) -> NoteContext 
         tags: Vec::new(),
         frontmatter,
         section_heading_text: Vec::new(),
+        block_ids: None,
     }
 }
 
@@ -4176,6 +4277,7 @@ where
     let v_uid = vault_uid(instance_id, &root_str);
     let vault_name =
         &crate::vault_registration::effective_vault_name(store, &v_uid, vault_name, vault_root);
+    refuse_unstorable_vault_name(vault_name, vault_root)?;
     // nw-608: before any scan work. The server-mode route names a vault by its
     // repo URL and roots it at a bare clone, so it is not a local registration.
     if record_repo_sha.is_none() {
@@ -4543,6 +4645,7 @@ where
             tags: parsed.tags.clone(),
             frontmatter: parsed.frontmatter.clone(),
             section_heading_text,
+            block_ids: Some(note_block_ids(&parsed)),
         };
 
         parse_pb.inc(1);
@@ -4827,6 +4930,9 @@ where
     // The durable dirty marker is established immediately before the first
     // possible graph write and remains until generation/artifact publication
     // has completed.
+    // Before the dirty marker and the graph write: a death from here until
+    // the commit below must stay visible after the restart.
+    record_vault_index_interrupted(store.db_path(), vault_root);
     let graph_publication =
         crate::manifest::begin_graph_mutation_publication(store, "full vault refresh")?;
     let notes_deleted = {
@@ -4930,6 +5036,7 @@ where
     }
 
     let publication = graph_publication.finish(true)?;
+    clear_vault_index_interrupted(store.db_path(), vault_root);
     // nw-587: evidence that survives losing the graph's un-checkpointed tail.
     // Local-directory vaults only: the server-mode path (`record_repo_sha`)
     // indexes a repo checkout under its URL, which `brain add` cannot re-add.
@@ -5007,6 +5114,19 @@ struct NoteContext {
     /// "Supersedes" / "Depends on" / "See also" groups). `None` for the
     /// preamble or a section with no owning heading.
     section_heading_text: Vec<Option<String>>,
+    /// Lowercased Obsidian block ids (`^blk1`) declared in the note, or `None`
+    /// when they are not known: a note loaded from the store keeps no block
+    /// ids, so a block link into it cannot be checked and resolves to the note.
+    block_ids: Option<HashSet<String>>,
+}
+
+/// Lowercased block ids of a parsed note, for block-reference links.
+fn note_block_ids(parsed: &nestweaver_parser::markdown::ParsedNote) -> HashSet<String> {
+    parsed
+        .block_refs
+        .iter()
+        .map(|(_, id)| id.to_lowercase())
+        .collect()
 }
 
 /// A navigable destination resolved by the indexing wikilink policy.
@@ -5088,6 +5208,7 @@ pub fn resolve_note_wikilink(
                 tags: Vec::new(),
                 frontmatter,
                 section_heading_text: Vec::new(),
+                block_ids: None,
             }
         })
         .collect();
@@ -5280,6 +5401,8 @@ struct WikilinkLookup<'a> {
     folder_by_note: HashMap<&'a str, &'a str>,
     /// note_uid → heading slug → heading_uid. For anchor resolution.
     headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>>,
+    /// note_uid → its block ids, when known. For `[[Note#^block]]` links.
+    blocks_by_note: HashMap<&'a str, &'a HashSet<String>>,
     /// (folder, lowercased filename stem) → note_uids in that folder.
     ///
     /// Stems ONLY. This map used to hold titles as well, under the same key
@@ -5300,6 +5423,7 @@ impl<'a> WikilinkLookup<'a> {
         let mut by_stem: HashMap<String, Vec<&'a str>> = HashMap::new();
         let mut folder_by_note: HashMap<&'a str, &'a str> = HashMap::new();
         let mut headings_by_note: HashMap<&'a str, HashMap<&'a str, &'a str>> = HashMap::new();
+        let mut blocks_by_note: HashMap<&'a str, &'a HashSet<String>> = HashMap::new();
         let mut by_folder_stem: HashMap<(String, String), Vec<&'a str>> = HashMap::new();
         let mut known_uids: HashSet<&'a str> = HashSet::new();
 
@@ -5352,6 +5476,9 @@ impl<'a> WikilinkLookup<'a> {
                 heading_map.insert(slug.as_str(), h_uid.as_str());
             }
             headings_by_note.insert(note.note_uid.as_str(), heading_map);
+            if let Some(blocks) = &note.block_ids {
+                blocks_by_note.insert(note.note_uid.as_str(), blocks);
+            }
         }
 
         Self {
@@ -5361,6 +5488,7 @@ impl<'a> WikilinkLookup<'a> {
             by_stem,
             folder_by_note,
             headings_by_note,
+            blocks_by_note,
             by_folder_stem,
             known_uids,
         }
@@ -5729,7 +5857,26 @@ impl<'a> WikilinkLookup<'a> {
             unresolved: false,
         };
         for candidate in candidates {
-            if let Some(anchor) = &link.heading_anchor {
+            if let Some(block) = link
+                .heading_anchor
+                .as_deref()
+                .and_then(|anchor| anchor.strip_prefix('^'))
+            {
+                // `[[Note#^blk1]]` names a block, never a heading: it links
+                // the note when the note declares that block id (or when the
+                // note's block ids are not known to this pass).
+                let declared = self
+                    .blocks_by_note
+                    .get(candidate.note_uid.as_str())
+                    .is_none_or(|blocks| blocks.contains(&block.trim().to_lowercase()));
+                if declared {
+                    resolved
+                        .targets
+                        .push((candidate.note_uid, confidence, false));
+                } else {
+                    resolved.unresolved = true;
+                }
+            } else if let Some(anchor) = &link.heading_anchor {
                 if let Some(heading) =
                     self.find_heading(&candidate.note_uid, &slugify_anchor(anchor))
                 {
@@ -8028,6 +8175,57 @@ sub b body
         );
     }
 
+    /// QA regression (#513): a vault name the store refuses (a control
+    /// character, usually from the folder name) used to be rejected inside
+    /// the bulk write, after the durable `.index-dirty` marker was made. The
+    /// dropped guard kept the marker, so every later vault write failed with
+    /// "refusing to overwrite a dirty publication". The refusal must come
+    /// first, on both refresh routes, and leave the next write working.
+    #[test]
+    fn unstorable_vault_name_is_refused_before_the_publication_marker() {
+        let (dir, root) = make_vault(&[("ok.md", "# Ok\n\nbody\n")]);
+        let db_path = dir.path().join("graph.lbug");
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let marker = crate::sidecar_path(&db_path, ".index-dirty");
+        let since = std::time::SystemTime::UNIX_EPOCH;
+
+        let full = index_markdown_directory_with_store(
+            &store,
+            &root,
+            &db_path,
+            "default",
+            "bad\u{7}name",
+            &[],
+        );
+        let message = format!(
+            "{:#}",
+            full.err().expect("control character must be refused")
+        );
+        assert!(message.contains("--name"), "{message}");
+        assert!(!marker.exists(), "a refused add must not leave {marker:?}");
+
+        let incremental = index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "default",
+            "bad\u{1b}name",
+            since,
+            &[],
+        );
+        let message = format!("{:#}", incremental.err().expect("--since route too"));
+        assert!(message.contains("--name"), "{message}");
+        assert!(
+            !marker.exists(),
+            "a refused --since add must not leave {marker:?}"
+        );
+
+        // The next write is not wedged.
+        let ok = index_markdown_directory_with_store(&store, &root, &db_path, "default", "v", &[])
+            .unwrap();
+        assert_eq!(ok.notes_count, 1);
+        assert!(!marker.exists());
+    }
+
     #[test]
     fn refresh_persists_skipped_files_sidecar() {
         let note = |title: &str, size: usize| {
@@ -8720,6 +8918,38 @@ sub b body
         // Verify the wikilink went to the Heading variant.
         let count = store.count_wikilink_edges().unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// QA vault: `[[Beta#^blk1]]` names an Obsidian block id, not a heading.
+    /// It used to be slugified as a heading and recorded as unresolved.
+    #[test]
+    fn block_ref_anchor_resolves_against_block_ids() {
+        let (_dir, root) = make_vault(&[
+            ("beta.md", "# Beta\n\n## Section One\nSome text ^blk1\n"),
+            (
+                "alpha.md",
+                "# Alpha\n\n[[Beta#^blk1]] [[Beta#^BLK1]] [[Beta#^nope]] [[Absent#^blk1]]\n",
+            ),
+        ]);
+        let (result, store) = index_markdown_directory_in_memory(&root, "default", "v").unwrap();
+        assert_eq!(result.resolved_link_edges, 2);
+        let targets: HashSet<_> = store
+            .all_unresolved_wikilinks()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.4)
+            .collect();
+        assert_eq!(
+            targets,
+            HashSet::from(["Beta#^nope".into(), "Absent#^blk1".into()])
+        );
+        let broken = crate::brain_docgraph::broken_links(&store, 3).unwrap();
+        let missing: HashMap<_, _> = broken
+            .iter()
+            .map(|link| (link.wikilink_text.as_str(), link.missing_anchor.as_deref()))
+            .collect();
+        assert_eq!(missing.get("Beta#^nope"), Some(&Some("^nope")));
+        assert_eq!(missing.get("Absent#^blk1"), Some(&None));
     }
 
     /// SECURITY regression test: a symlink whose target is outside the
@@ -10833,5 +11063,33 @@ mod duplicate_vault_name_tests {
                 .any(|cause| cause.is::<crate::vault_registration::DuplicateVaultName>()),
             "{error:#}"
         );
+    }
+
+    /// QA: a full vault index killed after its scan (before its one graph
+    /// transaction committed) left the graph at its old state while search,
+    /// rebuilt from the bodies on disk, showed the new text, and `brain
+    /// status` read current. The row recorded before the write survives that
+    /// death and is disclosed until a full index of the vault lands.
+    #[test]
+    fn an_interrupted_full_vault_index_is_disclosed_until_one_lands() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let root = vault_at(vault_dir.path(), "body");
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("brain.lbug");
+        index_markdown_directory(&root, &db, "default", "v").unwrap();
+        let pending = || skipped_notes_status_json(Some(&db)).0["reconciliation_pending"].clone();
+        assert_eq!(pending(), 0, "a finished index owes nothing");
+
+        // What a process killed between the scan and the commit leaves.
+        record_vault_index_interrupted(Some(&db), &root);
+        assert_eq!(pending(), 1);
+        let notes = skipped_notes_status_json(Some(&db)).0["reconciliation_pending_notes"].clone();
+        assert!(
+            notes.to_string().contains("brain refresh"),
+            "the disclosure names the remedy: {notes}"
+        );
+
+        index_markdown_directory(&root, &db, "default", "v").unwrap();
+        assert_eq!(pending(), 0, "a full index that lands retires the row");
     }
 }

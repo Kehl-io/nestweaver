@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 
@@ -806,12 +806,87 @@ fn verify_requested_config_evidence(
         // (it is a field on the RPC, unlike a config), works against a running
         // daemon, and needs no restart — so name it.
         anyhow::bail!(
-            "explicit --config {} does not match the running daemon's effective config              ({effective_description}).\n--config binds a daemon for its LIFETIME — it              also carries [authz], ranking priors, indexing limits and server settings,              which a running daemon built once at startup and cannot re-adopt per              request. {}\nTo place this ONE command's data under a different instance              without restarting anything, pass `--instance <id>` instead: it is carried              per-request and overrides the daemon's default.",
+            "explicit --config {} does not match the running daemon's effective config ({effective_description}).\n--config binds a daemon for its LIFETIME — it also carries [authz], ranking priors, indexing limits and server settings, which a running daemon built once at startup and cannot re-adopt per request. {}\nTo place this ONE command's data under a different instance without restarting anything, pass `--instance <id>` instead: it is carried per-request and overrides the daemon's default.",
             requested.as_path().unwrap().display(),
             restart_with_requested_config_remedy(db_path, requested)
         );
     }
     Ok(())
+}
+
+/// The startup error a daemon wrote to `daemon.log` (its stderr) in this
+/// attempt: the last `Daemon error:`/`Error:` line after the last
+/// `[daemon] starting for` marker, from a log written since `since` (minus a
+/// little slack for the spawn that precedes the wait). `None` when there is no
+/// such line, or the log predates this attempt and would describe another.
+///
+/// The engine's "The database may be checkpointing; please retry later." is
+/// dropped: it is a guess appended to a truncation error, and for a truncated
+/// or corrupt file retrying never helps.
+fn daemon_startup_error(log: &Path, since: std::time::SystemTime) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 16 * 1024;
+    let mut file = std::fs::File::open(log).ok()?;
+    let metadata = file.metadata().ok()?;
+    let slack = std::time::Duration::from_secs(10);
+    if metadata.modified().ok()? + slack < since {
+        return None;
+    }
+    let start = metadata.len().saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    let attempt = tail
+        .rfind("[daemon] starting for ")
+        .map_or(&tail[..], |at| &tail[at..]);
+    let line = attempt
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("Daemon error:") || line.starts_with("Error:"))?;
+    let line = line
+        .replace(
+            " The database may be checkpointing; please retry later.",
+            "",
+        )
+        .replace("The database may be checkpointing; please retry later.", "");
+    let line = line.trim();
+    (!line.is_empty()).then(|| line.chars().take(2000).collect())
+}
+
+/// Retries [`DaemonClient::connect`] makes after a connection-level failure:
+/// 0.2 + 0.4 + 0.6 + 0.8 + 1.0 = 3s of waiting at most.
+const CONNECT_RETRY_ATTEMPTS: u32 = 5;
+
+/// Whether `error` is a connection that was reset, refused or cut — what a
+/// daemon still tearing down produces — rather than an answer.
+fn is_transient_connection_failure(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    let io_kind = error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            )
+        })
+    });
+    if io_kind {
+        return true;
+    }
+    let text = format!("{error:#}").to_ascii_lowercase();
+    [
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "connection closed before message completed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn verify_requested_config_with_health(
@@ -1119,16 +1194,14 @@ impl DaemonClient {
         Self::connect_with_usage(db_path, config_path, autostart::DaemonUsage::LongRunning).await
     }
 
-    async fn connect_with_usage(
-        db_path: &Path,
-        config_path: Option<&Path>,
-        usage: autostart::DaemonUsage,
-    ) -> Result<Self> {
-        nestweaver_daemon::lifecycle::watch_daemon_exit_as_client(db_path);
-        let sock_path =
-            autostart::ensure_daemon_for_client_async(db_path, config_path, usage).await?;
-        let mut client = Self::connect_to_socket(&sock_path).await?;
-
+    /// One retryable attempt of [`Self::connect_with_usage`]'s first step:
+    /// connect to the socket autostart reported, and run the bounded health
+    /// check.
+    #[allow(clippy::ptr_arg)]
+    async fn connect_and_check_health(
+        sock_path: &PathBuf,
+    ) -> Result<(Self, nestweaver_proto::HealthCheckResponse)> {
+        let mut client = Self::connect_to_socket(sock_path).await?;
         // Version check. Bounded so a connected-but-unresponsive daemon can't hang connect().
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -1140,6 +1213,47 @@ impl DaemonClient {
         .context("health check timed out — daemon connected but unresponsive")?
         .context("health check failed")?
         .into_inner();
+        Ok((client, resp))
+    }
+
+    async fn connect_with_usage(
+        db_path: &Path,
+        config_path: Option<&Path>,
+        usage: autostart::DaemonUsage,
+    ) -> Result<Self> {
+        nestweaver_daemon::lifecycle::watch_daemon_exit_as_client(db_path);
+        // A daemon that was just killed can still be tearing down: its socket
+        // accepts and then resets, or refuses, for a moment. Clients that
+        // arrived in that window failed outright (26 of 30 in QA) although the
+        // next attempt autostarts cleanly, so a connection-level failure gets
+        // a short bounded retry. Anything else fails at once.
+        let mut attempt: u32 = 0;
+        let (sock_path, mut client, resp) = loop {
+            // Ensuring (autostarting) the daemon is NOT retried: its failure
+            // is an answer, and the daemon's own startup error, now quoted in
+            // it, may well mention a refused connection. Only connecting to
+            // and health-checking a daemon it reported as up is retried; the
+            // next attempt re-ensures, so a daemon that finished exiting in
+            // between is started afresh.
+            let sock_path =
+                autostart::ensure_daemon_for_client_async(db_path, config_path, usage).await?;
+            match Self::connect_and_check_health(&sock_path).await {
+                Ok((client, resp)) => break (sock_path, client, resp),
+                Err(error)
+                    if attempt < CONNECT_RETRY_ATTEMPTS
+                        && is_transient_connection_failure(&error) =>
+                {
+                    attempt += 1;
+                    debug!(
+                        attempt,
+                        "daemon connection failed transiently, retrying: {error:#}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)))
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
 
         let our_version = env!("CARGO_PKG_VERSION");
         if resp.version != our_version {
@@ -1441,10 +1555,19 @@ impl DaemonClient {
         mut abort: Option<ReadinessAbort<'_>>,
     ) -> Result<nestweaver_proto::HealthCheckResponse> {
         let started = std::time::Instant::now();
+        let started_wall = std::time::SystemTime::now();
         let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
         let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance_id);
         let mut delay = std::time::Duration::from_millis(50);
         let max_delay = std::time::Duration::from_millis(500);
+        let reported = || {
+            daemon_startup_error(
+                &nestweaver_daemon::lifecycle::log_path(&instance_id),
+                started_wall,
+            )
+            .map(|error| format!("\nThe daemon reported: {error}"))
+            .unwrap_or_default()
+        };
 
         loop {
             let remaining = timeout.saturating_sub(started.elapsed());
@@ -1503,9 +1626,10 @@ impl DaemonClient {
                 && let Some(reason) = abort()
             {
                 anyhow::bail!(
-                    "daemon for {} will not become healthy: {reason}. Check the daemon logs: {}",
+                    "daemon for {} will not become healthy: {reason}. Check the daemon logs: {}{}",
                     db_path.display(),
                     nestweaver_daemon::lifecycle::log_hint(&instance_id),
+                    reported(),
                 );
             }
 
@@ -1513,6 +1637,18 @@ impl DaemonClient {
                 && Some(pid) != ignore_pid
                 && !autostart::is_process_alive(pid)
             {
+                // The daemon's own startup error, when it logged one, is the
+                // answer; without it the operator was told to run `daemon
+                // start`, which fails the same way.
+                let reported = reported();
+                if !reported.is_empty() {
+                    anyhow::bail!(
+                        "daemon process {pid} exited before becoming healthy for {}.{reported}\n\
+                         Full log: {}",
+                        db_path.display(),
+                        nestweaver_daemon::lifecycle::log_hint(&instance_id),
+                    );
+                }
                 anyhow::bail!(
                     "daemon process {pid} exited before becoming healthy for {}. Check the daemon logs: {}. \
                      If this was a restart replacement (e.g. it lost the database write lock to a third party \
@@ -3287,5 +3423,64 @@ mod agent_binary_tests {
         assert_eq!(release_is_newer("dev", "12.0.4"), None);
         assert!(agent_runs_another_binary(Some(&other), &exe));
         assert!(!agent_runs_another_binary(None, &exe));
+    }
+}
+
+#[cfg(test)]
+mod daemon_startup_error_tests {
+    use super::daemon_startup_error;
+
+    /// QA: a daemon that could not start (truncated database, lease held,
+    /// a directory at the socket path) surfaced only "exited before becoming
+    /// healthy … check logs". Its own error line is what the client reports.
+    #[test]
+    fn the_last_attempts_error_is_read_from_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        std::fs::write(
+            &log,
+            "[daemon] starting for /old.lbug (instance a)\nDaemon error: old failure\n\
+             [daemon] starting for /db.lbug (instance a)\nsome progress\n\
+             Daemon error: failed to open database: database corruption (truncated database \
+             file): catalog page range outside the file. The database may be checkpointing; \
+             please retry later.\n",
+        )
+        .unwrap();
+        let since = std::time::SystemTime::now();
+        let error = daemon_startup_error(&log, since).expect("the error line");
+        assert!(
+            error.starts_with("Daemon error: failed to open database"),
+            "{error}"
+        );
+        assert!(!error.contains("checkpointing"), "{error}");
+        assert!(!error.contains("old failure"), "{error}");
+
+        // A log older than this attempt describes another one.
+        let later = since + std::time::Duration::from_secs(120);
+        assert!(daemon_startup_error(&log, later).is_none());
+        // No error line, no claim.
+        std::fs::write(&log, "[daemon] starting for /db.lbug (instance a)\nok\n").unwrap();
+        assert!(daemon_startup_error(&log, since).is_none());
+        assert!(daemon_startup_error(&dir.path().join("missing.log"), since).is_none());
+    }
+}
+
+#[cfg(test)]
+mod transient_connection_tests {
+    use super::is_transient_connection_failure;
+
+    /// QA: clients hitting a daemon that was still tearing down failed
+    /// instead of retrying. Reset/refused is retried; an answer is not.
+    #[test]
+    fn reset_and_refused_are_transient_and_answers_are_not() {
+        let reset = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .context("health check failed");
+        assert!(is_transient_connection_failure(&reset));
+        let refused = anyhow::anyhow!("transport error: Connection refused (os error 111)");
+        assert!(is_transient_connection_failure(&refused));
+        let answer = anyhow::anyhow!("daemon process 42 exited before becoming healthy");
+        assert!(!is_transient_connection_failure(&answer));
+        let mismatch = anyhow::anyhow!("explicit --config x does not match");
+        assert!(!is_transient_connection_failure(&mismatch));
     }
 }

@@ -78,7 +78,7 @@ pub use write::{
     InstanceRepoRecovery, InstanceUidHandoff, InstanceUidHandoffIdentity, InstanceUidMigrationPlan,
     InstanceUidRemap, InstanceUidRemapPlanState, InstanceVaultRecovery, MergeResult,
     MutationDisposition, MutationFailure, MutationOutcome, ProjectMutationDisposition,
-    PurgeInstanceResult,
+    PurgeInstanceResult, REPO_PUBLICATION_INCOMPLETE_PREFIX,
 };
 pub use write_lease::{
     DbNamespaceLease, DbWriteLease, WriteLeaseError, WriteLeaseState, acquire_db_namespace_lease,
@@ -472,6 +472,36 @@ mod tests {
         let uids: Vec<_> = found.iter().map(|s| s.uid.as_str()).collect();
         assert!(uids.contains(&"s1"));
         assert!(uids.contains(&"s2"));
+    }
+
+    /// QA #5: a Go method is named `Type::method` (and `file::Type::method`)
+    /// through its receiver, which Go writes outside the type block.
+    #[test]
+    fn lookup_by_spec_names_go_methods_by_receiver() {
+        let store = test_store();
+        for (uid, signature) in [
+            ("uuid_string", "func (u UUID) String() string {"),
+            ("version_string", "func (v Version) String() string {"),
+            ("variant_string", "func (v *Variant) String() string {"),
+        ] {
+            let mut sym = make_symbol(uid, "String", "repo-1", "uuid.go");
+            sym.kind = SymbolKind::Method;
+            sym.signature = signature.to_string();
+            store.insert_symbol(&sym).unwrap();
+        }
+        let uids = |spec: &str| -> Vec<String> {
+            store
+                .lookup_symbols_by_spec(spec)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.uid)
+                .collect()
+        };
+        assert_eq!(uids("UUID::String"), ["uuid_string"]);
+        assert_eq!(uids("uuid.go::UUID::String"), ["uuid_string"]);
+        assert_eq!(uids("Variant::String"), ["variant_string"]);
+        assert!(uids("Nope::String").is_empty());
+        assert_eq!(uids("String").len(), 3);
     }
 
     /// nw-113: `file::name` narrows a name lookup by repo-relative path or

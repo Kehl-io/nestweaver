@@ -74,6 +74,10 @@
 (import_statement
   name: (dotted_name) @name) @reference.import
 
+(import_statement
+  name: (aliased_import
+    name: (dotted_name) @name)) @reference.import
+
 ; Extends (superclasses)
 (class_definition
   superclasses: (argument_list

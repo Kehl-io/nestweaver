@@ -1,5 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
+assertion_line: 6324
 expression: parsed
 ---
 path: src/main.rs
@@ -16,7 +17,7 @@ symbols:
     type_info:
       declared_type: ~
       parameter_types: []
-      return_type: "Imported { value }"
+      return_type: Imported
     parent_name: ~
     scope_chain: ~
 references:

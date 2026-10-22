@@ -68,3 +68,30 @@
 (mixins
   (type
     (type_identifier) @name)) @reference.implements
+
+; Object construction: `new Foo(...)` is a call of the class, exactly as
+; typescript.scm records it (nw-323 defect D). Without it a class that is only
+; ever instantiated had no inbound reference at all and `dead-code` reported it.
+; Anchored to the LAST identifier of the type name, so a prefixed `p.Foo`
+; yields `Foo`, never a second bare call to the import prefix `p`.
+(new_expression
+  type: (type
+    (type_identifier) @name
+    .)) @reference.call
+
+(new_expression
+  type: (type
+    (type_identifier) @name
+    .
+    (type_arguments))) @reference.call
+
+(const_object_expression
+  type: (type
+    (type_identifier) @name
+    .)) @reference.call
+
+(const_object_expression
+  type: (type
+    (type_identifier) @name
+    .
+    (type_arguments))) @reference.call

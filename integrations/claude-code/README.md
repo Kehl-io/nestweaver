@@ -23,24 +23,39 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
 
    The MCP server automatically starts a background daemon that owns the database. Multiple MCP servers and CLI commands can share the same database concurrently — no lock contention.
 
-3. (Optional) Enable hooks for enriched context:
+3. (Optional) Enable the enrichment hooks in this directory. They are shell
+   scripts that need `bash` and `jq` on `PATH`; each stays silent (exit 0) when
+   either is missing or the database does not exist.
    ```bash
-   # Merge the hook config into your existing .claude/settings.json
-   cat integrations/claude-code/settings.json
+   mkdir -p .claude/hooks/nestweaver
+   cp /path/to/nestweaver/integrations/claude-code/hooks/*.sh .claude/hooks/nestweaver/
    ```
+   Then merge the `hooks` object from
+   [`settings.json`](settings.json) into your project's `.claude/settings.json`.
+   The commands reference the scripts as
+   `"$CLAUDE_PROJECT_DIR/.claude/hooks/nestweaver/<name>.sh"`, so they work from
+   any working directory inside the project. If you keep the scripts elsewhere,
+   change those paths. MCP servers belong in `.mcp.json` (step 2), not in
+   `settings.json`.
 
-> **Recommended:** Use `nestweaver setup claude-code` to automatically install the MCP server config (`.mcp.json`) and skill (`.claude/skills/nestweaver/SKILL.md`).
+> **Recommended:** Use `nestweaver setup claude-code` to automatically install the MCP server config (`.mcp.json`), the skill (`.claude/skills/nestweaver/SKILL.md`), and two lightweight hooks (SessionStart brain status, and a PreToolUse hint on grep/rg/find) in `.claude/settings.json`. Re-running it repairs hooks written by older releases.
 
 ## Hooks
 
-| Hook | Trigger | Effect |
-|------|---------|--------|
-| `SessionStart` | Session begins | Prints brain status and staleness check |
-| `pre-read-enrich.sh` | Claude reads a file | Shows related symbols and their graph position |
-| `pre-write-impact` | Claude writes/edits a file | Shows blast radius of the file being modified |
-| `pre-search-enrich.sh` | Claude runs grep/rg | Adds PageRank-ordered graph results |
-| `post-commit-stale-check.sh` | After `git commit` | Warns if index is stale |
-| `post-edit-impact.sh` | After file edits | Shows blast radius of the change |
+Every script reads the hook event from stdin (`tool_input.file_path` or
+`tool_input.command`) and reports back as
+`{"hookSpecificOutput": {"hookEventName": …, "additionalContext": …}}` on
+stdout, which Claude Code adds to the conversation next to the tool result.
+None of them blocks a tool call. The database is `$NESTWEAVER_DB` when set,
+otherwise `$CLAUDE_PROJECT_DIR/nestweaver.lbug`.
+
+| Hook | Event (matcher) | Effect |
+|------|-----------------|--------|
+| SessionStart command | `SessionStart` | Prints brain status; plain stdout on SessionStart becomes session context |
+| `pre-read-enrich.sh` | `PreToolUse` (`Read`) | Adds the symbols related to the file being read |
+| `post-edit-impact.sh` | `PreToolUse` (`Write\|Edit`) | Adds the blast radius of the file about to be modified. It runs *before* the edit so the impact is known while the change is being made; the name is kept for compatibility with existing configs |
+| `pre-search-enrich.sh` | `PreToolUse` (`Bash`) | On `grep`/`rg` commands, adds graph search results for the search term |
+| `post-commit-stale-check.sh` | `PostToolUse` (`Bash`) | After `git commit`, adds a re-index reminder when `stale-check` reports drift |
 
 ## MCP Tools
 
@@ -120,20 +135,22 @@ exactly like the rest.
 | `NESTWEAVER_NO_DAEMON` | unset | *Requests* a daemon bypass. CI-only; standard artifacts ignore the request and use the daemon |
 | `NESTWEAVER_ALLOW_NO_DAEMON` | unset | Explicit CI-only permit; also requires the internal CI test artifact and a GitHub Actions runner context |
 
-The daemon's idle timeout is a `daemon run --idle-timeout <secs>` flag (3600 by
-default when autostarted), **not** an environment variable. See CLAUDE.md for the
-full operator-facing environment-variable table.
+The daemon's idle timeout is the `daemon start --idle-timeout <secs>` flag
+(default 3600). An autostart against a database that looks temporary (under
+`/tmp`, `$TMPDIR` or `/var/folders`) uses a 60-second timeout instead, tunable
+with `NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS`. See CLAUDE.md for the full
+operator-facing environment-variable table.
 
 ## Daemon
 
-NestWeaver uses a background daemon process that exclusively owns the database and serves all queries via gRPC over a Unix domain socket. The daemon auto-starts on first use and exits after 1 hour of inactivity.
+NestWeaver uses a background daemon process that exclusively owns the database and serves all queries via gRPC over a Unix domain socket. The daemon auto-starts on first use and exits after an hour of inactivity (see the idle timeout above).
 
 ```bash
 nestweaver daemon status --db ./nestweaver.lbug   # check daemon state
 nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon
 ```
 
-Daemon logs are written to `~/.local/state/nestweaver/<instance>/daemon.log`.
+Daemon logs are written to `~/.local/state/nestweaver/<id>/daemon.log`, where `<id>` is a short hash of the database path (rotated daily; `$XDG_STATE_HOME` replaces `~/.local/state` when set).
 
 Daemon bypass is CI-only. Local MCP sessions, fixtures, and recovery must use
 the daemon. Standard development and release artifacts cannot honor bypass

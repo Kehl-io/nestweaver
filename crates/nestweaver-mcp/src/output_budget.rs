@@ -389,6 +389,12 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
             {
                 parent["next_body_offset"] = json!(offset + clipped_chars as u64);
                 parent["body_truncated"] = json!(true);
+            } else if parent.is_object() {
+                // Any row whose `body` was clipped says so itself, not only
+                // through the top-level `truncated`: a `read_symbols` symbol
+                // omits `body_truncated` when false, so a reader of one
+                // symbol took a clipped body for the whole source.
+                parent["body_truncated"] = json!(true);
             }
         }
         let mirror_label = mirror_path.as_ref().map(|path| cut_label(path));
@@ -779,6 +785,30 @@ mod tests {
     #[test]
     fn quality_budget_context_connected_counts_follow_late_prefix() {
         quality_count_case("connected", &["returned", "connected_count"]);
+    }
+
+    /// A `read_symbols` body clipped by the output budget must flag its own
+    /// row, not only the top-level `truncated`.
+    #[test]
+    fn a_budget_clipped_symbol_body_sets_its_own_body_truncated() {
+        let payload = quality_wrapped(json!({
+            "symbols": [
+                {"uid":"sym:a","name":"a","start_line":1,"end_line":900,"body":"x".repeat(60_000)},
+                {"uid":"sym:b","name":"b","start_line":1,"end_line":2,"body":"fn b() {}"}
+            ],
+            "not_found": [],
+            "truncated": false
+        }));
+        assert_eq!(payload["truncated"], true, "{payload}");
+        let symbols = payload["symbols"].as_array().unwrap();
+        assert!(symbols[0]["body"].as_str().unwrap().len() < 60_000);
+        assert_eq!(symbols[0]["body_truncated"], true, "{payload}");
+        assert!(
+            symbols
+                .get(1)
+                .is_none_or(|row| row.get("body_truncated").is_none()),
+            "an unclipped body is not flagged: {payload}"
+        );
     }
 
     #[test]

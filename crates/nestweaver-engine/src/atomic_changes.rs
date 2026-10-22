@@ -343,7 +343,9 @@ pub fn compute_local_changes(
     use anyhow::Context;
 
     // Unstaged changes
-    let output = crate::git_cmd::isolated_git()
+    // A working-tree diff runs the repository's clean filters unless
+    // `isolated_git_in` disables them.
+    let output = crate::git_cmd::isolated_git_in(repo_path)?
         .args(["diff", "--name-only", "HEAD"])
         .current_dir(repo_path)
         .output()
@@ -355,7 +357,7 @@ pub fn compute_local_changes(
         .collect();
 
     // Staged but not yet committed changes
-    let staged = crate::git_cmd::isolated_git()
+    let staged = crate::git_cmd::isolated_git_in(repo_path)?
         .args(["diff", "--name-only", "--cached"])
         .current_dir(repo_path)
         .output()
@@ -1089,6 +1091,14 @@ fn collect_transitive_references(
 
 #[cfg(test)]
 mod tests {
+    /// A repository's clean filters and diff drivers never run.
+    #[test]
+    fn compute_local_changes_runs_no_repository_attribute_programs() {
+        let repo = crate::git_cmd::hostile_repo::hostile_repo();
+        let changes = compute_local_changes(repo.path(), REPO_URL).unwrap();
+        assert!(!changes.is_empty(), "the edits must still be seen");
+        assert_eq!(repo.ran(), Vec::<String>::new());
+    }
 
     /// Comparing the working tree reads the index, which would run the
     /// repository's `core.fsmonitor` program without isolation.

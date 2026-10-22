@@ -57,3 +57,18 @@
 (trait_definition
   extend: (extends_clause
     type: (type_identifier) @name)) @reference.extends
+
+; Object construction: `new Foo(...)` is a call of the class, exactly as
+; typescript.scm records it (nw-323 defect D). Without it a class that is only
+; ever instantiated had no inbound reference at all and `dead-code` reported it.
+(instance_expression
+  (type_identifier) @name) @reference.call
+
+(instance_expression
+  (generic_type
+    type: (type_identifier) @name)) @reference.call
+
+; The grammar may also read `Foo(...)` after `new` as one applied type.
+(instance_expression
+  (applied_constructor_type
+    (type_identifier) @name)) @reference.call

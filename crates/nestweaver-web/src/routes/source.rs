@@ -99,7 +99,7 @@ fn read_indexed_file_with_hook(repo_root: &Path, file: &str, before_open: impl F
     // Open each component relative to a pinned directory descriptor. A path
     // swapped for a symlink after canonicalization must never be followed.
     #[cfg(unix)]
-    let opened = open_without_symlinks(&canon_path);
+    let opened = open_without_symlinks(&canon_root, Path::new(file));
     #[cfg(not(unix))]
     let opened: std::io::Result<std::fs::File> = Err(std::io::ErrorKind::Unsupported.into());
     let Ok(f) = opened else {
@@ -123,13 +123,18 @@ fn read_indexed_file_with_hook(repo_root: &Path, file: &str, before_open: impl F
 }
 
 #[cfg(unix)]
-fn open_without_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
-    let root = CString::new("/").expect("constant path");
+fn open_without_symlinks(root: &Path, relative: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    // Start at the (already canonical) repository root rather than at `/`:
+    // only the components below the root are untrusted, and some sandboxes
+    // and containers refuse to open `/` or an ancestor directory for reading.
+    let root = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     // SAFETY: the C string is NUL terminated; a successful fd is owned by File.
     let fd = unsafe {
         libc::open(
             root.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
         )
     };
     if fd < 0 {
@@ -137,7 +142,7 @@ fn open_without_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
     }
     // SAFETY: open returned a new owned fd.
     let mut dir = unsafe { std::fs::File::from_raw_fd(fd) };
-    let components: Vec<_> = path
+    let components: Vec<_> = relative
         .components()
         .filter_map(|c| match c {
             Component::Normal(s) => Some(s),
@@ -145,7 +150,6 @@ fn open_without_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
         })
         .collect();
     for (i, part) in components.iter().enumerate() {
-        use std::os::unix::ffi::OsStrExt;
         let name = CString::new(part.as_bytes())
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         let flags = libc::O_RDONLY

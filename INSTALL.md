@@ -91,8 +91,7 @@ nestweaver --version
 
 On Linux, `sha256sum -c "$ARCHIVE.sha256"` is an equivalent checksum command.
 
-Starting with the release that contains this change, both macOS CLI archives
-are built with Metal support. To opt out explicitly and use CPU embeddings,
+Both macOS CLI archives are built with Metal support. To opt out explicitly and use CPU embeddings,
 set:
 
 ```toml
@@ -129,10 +128,10 @@ the checkout's `.cargo/config.toml`: it forces `LBUG_BUILD_FROM_SOURCE=1` so
 the build compiles Ladybug from source, rather than linking a prebuilt archive
 whose hidden ELF symbols cause zstd link errors.
 
-**`LBUG_SOURCE_DIR` is required for now.** The published `lbug` 0.21.1 crate
+**`LBUG_SOURCE_DIR` is required for now.** The published `lbug` 0.21.2 crate
 cannot build its own bundled sources (the packaging fix is merged upstream but
 not yet released), so the build reads them from a LadybugDB checkout at tag
-`v0.21.1` named by `LBUG_SOURCE_DIR`. `scripts/fetch-lbug-source.sh` makes a
+`v0.21.2` named by `LBUG_SOURCE_DIR`. `scripts/fetch-lbug-source.sh` makes a
 shallow clone of that tag (about 80 MB, no submodules) under `target/`,
 verifies its commit, and prints the `export` line; `eval` applies it to the
 current shell. Pass a directory to put the clone elsewhere, or point
@@ -191,7 +190,7 @@ is refused with `nestweaver::db_rebuild_required`. Back it up and follow the
 and the error's recovery command. A forced re-index alone is not the remedy
 for an incompatible storage format.
 
-For a compatible database, the current **`RESOLVER_GENERATION` is 11**.
+For a compatible database, the current **`RESOLVER_GENERATION` is 12**.
 Compatibility requires an exact match: a graph written by an older or newer
 resolver must be fully re-indexed before you trust its edges and rankings.
 
@@ -201,6 +200,9 @@ nestweaver index --repo /path/to/repo --db /path/to/nestweaver.lbug --force
 ```
 
 `stale-check` reports `outdated_resolver` and exits 2 for a resolver mismatch.
+Upgrading from 12.2.x or earlier moves the generation from 11 to 12 (Go,
+Python and Kotlin/Java import resolution and method-call resolution changed),
+so every repository needs this forced re-index once.
 **`--force` is required** for each repository: an incremental index at git
 HEAD can report no changes and leave the old generation in place. Vaults are
 not repositories and carry no code resolver generation.

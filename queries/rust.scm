@@ -68,6 +68,25 @@
   function: (scoped_identifier
     name: (identifier) @name)) @reference.call
 
+; Turbofish calls: `generic::<u8>(1)`, `x.parse::<T>()`, `Type::f::<T>()`.
+; The callee is wrapped in a `generic_function`, so none of the three forms
+; above matched and the call produced no reference at all. parse.rs unwraps
+; `generic_function` when it extracts the receiver, so `x.parse::<T>()` keeps
+; `x` as its receiver instead of becoming a bare call to `parse`.
+(call_expression
+  function: (generic_function
+    function: (identifier) @name)) @reference.call
+
+(call_expression
+  function: (generic_function
+    function: (field_expression
+      field: (field_identifier) @name))) @reference.call
+
+(call_expression
+  function: (generic_function
+    function: (scoped_identifier
+      name: (identifier) @name))) @reference.call
+
 ; Macro invocations are not function calls. `format!(...)` must not resolve
 ; to a field or function that merely shares the name.
 (macro_invocation

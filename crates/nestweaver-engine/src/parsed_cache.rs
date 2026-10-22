@@ -52,7 +52,15 @@ use serde::{Deserialize, Serialize};
 /// 7 — nw-787: nested JS/TS function declarations emit a
 ///     `HoistedDeclaration` reference recording the region they are visible
 ///     in (function-body hoisting, or the block in strict code).
-const CACHE_VERSION: u32 = 7;
+/// 8 — Go import references carry their explicit package name as
+///     `receiver`, Kotlin/Java files emit their package clause as a
+///     `PackageBinding`, and Python `import a.b as c` emits the import and
+///     its `ImportAlias`. Same unreleased version: `new Foo()` captures in
+///     Java/C#/PHP/C++/Scala/Groovy/Dart, Rust turbofish calls, bare TS/JS
+///     decorators, Go method `parent_name` (the receiver type), return types
+///     that end before a one-line body, and one JS/TS `this.x =` property
+///     per class.
+const CACHE_VERSION: u32 = 8;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;

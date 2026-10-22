@@ -15,11 +15,15 @@ Or manually add to `~/.codeium/windsurf/mcp_config.json`:
   "mcpServers": {
     "nestweaver": {
       "command": "nestweaver",
-      "args": ["mcp", "--db", "./nestweaver.lbug"]
+      "args": ["mcp", "--db", "/absolute/path/to/nestweaver.lbug"]
     }
   }
 }
 ```
+
+This is a user-level file, so use an absolute database path: a relative one
+resolves against whatever directory Windsurf starts the server from. `setup`
+writes the absolute path for you.
 
 Restart Windsurf to detect the MCP server.
 

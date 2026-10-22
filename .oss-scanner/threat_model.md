@@ -44,8 +44,12 @@ Defences to test against, with their homes:
 - **Remote git**: `crates/nestweaver-engine/src/ssrf.rs` (`guard_git_url`). It allows https, http and ssh only,
   rejects internal and encoded addresses, fails closed on DNS errors, and pins the resolved IP for http(s) with
   redirects off. `apply_git_isolation` in `crates/nestweaver-engine/src/git_cmd.rs` drops system and global git config,
-  prompts and credential helpers, and disables a repository's fsmonitor, hooks and auto-maintenance, so indexing or
-  watching a repository should run no program its own git config names.
+  prompts and credential helpers, and disables a repository's fsmonitor, hooks, auto-maintenance and `core.askPass`.
+  `isolated_git_in` additionally lists the repository's clean/smudge/process filter, textconv and external-diff driver
+  config without running anything and blanks every program it names, failing closed when that listing fails. Indexing,
+  watching, the working-tree diffs behind `affected-tests --base-ref`, `pr-impact --base`, `blast-radius` and
+  `pre-push-impact --local-changes`, and MCP tool calls should therefore run no program a repository's own git config
+  names.
 - **Indexing limits**: `crates/nestweaver-engine/src/index_limits.rs` caps source files at 2 MiB and notes at 1 MiB by
   default, with 64 MiB ceilings. The walker honours `.gitignore` and does not follow symlinks.
 - **Indexing roots**: `brain_add_source` and watch roots are checked by `is_unsafe_index_root` and `watch_path_allowed`
@@ -172,9 +176,8 @@ stdio MCP, default config) weighs more than one that needs an unusual setting.
 - With no `instance.toml`, `brain_add_source` can index any absolute path except system roots and `$HOME` itself.
   That is the single-user default; report escapes of the allowlist when a config is present, or of the denylist.
 - Anyone holding the org query token can read the whole indexed graph (`.github/SECURITY.md`).
-- CLI commands a user runs inside a working tree to diff it (`affected-tests --base-ref`, `pr-impact --base`,
-  `pre-push-impact --local-changes`) run Git there and honour that tree's filter drivers (and, for `pre-push-impact`,
-  its fsmonitor), as running `git diff` in that tree would. This is tracked separately. Program execution during
-  `index`, `watch`, the daemon or an MCP tool call is in scope.
+- Neutralising a repository's filter drivers means a file such a driver (for example Git LFS installed with
+  `--local`) would have normalised can read as modified in change detection. Over-selection of that kind is expected;
+  program execution during `index`, `watch`, a working-tree diff, the daemon or an MCP tool call is in scope.
 - Missing rate limiting, and resource use proportional to the size of what the operator chose to index.
 - Behaviour that needs the `ci-direct-tests` or `release-fixture-hooks` features, or the macOS-only `metal` feature.

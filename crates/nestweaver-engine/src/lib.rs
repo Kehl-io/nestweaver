@@ -568,6 +568,7 @@ pub mod dead_code;
 pub mod did_you_mean;
 pub mod diff_impact;
 pub mod drain;
+pub mod embed_pass_marker;
 pub mod embedding;
 pub mod eval;
 pub mod export;
@@ -649,7 +650,7 @@ pub use backup::{
     RestoreResult, StagedBackup, backup_inspect, backup_list, backup_restore, backup_save,
     package_staged, stage_backup_from_store,
 };
-pub use bare_clone::{mint_repo_identity, read_origin_url};
+pub use bare_clone::{ensure_own_git_metadata, mint_repo_identity, read_origin_url};
 pub use blast_radius::{
     AffectedCluster, AffectedSymbol as BlastAffectedSymbol, AnalysisStatus, BlastRadiusOptions,
     BlastRadiusResult, ChangedSymbol, GateState, Notification, NotificationLevel,
