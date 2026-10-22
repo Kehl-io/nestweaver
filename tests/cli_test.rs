@@ -10906,7 +10906,7 @@ fn install_hook_preserves_every_key_it_does_not_own() {
         .collect();
     assert_eq!(
         matchers,
-        vec!["Edit", "Task"],
+        vec!["Edit", "Task|Agent"],
         "the user's own matcher is not NestWeaver's to move or drop"
     );
 
@@ -11002,7 +11002,7 @@ fn install_hook_replaces_the_settings_file_instead_of_truncating_it_in_place() {
     let after: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(after["env"]["MY_API_KEY"], "sk-live-do-not-lose-me");
-    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
 
     let leftovers: Vec<_> = std::fs::read_dir(dir.path().join(".claude"))
         .unwrap()
@@ -11058,7 +11058,7 @@ fn install_hook_follows_a_symlinked_settings_file_into_a_dotfiles_repo() {
         "the user's key must survive the merge: {after}"
     );
     assert_eq!(
-        after["hooks"]["PreToolUse"][0]["matcher"], "Task",
+        after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent",
         "the hook must land in the file the link names: {after}"
     );
     assert!(
@@ -11136,7 +11136,7 @@ fn install_hook_refuses_a_dangling_symlinked_settings_file() {
         .success();
     let after: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&missing).unwrap()).unwrap();
-    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
 }
 
 /// Unparseable input is a refusal, not an empty object.
