@@ -23491,14 +23491,6 @@ mod daemon_index_progress_tests {
     }
 }
 
-/// Resolve the source root for body reads: explicit `root` arg, else cwd.
-fn arg_root(store: &GraphStore, args: &Value) -> Result<std::path::PathBuf, anyhow::Error> {
-    match arg_root_opt(store, args)? {
-        Some(root) => Ok(root),
-        None => Ok(std::env::current_dir().unwrap_or_default()),
-    }
-}
-
 /// An explicit `root` for reading source bodies, refused unless it lies inside
 /// an indexed repository's or vault's root, or is a linked worktree of an
 /// indexed repository.
@@ -23506,7 +23498,7 @@ fn arg_root(store: &GraphStore, args: &Value) -> Result<std::path::PathBuf, anyh
 /// `root` decides which directory symbol spans are read from. Unchecked, any
 /// caller could read lines of any file on the host whose relative path matches
 /// an indexed one.
-fn contained_source_root(
+pub fn contained_source_root(
     store: &GraphStore,
     root: &Path,
 ) -> Result<std::path::PathBuf, anyhow::Error> {
@@ -23615,7 +23607,7 @@ fn git_checkout_position(path: &Path) -> Option<GitCheckoutPosition> {
     })
 }
 
-/// Like [`arg_root`], but returns `None` when `root` was omitted instead of
+/// The explicit `root` for source reads, or `None` when it was omitted instead of
 /// defaulting to cwd.
 ///
 /// nw-560: `investigate_expand`/`investigate_hydrate` need to tell "omitted"
@@ -23701,7 +23693,7 @@ fn tool_investigate(
         .get("token_budget")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
-    let root = arg_root(store, &args)?;
+    let (root, root_refused) = investigate_body_root(store, &args)?;
     let db_path = current_db_path(store).ok();
     let result = investigate(
         store,
@@ -23714,7 +23706,44 @@ fn tool_investigate(
         embed_model,
     )
     .map_err(|error| investigate_scope_error(store, scope, error))?;
-    Ok(serde_json::to_value(result)?)
+    let mut value = serde_json::to_value(result)?;
+    if let (Some(refused), Some(object)) = (root_refused, value.as_object_mut()) {
+        object.insert("root_not_used".into(), json!(refused));
+    }
+    Ok(value)
+}
+
+/// The root `investigate` inlines bodies from, and why a supplied one was not
+/// used.
+///
+/// The CLI always sends its working directory as `root` (nw-340), so a root
+/// outside every indexed source is the ordinary case of running `investigate`
+/// from elsewhere, not a request to read that directory. It is not refused:
+/// the map is still answered, its bodies are not read from that directory
+/// (an empty root serves nothing — [`FilesystemReader`] cannot resolve it),
+/// and `root_not_used` says why. The CLI's direct route does the same.
+///
+/// [`FilesystemReader`]: nestweaver_engine::content_reader::FilesystemReader
+pub fn investigate_body_root(
+    store: &GraphStore,
+    args: &Value,
+) -> Result<(std::path::PathBuf, Option<String>), anyhow::Error> {
+    let Some(root) = args.get("root").and_then(Value::as_str) else {
+        return Ok((std::env::current_dir().unwrap_or_default(), None));
+    };
+    Ok(investigate_root_or_none(store, Path::new(root)))
+}
+
+/// [`contained_source_root`], or an empty root and the refusal when `root`
+/// lies outside every indexed source.
+pub fn investigate_root_or_none(
+    store: &GraphStore,
+    root: &Path,
+) -> (std::path::PathBuf, Option<String>) {
+    match contained_source_root(store, root) {
+        Ok(root) => (root, None),
+        Err(error) => (std::path::PathBuf::new(), Some(error.to_string())),
+    }
 }
 
 /// 12.1.1 (V4): a scope the caller got wrong is reported as their mistake:

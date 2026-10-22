@@ -24366,8 +24366,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let res = match root.as_deref() {
                 Some(root) => {
+                    // The same containment the daemon's read_symbols applies,
+                    // so both routes refuse a --root outside every indexed
+                    // source (a missing or unsearchable one passes through to
+                    // the unreadable_root diagnostic below).
+                    let contained = nestweaver_mcp::tools::contained_source_root(&store, root)?;
                     let reader = nestweaver_engine::content_reader::FilesystemReader::with_limits(
-                        root, limits,
+                        &contained, limits,
                     );
                     nestweaver_engine::read_symbols::read_symbols(
                         &store,
@@ -25890,6 +25895,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
             let root = root.unwrap_or_else(detect_repo_root);
+            // As the daemon's investigate does: a root outside every indexed
+            // source serves no bodies, and the payload says why.
+            let (root, root_not_used) =
+                nestweaver_mcp::tools::investigate_root_or_none(&store, &root);
             // nw-189: "all", not "vault". Both are pass-throughs, but the
             // result echoes this string back, and defaulting to "vault" told a
             // caller who supplied NO scope that their results were
@@ -25916,6 +25925,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Built unconditionally so text and JSON render from the SAME
             // payload, and so the daemon path can reuse the renderer (nw-108).
             let mut payload = serde_json::to_value(&result)?;
+            if let (Some(refused), Some(object)) = (root_not_used, payload.as_object_mut()) {
+                object.insert("root_not_used".into(), serde_json::json!(refused));
+            }
             // nw-670 re-review R1: the direct route stamps what the daemon's
             // MCP seam would have.
             nestweaver_engine::code_links::stamp_code_links_disclosure(&db_path, &mut payload);
