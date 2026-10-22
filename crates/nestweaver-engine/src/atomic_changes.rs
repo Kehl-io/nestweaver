@@ -344,9 +344,15 @@ pub fn compute_local_changes(
 
     // Unstaged changes
     // A working-tree diff runs the repository's clean filters unless
-    // `isolated_git_in` disables them.
+    // `isolated_git_in` disables them, and a submodule's own filters unless
+    // Git stays out of submodule working trees.
     let output = crate::git_cmd::isolated_git_in(repo_path)?
-        .args(["diff", "--name-only", "HEAD"])
+        .args([
+            "diff",
+            "--name-only",
+            crate::git_cmd::IGNORE_SUBMODULE_WORKTREES,
+            "HEAD",
+        ])
         .current_dir(repo_path)
         .output()
         .context("git diff --name-only HEAD")?;
@@ -358,7 +364,12 @@ pub fn compute_local_changes(
 
     // Staged but not yet committed changes
     let staged = crate::git_cmd::isolated_git_in(repo_path)?
-        .args(["diff", "--name-only", "--cached"])
+        .args([
+            "diff",
+            "--name-only",
+            crate::git_cmd::IGNORE_SUBMODULE_WORKTREES,
+            "--cached",
+        ])
         .current_dir(repo_path)
         .output()
         .context("git diff --name-only --cached")?;

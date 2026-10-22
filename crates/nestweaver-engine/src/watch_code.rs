@@ -3063,6 +3063,7 @@ impl CodeWatcher {
             "--porcelain=v1",
             "-z",
             "--untracked-files=all",
+            crate::git_cmd::IGNORE_SUBMODULE_WORKTREES,
         ]);
         let output = crate::git_cmd::run_git_with_timeout(command, Duration::from_secs(15))
             .context("git status for watcher HEAD record")?;

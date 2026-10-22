@@ -17639,7 +17639,14 @@ fn pre_push_changed_file_count(repo_path: &Path, diff: Option<&str>) -> usize {
         return 0;
     };
     command
-        .args(["diff", "--name-only", "-z", range, "--"])
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            nestweaver_engine::git_cmd::IGNORE_SUBMODULE_WORKTREES,
+            range,
+            "--",
+        ])
         .current_dir(repo_path)
         .output()
         .ok()
@@ -17767,6 +17774,66 @@ mod pre_push_changed_file_count_tests {
         assert!(
             !markers.path().join("ran").exists(),
             "a repository program ran"
+        );
+    }
+
+    /// A submodule's own config names programs the superproject's overrides
+    /// cannot see; the working-tree diff must not recurse into it, even when
+    /// `.gitmodules` asks for every submodule change (`ignore = none`).
+    #[test]
+    fn counts_changes_without_running_submodule_programs() {
+        let repo = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        for dir in [root, sub.as_path()] {
+            git(dir, &["init", "-q"]);
+            git(dir, &["config", "user.email", "test@example.com"]);
+            git(dir, &["config", "user.name", "Test"]);
+            git(dir, &["config", "commit.gpgsign", "false"]);
+        }
+        std::fs::write(sub.join("s.py"), "x = 1\n").unwrap();
+        std::fs::write(sub.join(".gitattributes"), "* filter=subevil\n").unwrap();
+        git(&sub, &["add", "."]);
+        git(&sub, &["commit", "-q", "-m", "sub"]);
+        let program = markers.path().join("program.sh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nexec cat\n",
+                markers.path().join("ran").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            &sub,
+            &["config", "filter.subevil.clean", program.to_str().unwrap()],
+        );
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n\tignore = none\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        git(root, &["add", "a.rs", ".gitmodules", "sub"]);
+        git(root, &["commit", "-q", "-m", "init"]);
+        std::fs::write(root.join("a.rs"), "fn b() {}\n").unwrap();
+        // Unchanged contents, future mtime: Git must rehash it to compare.
+        let s_py = sub.join("s.py");
+        std::fs::write(&s_py, "x = 1\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&s_py)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+
+        assert_eq!(pre_push_changed_file_count(root, None), 1);
+        assert!(
+            !markers.path().join("ran").exists(),
+            "a submodule program ran"
         );
     }
 }
