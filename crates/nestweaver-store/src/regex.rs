@@ -2561,8 +2561,7 @@ impl GraphStore {
         let verification_ms = elapsed_millis(verification_started);
         // Nodes the admission prefilter rejected were evaluated by the real
         // regex too; count them so `scanned_candidates` reports the work done.
-        scanned_candidates = scanned_candidates
-            .saturating_add(prefilter_rejected.get());
+        scanned_candidates = scanned_candidates.saturating_add(prefilter_rejected.get());
 
         // The verification loop ran over everything COLLECTION handed it
         // without itself hitting a limit — but collection may not have
