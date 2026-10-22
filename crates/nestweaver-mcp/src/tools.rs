@@ -31001,9 +31001,13 @@ mod arg_alias_tests {
                 && err.contains("Section, Note, Symbol, Frontmatter"),
             "{err}"
         );
-        let err = tool_count_patterns(&store, json!({ "patterns": ["x"], "kinds": ["Heading"] }))
-            .unwrap_err()
-            .to_string();
+        let err = tool_count_patterns(
+            &store,
+            json!({ "patterns": ["x"], "kinds": ["Heading"] }),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("unknown kind 'Heading'"), "{err}");
         // Case-insensitive valid kinds pass validation (empty results are fine
         // on an empty store).
