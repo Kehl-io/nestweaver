@@ -1702,7 +1702,11 @@ fn resolve_single_reference(
             }
             let rank = match jvm_imports {
                 None => None,
-                Some(jvm) => match jvm.rank(f, sym.start_line)? {
+                Some(jvm) => match jvm.rank(
+                    f,
+                    sym.start_line,
+                    reference.receiver.is_none().then_some(sym.name.as_str()),
+                )? {
                     JvmImportRank::OnDemand if jvm_shadowed => return None,
                     rank => Some(rank),
                 },
@@ -2258,7 +2262,7 @@ fn jvm_type_origin(
             && imports.iter().any(|(_, target)| target == file))
         .then(|| {
             jvm_imports.map_or(Some(JvmImportRank::OnDemand), |jvm| {
-                jvm.rank(file, symbol.start_line)
+                jvm.rank(file, symbol.start_line, Some(type_name))
             })
         })
         .flatten();

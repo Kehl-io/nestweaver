@@ -601,3 +601,44 @@ fn go_build_ignore_file_is_not_a_package_callee() {
         "a build-ignored file must not be a callee: {calls:#?}"
     );
 }
+
+/// Review finding: `import com.a.Outer;` brings `Outer` into scope, not its
+/// nested `Inner`, so a bare `Inner` in package `com.b` is `com.b.Inner`.
+#[test]
+fn java_single_type_import_does_not_import_nested_types() {
+    let outer = r#"package com.a;
+
+public class Outer {
+    public static class Inner {
+        public void m() {}
+    }
+}
+"#;
+    let inner = "package com.b;\n\npublic class Inner {\n    public void m() {}\n}\n";
+    let user = r#"package com.b;
+
+import com.a.Outer;
+
+public class User {
+    void use() {
+        Inner x = new Inner();
+        x.m();
+    }
+}
+"#;
+    let inputs = [
+        ("src/com/a/Outer.java", outer),
+        ("src/com/b/Inner.java", inner),
+        ("src/com/b/User.java", user),
+    ];
+    let (files, edges) = resolve_typed(&inputs, Language::Java);
+    let calls = calls(&files, &edges);
+    assert!(
+        calls.contains("src/com/b/User.java::use -> src/com/b/Inner.java::m"),
+        "{calls:#?}"
+    );
+    assert!(
+        !calls.contains("src/com/b/User.java::use -> src/com/a/Outer.java::m"),
+        "{calls:#?}"
+    );
+}

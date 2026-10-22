@@ -98,6 +98,10 @@ pub(crate) struct JvmFileImports {
     /// Target file → line spans of the top-level declarations single-type
     /// imports name in it.
     declarations: HashMap<String, Vec<(u32, u32)>>,
+    /// Simple names single-type imports bring into scope (`Inner` for
+    /// `import a.b.Outer.Inner`; `import a.b.Outer` brings `Outer`, not its
+    /// nested `Inner`).
+    names: HashSet<String>,
     /// Target files of on-demand (package) imports.
     on_demand: HashSet<String>,
 }
@@ -116,13 +120,26 @@ impl JvmFileImports {
     /// `target` is reached only by single-type imports of OTHER top-level
     /// declarations. A target recorded under neither form (a fallback
     /// file-path resolution) counts as on demand.
-    pub(crate) fn rank(&self, target: &str, line: u32) -> Option<JvmImportRank> {
+    ///
+    /// `simple_name` is `Some` when the reference names the declaration by
+    /// its simple name (a bare call, a type name): a single-type import then
+    /// covers it only if it imports that very name, so `import a.Outer` does
+    /// not put `Outer`'s nested `Inner` in scope. A member reached through a
+    /// receiver (`Outer.helper()`) passes `None`: the span decides.
+    pub(crate) fn rank(
+        &self,
+        target: &str,
+        line: u32,
+        simple_name: Option<&str>,
+    ) -> Option<JvmImportRank> {
         let spans = self.declarations.get(target);
-        if spans.is_some_and(|spans| {
-            spans
-                .iter()
-                .any(|&(start, end)| start <= line && line <= end)
-        }) {
+        if simple_name.is_none_or(|name| self.names.contains(name))
+            && spans.is_some_and(|spans| {
+                spans
+                    .iter()
+                    .any(|&(start, end)| start <= line && line <= end)
+            })
+        {
             Some(JvmImportRank::Declaration)
         } else if spans.is_none() || self.on_demand.contains(target) {
             Some(JvmImportRank::OnDemand)
@@ -856,6 +873,8 @@ pub(crate) fn build_import_graph_with_languages(
                 match jvm_index.resolve(specifier) {
                     lang::kotlin::JvmImport::Declaration(targets) => {
                         let file_imports = jvm_imports.entry(file_path.clone()).or_default();
+                        let simple_name = specifier.rsplit('.').next().unwrap_or(specifier);
+                        file_imports.names.insert(simple_name.to_string());
                         for (target, spans) in targets {
                             if target == file_path.as_str() {
                                 continue;
