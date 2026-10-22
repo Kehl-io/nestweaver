@@ -78,6 +78,58 @@ pub struct ImportGraph {
     go_imports: HashMap<String, GoFileImports>,
     unresolved_exports: HashMap<String, HashSet<String>>,
     incomplete_stars: HashSet<String>,
+    /// Go files whose build constraint is `ignore`: in no package.
+    go_build_ignored: HashSet<String>,
+    /// Kotlin/Java file → its declared package, when known this pass.
+    jvm_packages: HashMap<String, String>,
+    /// Kotlin/Java importer → what its imports name.
+    jvm_imports: HashMap<String, JvmFileImports>,
+}
+
+/// What one Kotlin/Java file's imports name, by target file.
+///
+/// A resolved import pair says only "this file imports something in that
+/// file". Java and Kotlin need more: a single-type import names one
+/// top-level declaration (not the rest of its file), and it outranks a
+/// same-package declaration, which outranks an on-demand import (JLS 6.4.1;
+/// Kotlin: explicit import > same package > star import).
+#[derive(Debug, Default)]
+pub(crate) struct JvmFileImports {
+    /// Target file → line spans of the top-level declarations single-type
+    /// imports name in it.
+    declarations: HashMap<String, Vec<(u32, u32)>>,
+    /// Target files of on-demand (package) imports.
+    on_demand: HashSet<String>,
+}
+
+/// How a Kotlin/Java import reaches a declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum JvmImportRank {
+    /// Named by a single-type import: shadows a same-package declaration.
+    Declaration,
+    /// Reached only through an on-demand import: shadowed by one.
+    OnDemand,
+}
+
+impl JvmFileImports {
+    /// How the declaration at `line` of `target` is imported; `None` when
+    /// `target` is reached only by single-type imports of OTHER top-level
+    /// declarations. A target recorded under neither form (a fallback
+    /// file-path resolution) counts as on demand.
+    pub(crate) fn rank(&self, target: &str, line: u32) -> Option<JvmImportRank> {
+        let spans = self.declarations.get(target);
+        if spans.is_some_and(|spans| {
+            spans
+                .iter()
+                .any(|&(start, end)| start <= line && line <= end)
+        }) {
+            Some(JvmImportRank::Declaration)
+        } else if spans.is_none() || self.on_demand.contains(target) {
+            Some(JvmImportRank::OnDemand)
+        } else {
+            None
+        }
+    }
 }
 
 /// What one Go file's imports bind.
@@ -328,6 +380,28 @@ impl ImportGraph {
         })
     }
 
+    /// Whether a Go file's build constraint is `ignore` (a `go run`
+    /// generator or script that belongs to no package), as far as this
+    /// resolution pass knows.
+    pub(crate) fn go_build_ignored(&self, file: &str) -> bool {
+        self.go_build_ignored.contains(file)
+    }
+
+    /// What the Kotlin/Java file `file` imports, by target; `None` when it
+    /// resolved no import through the package index.
+    pub(crate) fn jvm_imports_of(&self, file: &str) -> Option<&JvmFileImports> {
+        self.jvm_imports.get(file)
+    }
+
+    /// Whether two Kotlin/Java files are in one package: their package
+    /// clauses when both are known this pass, otherwise one directory.
+    pub(crate) fn jvm_same_package(&self, a: &str, b: &str) -> bool {
+        match (self.jvm_packages.get(a), self.jvm_packages.get(b)) {
+            (Some(left), Some(right)) => left == right,
+            _ => crate::util::parent_dir(a) == crate::util::parent_dir(b),
+        }
+    }
+
     /// The package clause recorded for a Go file, when its references were
     /// part of this resolution pass.
     pub(crate) fn go_package_of(&self, file: &str) -> Option<&str> {
@@ -395,6 +469,9 @@ pub(crate) fn build_import_graph_with_languages(
     let mut literal_export_lines = HashMap::new();
     let mut star_exports = HashMap::new();
     let mut go_packages = HashMap::new();
+    let mut go_build_ignored = HashSet::new();
+    let mut jvm_packages = HashMap::new();
+    let mut jvm_imports: HashMap<String, JvmFileImports> = HashMap::new();
     let mut go_imports: HashMap<String, GoFileImports> = HashMap::new();
     let mut unresolved_exports: HashMap<String, HashSet<String>> = HashMap::new();
     let mut incomplete_stars = HashSet::new();
@@ -408,20 +485,39 @@ pub(crate) fn build_import_graph_with_languages(
     // Package clauses first: an importer's qualifier is the IMPORTED file's
     // package name, and that file may come later in `files`.
     for (file_path, _, references) in files {
-        if language_of(file_path) == Language::Go {
+        let language = language_of(file_path);
+        if matches!(language, Language::Go | Language::Kotlin | Language::Java) {
             let packages: Vec<_> = references
                 .iter()
                 .filter(|reference| reference.kind == ReferenceKind::PackageBinding)
                 .collect();
             if packages.len() == 1 {
-                go_packages.insert(file_path.clone(), packages[0].name.clone());
+                let package = packages[0];
+                if language != Language::Go {
+                    jvm_packages.insert(file_path.clone(), package.name.clone());
+                } else if package.receiver.as_deref()
+                    == Some(nestweaver_parser::parse::GO_BUILD_IGNORE)
+                {
+                    // `//go:build ignore`: a standalone `go run` program, in
+                    // no build of its directory's package.
+                    go_build_ignored.insert(file_path.clone());
+                } else {
+                    go_packages.insert(file_path.clone(), package.name.clone());
+                }
             }
         }
     }
     let go_index = files
         .iter()
         .any(|(file_path, _, _)| language_of(file_path) == Language::Go)
-        .then(|| lang::go_lang::GoPackageIndex::new(known_files.iter().copied()));
+        .then(|| {
+            lang::go_lang::GoPackageIndex::new(
+                known_files
+                    .iter()
+                    .copied()
+                    .filter(|file| !go_build_ignored.contains(*file)),
+            )
+        });
     let jvm_index = files
         .iter()
         .any(|(file_path, _, _)| {
@@ -757,15 +853,34 @@ pub(crate) fn build_import_graph_with_languages(
                     .as_ref()
                     .filter(|_| matches!(language, Language::Kotlin | Language::Java))
             {
-                let targets = jvm_index.resolve(specifier);
-                if !targets.is_empty() {
-                    imports.extend(
-                        targets
-                            .into_iter()
-                            .filter(|target| *target != file_path.as_str())
-                            .map(|target| (specifier.clone(), target.to_string())),
-                    );
-                    continue;
+                match jvm_index.resolve(specifier) {
+                    lang::kotlin::JvmImport::Declaration(targets) => {
+                        let file_imports = jvm_imports.entry(file_path.clone()).or_default();
+                        for (target, spans) in targets {
+                            if target == file_path.as_str() {
+                                continue;
+                            }
+                            file_imports
+                                .declarations
+                                .entry(target.to_string())
+                                .or_default()
+                                .extend(spans);
+                            imports.push((specifier.clone(), target.to_string()));
+                        }
+                        continue;
+                    }
+                    lang::kotlin::JvmImport::OnDemand(targets) if !targets.is_empty() => {
+                        let file_imports = jvm_imports.entry(file_path.clone()).or_default();
+                        for target in targets {
+                            if target == file_path.as_str() {
+                                continue;
+                            }
+                            file_imports.on_demand.insert(target.to_string());
+                            imports.push((specifier.clone(), target.to_string()));
+                        }
+                        continue;
+                    }
+                    lang::kotlin::JvmImport::OnDemand(_) => {}
                 }
             }
             let resolved =
@@ -825,6 +940,9 @@ pub(crate) fn build_import_graph_with_languages(
         go_imports,
         unresolved_exports,
         incomplete_stars,
+        go_build_ignored,
+        jvm_packages,
+        jvm_imports,
     }
 }
 
@@ -1310,6 +1428,9 @@ mod tests {
             go_imports: HashMap::new(),
             unresolved_exports: HashMap::new(),
             incomplete_stars: HashSet::new(),
+            go_build_ignored: HashSet::new(),
+            jvm_packages: HashMap::new(),
+            jvm_imports: HashMap::new(),
         };
         let result = graph.bindings_of("src/main.js");
         assert_eq!(result.len(), 1);
@@ -1423,6 +1544,9 @@ mod tests {
             go_imports: HashMap::new(),
             unresolved_exports: HashMap::new(),
             incomplete_stars: HashSet::new(),
+            go_build_ignored: HashSet::new(),
+            jvm_packages: HashMap::new(),
+            jvm_imports: HashMap::new(),
         };
         let lines = |bindings: Vec<&NamedBinding>| -> Vec<u32> {
             bindings.iter().map(|binding| binding.start_line).collect()
@@ -1455,6 +1579,9 @@ mod tests {
             go_imports: HashMap::new(),
             unresolved_exports: HashMap::new(),
             incomplete_stars: HashSet::new(),
+            go_build_ignored: HashSet::new(),
+            jvm_packages: HashMap::new(),
+            jvm_imports: HashMap::new(),
             export_aliases: HashMap::from([(
                 "leaf.js".into(),
                 HashMap::from([("helper".into(), ("helper".into(), None))]),
@@ -1482,6 +1609,9 @@ mod tests {
             go_imports: HashMap::new(),
             unresolved_exports: HashMap::new(),
             incomplete_stars: HashSet::new(),
+            go_build_ignored: HashSet::new(),
+            jvm_packages: HashMap::new(),
+            jvm_imports: HashMap::new(),
             export_aliases: HashMap::from([(
                 "leaf.js".into(),
                 HashMap::from([("helper".into(), ("helper".into(), None))]),

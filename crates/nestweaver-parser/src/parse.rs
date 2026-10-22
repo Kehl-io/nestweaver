@@ -2378,6 +2378,14 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
     if lang == Language::Go {
         annotate_go_import_names(tree.root_node(), source_bytes, &mut references);
+        if go_build_ignored(source) {
+            for reference in references
+                .iter_mut()
+                .filter(|reference| reference.kind == ReferenceKind::PackageBinding)
+            {
+                reference.receiver = Some(GO_BUILD_IGNORE.to_string());
+            }
+        }
     }
 
     // nw-151: recover calls written inside Rust macro bodies.
@@ -6096,6 +6104,60 @@ fn annotate_go_import_names(
     }
 }
 
+/// The `receiver` of a Go file's package clause (`PackageBinding`) when the
+/// file's build constraint is the `ignore` convention (`//go:build ignore`,
+/// or the legacy `// +build ignore`). Such a file is in no build: it is a
+/// generator or script run on its own with `go run`, never a file of the
+/// package its directory holds, so no importer can call into it.
+pub const GO_BUILD_IGNORE: &str = "ignore";
+
+/// Whether a Go file's build constraints exclude it from every build through
+/// the `ignore` tag. Constraints sit in the header, before the package
+/// clause, preceded only by blank lines and line comments. A `//go:build`
+/// line wins over legacy `// +build` lines. Only the convention is
+/// recognised: an expression that is `ignore`, or a conjunction with an
+/// `ignore` term.
+fn go_build_ignored(source: &str) -> bool {
+    let ignore_term = |expression: &str| {
+        let expression = expression.trim();
+        !expression.contains("||")
+            && expression
+                .split("&&")
+                .any(|term| term.trim().trim_matches(|c: char| c == '(' || c == ')') == "ignore")
+    };
+    let mut go_build = None;
+    let mut plus_build = false;
+    for line in source.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(expression) = line.strip_prefix("//go:build")
+            && expression.starts_with(char::is_whitespace)
+        {
+            if go_build.is_none() {
+                go_build = Some(ignore_term(expression));
+            }
+            continue;
+        }
+        if let Some(options) = line.strip_prefix("// +build")
+            && options.starts_with(char::is_whitespace)
+        {
+            // Space-separated options are OR'd, comma-separated terms AND'd;
+            // the line is false when every option has an `ignore` term.
+            let mut options = options.split_whitespace().peekable();
+            plus_build |= options.peek().is_some()
+                && options.all(|option| option.split(',').any(|term| term == "ignore"));
+            continue;
+        }
+        if line.starts_with("//") {
+            continue;
+        }
+        break;
+    }
+    go_build.unwrap_or(plus_build)
+}
+
 /// Remove surrounding quotes from string literals.
 fn strip_quotes(s: &str) -> String {
     let s = s.trim();
@@ -6145,6 +6207,38 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// QA (post-#515): a `//go:build ignore` generator must be marked so the
+    /// resolver keeps it out of its directory's package.
+    #[test]
+    fn go_build_ignore_header_marks_the_package_clause() {
+        for (source, ignored) in [
+            ("//go:build ignore\n\npackage util\n", true),
+            (
+                "// Code generator.\n\n//go:build ignore\n// +build ignore\n\npackage util\n",
+                true,
+            ),
+            ("// +build ignore\n\npackage util\n", true),
+            ("//go:build ignore && tools\n\npackage util\n", true),
+            ("/* header */\n//go:build ignore\n\npackage util\n", false),
+            ("//go:build !ignore\n\npackage util\n", false),
+            ("//go:build ignore || linux\n\npackage util\n", false),
+            ("// +build ignore linux\n\npackage util\n", false),
+            ("//go:build linux\n\npackage util\n", false),
+            ("package util\n\n//go:build ignore\n", false),
+            ("package util\n", false),
+        ] {
+            let parsed = parse_source(Path::new("a/util/gen.go"), source).unwrap();
+            let receivers: Vec<Option<&str>> = parsed
+                .references
+                .iter()
+                .filter(|reference| reference.kind == ReferenceKind::PackageBinding)
+                .map(|reference| reference.receiver.as_deref())
+                .collect();
+            let expected = ignored.then_some(GO_BUILD_IGNORE);
+            assert_eq!(receivers, vec![expected], "{source:?}");
+        }
+    }
 
     /// nw-812: a slow first compile of one query key must not block a
     /// different key. The global cache mutex used to be held across

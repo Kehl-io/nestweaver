@@ -422,3 +422,182 @@ fn parser_records_import_names_and_package_clauses() {
             && r.receiver.as_deref() == Some("*")
     }));
 }
+
+/// [`resolve`] with per-file type environments, as the indexer passes them:
+/// typed receivers (`Foo f = new Foo(); f.hit();`) need them.
+fn resolve_typed(inputs: &[(&str, &str)], language: Language) -> (Files, Vec<ResolvedEdge>) {
+    let mut files = Vec::new();
+    let mut languages = HashMap::new();
+    let mut envs = HashMap::new();
+    for (path, source) in inputs {
+        let parsed = parse_source(Path::new(path), source).unwrap();
+        let detected = nestweaver_parser::detect_language(Path::new(path)).unwrap();
+        languages.insert((*path).to_string(), detected);
+        envs.insert(
+            (*path).to_string(),
+            crate::types::TypeEnvironment::build(
+                source,
+                detected,
+                &parsed.symbols,
+                &parsed.type_bindings,
+            ),
+        );
+        files.push(((*path).to_string(), parsed.symbols, parsed.references));
+    }
+    let edges = resolve_references_with_file_languages(
+        &files,
+        language,
+        REPO,
+        &WorkspaceContext::default(),
+        Some(&envs),
+        None,
+        Some(&languages),
+    );
+    (files, edges)
+}
+
+/// QA (post-#515): Kotlin name precedence is explicit import > same package
+/// > star import. `import com.k1.make` imports `make`, not every top-level
+/// declaration of its file, so `Thing()` in `com.k2` is `com.k2.Thing`.
+#[test]
+fn kotlin_same_package_type_wins_over_package_imports() {
+    let k1 = "package com.k1\n\nclass Thing\n\nfun make(): Thing = Thing()\n";
+    let thing = "package com.k2\n\nclass Thing\n";
+    let named =
+        "package com.k2\n\nimport com.k1.make\n\nfun named() {\n    Thing()\n    make()\n}\n";
+    let star = "package com.k2\n\nimport com.k1.*\n\nfun star() {\n    Thing()\n    make()\n}\n";
+    let explicit = "package com.k2\n\nimport com.k1.Thing\n\nfun explicit() {\n    Thing()\n}\n";
+    let inputs = [
+        ("src/com/k1/K1.kt", k1),
+        ("src/com/k2/Thing.kt", thing),
+        ("src/com/k2/Use.kt", named),
+        ("src/com/k2/Star.kt", star),
+        ("src/com/k2/Explicit.kt", explicit),
+    ];
+    let (files, edges) = resolve(&inputs, Language::Kotlin, &WorkspaceContext::default());
+    let calls = calls(&files, &edges);
+    for expected in [
+        "src/com/k2/Use.kt::named -> src/com/k2/Thing.kt::Thing",
+        "src/com/k2/Use.kt::named -> src/com/k1/K1.kt::make",
+        "src/com/k2/Star.kt::star -> src/com/k2/Thing.kt::Thing",
+        "src/com/k2/Star.kt::star -> src/com/k1/K1.kt::make",
+        "src/com/k2/Explicit.kt::explicit -> src/com/k1/K1.kt::Thing",
+    ] {
+        assert!(calls.contains(expected), "missing {expected}: {calls:#?}");
+    }
+    for unexpected in [
+        "src/com/k2/Use.kt::named -> src/com/k1/K1.kt::Thing",
+        "src/com/k2/Star.kt::star -> src/com/k1/K1.kt::Thing",
+        "src/com/k2/Explicit.kt::explicit -> src/com/k2/Thing.kt::Thing",
+    ] {
+        assert!(
+            !calls.contains(unexpected),
+            "unexpected {unexpected}: {calls:#?}"
+        );
+    }
+}
+
+/// QA (post-#515): in Java a same-package type shadows a type-import-on-
+/// demand (JLS 6.4.1) and is shadowed by a single-type import. Covers the
+/// constructed receiver (`new Foo().hit()`) and a local of declared type
+/// (`Foo f = new Foo(); f.hit();`), with and without imports.
+#[test]
+fn java_same_package_type_wins_over_on_demand_import() {
+    let foo_a = "package com.a;\n\npublic class Foo {\n    public void hit() {}\n}\n";
+    let foo_b = "package com.b;\n\npublic class Foo {\n    public void hit() {}\n}\n";
+    let on_demand = r#"package com.b;
+
+import com.a.*;
+
+public class Use {
+    void direct() {
+        new Foo().hit();
+    }
+
+    void local() {
+        Foo f = new Foo();
+        f.hit();
+    }
+}
+"#;
+    let plain = r#"package com.b;
+
+public class Plain {
+    void local() {
+        Foo f = new Foo();
+        f.hit();
+    }
+}
+"#;
+    let single = r#"package com.b;
+
+import com.a.Foo;
+
+public class Single {
+    void local() {
+        Foo f = new Foo();
+        f.hit();
+    }
+}
+"#;
+    let inputs = [
+        ("src/com/a/Foo.java", foo_a),
+        ("src/com/b/Foo.java", foo_b),
+        ("src/com/b/Use.java", on_demand),
+        ("src/com/b/Plain.java", plain),
+        ("src/com/b/Single.java", single),
+    ];
+    let (files, edges) = resolve_typed(&inputs, Language::Java);
+    let calls = calls(&files, &edges);
+    for expected in [
+        "src/com/b/Use.java::direct -> src/com/b/Foo.java::hit",
+        "src/com/b/Use.java::local -> src/com/b/Foo.java::hit",
+        "src/com/b/Plain.java::local -> src/com/b/Foo.java::hit",
+        "src/com/b/Single.java::local -> src/com/a/Foo.java::hit",
+    ] {
+        assert!(calls.contains(expected), "missing {expected}: {calls:#?}");
+    }
+    for unexpected in [
+        "src/com/b/Use.java::direct -> src/com/a/Foo.java::hit",
+        "src/com/b/Use.java::local -> src/com/a/Foo.java::hit",
+        "src/com/b/Single.java::local -> src/com/b/Foo.java::hit",
+    ] {
+        assert!(
+            !calls.contains(unexpected),
+            "unexpected {unexpected}: {calls:#?}"
+        );
+    }
+}
+
+/// QA (post-#515): a `//go:build ignore` generator in a package directory is
+/// a standalone program, not a file of the package. Its `Do` is neither the
+/// imported callee nor a build variant of the real `Do`.
+#[test]
+fn go_build_ignore_file_is_not_a_package_callee() {
+    let main =
+        "package main\n\nimport \"example.com/go1/a/util\"\n\nfunc main() {\n\tutil.Do()\n}\n";
+    let real = "package util\n\nfunc Do() {}\n";
+    let other = "package util\n\nfunc Other() {\n\tDo()\n}\n";
+    let generator = "//go:build ignore\n\npackage util\n\nfunc Do() {}\n";
+    let inputs = [
+        ("main.go", main),
+        ("a/util/u.go", real),
+        ("a/util/other.go", other),
+        // Sorts first in its directory, as in the QA repro.
+        ("a/util/gen.go", generator),
+    ];
+    let (files, edges) = resolve(&inputs, Language::Go, &go_workspace());
+    let calls = calls(&files, &edges);
+    for expected in [
+        "main.go::main -> a/util/u.go::Do",
+        "a/util/other.go::Other -> a/util/u.go::Do",
+    ] {
+        assert!(calls.contains(expected), "missing {expected}: {calls:#?}");
+    }
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.ends_with("-> a/util/gen.go::Do")),
+        "a build-ignored file must not be a callee: {calls:#?}"
+    );
+}

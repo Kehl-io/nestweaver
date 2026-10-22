@@ -5,7 +5,7 @@ use nestweaver_schema::{
 };
 use rayon::prelude::*;
 
-use crate::imports::{ImportGraph, NamedBinding, build_import_graph_with_languages};
+use crate::imports::{ImportGraph, JvmImportRank, NamedBinding, build_import_graph_with_languages};
 use crate::types::TypeEnvironment;
 use crate::util::parent_dir;
 use crate::workspace::WorkspaceContext;
@@ -621,6 +621,11 @@ fn go_build_variant_edges(
 /// external `_test` package, so the same directory counts as the same
 /// package unless exactly one of the two is a `_test.go` file.
 fn go_same_package(graph: &ImportGraph, a: &str, b: &str) -> bool {
+    // A `//go:build ignore` file is a standalone `go run` program: it shares
+    // a package with no other file of its directory (not a build variant).
+    if graph.go_build_ignored(a) || graph.go_build_ignored(b) {
+        return a == b;
+    }
     match (graph.go_package_of(a), graph.go_package_of(b)) {
         (Some(left), Some(right)) => left == right,
         _ => a.ends_with("_test.go") == b.ends_with("_test.go"),
@@ -1665,39 +1670,84 @@ fn resolve_single_reference(
             .collect()
     };
     imports.sort_by(|(_, a), (_, b)| a.cmp(b));
-    for (_, imported_file) in &imports {
-        if let Some(syms) = &candidates
-            && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
-                f == imported_file
-                    && candidate_matches(
-                        reference,
-                        if language == Language::Rust && graph.resolves_parent(file_path, f) {
-                            f
-                        } else {
-                            file_path
-                        },
-                        f,
-                        sym,
-                        language,
-                        graph,
-                    )
+    // Kotlin/Java: a single-type import names one top-level declaration (not
+    // its whole file) and shadows a same-package declaration, which shadows
+    // an on-demand import (JLS 6.4.1; Kotlin: explicit > same package >
+    // star). `jvm_shadowed` hands an on-demand-only name to the same-package
+    // tier below.
+    let jvm_imports = binding
+        .is_none()
+        .then(|| graph.jvm_imports_of(file_path))
+        .flatten()
+        .filter(|_| matches!(language, Language::Kotlin | Language::Java));
+    let jvm_shadowed = jvm_imports.is_some()
+        && candidates.is_some_and(|syms| {
+            syms.iter().any(|(f, sym)| {
+                // A bare name denotes a package member: a top-level one.
+                *f != file_path
+                    && (reference.receiver.is_some() || sym.parent_name.is_none())
+                    && graph.jvm_same_package(file_path, f)
+                    && candidate_matches(reference, file_path, f, sym, language, graph)
+                    && !bare_call_names_member(reference, sym, language)
             })
+        });
+    let mut imported: Option<(Option<JvmImportRank>, &str, &RawSymbol)> = None;
+    for (_, imported_file) in &imports {
+        let Some(syms) = &candidates else {
+            break;
+        };
+        let found = syms.iter().find_map(|(f, sym)| {
+            if f != imported_file {
+                return None;
+            }
+            let rank = match jvm_imports {
+                None => None,
+                Some(jvm) => match jvm.rank(f, sym.start_line)? {
+                    JvmImportRank::OnDemand if jvm_shadowed => return None,
+                    rank => Some(rank),
+                },
+            };
+            candidate_matches(
+                reference,
+                if language == Language::Rust && graph.resolves_parent(file_path, f) {
+                    f
+                } else {
+                    file_path
+                },
+                f,
+                sym,
+                language,
+                graph,
+            )
+            .then_some((rank, *f, *sym))
+        });
+        if let Some(found) = found
+            && imported.is_none_or(|(rank, _, _)| found.0 < rank)
         {
-            let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
-            let confidence = confidence_score(MatchType::ImportResolved, language);
-            return Some(ResolvedEdge {
-                source_uid,
-                target_uid,
-                edge_type,
-                confidence,
-                link_type: None,
-                evidence: vec![EdgeEvidence {
-                    kind: "import_resolved".to_string(),
-                    weight: confidence,
-                    note: None,
-                }],
-            });
+            imported = Some(found);
+            if found
+                .0
+                .is_none_or(|rank| rank == JvmImportRank::Declaration)
+            {
+                break;
+            }
         }
+    }
+    if let Some((_, imported_file, sym)) = imported {
+        let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
+        let confidence = confidence_score(MatchType::ImportResolved, language);
+        return Some(ResolvedEdge {
+            source_uid,
+            target_uid,
+            edge_type,
+            confidence,
+            link_type: None,
+            evidence: vec![EdgeEvidence {
+                kind: "import_resolved".to_string(),
+                weight: confidence,
+                note: None,
+            }],
+        });
     }
 
     // Priority 3: Re-exports.
@@ -1708,7 +1758,13 @@ fn resolve_single_reference(
     // Bounded at REEXPORT_MAX_HOPS with a visited set so a cyclic barrel (which
     // TypeScript permits) cannot loop, and so the fan-out stays bounded: this
     // tier is why nw-153's guards exist.
-    let mut frontier: Vec<String> = imports.iter().map(|(_, f)| f.to_string()).collect();
+    // Kotlin/Java imports re-export nothing; a same-package name shadowed
+    // its on-demand imports and goes to the same-package tier.
+    let mut frontier: Vec<String> = if jvm_shadowed {
+        Vec::new()
+    } else {
+        imports.iter().map(|(_, f)| f.to_string()).collect()
+    };
     let mut visited: std::collections::HashSet<String> = frontier.iter().cloned().collect();
     visited.insert(file_path.to_string());
     for _ in 0..REEXPORT_MAX_HOPS {
@@ -1789,7 +1845,16 @@ fn resolve_single_reference(
         let mut same_pkg: Vec<_> = syms
             .iter()
             .filter(|(candidate_file, _)| {
-                *candidate_file != file_path && parent_dir(candidate_file) == same_dir
+                *candidate_file != file_path
+                    && if matches!(language, Language::Kotlin | Language::Java) {
+                        graph.jvm_same_package(file_path, candidate_file)
+                    } else {
+                        parent_dir(candidate_file) == same_dir
+                            // A `//go:build ignore` program shares no package.
+                            && !(language == Language::Go
+                                && (graph.go_build_ignored(file_path)
+                                    || graph.go_build_ignored(candidate_file)))
+                    }
             })
             .filter(|(candidate_file, sym)| {
                 candidate_matches(reference, file_path, candidate_file, sym, language, graph)
@@ -2145,6 +2210,9 @@ fn typed_receiver_origin(
     if !imports.is_empty() {
         return None;
     }
+    if matches!(language, Language::Kotlin | Language::Java) {
+        return jvm_type_origin(source_file, type_name, symbol_map, graph, type_kind);
+    }
     // Resolved globs may expose a class even without a named alias record.
     let imports = graph.imports_of(source_file);
     let reachable: Vec<_> = symbol_map
@@ -2160,6 +2228,58 @@ fn typed_receiver_origin(
         .collect();
     (reachable.len() == 1).then(|| TypedReceiverOrigin {
         file: reachable[0].0.into(),
+        name: type_name.into(),
+        rust_class_position: None,
+    })
+}
+
+/// The Kotlin/Java declaration a type name in `source_file` denotes, by the
+/// languages' precedence: a single-type import, then a top-level type of the
+/// same package, then an on-demand import (JLS 6.4.1; Kotlin: explicit
+/// import > same package > star import). `Foo f = new Foo(); f.hit();` in
+/// package `com.b` with `import com.a.*;` is `com.b.Foo`, and with no import
+/// at all a same-package `Foo` is still a known origin. Ambiguity at the
+/// winning tier is no origin.
+fn jvm_type_origin(
+    source_file: &str,
+    type_name: &str,
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+    graph: &ImportGraph,
+    type_kind: impl Fn(SymbolKind) -> bool,
+) -> Option<TypedReceiverOrigin> {
+    let imports = graph.imports_of(source_file);
+    let jvm_imports = graph.jvm_imports_of(source_file);
+    let mut best: Option<(u8, Vec<&str>)> = None;
+    for (file, symbol) in symbol_map.get(type_name).into_iter().flatten() {
+        if *file == source_file || !type_kind(symbol.kind) {
+            continue;
+        }
+        let import_rank = (symbol.visibility != Visibility::Private
+            && imports.iter().any(|(_, target)| target == file))
+        .then(|| {
+            jvm_imports.map_or(Some(JvmImportRank::OnDemand), |jvm| {
+                jvm.rank(file, symbol.start_line)
+            })
+        })
+        .flatten();
+        let top_level = symbol.parent_name.is_none();
+        let rank = match import_rank {
+            Some(JvmImportRank::Declaration) => 0,
+            _ if top_level && graph.jvm_same_package(source_file, file) => 1,
+            Some(JvmImportRank::OnDemand) if top_level => 2,
+            _ => continue,
+        };
+        if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+            best = Some((rank, vec![*file]));
+        } else if let Some((best_rank, files)) = best.as_mut()
+            && *best_rank == rank
+        {
+            files.push(*file);
+        }
+    }
+    let (_, files) = best?;
+    (files.len() == 1).then(|| TypedReceiverOrigin {
+        file: files[0].into(),
         name: type_name.into(),
         rust_class_position: None,
     })
