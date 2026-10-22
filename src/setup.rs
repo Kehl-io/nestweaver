@@ -1402,7 +1402,10 @@ fn set_json_flag(args: &mut Vec<serde_json::Value>, flag: &str, value: &str) {
 /// Set the value after `flag` in a TOML argv, appending the pair if absent.
 /// Replaces the one value in place, so comments and layout around it survive.
 fn set_toml_flag(args: &mut toml_edit::Array, flag: &str, value: &str) {
-    match args.iter().position(|a| a.as_str() == Some(flag)) {
+    // Bound first: `Array::iter` returns a boxed iterator, which has drop glue,
+    // so as a `match` scrutinee its borrow would outlive the arms that mutate.
+    let position = args.iter().position(|a| a.as_str() == Some(flag));
+    match position {
         Some(i) if i + 1 < args.len() => {
             let decor = args
                 .get(i + 1)
@@ -1513,13 +1516,15 @@ fn merge_codex_mcp(
     // own config.
     let points_elsewhere = matches!(outcome, Registration::PointsElsewhere { .. });
     if !points_elsewhere && let Some(desired_config) = desired_config.as_deref() {
-        if let Some(config_index) = args
+        // Bound first, for the same boxed-iterator reason as `set_toml_flag`.
+        let config_position = args
             .iter()
-            .position(|value| value.as_str() == Some("--config"))
-        {
+            .position(|value| value.as_str() == Some("--config"));
+        if let Some(config_index) = config_position {
             let Some(current) = args
                 .get(config_index + 1)
                 .and_then(toml_edit::Value::as_str)
+                .map(str::to_string)
             else {
                 anyhow::bail!(
                     "[mcp_servers.nestweaver] in {} has --config without a path",
