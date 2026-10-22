@@ -8197,7 +8197,7 @@ sub b body
             "bad\u{7}name",
             &[],
         );
-        let message = format!("{:#}", full.expect_err("control character must be refused"));
+        let message = format!("{:#}", full.err().expect("control character must be refused"));
         assert!(message.contains("--name"), "{message}");
         assert!(!marker.exists(), "a refused add must not leave {marker:?}");
 
@@ -8209,7 +8209,7 @@ sub b body
             since,
             &[],
         );
-        let message = format!("{:#}", incremental.expect_err("--since route too"));
+        let message = format!("{:#}", incremental.err().expect("--since route too"));
         assert!(message.contains("--name"), "{message}");
         assert!(
             !marker.exists(),
