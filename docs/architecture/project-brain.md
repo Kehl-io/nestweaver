@@ -5,7 +5,7 @@
 **Audience:** Engineers implementing the system; reviewers evaluating the approach
 
 The shipped commands are `nestweaver brain add <path>`, default database `./nestweaver.lbug`, and `nestweaver daemon` / `nestweaver brain watch`. This draft's onboarding contract (`brain pause`, `index-vault`, `sources.toml`, `nestweaverd`, `brain add --no-watch`) was not what shipped.
-**Companion doc:** `docs/plans/markdown-brain-extension.md` (effort and phasing plan)
+**Companion doc:** a separate effort and phasing plan (`markdown-brain-extension.md`), not kept in this repository.
 
 ---
 
@@ -566,11 +566,16 @@ greedy_token_budgeted(ranked_nodes, budget):
 The MCP server is implemented in `nestweaver-mcp` using **`rmcp`** (the official Rust MCP SDK, `rmcp` crate). Transport: stdio (default for Claude Desktop / Claude Code integration). SSE/HTTP optional behind a feature flag.
 
 Launched via `nestweaver mcp [--db PATH] [--config PATH]`. The normal path
-proxies through the database-owning daemon; `--no-daemon` is an explicitly
-read-only CI/testing surface. File watching is managed separately through
+proxies through the database-owning daemon; the direct read-only route exists
+only in the unpublished CI test build (release binaries ignore `--no-daemon`). File watching is managed separately through
 `nestweaver watch` / `nestweaver brain watch`.
 
 ### 7.2 Tool catalogue
+
+> This catalogue is the original design and lists tools that never shipped
+> (`note_create`, `note_append`, `note_link`, `projects_list`, `code_for`,
+> `note_for`, `note_section`). The live catalogue is the 43 tools a
+> `tools/list` call returns; see [Server Mode](../server-mode.md).
 
 #### Read tools (Phase 1–2)
 
@@ -1933,4 +1938,4 @@ Bench output goes to `target/criterion/` as both per-bench JSON and a top-level 
 
 ---
 
-*End of design document. Companion document: `docs/plans/markdown-brain-extension.md` for effort estimation and recommended phasing.*
+*End of design document. The companion effort and phasing plan is not kept in this repository.*

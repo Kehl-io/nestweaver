@@ -135,20 +135,22 @@ exactly like the rest.
 | `NESTWEAVER_NO_DAEMON` | unset | *Requests* a daemon bypass. CI-only; standard artifacts ignore the request and use the daemon |
 | `NESTWEAVER_ALLOW_NO_DAEMON` | unset | Explicit CI-only permit; also requires the internal CI test artifact and a GitHub Actions runner context |
 
-The daemon's idle timeout is a `daemon run --idle-timeout <secs>` flag (3600 by
-default when autostarted), **not** an environment variable. See CLAUDE.md for the
-full operator-facing environment-variable table.
+The daemon's idle timeout is the `daemon start --idle-timeout <secs>` flag
+(default 3600). An autostart against a database that looks temporary (under
+`/tmp`, `$TMPDIR` or `/var/folders`) uses a 60-second timeout instead, tunable
+with `NESTWEAVER_EPHEMERAL_IDLE_TIMEOUT_SECS`. See CLAUDE.md for the full
+operator-facing environment-variable table.
 
 ## Daemon
 
-NestWeaver uses a background daemon process that exclusively owns the database and serves all queries via gRPC over a Unix domain socket. The daemon auto-starts on first use and exits after 1 hour of inactivity.
+NestWeaver uses a background daemon process that exclusively owns the database and serves all queries via gRPC over a Unix domain socket. The daemon auto-starts on first use and exits after an hour of inactivity (see the idle timeout above).
 
 ```bash
 nestweaver daemon status --db ./nestweaver.lbug   # check daemon state
 nestweaver daemon stop --db ./nestweaver.lbug     # stop the daemon
 ```
 
-Daemon logs are written to `~/.local/state/nestweaver/<instance>/daemon.log`.
+Daemon logs are written to `~/.local/state/nestweaver/<id>/daemon.log`, where `<id>` is a short hash of the database path (rotated daily; `$XDG_STATE_HOME` replaces `~/.local/state` when set).
 
 Daemon bypass is CI-only. Local MCP sessions, fixtures, and recovery must use
 the daemon. Standard development and release artifacts cannot honor bypass

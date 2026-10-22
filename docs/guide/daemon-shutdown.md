@@ -202,13 +202,16 @@ systemctl start nestweaver          # or: nestweaver daemon start --config <toml
 nestweaver brain refresh ... --config <toml>
 ```
 
-> **Linux status is currently ambiguous about this.** On macOS `daemon status`
+> **Ask `daemon status --json` which kind you have.** On macOS the text output
 > distinguishes `Daemon is running (launchd agent)` from a bare PID. On Linux
-> both a systemd-supervised daemon and an ad-hoc one print
-> `Daemon is running (PID <n>)`, so status alone will not tell you which you
-> have. Until that is disclosed, treat `systemctl is-active` and
-> `nestweaver daemon status` as answering **different questions**: whether the
-> unit is up, versus whether something is serving the database.
+> the text output prints `Daemon is running (PID <n>)` for both kinds, but
+> `nestweaver daemon --db <db> status --json` reports the supervision: a
+> daemon owned by a **user** service (`systemctl --user`) reads `systemd-user`,
+> an unsupervised one reads `ad-hoc`, and a **system** unit like the example
+> above reads `unknown/unverifiable` (see "Observe the selected runtime before
+> recovery" below). Either way, `systemctl is-active` and
+> `nestweaver daemon status` answer **different questions**: whether the unit
+> is up, versus whether something is serving the database.
 
 ### macOS, launchd — **was the tightest exposure of all; now partially fixed**
 
@@ -262,7 +265,9 @@ real fix is crash safety in the store, not a larger number here.
 instance, socket, observed ownership evidence and supervision. A held database
 lock with a missing socket is `running_but_unreachable`; an unreadable lock is
 `unknown`, not proof that the database is stopped. Neither status path starts a
-daemon or removes runtime files. Identify the lock holder before signaling it:
+daemon or removes runtime files. `daemon status` exits **69** (`EX_UNAVAILABLE`)
+in those two states, so a script can tell "stopped" (exit 0) from "stuck and
+needs an operator"; exit 1 still means the check itself failed. Identify the lock holder before signaling it:
 a direct indexing process can own the same write lock as a daemon.
 
 Linux supervision is `systemd-user` only when the live process belongs to a

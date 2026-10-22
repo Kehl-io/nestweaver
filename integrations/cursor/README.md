@@ -34,7 +34,7 @@ Use `--tools` to pick an explicit subset instead, which is the supported way to
 go beyond lite mode without tripping the cap:
 
 ```jsonc
-"args": ["mcp", "--tools", "brain_context,brain_search,brain_impact,flow_trace,read_symbols"]
+"args": ["mcp", "--tools", "brain_context,brain_search,brain_impact,flow_trace,read_symbols", "--db", "/absolute/path/to/nestweaver.lbug"]
 ```
 
 Other editors have no such cap; this section is Cursor-specific.

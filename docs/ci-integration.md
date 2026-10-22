@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0            # full history needed for diff
-      - uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v1
+      - uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.1
         with:
           server: ${{ secrets.NESTWEAVER_URL }}
           token: ${{ secrets.NESTWEAVER_TOKEN }}
@@ -33,6 +33,12 @@ jobs:
 
 That's it. The action diffs the PR against the base branch, sends the changed
 symbols to your NestWeaver server, and posts a comment with the results.
+
+**Pin the action to a release tag.** There is no moving major tag (`@v1`,
+`@v12`); reference an exact release such as `@v12.2.1` (or a commit SHA) and
+bump it when you upgrade. The `version` input (default `latest`) separately
+selects which CLI release the action installs; set it to the same release to
+keep the action and the CLI in step.
 
 ## Quick Start: GitLab CI
 
@@ -90,7 +96,7 @@ pipeline availability to the NestWeaver server.
 
 GitHub Actions:
 ```yaml
-- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v1
+- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.1
   with:
     server: ${{ secrets.NESTWEAVER_URL }}
     token: ${{ secrets.NESTWEAVER_TOKEN }}
@@ -113,7 +119,7 @@ treat a missing report as a pipeline failure.
 
 GitHub Actions:
 ```yaml
-- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v1
+- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.1
   with:
     server: ${{ secrets.NESTWEAVER_URL }}
     token: ${{ secrets.NESTWEAVER_TOKEN }}
@@ -127,6 +133,14 @@ nestweaver-impact:
   variables:
     NESTWEAVER_FAIL_ON_ERROR: "true"
 ```
+
+### Other inputs and outputs
+
+The GitHub Action also accepts `severity` (minimum severity to report:
+`breaking`, `warning` or `info`; default `info`), `comment` (post a PR comment;
+default `true`) and `version` (CLI release to install; default `latest`). It
+sets two step outputs: `has-breaking` (`true`/`false`) and `impact-count` (the
+total number of impacted symbols).
 
 ### Defaults
 
@@ -220,9 +234,16 @@ nestweaver contracts diff \
   --fail-on-breaking
 ```
 
-BREAKING = endpoint removed, response field removed, field type changed, or a
-request field made newly required. Compatible additions (a new endpoint, a new
-optional field) are reported as INFO and do not fail the job. Add `--json` for a
+BREAKING = endpoint removed, response field removed, field type changed, a
+request field made newly required, or a request-parameter or success-status
+change a caller would notice: a parameter that became required, changed type or
+moved location (for example from query to header), a removed path parameter,
+or a removed `2xx` response code that no remaining code or range covers (`200`
+replaced by `2XX` is not breaking). Compatible additions (a new endpoint, a new
+optional field or parameter, a relaxed requirement, a removed optional
+query/header/cookie parameter) are reported as INFO and do not fail the job.
+Parameter and response-status changes are new in this release, so
+`--fail-on-breaking` can now fail on specs that used to pass. Add `--json` for a
 machine-readable report. See `nestweaver contracts diff --help`.
 
 ## Blast Radius as SARIF (code scanning / PR annotations)
@@ -349,8 +370,43 @@ strict_block_on_high_risk = false # default — the risk score stays advisory
 ```
 
 **Locally**, the same output is one command away — `nestweaver hooks --install`
-adds an advisory pre-push check (see the CLI guide), and `--sarif` can be opened
+adds an advisory pre-push check (`nestweaver hooks --help`; it runs
+`nestweaver pr-impact --base` against the merge-base), and `--sarif` can be opened
 in the VS Code *SARIF Viewer* extension for inline review before you push.
+
+## Selecting tests with `affected-tests`
+
+`nestweaver affected-tests` maps a change to the test files it should run, in
+priority tiers, with a `recommendation` (`run-full-suite` on any degraded run).
+It needs a local index of the repository under test.
+
+```bash
+# Diff against a ref. This compares the ref to the WORKING TREE
+# (`git diff --name-only <ref>`), so uncommitted edits are included and it is
+# NOT the merge-base diff; pass a merge-base sha if that is what you want.
+nestweaver affected-tests --base-ref "$(git merge-base origin/main HEAD)" --json
+
+# Or name the changed files (repo-relative) yourself.
+nestweaver affected-tests --files src/auth.rs,src/db.rs --repo my-service --json
+```
+
+The selection is scoped to ONE repository, and repo-relative paths resolve in
+that repository only:
+
+- With `--base-ref`, the default is the indexed repo checked out at the
+  working directory's git root.
+- With `--files`, the default is the only indexed repo. When several repos are
+  indexed, `--repo <name or UID>` is required; without it the command refuses
+  with exit **64** ("could belong to any of N indexed repositories … pass
+  --repo").
+- `--repo` naming no indexed repo exits **2**.
+- `--files` and `--base-ref` cannot be combined (exit 64). Over MCP, passing
+  `changed_files`/`files` together with `base_ref` is likewise refused, and the
+  `repo` argument names the repository `base_ref` diffs.
+
+`--json` names the repository it diffed, and each changed symbol carries its
+`repo_uid`. The Git calls that compute the diff run with the repository's own
+programs (fsmonitor, hooks, filter and diff drivers) disabled.
 
 ## Measuring your own miss rate
 
@@ -532,9 +588,13 @@ To name the generation-stale subset specifically:
 
 `hubs`, `bridges`, `repo-map`, `ranking rank` and `summary --level hub` also
 disclose it (`rankings_stale` / `stale_repos` on `--json`, a stderr warning
-otherwise). `clusters`, `blast-radius`, `affected-tests`, `generate-guide`,
-PPR-backed `context` and the web UI do not. Do not read the absence of a warning
-on those as evidence of freshness.
+otherwise). `blast-radius` / `pr-impact`, `detect-changes` and
+`affected-tests` degrade their answer (and list the repo in
+`resolver_stale_repos`) when a stale repository owns a changed file or is
+linked to one; any other stale repository is only named in a
+`resolver-generation-stale-unrelated` warning. `clusters`, `generate-guide`,
+PPR-backed `context` and the web UI do not disclose it. Do not read the absence
+of a warning on those as evidence of freshness.
 
 **`dead-code` does not disclose — it refuses**, and it exits `2` doing so. Its
 output is a list of symbols to *delete*, computed by walking forward from entry

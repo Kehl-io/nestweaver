@@ -275,6 +275,13 @@ the holder and how long it has held it. That line is a **message, not a
 timeout**: long-running write RPCs remain uncapped, and nothing in this path
 cancels or shortens them.
 
+The exception is small metadata writes (`set_extension`, `unset_extension`,
+`interactions forget`). They wait at most
+`NESTWEAVER_METADATA_WRITE_WAIT_SECS` (default 15, at most 3600; `0` refuses at
+once when busy) for the write lock, then return a `write-busy` error that names
+the holder and says nothing was written, so they no longer hang behind a long
+index. A request cancelled while it waits is never applied.
+
 ---
 
 ## Network Architecture
@@ -340,6 +347,38 @@ query tool that runs and matches nothing is not an error: it returns
 `isError: false` with empty results. Behind a daemon with an upstream, a
 two-tier `brain_impact` result carries the envelope at its top level when
 neither tier found the symbol (or the upstream was unavailable).
+
+`brain_remove_source` refuses an ambiguous target rather than guessing. A
+name, path, URL or UID that matches more than one source (for example a vault
+and a repo that share a name, including a repo's URL-derived name) is a tool
+error listing each candidate's kind and UID, and nothing is removed; pass one
+candidate's UID. Repo URLs match exactly, never by suffix. A source whose
+stored name contains control characters is listed escaped and can be removed
+by path or UID.
+
+#### Input limits
+
+Client-supplied lists and strings are bounded, and each limit is published in
+the tool's `inputSchema` (`maxItems`, `maxLength`, `maximum`), so a client can
+read it rather than discover it. A list over its limit is rejected, not
+truncated; seed lists are deduplicated first.
+
+| Input | Limit |
+|---|---|
+| `brain_context` / `code_context` `seeds` | 256 |
+| `kinds` filters | 32 |
+| `repos` / `tags` scope filters | 100 on the context tools (`hub_nodes` / `bridge_nodes` `repos`: 1000) |
+| changed-file lists (`changed_files` / `files`) and `read_symbols` targets | 1000 |
+| `count_patterns` `patterns` | 64 |
+| `brain_add_source` `name` | 255 characters, no control characters |
+| `set_extension` | `uid` 1 KiB and `key` 256 bytes, both without control characters; `value` 64 KiB of JSON; at most 256 properties per node, 100,000 annotated nodes and a 32 MiB sidecar. `last_indexed_at` is a reserved key |
+| One MCP stdio frame | 64 MiB |
+
+`count_patterns` also has a whole-call `max_millis` budget (default 10,000 ms,
+at most 600,000), shared by all patterns, and stops when the request is
+cancelled or the client disconnects. Error messages and gRPC status details
+that echo an input are bounded, so a long argument cannot overflow HTTP/2
+trailers.
 
 Send `notifications/cancelled` with `params.requestId` to cancel an in-flight
 request. Stdio continues reading cancellation and ping frames while tool work
@@ -981,8 +1020,13 @@ immediately in normal operation.
 > bindings. Generation 11 (nw-787, nw-789) scopes nested JS/TS `function`
 > declarations and nested Python `def`s to where they are visible, stops a
 > bare JS/TS call binding a method or accessor, and gives a nested class's
-> members their own class (parsed cache 7). A generation-8, -9 or -10 graph
-> must also be rebuilt:
+> members their own class (parsed cache 7). Generation 12 resolves imports
+> by package declaration (Go `go.mod`/`go.work`, Python relative imports and
+> `__init__` re-exports, Kotlin/Java packages), resolves method calls on a
+> call or `new` receiver, links `new Foo()` to its class in Java, C#, PHP,
+> C++, Scala, Groovy and Dart, and attaches Go methods to their receiver type
+> (parsed cache 8). A graph indexed by any earlier generation must also be
+> rebuilt:
 > `stale-check` exits 2 and `dead-code` refuses until it matches. Re-index
 > every repo — `nestweaver index --repo <path> --force` — before trusting any
 > ranking on this server.

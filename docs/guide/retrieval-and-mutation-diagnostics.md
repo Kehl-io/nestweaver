@@ -207,6 +207,13 @@ are omitted from errors; the selected repository is still identified.
 
 `base_ref` requests re-read live Git state on every call, including identical
 requests; explicit `changed_files` inputs retain graph response caching.
+Pass either `changed_files` (alias `files`) or `base_ref`, not both: the pair is
+refused as invalid arguments instead of silently ignoring `base_ref`. The
+`repo` argument (name or UID) names the repository `base_ref` diffs; with
+several repositories visible and no `repo`, the call is refused. The CLI twin
+behaves the same way: `affected-tests --files` requires `--repo` when more than
+one repository is indexed (exit 64), and its paths resolve in that repository
+only.
 
 Source indexing preserves the walk's ignore policy when restoring committed
 files missing from the graph. A tracked source matched by Git ignore rules
@@ -220,6 +227,30 @@ daemon's `nestweaver index` route) still indexes the working tree and reports a
 `ReadError` skip for `.` so coverage does not read complete; an unknown commit
 fails. The incremental route (server mode) discloses an unavailable tree or
 source walk the same way at an unchanged commit, and fails at a changed one.
+
+An unreadable source in a language that cannot carry API contracts is skipped
+and disclosed as a `read_error` row, so coverage reads degraded and the index
+still completes. An unreadable JavaScript, TypeScript, Java or Kotlin source
+still fails the index closed: it may hold route handlers, and skipping it would
+publish a contract set without them. (An unreadable Rust source is skipped on
+the index path even when the repository has gRPC `.proto` specs; strict
+contract derivation still fails on it.) A source that vanishes during the scan,
+as during a checkout or rebase, is treated as a deletion, including during
+strict contract derivation. One malformed OpenAPI spec that never published
+contracts is skipped and disclosed as degraded coverage instead of failing
+every index.
+
+Edits to `.gitignore`, `.ignore` and `.git/info/exclude` are reconciled by the
+code watcher: newly hidden sources are retracted and newly visible ones are
+admitted, and startup reconciliation drops graphed files the walk now hides.
+(`.git/info/exclude` edits apply only when the watcher sees events inside
+`.git`; a linked worktree's shared exclude file is not covered.) A code watcher
+that cannot publish a batch is reported by `brain status` instead of staying
+silent.
+
+An incremental index that is killed part-way leaves a per-repo "publication
+incomplete" record: `stale-check` reports that repository as `incomplete` and
+the next index rebuilds it in full, so a partial graph never reads as current.
 
 Source or contract preparation failures before graph writes retire a fresh
 publication marker and generation reservation, so correcting the input permits

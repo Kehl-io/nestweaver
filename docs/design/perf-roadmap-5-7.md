@@ -1,7 +1,7 @@
 # Performance Optimization Roadmap: Items 5-7
 
 **Date:** 2026-05-30 (validated against codebase and research)
-**Status:** Research complete, validated, ready for implementation
+**Status:** Historical research note (2026-05-30). Check the code and CHANGELOG for what was implemented.
 **Context:** Items 1-4 are implemented on `feat/daemon-concurrent-access`.
 
 ---

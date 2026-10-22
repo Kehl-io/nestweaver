@@ -4,7 +4,7 @@
 
 The existing `low`, `medium`, and `high` filters remain accepted. Low includes all candidates; Medium excludes explicitly public candidates. High has no validated population and returns no rows with `high_confidence_available: false` and `confidence_filter_status: "unavailable_no_validated_population"`. An empty High response does not establish that the codebase has no dead code. All responses containing candidates carry `review_only: true`.
 
-Check `coverage` and its disclosures before using counts. Resolver-stale graphs refuse analysis and name the required reindex operations. Repository scope filters the results and totals after the global reachability walk; it does not remove other repositories' entry points from the walk.
+Check `coverage` and its disclosures before using counts. Resolver-stale graphs refuse analysis and name the required reindex operations. Repository scope filters the results and totals after the global reachability walk; it does not remove other repositories' entry points from the walk. With a repository scope, `entry_points` and `module_owner_roots` count that scope's own roots, like the other totals; `walk_roots` is the whole-graph walk's root count. Coverage reads degraded only when the whole-graph walk had no root, so a library reached only from another repository is not degraded, and the text warning "no entry point was found" is printed only when `walk_roots` is 0.
 
 ```sh
 nestweaver dead-code --repo my-library --limit 100 --json

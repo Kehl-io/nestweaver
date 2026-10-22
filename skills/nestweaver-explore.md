@@ -44,7 +44,7 @@ directly, so a path-deboosted test/mirror file is still pinned.
 
 ## Before you trust a ranking
 
-`RESOLVER_GENERATION` is 11. **Any graph whose recorded generation is not exactly 11
+`RESOLVER_GENERATION` is 12. **Any graph whose recorded generation is not exactly 12
 is ranked over stale edges** until it is re-indexed
 (`nestweaver index --repo <path> --force` — plain `index` is incremental and a
 no-op on a repo already at HEAD). `stale_check` reports it as
