@@ -38050,7 +38050,23 @@ credential_method = "ssh"
         let serialized = serde_json::to_string(&c).unwrap();
         assert_eq!(
             serialized,
-            r#"{"pattern":"foo","total_matches":4,"files_matched":2,"top_files":[{"path":"src/a.rs","count":3},{"path":"src/b.rs","count":1}],"stale_index":true,"ready_scopes":0,"dirty_scopes":0,"error_scopes":0,"posting_hits":0,"hydrated_candidates":0,"scanned_candidates":0,"timings":{"planning_ms":0,"hydration_ms":0,"verification_ms":0,"total_ms":0}}"#
+            r#"{"pattern":"foo","total_matches":4,"files_matched":2,"top_files":[{"path":"src/a.rs","count":3},{"path":"src/b.rs","count":1}],"stale_index":true,"ready_scopes":0,"dirty_scopes":0,"error_scopes":0,"posting_hits":0,"hydrated_candidates":0,"scanned_candidates":0,"timings":{"planning_ms":0,"hydration_ms":0,"verification_ms":0,"total_ms":0},"truncated":false}"#
+        );
+
+        // A budget-cut pattern keeps its truncation disclosure.
+        let cut = serde_json::json!({
+            "pattern": "foo",
+            "total_matches": 1,
+            "files_matched": 1,
+            "top_files": [],
+            "truncated": true,
+            "truncation_reason": "deadline",
+        });
+        let c = pattern_count_from_tool_json(&cut).expect("a cut entry must rebuild");
+        assert!(c.truncated);
+        assert_eq!(
+            c.truncation_reason,
+            Some(nestweaver_store::regex::RegexTruncationReason::Deadline)
         );
 
         // A pre-`stale_index` daemon payload still rebuilds (default false).

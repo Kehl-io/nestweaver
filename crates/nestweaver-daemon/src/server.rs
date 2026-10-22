@@ -11498,7 +11498,15 @@ impl NestWeaverDaemon for DaemonService {
             // `entry_points` without a coordinated upgrade.
             let summary =
                 nestweaver_engine::query::service_summary(&state.store, name, instance, repo)
-                    .map_err(|e| Status::internal(format!("service_summary failed: {e:#}")))?;
+                    .map_err(|e| {
+                        // An unresolved `--repo` keeps its class and candidates
+                        // in the status details, like every other repo filter.
+                        if nestweaver_mcp::tools::repo_filter_failure(&e).is_some() {
+                            dispatch_err_to_status("service_summary", e)
+                        } else {
+                            Status::internal(format!("service_summary failed: {e:#}"))
+                        }
+                    })?;
             match summary {
                 Some(summary) => serde_json::to_string(&summary)
                     .map_err(|e| Status::internal(format!("serialization failed: {e:#}"))),

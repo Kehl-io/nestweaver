@@ -13440,8 +13440,11 @@ fn tool_contract_drift(store: &GraphStore, args: Value) -> Result<Value, anyhow:
         1,
         RESULT_LIMIT_MAX,
     )?;
-    let report = nestweaver_engine::contracts::drift_for_store(store, repo)
-        .map_err(|e| anyhow!("drift_for_store: {e}"))?;
+    // `context`, not a re-formatted string: an unresolved repo filter must
+    // stay a typed `RepoFilterUnresolved` so the daemon can send its class
+    // and candidates in the status details.
+    let report =
+        nestweaver_engine::contracts::drift_for_store(store, repo).context("drift_for_store")?;
     // Shared with the CLI's local path so the two serializations cannot drift
     // apart again (they previously disagreed on totals, `clean`, `limit`, and
     // whether truncation happened at all).
