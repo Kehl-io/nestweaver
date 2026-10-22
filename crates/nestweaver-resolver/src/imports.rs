@@ -334,12 +334,6 @@ impl ImportGraph {
         self.go_packages.get(file).map(String::as_str)
     }
 
-    pub(crate) fn same_go_package(&self, from: &str, to: &str) -> bool {
-        self.go_packages
-            .get(from)
-            .is_some_and(|package| self.go_packages.get(to) == Some(package))
-    }
-
     /// Only a resolved `super` import grants access to its parent module's private items.
     pub(crate) fn resolves_parent(&self, from: &str, to: &str) -> bool {
         fn module_path(file: &str) -> &str {
@@ -1313,6 +1307,7 @@ mod tests {
             export_aliases: HashMap::new(),
             star_exports: HashMap::new(),
             go_packages: HashMap::new(),
+            go_imports: HashMap::new(),
             unresolved_exports: HashMap::new(),
             incomplete_stars: HashSet::new(),
         };
@@ -1425,6 +1420,7 @@ mod tests {
             export_aliases: HashMap::new(),
             star_exports: HashMap::new(),
             go_packages: HashMap::new(),
+            go_imports: HashMap::new(),
             unresolved_exports: HashMap::new(),
             incomplete_stars: HashSet::new(),
         };
@@ -1456,6 +1452,7 @@ mod tests {
             exports: HashMap::new(),
             named_bindings: HashMap::new(),
             go_packages: HashMap::new(),
+            go_imports: HashMap::new(),
             unresolved_exports: HashMap::new(),
             incomplete_stars: HashSet::new(),
             export_aliases: HashMap::from([(
@@ -1482,6 +1479,7 @@ mod tests {
             exports: HashMap::new(),
             named_bindings: HashMap::new(),
             go_packages: HashMap::new(),
+            go_imports: HashMap::new(),
             unresolved_exports: HashMap::new(),
             incomplete_stars: HashSet::new(),
             export_aliases: HashMap::from([(
