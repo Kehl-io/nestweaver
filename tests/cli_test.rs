@@ -15167,7 +15167,9 @@ fn brain_context_repo_filter_keeps_its_failure_class() {
 fn investigate_repo_scope_keeps_its_failure_class() {
     let dir = tempfile::tempdir().unwrap();
     let (db, exact) = two_web_apps(dir.path());
-    let root = dir.path().to_path_buf();
+    // An explicit --root must lie inside an indexed repository (or be a
+    // worktree of one); the directory holding both repos is not.
+    let root = exact.clone();
     assert_repo_filter_classes(&db, exact.to_str().unwrap(), "", |repo| {
         vec![
             "investigate".to_string(),
