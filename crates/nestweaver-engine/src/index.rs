@@ -10347,7 +10347,7 @@ impl WatcherBatchResolution {
             |file: &String| !changed.contains(file) && !self.protected_files.contains(file);
         match &self.resolution.resolve_filter {
             Some(filter) => {
-                for file in filter.iter().filter(|file| clears(*file)) {
+                for file in filter.iter().filter(|file| clears(file)) {
                     GraphStore::delete_resolved_edges_for_file_on(conn, r_uid, file)
                         .with_context(|| format!("clear re-resolved edges of {file}"))?;
                 }
