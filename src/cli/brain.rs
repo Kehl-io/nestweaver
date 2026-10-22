@@ -265,7 +265,10 @@ pub(crate) fn run_brain(
 
         BrainCommands::List { json, db, config } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            let value = if let Some(value) = try_hybrid_json_rpc(
+            // `_checked`: this caller passes an explicit `--config`, which the
+            // unchecked wrapper debug-asserts against (a debug build panicked
+            // on `brain list --config` whenever a daemon served it).
+            let value = if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),

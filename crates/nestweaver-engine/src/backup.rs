@@ -3614,6 +3614,9 @@ mod tests {
         std::fs::create_dir_all(&restoring).unwrap();
         std::fs::write(data_dir.join("partial.txt"), b"partial").unwrap();
         std::fs::write(restoring.join("good.txt"), b"good").unwrap();
+        // The pre-restore copy is a NestWeaver data directory: a later
+        // `--force` only replaces one of those.
+        drop(nestweaver_store::GraphStore::create(&restoring.join("prior.lbug")).unwrap());
         publish_restore_phase(&RestoreJournal {
             version: RESTORE_JOURNAL_VERSION,
             phase: RestorePhase::CopyInProgress,
@@ -5625,8 +5628,6 @@ mod destination_guard_tests {
         std::fs::write(&engine_format, "sidecar").unwrap();
         let tantivy = crate::sidecar_path(&db, ".tantivy-test");
         std::fs::create_dir_all(&tantivy).unwrap();
-        let before = std::fs::read(&db).unwrap();
-
         let mut destinations = vec![
             db.clone(),
             crate::sidecar_path(&db, ".wal"),
@@ -5655,7 +5656,11 @@ mod destination_guard_tests {
                 output.display()
             );
         }
-        assert_eq!(std::fs::read(&db).unwrap(), before, "database untouched");
+        // Opening the store for the save rewrites header counters, so bytes
+        // are not compared: the database must still BE the database (an
+        // archive renamed over it would start with the zstd magic instead).
+        assert_eq!(&std::fs::read(&db).unwrap()[..4], b"LBUG", "database replaced");
+        nestweaver_store::GraphStore::open_read_only(&db).expect("database still opens");
         assert_eq!(std::fs::read(&engine_format).unwrap(), b"sidecar");
         assert!(!crate::sidecar_path(&db, ".wal").exists());
 

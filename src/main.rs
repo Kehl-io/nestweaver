@@ -1992,6 +1992,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Internal,
     },
     EnvVar {
+        name: "NESTWEAVER_METADATA_WRITE_WAIT_SECS",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
         name: "NESTWEAVER_METAL_SMOKE_CACHE_DIR",
         role: EnvRole::Internal,
     },
@@ -17532,6 +17536,18 @@ mod secret_env_help_tests {
     /// printed the token. Every secret-looking env argument must hide it.
     #[test]
     fn secret_env_arguments_hide_their_values_in_help() {
+        // A big stack: building the very wide `Commands` parser overflows
+        // libtest's default 2 MiB thread stack, which killed the whole
+        // test binary with SIGSEGV.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(secret_env_arguments_hide_their_values_in_help_body)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    fn secret_env_arguments_hide_their_values_in_help_body() {
         fn walk(command: &clap::Command, path: &str, leaks: &mut Vec<String>) {
             for arg in command.get_arguments() {
                 let Some(env) = arg.get_env() else { continue };
@@ -43943,7 +43959,9 @@ mod cli_honesty_sweep_tests {
         for exception in [
             "NOT UNIVERSAL",
             "BEFORE --json is read",
-            "uncompilable --pattern",
+            // `regex-search`'s pattern is positional; there is no
+            // `--pattern` flag, which the help used to name.
+            "uncompilable regex pattern",
         ] {
             assert!(
                 help.contains(exception),
