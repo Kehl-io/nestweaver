@@ -27,14 +27,14 @@ DB="${NESTWEAVER_DB:-${CLAUDE_PROJECT_DIR:-.}/nestweaver.lbug}"
 [ -e "$DB" ] || exit 0
 
 # `--` ends option parsing: a file named `--db=x.py` must stay a search term.
-SYMBOLS=$(nestweaver search --json --db "$DB" -- "$(basename "$FILE_PATH" | sed 's/\.[^.]*$//')" 2>/dev/null || true)
+SYMBOLS=$(nestweaver search --json --db "$DB" -- "$(basename -- "$FILE_PATH" | sed 's/\.[^.]*$//')" 2>/dev/null || true)
 # `nestweaver search --json` returns {"results": [...]} on 6.4+ and a bare
 # array before it. Normalise to an array so this hook works against either
 # binary on PATH — a hook installed by `nestweaver setup` outlives any one
 # release.
 ROWS=$(printf '%s' "$SYMBOLS" | jq -c 'if type == "object" then (.results // []) else . end' 2>/dev/null || printf '[]')
 if [ "$(printf '%s' "$ROWS" | jq 'length')" -gt 0 ]; then
-  TEXT="NestWeaver: symbols related to $(basename "$FILE_PATH"):
+  TEXT="NestWeaver: symbols related to $(basename -- "$FILE_PATH"):
 $(printf '%s' "$ROWS" | jq -r '.[0:5] | .[] | "  \(.name) (\(.kind)) @ \(.file_path):\(.start_line)"')"
   emit_context "$TEXT"
 fi

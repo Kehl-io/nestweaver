@@ -27,7 +27,7 @@ DB="${NESTWEAVER_DB:-${CLAUDE_PROJECT_DIR:-.}/nestweaver.lbug}"
 [ -e "$DB" ] || exit 0
 
 # `--` ends option parsing: a file named `--db=x.py` must stay a search term.
-SYMBOLS=$(nestweaver search --json --db "$DB" -- "$(basename "$FILE_PATH" | sed 's/\.[^.]*$//')" 2>/dev/null || true)
+SYMBOLS=$(nestweaver search --json --db "$DB" -- "$(basename -- "$FILE_PATH" | sed 's/\.[^.]*$//')" 2>/dev/null || true)
 # `nestweaver search --json` returns {"results": [...]} on 6.4+ and a bare
 # array before it. Normalise so this hook works against either binary on PATH.
 # `impact --json` is a bare array on both and is left alone.
@@ -52,7 +52,7 @@ if [ "$(printf '%s' "$ROWS" | jq 'length')" -gt 0 ]; then
       if [ -n "$TOTAL" ] && [ "$TOTAL" != "$COUNT" ]; then
         SUFFIX=" (showing $COUNT of $TOTAL — result set was capped)"
       fi
-      TEXT="NestWeaver impact: editing $(basename "$FILE_PATH") may affect $COUNT dependent symbol(s)$SUFFIX:
+      TEXT="NestWeaver impact: editing $(basename -- "$FILE_PATH") may affect $COUNT dependent symbol(s)$SUFFIX:
 $(printf '%s' "$NODES" | jq -r '.[0:3] | .[] | "  -> \(.name) (\(.edge_type), depth \(.depth))"')"
       emit_context "$TEXT"
     fi

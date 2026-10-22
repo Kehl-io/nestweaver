@@ -261,6 +261,14 @@ impl CpuThrottle {
         THROTTLE.get_or_init(Self::from_env)
     }
 
+    /// A throttle that never waits, for CPU work done while the write gate
+    /// is held (a code watcher batch), where a throttle sleep would block
+    /// every other writer.
+    pub(crate) fn inert() -> &'static CpuThrottle {
+        static INERT: OnceLock<CpuThrottle> = OnceLock::new();
+        INERT.get_or_init(|| Self::new(None))
+    }
+
     /// Build from `NESTWEAVER_INDEX_CPU_PERCENT` (default disabled; only
     /// 1–40 enable it). A disabled throttle is inert: [`check`](Self::check)
     /// never sleeps.

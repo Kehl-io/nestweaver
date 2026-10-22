@@ -16775,3 +16775,43 @@ fn an_invalid_tuning_variable_is_named_in_a_plain_warning() {
         "non-TTY stderr must carry no ANSI: {stderr:?}"
     );
 }
+
+/// `hooks --install` from a subdirectory wrote `--db <subdir>/nestweaver.lbug`
+/// into the hook, but git runs the hook from the repository root. The default
+/// database resolves against the root, and the missing-database hint quotes it.
+#[test]
+fn hooks_install_from_a_subdirectory_binds_the_root_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("my repo");
+    let sub = repo.join("src/inner");
+    std::fs::create_dir_all(&sub).unwrap();
+    let init = StdCommand::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .output();
+    if !init.is_ok_and(|out| out.status.success()) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    let root = repo.canonicalize().unwrap();
+
+    let output = nestweaver_cmd()
+        .args(["hooks", "--install"])
+        .current_dir(&sub)
+        .env_remove("NESTWEAVER_DB")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let hook = std::fs::read_to_string(root.join(".git/hooks/pre-push")).unwrap();
+    let db = root.join("nestweaver.lbug");
+    let quoted = format!("'{}'", db.display());
+    assert!(hook.contains(&format!("--db {quoted}")), "{hook}");
+    assert!(!hook.contains("inner"), "{hook}");
+    assert!(
+        stderr.contains(&format!("--repo '{}' --db {quoted}", root.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("core.hooksPath"), "{stderr}");
+}

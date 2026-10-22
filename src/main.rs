@@ -12349,23 +12349,12 @@ fn pre_push_backups(hooks_dir: &Path) -> Vec<PathBuf> {
 /// git repo. Backs up any pre-existing non-nestweaver hook.
 fn install_pre_push_hook(cwd: &Path, strict: bool, db: &Path) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
-    // A custom core.hooksPath can point OUTSIDE the repo — installing a
-    // hook there affects other repos, so say so loudly. Only checked when the
+    // A hooks directory OUTSIDE the working tree affects more than this
+    // checkout, so say so — and say why, which differs. Only checked when the
     // hooks dir already exists and canonicalizes (a not-yet-created custom
     // path can't be resolved reliably).
-    if let Some(root) = git_repo_root(cwd)
-        && let Ok(hooks_canon) = hooks_dir.canonicalize()
-    {
-        let root_canon = root.canonicalize().unwrap_or(root);
-        if hooks_dir_outside_repo(&hooks_canon, &root_canon) {
-            eprintln!(
-                "warning: git hooks path {} resolves OUTSIDE the repository {} \
-                 (core.hooksPath is set) — the hook will be installed there and \
-                 may affect other repos",
-                hooks_canon.display(),
-                root_canon.display()
-            );
-        }
+    if let Some(message) = hooks_location_message(cwd, &hooks_dir) {
+        eprintln!("{message}");
     }
     let db = std::path::absolute(db)
         .with_context(|| format!("resolving database path {}", db.display()))?;
@@ -12479,18 +12468,141 @@ fn install_pre_push_hook(cwd: &Path, strict: bool, db: &Path) -> anyhow::Result<
     println!("Database: {}", db.display());
     if !db.exists() {
         eprintln!(
-            "warning: database {} does not exist yet. Index it (nestweaver index --repo . --db {}) \
-             or reinstall with --db pointing at your graph; until then the hook {}.",
-            db.display(),
-            db.display(),
-            if strict {
-                "rejects every push"
-            } else {
-                "only reports that the database is missing"
-            }
+            "{}",
+            missing_hook_db_warning(&db, git_repo_root(cwd).as_deref(), strict)
         );
     }
     Ok(EXIT_SUCCESS)
+}
+
+/// The database `hooks --install` writes into the hook when `--db` is not
+/// given. Git runs a pre-push hook from the top of the working tree, so the
+/// working-directory default (`./nestweaver.lbug`) is resolved against the
+/// repository root: from a subdirectory it used to name
+/// `<subdir>/nestweaver.lbug`, a database the index never writes. A
+/// `NESTWEAVER_DB` the user set is their path and resolves like any other.
+fn hooks_default_db(cwd: &Path, (path, source): (PathBuf, DbSource)) -> PathBuf {
+    if source == DbSource::CwdLocal
+        && path.is_relative()
+        && let Some(root) = git_repo_root(cwd)
+    {
+        return root.join(path.strip_prefix(".").unwrap_or(path.as_path()));
+    }
+    path
+}
+
+/// The warning printed when the hook's database does not exist yet. The
+/// paths in the command to run are shell-quoted, so it pastes as one command
+/// whatever they contain, and `--repo` names the repository root, not the
+/// subdirectory `hooks --install` was run from.
+fn missing_hook_db_warning(db: &Path, repo_root: Option<&Path>, strict: bool) -> String {
+    let repo = repo_root.map_or_else(
+        || ".".to_string(),
+        |root| setup::shell_quote(&root.to_string_lossy()),
+    );
+    format!(
+        "warning: database {} does not exist yet. Index it (nestweaver index --repo {repo} --db {}) \
+         or reinstall with --db pointing at your graph; until then the hook {}.",
+        db.display(),
+        setup::shell_quote(&db.to_string_lossy()),
+        if strict {
+            "rejects every push"
+        } else {
+            "only reports that the database is missing"
+        }
+    )
+}
+
+/// `git config --get <key>` as git itself resolves it for `cwd` — every
+/// scope, not the isolated view (which pins `core.hooksPath`). None when unset.
+fn git_config_value(cwd: &Path, key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", key])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// The repository's common git directory (shared by all its worktrees).
+fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Some(if dir.is_absolute() {
+        dir
+    } else {
+        cwd.join(dir)
+    })
+}
+
+/// What `hooks --install` says when the hooks directory resolves outside the
+/// working tree, or None when it does not.
+fn hooks_location_message(cwd: &Path, hooks_dir: &Path) -> Option<String> {
+    let root = git_repo_root(cwd)?;
+    let hooks_canon = hooks_dir.canonicalize().ok()?;
+    let root_canon = root.canonicalize().unwrap_or(root);
+    let hooks_path = git_config_value(cwd, "core.hooksPath");
+    let common_canon = git_common_dir(cwd).and_then(|dir| dir.canonicalize().ok());
+    let symlinked =
+        std::fs::symlink_metadata(hooks_dir).is_ok_and(|meta| meta.file_type().is_symlink());
+    hooks_location_warning(
+        &hooks_canon,
+        &root_canon,
+        hooks_path.as_deref(),
+        common_canon.as_deref(),
+        symlinked,
+    )
+}
+
+/// The explanation for a hooks directory outside the working tree. Only a
+/// configured `core.hooksPath` is reported as one: a linked worktree keeps its
+/// hooks in the main repository's git directory, and a symlinked hooks
+/// directory leads wherever its link does. All paths are canonical.
+fn hooks_location_warning(
+    hooks_canon: &Path,
+    root_canon: &Path,
+    hooks_path: Option<&str>,
+    common_dir_canon: Option<&Path>,
+    symlinked: bool,
+) -> Option<String> {
+    if !hooks_dir_outside_repo(hooks_canon, root_canon) {
+        return None;
+    }
+    let hooks = hooks_canon.display();
+    let root = root_canon.display();
+    Some(if let Some(configured) = hooks_path {
+        format!(
+            "warning: git hooks path {hooks} resolves OUTSIDE the repository {root} \
+             (core.hooksPath is set to {configured}) — the hook will be installed there \
+             and may affect other repos"
+        )
+    } else if symlinked {
+        format!(
+            "warning: git hooks path {hooks} resolves OUTSIDE the repository {root} \
+             (the hooks directory is a symbolic link) — the hook will be installed at \
+             the link's target and affects every repository that shares it"
+        )
+    } else if let Some(common) = common_dir_canon.filter(|common| hooks_canon.starts_with(common)) {
+        format!(
+            "note: git hooks path {hooks} is in the repository's shared git directory {} \
+             outside the working tree {root} (a linked worktree or a separate git \
+             directory) — the hook applies to every worktree of this repository",
+            common.display()
+        )
+    } else {
+        format!(
+            "warning: git hooks path {hooks} resolves OUTSIDE the repository {root} \
+             — the hook will be installed there and may affect other repos"
+        )
+    })
 }
 
 /// Remove the nestweaver pre-push hook and restore the most recent backed-up
@@ -12517,7 +12629,22 @@ fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing of ours was removed, so there is nothing to restore a
+            // backup over. Restoring one here resurrected a hook the user had
+            // since deleted themselves.
             println!("No pre-push hook to remove.");
+            let backups = pre_push_backups(&hooks_dir);
+            if !backups.is_empty() {
+                println!(
+                    "Backups from an earlier install were left in place: {}",
+                    backups
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            return Ok(EXIT_SUCCESS);
         }
         Err(error) => {
             return Err(error).with_context(|| format!("inspecting {}", hook_path.display()));
@@ -29146,7 +29273,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if uninstall {
                 Ok((uninstall_pre_push_hook(&cwd)?, None))
             } else if install {
-                let db_path = db.unwrap_or_else(default_db_path);
+                let db_path =
+                    db.unwrap_or_else(|| hooks_default_db(&cwd, default_db_path_with_source()));
                 Ok((install_pre_push_hook(&cwd, strict, &db_path)?, None))
             } else {
                 eprintln!(
@@ -39294,6 +39422,224 @@ mod pr_impact_hook_tests {
         uninstall_pre_push_hook(&repo).expect("uninstall");
         assert_eq!(std::fs::read_link(&hook).unwrap(), outside);
         assert!(!outside.exists());
+    }
+
+    fn git_commit(repo: &Path) {
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "c0",
+            ],
+        );
+    }
+
+    /// `hooks --uninstall` with no nestweaver hook installed restored an old
+    /// `.nestweaver.bak`, resurrecting a hook the user had removed. A backup
+    /// is only restored over a hook of ours that was just removed.
+    #[test]
+    fn uninstall_without_our_hook_restores_no_backup() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        let hooks_dir = git_hooks_dir(repo).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook = hooks_dir.join("pre-push");
+        let backup = hooks_dir.join("pre-push.nestweaver.bak");
+        std::fs::write(&backup, "#!/bin/sh\necho removed-by-the-user\n").unwrap();
+
+        assert_eq!(uninstall_pre_push_hook(repo).unwrap(), EXIT_SUCCESS);
+        assert!(
+            !path_occupied(&hook),
+            "no hook may be restored when ours was not installed"
+        );
+        assert!(backup.exists(), "the backup is left where it was");
+    }
+
+    /// From a subdirectory the default database was `<subdir>/nestweaver.lbug`,
+    /// but git runs the hook from the repository root. The default resolves
+    /// against the root; a `NESTWEAVER_DB` the user set is left alone.
+    #[test]
+    fn default_hook_db_resolves_against_the_repo_root() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let sub = repo.join("crates/inner");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&repo, &["init", "-q"]);
+        let root = git_repo_root(&repo).unwrap();
+
+        let db = hooks_default_db(
+            &sub,
+            (PathBuf::from("./nestweaver.lbug"), DbSource::CwdLocal),
+        );
+        assert_eq!(db, root.join("nestweaver.lbug"));
+
+        let env = hooks_default_db(&sub, (PathBuf::from("graphs/g.lbug"), DbSource::Env));
+        assert_eq!(env, PathBuf::from("graphs/g.lbug"));
+
+        // Outside a repository there is no root to resolve against.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        if git_repo_root(&outside).is_none() {
+            assert_eq!(
+                hooks_default_db(
+                    &outside,
+                    (PathBuf::from("./nestweaver.lbug"), DbSource::CwdLocal)
+                ),
+                PathBuf::from("./nestweaver.lbug")
+            );
+        }
+
+        // End to end: the hook installed from the subdirectory names the
+        // root's database.
+        install_pre_push_hook(&sub, false, &db).expect("install");
+        let body = std::fs::read_to_string(git_hooks_dir(&repo).unwrap().join("pre-push")).unwrap();
+        let expected = setup::shell_quote(&root.join("nestweaver.lbug").to_string_lossy());
+        assert!(body.contains(&expected), "{body}");
+        assert!(!body.contains("crates/inner"), "{body}");
+    }
+
+    /// The missing-database hint printed the path unquoted, so a path with a
+    /// space did not paste as one command.
+    #[test]
+    fn missing_db_hint_quotes_its_paths() {
+        let warning = missing_hook_db_warning(
+            Path::new("/my graphs/it's.lbug"),
+            Some(Path::new("/my repo")),
+            false,
+        );
+        assert!(
+            warning.contains(r"nestweaver index --repo '/my repo' --db '/my graphs/it'\''s.lbug'"),
+            "{warning}"
+        );
+        assert!(!warning.contains("  "), "{warning}");
+        let fallback = missing_hook_db_warning(Path::new("/g.lbug"), None, true);
+        assert!(fallback.contains("--repo . --db '/g.lbug'"), "{fallback}");
+        assert!(fallback.contains("rejects every push"), "{fallback}");
+    }
+
+    /// "(core.hooksPath is set)" was printed for every hooks directory outside
+    /// the working tree; a linked worktree or a symlinked hooks directory has a
+    /// different explanation.
+    #[test]
+    fn hooks_location_warning_names_the_real_cause() {
+        let root = Path::new("/work/repo");
+        assert_eq!(
+            hooks_location_warning(Path::new("/work/repo/.git/hooks"), root, None, None, false),
+            None
+        );
+        // A core.hooksPath inside the repository is not worth a warning.
+        assert_eq!(
+            hooks_location_warning(
+                Path::new("/work/repo/.githooks"),
+                root,
+                Some(".githooks"),
+                None,
+                false
+            ),
+            None
+        );
+
+        let configured = hooks_location_warning(
+            Path::new("/shared/hooks"),
+            root,
+            Some("/shared/hooks"),
+            Some(Path::new("/work/repo/.git")),
+            false,
+        )
+        .unwrap();
+        assert!(
+            configured.contains("core.hooksPath is set to /shared/hooks"),
+            "{configured}"
+        );
+
+        let worktree = hooks_location_warning(
+            Path::new("/work/main/.git/hooks"),
+            root,
+            None,
+            Some(Path::new("/work/main/.git")),
+            false,
+        )
+        .unwrap();
+        assert!(!worktree.contains("core.hooksPath"), "{worktree}");
+        assert!(worktree.contains("linked worktree"), "{worktree}");
+
+        let linked = hooks_location_warning(
+            Path::new("/dotfiles/hooks"),
+            root,
+            None,
+            Some(Path::new("/work/repo/.git")),
+            true,
+        )
+        .unwrap();
+        assert!(!linked.contains("core.hooksPath"), "{linked}");
+        assert!(linked.contains("symbolic link"), "{linked}");
+
+        for message in [configured, worktree, linked] {
+            assert!(!message.contains("  "), "{message}");
+        }
+    }
+
+    /// The same, against real repositories: a linked worktree is not reported
+    /// as `core.hooksPath`, and a configured one is.
+    #[test]
+    fn hooks_location_message_in_a_linked_worktree_and_with_hooks_path() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git_commit(&main);
+        let linked = tmp.path().join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let hooks_dir = git_hooks_dir(&linked).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let message = hooks_location_message(&linked, &hooks_dir)
+            .expect("a linked worktree's hooks live outside its working tree");
+        assert!(!message.contains("core.hooksPath"), "{message}");
+        assert!(message.contains("linked worktree"), "{message}");
+
+        // The main checkout's own hooks are inside it: nothing to say.
+        let main_hooks = git_hooks_dir(&main).unwrap();
+        assert_eq!(hooks_location_message(&main, &main_hooks), None);
+
+        let shared = tmp.path().join("shared-hooks");
+        std::fs::create_dir_all(&shared).unwrap();
+        git(
+            &main,
+            &["config", "core.hooksPath", shared.to_str().unwrap()],
+        );
+        let hooks_dir = git_hooks_dir(&main).unwrap();
+        let message = hooks_location_message(&main, &hooks_dir).expect("outside");
+        assert!(message.contains("core.hooksPath is set"), "{message}");
     }
 }
 
