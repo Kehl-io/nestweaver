@@ -5659,7 +5659,11 @@ mod destination_guard_tests {
         // Opening the store for the save rewrites header counters, so bytes
         // are not compared: the database must still BE the database (an
         // archive renamed over it would start with the zstd magic instead).
-        assert_eq!(&std::fs::read(&db).unwrap()[..4], b"LBUG", "database replaced");
+        assert_eq!(
+            &std::fs::read(&db).unwrap()[..4],
+            b"LBUG",
+            "database replaced"
+        );
         nestweaver_store::GraphStore::open_read_only(&db).expect("database still opens");
         assert_eq!(std::fs::read(&engine_format).unwrap(), b"sidecar");
         assert!(!crate::sidecar_path(&db, ".wal").exists());
