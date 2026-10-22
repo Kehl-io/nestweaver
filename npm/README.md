@@ -69,9 +69,13 @@ The current resolver generation is **12**. A graph recorded at any other generat
 ```sh
 nestweaver stale-check
 nestweaver index --repo . --force
+nestweaver brain refresh /path/to/vault   # once per registered vault
 ```
 
 `stale-check` exits 2 and reports `outdated_resolver` when a re-index is required.
+After upgrading to 12.2.2, run `index --repo <path> --force` once for each
+repository (resolver generation 12) and `brain refresh <vault>` once for each
+vault, so wikilinks and note-to-code links are derived by the new release.
 
 ## License
 

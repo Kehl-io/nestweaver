@@ -21,7 +21,12 @@ args = ["mcp", "--db", "/absolute/path/to/nestweaver.lbug"]
 `setup` writes the absolute database path, so the server finds the same graph
 whatever directory Codex starts it from.
 
-NestWeaver will also generate an `AGENTS.md` file with codebase intelligence.
+NestWeaver also writes a codebase guide into `AGENTS.md`, between
+`<!-- nestweaver:begin -->` and `<!-- nestweaver:end -->` markers. It creates
+the file when it is missing and replaces only the marked span when it exists.
+An existing `AGENTS.md` without one pair of markers is left unchanged and the
+Codex step reports an error (`setup --force` does not overwrite it); add the
+two marker lines where the guide should go and re-run setup.
 
 ## Environment Variables
 

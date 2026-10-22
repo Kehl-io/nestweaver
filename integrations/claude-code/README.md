@@ -38,7 +38,7 @@ Deep integration between NestWeaver's code knowledge graph and Claude Code.
    change those paths. MCP servers belong in `.mcp.json` (step 2), not in
    `settings.json`.
 
-> **Recommended:** Use `nestweaver setup claude-code` to automatically install the MCP server config (`.mcp.json`), the skill (`.claude/skills/nestweaver/SKILL.md`), and two lightweight hooks (SessionStart brain status, and a PreToolUse hint on grep/rg/find) in `.claude/settings.json`. Re-running it repairs hooks written by older releases.
+> **Recommended:** Use `nestweaver setup claude-code` to automatically install the MCP server config (`.mcp.json`), the skill (`.claude/skills/nestweaver/SKILL.md`), and two lightweight hooks (SessionStart brain status, and a PreToolUse hint that fires only when `grep`, `rg`, `find`, `fd`, `ack` or `ag` is the command being run, and does nothing without `jq`) in `.claude/settings.json`. Re-running it repairs hooks written by older releases. Setup recognises only the exact hook commands it writes, so a hook of your own that looks similar is left alone.
 
 ## Hooks
 
@@ -54,8 +54,8 @@ otherwise `$CLAUDE_PROJECT_DIR/nestweaver.lbug`.
 | SessionStart command | `SessionStart` | Prints brain status; plain stdout on SessionStart becomes session context |
 | `pre-read-enrich.sh` | `PreToolUse` (`Read`) | Adds the symbols related to the file being read |
 | `post-edit-impact.sh` | `PreToolUse` (`Write\|Edit`) | Adds the blast radius of the file about to be modified. It runs *before* the edit so the impact is known while the change is being made; the name is kept for compatibility with existing configs |
-| `pre-search-enrich.sh` | `PreToolUse` (`Bash`) | On `grep`/`rg` commands, adds graph search results for the search term |
-| `post-commit-stale-check.sh` | `PostToolUse` (`Bash`) | After `git commit`, adds a re-index reminder when `stale-check` reports drift |
+| `pre-search-enrich.sh` | `PreToolUse` (`Bash`) | When the command runs `grep` or `rg`, searches the graph for the search pattern (not the file paths it names) and adds the results |
+| `post-commit-stale-check.sh` | `PostToolUse` (`Bash`) | After `git commit`, runs `nestweaver stale-check --json` and adds a re-index reminder when it reports a stale or resolver-stale repo |
 
 ## MCP Tools
 
