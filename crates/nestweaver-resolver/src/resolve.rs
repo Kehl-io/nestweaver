@@ -11958,13 +11958,13 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
         let path = "pkg/core.py";
         let source = "class A:\n    def get(self):\n        return 1\n\nclass B:\n    def get(self):\n        return 2\n    @staticmethod\n    def make():\n        return B()\n\ndef user():\n    return B.make().get()\n";
         let (files, edges) = review_edges(&[(path, source)], Language::Python);
-        let user = uid(&files, path, "user");
-        assert!(
-            !edges.iter().any(|edge| edge.edge_type == EdgeType::Calls
-                && edge.source_uid == user
-                && edge.target_uid.starts_with("sym:")),
-            "`get` is declared twice; nothing may be guessed: {edges:#?}"
-        );
+        // `user` does call `B.make` (line 9); neither `get` may be guessed.
+        for get_line in [2, 6] {
+            assert!(
+                !qa_calls(&files, &edges, (path, "user"), (path, "get", get_line)),
+                "`get` is declared twice; nothing may be guessed: {edges:#?}"
+            );
+        }
     }
 
     #[test]
