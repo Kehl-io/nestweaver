@@ -13117,11 +13117,27 @@ fn read_symbols_unreadable_root_is_exit_1_not_a_missing_target() {
     assert_eq!(code, Some(2), "{payload}");
     assert_eq!(payload["not_found"][0], "nw539NoSuchSymbolXYZ", "{payload}");
 
-    // nw-706: a READABLE --root holding none of the indexed files (the wrong
-    // tree) is the same state, with its own reason.
+    // A READABLE --root outside every indexed repository and vault is now
+    // refused before anything is read from it: the root decides which
+    // directory symbol spans are read from, so an arbitrary one would read
+    // lines of any host file at an indexed relative path. Still exit 1, and
+    // the refusal names the root.
     let wrong_tree = dir.path().join("elsewhere");
     std::fs::create_dir_all(&wrong_tree).unwrap();
-    let (code, payload, _) = read("nw539ReadTarget", Some(&wrong_tree));
+    std::fs::write(wrong_tree.join("main.js"), "function nw539ReadTarget() {}\n").unwrap();
+    let (code, payload, output) = read("nw539ReadTarget", Some(&wrong_tree));
+    assert_eq!(code, Some(1), "{payload}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not inside an indexed repository")
+            && stderr.contains(&wrong_tree.display().to_string()),
+        "{stderr}"
+    );
+    // nw-706: a readable root INSIDE the indexed repository that holds none
+    // of its files (the wrong subtree) keeps its own reason.
+    let wrong_subtree = repo_dir.join("empty");
+    std::fs::create_dir_all(&wrong_subtree).unwrap();
+    let (code, payload, _) = read("nw539ReadTarget", Some(&wrong_subtree));
     assert_eq!(code, Some(1), "{payload}");
     assert_eq!(payload["error"], "unreadable_root", "{payload}");
     assert_eq!(
