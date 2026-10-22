@@ -327,7 +327,7 @@ fn load_extensions_strict(path: &Path) -> Result<Option<ExtensionStore>, anyhow:
 }
 
 fn write_extension_store_durable(path: &Path, store: &ExtensionStore) -> Result<(), anyhow::Error> {
-    let json = serde_json::to_vec_pretty(store)?;
+    let json = serialize_extension_store(store)?;
     nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| file.write_all(&json))
         .map_err(|error| {
             anyhow::anyhow!(
@@ -403,7 +403,8 @@ fn write_extension_handoff_journal(
         fingerprint: handoff_fingerprint(&entries)?,
         entries,
     };
-    let json = serde_json::to_vec_pretty(&journal)?;
+    // Compact for the same reason as the sidecar: the entries carry values.
+    let json = serde_json::to_vec(&journal)?;
     nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| file.write_all(&json))
         .map_err(|error| {
             anyhow::anyhow!(
@@ -442,7 +443,7 @@ fn write_instance_extension_migration_journal(
     path: &Path,
     journal: &InstanceExtensionMigrationJournal,
 ) -> Result<(), anyhow::Error> {
-    let json = serde_json::to_vec_pretty(journal)?;
+    let json = serde_json::to_vec(journal)?;
     nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| file.write_all(&json))
         .map_err(|error| {
             anyhow::anyhow!(
@@ -2165,7 +2166,7 @@ pub fn remove_extension_uid_durable(db_path: &Path, uid: &str) -> Result<bool, a
         return Ok(false);
     }
 
-    let json = serde_json::to_vec_pretty(&store)?;
+    let json = serialize_extension_store(&store)?;
     nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| file.write_all(&json))
         .map_err(|error| {
             anyhow::anyhow!(
@@ -2218,7 +2219,7 @@ pub fn remove_extension_key_durable(
         store.remove(uid);
     }
 
-    let json = serde_json::to_vec_pretty(&store)?;
+    let json = serialize_extension_store(&store)?;
     nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| file.write_all(&json))
         .map_err(|error| {
             anyhow::anyhow!(
@@ -2235,6 +2236,67 @@ pub const MAX_EXTENSION_KEY_BYTES: usize = 256;
 /// rewritten whole on every set, so one unbounded value (20 MB was accepted)
 /// made every later write and read of every property pay for it.
 pub const MAX_EXTENSION_VALUE_BYTES: usize = 64 * 1024;
+/// Deepest array/object nesting an extension value may have. The sidecar
+/// wraps each value two levels deeper (`{uid: {key: value}}`), and
+/// `serde_json` refuses to parse past 128 levels, so a value near that depth
+/// would be written fine and then make the whole sidecar unreadable.
+pub const MAX_EXTENSION_VALUE_DEPTH: usize = 64;
+
+/// Array/object nesting depth of `value` (a scalar is 0).
+fn json_nesting_depth(value: &serde_json::Value) -> usize {
+    let mut deepest = 0;
+    let mut stack = vec![(value, 0usize)];
+    while let Some((value, depth)) = stack.pop() {
+        match value {
+            serde_json::Value::Array(items) => {
+                deepest = deepest.max(depth + 1);
+                stack.extend(items.iter().map(|child| (child, depth + 1)));
+            }
+            serde_json::Value::Object(map) => {
+                deepest = deepest.max(depth + 1);
+                stack.extend(map.values().map(|child| (child, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// A Unicode format character (general category `Cf`): invisible, and the
+/// bidi controls among them (U+202A–U+202E, U+2066–U+2069, U+200E/F,
+/// U+061C) reorder how the surrounding text displays, so a uid holding one
+/// can render as a different uid. `char::is_control` covers only `Cc`.
+///
+/// U+200C/U+200D (ZWNJ/ZWJ) are left out on purpose: they are part of
+/// correct spelling in several scripts and of emoji sequences, so a real
+/// file path — and the uid derived from it — can carry them.
+fn is_disallowed_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
 
 /// Refuse an extension property the sidecar should not hold: an empty, over-long
 /// or control-character key, or an over-large value. Checked before the
@@ -2261,6 +2323,12 @@ pub fn validate_extension_property(key: &str, value: &serde_json::Value) -> Resu
             "'value' is {value_bytes} bytes of JSON; the maximum is {MAX_EXTENSION_VALUE_BYTES}"
         ));
     }
+    let depth = json_nesting_depth(value);
+    if depth > MAX_EXTENSION_VALUE_DEPTH {
+        return Err(format!(
+            "'value' nests {depth} levels deep; the maximum is {MAX_EXTENSION_VALUE_DEPTH}"
+        ));
+    }
     Ok(())
 }
 
@@ -2283,8 +2351,10 @@ pub const MAX_EXTENSION_SIDECAR_BYTES: usize = 32 * 1024 * 1024;
 /// staleness, which reads it back (`get_last_indexed_at`).
 pub const RESERVED_EXTENSION_KEYS: &[&str] = &["last_indexed_at"];
 
-/// Refuse a UID no extension should be written under: empty, over
-/// [`MAX_EXTENSION_UID_BYTES`], or containing a control character.
+/// Refuse a UID no extension should be written under: empty or only
+/// whitespace, over [`MAX_EXTENSION_UID_BYTES`], or containing a control
+/// character or an invisible format/bidi character
+/// (see [`is_disallowed_format_char`]).
 ///
 /// The UID is NOT required to name a live graph node. That is deliberate and
 /// documented on [`load_live_extensions`]: application-owned keys that are not
@@ -2293,6 +2363,9 @@ pub const RESERVED_EXTENSION_KEYS: &[&str] = &["last_indexed_at"];
 pub fn validate_extension_uid(uid: &str) -> Result<(), String> {
     if uid.is_empty() {
         return Err("'uid' must not be empty".to_string());
+    }
+    if uid.trim().is_empty() {
+        return Err("'uid' must not be only whitespace".to_string());
     }
     if uid.len() > MAX_EXTENSION_UID_BYTES {
         return Err(format!(
@@ -2303,6 +2376,12 @@ pub fn validate_extension_uid(uid: &str) -> Result<(), String> {
     if let Some(c) = uid.chars().find(|c| c.is_control()) {
         return Err(format!(
             "'uid' must not contain control characters (found {})",
+            c.escape_unicode()
+        ));
+    }
+    if let Some(c) = uid.chars().find(|c| is_disallowed_format_char(*c)) {
+        return Err(format!(
+            "'uid' must not contain invisible format or bidi characters (found {})",
             c.escape_unicode()
         ));
     }
@@ -2366,11 +2445,24 @@ pub fn set_property_capped(
     Ok(())
 }
 
+/// The sidecar's on-disk bytes: compact JSON.
+///
+/// It was pretty-printed, which indents every nested level on its own line:
+/// a 60,601-byte value nested 100 deep (under [`MAX_EXTENSION_VALUE_BYTES`],
+/// which measures compact JSON) became 6.49 MB on disk, so five such writes
+/// exhausted the shared [`MAX_EXTENSION_SIDECAR_BYTES`] for every caller and
+/// each write rewrote megabytes. Compact output keeps the sidecar within a
+/// few bytes of the sum of what the per-value cap measured. Every reader
+/// parses JSON, so a pretty sidecar written by an older version still loads.
+fn serialize_extension_store(store: &ExtensionStore) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(store)
+}
+
 /// Serialize the sidecar for a user/agent write, refusing one larger than
 /// [`MAX_EXTENSION_SIDECAR_BYTES`]. Pair with [`write_extensions_serialized`]
 /// so the sidecar is serialized once.
 pub fn serialize_extensions_capped(store: &ExtensionStore) -> Result<Vec<u8>, String> {
-    let bytes = serde_json::to_vec_pretty(store)
+    let bytes = serialize_extension_store(store)
         .map_err(|error| format!("serialize extension sidecar: {error}"))?;
     if bytes.len() > MAX_EXTENSION_SIDECAR_BYTES {
         return Err(format!(
@@ -3936,6 +4028,94 @@ mod write_bound_tests {
         assert!(error.len() < 200, "the refusal must not echo the uid");
         assert!(validate_extension_write("", "team", &value).is_err());
         assert!(validate_extension_write("sym:\u{1b}[31m", "team", &value).is_err());
+    }
+
+    /// A blank uid and one carrying an invisible format/bidi character were
+    /// accepted: `char::is_control` covers only `Cc`, and U+202E makes
+    /// `sym:abc\u{202E}fed` display as a different uid.
+    #[test]
+    fn a_blank_or_format_character_uid_is_refused() {
+        let value = serde_json::json!("x");
+        for uid in [" ", "\t \u{3000}", "\u{2003}"] {
+            let error = validate_extension_write(uid, "team", &value).unwrap_err();
+            assert!(error.contains("whitespace"), "{uid:?}: {error}");
+        }
+        for uid in [
+            "sym:abc\u{202E}fed",
+            "sym:\u{2066}a\u{2069}",
+            "sym:a\u{200B}b",
+            "sym:\u{FEFF}a",
+            "sym:a\u{00AD}b",
+            "sym:a\u{E0041}",
+            "sym:a\u{061C}",
+        ] {
+            let error = validate_extension_write(uid, "team", &value).unwrap_err();
+            assert!(error.contains("format or bidi"), "{uid:?}: {error}");
+        }
+        // Ordinary non-ASCII, inner spaces and joiners in real names pass.
+        for uid in [
+            "sym:repo:src/caf\u{e9}.rs::f",
+            "sym:repo:a b.rs::f",
+            "sym:repo:\u{0928}\u{094D}\u{200D}.rs::f",
+            "note:\u{1F469}\u{200D}\u{1F4BB}",
+        ] {
+            assert!(
+                validate_extension_write(uid, "team", &value).is_ok(),
+                "{uid:?}"
+            );
+        }
+    }
+
+    /// The sidecar is compact JSON, so the per-value cap (measured compact)
+    /// bounds what one value adds to the shared sidecar budget. Pretty output
+    /// grew a 60 KB value nested 100 deep to 6.49 MB.
+    #[test]
+    fn a_deeply_nested_value_costs_the_sidecar_about_its_own_size() {
+        let mut value = serde_json::json!("leaf");
+        for _ in 0..MAX_EXTENSION_VALUE_DEPTH {
+            value = serde_json::json!([value, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        }
+        validate_extension_write("sym:a", "deep", &value).unwrap();
+        let value_bytes = serde_json::to_vec(&value).unwrap().len();
+        let mut store = ExtensionStore::new();
+        set_property_capped(&mut store, "sym:a", "deep", value).unwrap();
+        let bytes = serialize_extensions_capped(&store).unwrap();
+        assert!(
+            bytes.len() < value_bytes + 64,
+            "{} sidecar bytes for a {value_bytes}-byte value",
+            bytes.len()
+        );
+
+        // What is written durably is compact too, and still loads.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        save_extensions(&db, &store).unwrap();
+        let on_disk = std::fs::read(sidecar_path(&db)).unwrap();
+        assert_eq!(on_disk.len(), bytes.len());
+        assert_eq!(load_extensions_checked(&db).unwrap(), store);
+
+        // A sidecar an older version pretty-printed still reads.
+        std::fs::write(
+            sidecar_path(&db),
+            serde_json::to_vec_pretty(&store).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_extensions_checked(&db).unwrap(), store);
+    }
+
+    /// A value deeper than the cap is refused before it can make the sidecar
+    /// unparseable (`serde_json` stops at 128 levels, and the sidecar adds
+    /// two).
+    #[test]
+    fn an_over_deep_value_is_refused() {
+        let mut value = serde_json::json!(1);
+        for _ in 0..=MAX_EXTENSION_VALUE_DEPTH {
+            value = serde_json::json!([value]);
+        }
+        let error = validate_extension_write("sym:a", "deep", &value).unwrap_err();
+        assert!(error.contains("nests"), "{error}");
+        assert_eq!(json_nesting_depth(&serde_json::json!("x")), 0);
+        assert_eq!(json_nesting_depth(&serde_json::json!({"a": [1]})), 2);
     }
 
     #[test]
