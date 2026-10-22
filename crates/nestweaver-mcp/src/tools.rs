@@ -2217,7 +2217,7 @@ mod tool_schema_validation_tests {
             ),
             (
                 "count_patterns",
-                "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. Same index as regex_search.",
+                "Count regex matches per pattern (total, files matched, top files) without returning them; compare several patterns in one call. A max_millis cut marks a pattern truncated.",
             ),
             (
                 "brain_broken_links",
@@ -23516,7 +23516,18 @@ fn contained_source_root(
             root.display()
         )
     };
-    let canonical = std::fs::canonicalize(root).map_err(|_| refused())?;
+    // A root that cannot be resolved (missing, or unreadable) can serve no
+    // bytes; hand it through unchanged so the read reports its
+    // `unreadable_root` diagnostic rather than a containment refusal.
+    let Ok(canonical) = std::fs::canonicalize(root) else {
+        return Ok(root.to_path_buf());
+    };
+    // Likewise a directory that cannot be searched (no execute permission):
+    // nothing below it can be opened. `stat("<dir>/.")` needs exactly that
+    // permission; a readable listing is not required to open known names.
+    if std::fs::metadata(canonical.join(".")).is_err() {
+        return Ok(root.to_path_buf());
+    }
     let mut roots: Vec<std::path::PathBuf> = store
         .list_repos(None)?
         .iter()

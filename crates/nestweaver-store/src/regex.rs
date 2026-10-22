@@ -440,8 +440,11 @@ struct CandidateLimits<'a> {
     /// `count_patterns` found it. Filtering at admission makes the cap count
     /// MATCHING nodes instead of arbitrary ones.
     prefilter: Option<&'a regex::Regex>,
-    /// Nodes the prefilter evaluated, reported as scanned candidates.
-    evaluated: Option<&'a std::cell::Cell<usize>>,
+    /// Nodes the prefilter evaluated and REJECTED. Admitted nodes are
+    /// verified (and counted) again by the verification loop, and a matching
+    /// node turned away by the cap was never admitted, so only rejections
+    /// are added to `scanned_candidates`.
+    rejected: Option<&'a std::cell::Cell<usize>>,
 }
 
 impl CandidateLimits<'_> {
@@ -449,10 +452,11 @@ impl CandidateLimits<'_> {
         let Some(re) = self.prefilter else {
             return true;
         };
-        if let Some(evaluated) = self.evaluated {
-            evaluated.set(evaluated.get().saturating_add(1));
+        let matched = re.is_match(text);
+        if !matched && let Some(rejected) = self.rejected {
+            rejected.set(rejected.get().saturating_add(1));
         }
-        re.is_match(text)
+        matched
     }
 }
 
@@ -1103,7 +1107,7 @@ impl GraphStore {
                         cancel: None,
                         max_candidates: usize::MAX,
                         prefilter: None,
-                        evaluated: None,
+                        rejected: None,
                     },
                 )?
                 .0;
@@ -2340,8 +2344,7 @@ impl GraphStore {
         let mut hydration_stop = None;
         // Scanned (non-posting) nodes are matched at admission; see
         // `CandidateLimits::prefilter`.
-        let prefilter_evaluated = std::cell::Cell::new(0usize);
-        let mut prefilter_admitted = 0usize;
+        let prefilter_rejected = std::cell::Cell::new(0usize);
         let (mut candidates, hydrated_candidates) = if planning_deadline {
             (Vec::new(), 0)
         } else {
@@ -2357,10 +2360,9 @@ impl GraphStore {
                             cancel,
                             max_candidates: candidate_cap,
                             prefilter: Some(&re),
-                            evaluated: Some(&prefilter_evaluated),
+                            rejected: Some(&prefilter_rejected),
                         },
                     )?;
-                    prefilter_admitted = candidates.len();
                     let (mut hydrated, hydrated_stop) = self.load_candidates_by_uid(
                         &plan.matching_ready_uids,
                         path_prefix,
@@ -2371,7 +2373,7 @@ impl GraphStore {
                             cancel,
                             max_candidates: candidate_cap.saturating_sub(candidates.len()),
                             prefilter: None,
-                            evaluated: None,
+                            rejected: None,
                         },
                     )?;
                     hydration_stop = stronger_truncation(fallback_stop, hydrated_stop);
@@ -2394,10 +2396,9 @@ impl GraphStore {
                             cancel,
                             max_candidates: candidate_cap,
                             prefilter: Some(&re),
-                            evaluated: Some(&prefilter_evaluated),
+                            rejected: Some(&prefilter_rejected),
                         },
                     )?;
-                    prefilter_admitted = candidates.len();
                     hydration_stop = stop;
                     (candidates, 0)
                 }
@@ -2561,7 +2562,7 @@ impl GraphStore {
         // Nodes the admission prefilter rejected were evaluated by the real
         // regex too; count them so `scanned_candidates` reports the work done.
         scanned_candidates = scanned_candidates
-            .saturating_add(prefilter_evaluated.get().saturating_sub(prefilter_admitted));
+            .saturating_add(prefilter_rejected.get());
 
         // The verification loop ran over everything COLLECTION handed it
         // without itself hitting a limit — but collection may not have
@@ -2763,7 +2764,7 @@ impl GraphStore {
                 cancel,
                 max_candidates: usize::MAX,
                 prefilter: None,
-                evaluated: None,
+                rejected: None,
             };
             // Any other collector stop (rows it could not decode) means the
             // corpus was short: the counts are lower bounds and say so.
@@ -3094,8 +3095,13 @@ mod tests {
             2,
             "both collected candidates actually match the pattern: {result:?}"
         );
+        // The fixture has no trigram index, so the no-index disclosure is
+        // expected; the empty-result scan-budget hedge must not appear.
         assert!(
-            result.note.is_none(),
+            result
+                .note
+                .as_deref()
+                .is_none_or(|note| !note.contains(SCAN_BUDGET_NOTE)),
             "results are non-empty, so no scan-budget hedge note applies: {result:?}"
         );
     }
