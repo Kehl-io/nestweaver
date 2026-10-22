@@ -757,13 +757,15 @@ const LEGACY_CLAUDE_PRE_TOOL_USE_COMMAND: &str = "INPUT=$(cat); CMD=$(echo \"$IN
 /// The jq program the PreToolUse(Bash) hook runs on the event: `true` when a
 /// search tool is the INVOKED command of some pipeline segment.
 ///
-/// Quoted strings are blanked first, so `git commit -m "find the bug"` has no
-/// `find` left in it; the command is then split at `|`, `;`, `&`, `(`, `)`,
+/// Quoted strings are blanked first, in ONE left-to-right pass so whichever
+/// quote opens first wins (an apostrophe inside double quotes must not open a
+/// single-quoted run), so `git commit -m "find the bug"` has no `find` left
+/// in it; the command is then split at `|`, `;`, `&`, `(`, `)`,
 /// backticks and newlines, and each segment's first word — after `VAR=value` assignments
 /// and wrappers such as `sudo`, `xargs`, `if` — must be the tool, optionally
 /// with a directory (`/usr/bin/grep`). `echo find me` stays silent. `\u0027` is
 /// a single quote, which cannot appear inside the shell's single quotes.
-const CLAUDE_PRE_TOOL_USE_JQ: &str = r#"(.tool_input.command // "") | gsub("\u0027[^\u0027]*\u0027"; "Q") | gsub("\"(\\\\.|[^\"\\\\])*\""; "Q") | [splits("[|;&()`\n]")] | any(.[]; test("^\\s*([A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)*((sudo|command|exec|time|nice|env|xargs|if|then|else|elif|do|while|until|!)\\s+)*(\\S*/)?(grep|egrep|fgrep|rg|find|fd|ack|ag)(\\s|$)"))"#;
+const CLAUDE_PRE_TOOL_USE_JQ: &str = r#"(.tool_input.command // "") | gsub("\u0027[^\u0027]*\u0027|\"(\\\\.|[^\"\\\\])*\""; "Q") | [splits("[|;&()`\n]")] | any(.[]; test("^\\s*([A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)*((sudo|command|exec|time|nice|env|xargs|if|then|else|elif|do|while|until|!)\\s+)*(\\S*/)?(grep|egrep|fgrep|rg|find|fd|ack|ag)(\\s|$)"))"#;
 
 fn claude_session_start_command(db_str: &str) -> String {
     // SessionStart is one of the events whose plain stdout Claude Code adds to
@@ -832,14 +834,19 @@ fn previous_claude_pre_tool_use_command() -> String {
 
 /// True when `word` is exactly one shell word as setup writes a database path:
 /// [`shell_quote`]d, or (releases before the quoting fix) bare with no
-/// whitespace.
+/// whitespace or shell metacharacter — so `./a.lbug;my-thing` is not ours.
+/// An old unquoted install whose path held a space never worked and is not
+/// recognised; a re-run adds the working hook beside it.
 fn is_one_shell_word(word: &str) -> bool {
     if let Some(quoted) = word.strip_prefix('\'') {
         return quoted
             .strip_suffix('\'')
             .is_some_and(|inner| shell_quote(&inner.replace(r"'\''", "'")) == word);
     }
-    !word.is_empty() && !word.contains(char::is_whitespace)
+    !word.is_empty()
+        && !word
+            .chars()
+            .any(|c| c.is_whitespace() || ";|&$()<>'\"\\`*?[]{}".contains(c))
 }
 
 /// True when `hook` is one of the entries this module generated — the exact
@@ -2905,6 +2912,8 @@ mod integration_fix_tests {
             "nestweaver brain status --db ./mine.lbug",
             "nestweaver brain status --db ./mine.lbug --json | my-formatter",
             "nestweaver brain status --db ./a.lbug; my-thing 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
+            "nestweaver brain status --db ./a.lbug;my-thing 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
+            "nestweaver brain status --db $(pick-db) 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
             "nestweaver brain status --db 'a' 'b' 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
             "echo 'NestWeaver is indexed' && my-check",
             "my-own-hook.sh",
@@ -3007,6 +3016,8 @@ mod integration_fix_tests {
             "ls; rg x",
             "echo $(find . -type f)",
             "ls | xargs grep foo",
+            // An apostrophe inside double quotes opens no single-quoted run.
+            "echo \"it's\"; grep x; echo 'y'",
         ] {
             assert!(fires(search), "must fire on {search:?}");
         }
