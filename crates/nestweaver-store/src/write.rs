@@ -4317,7 +4317,17 @@ impl GraphStore {
         file_path: &str,
     ) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_resolved_edges_for_file_on(&conn, repo_uid, file_path)
+    }
 
+    /// [`Self::delete_resolved_edges_for_file`] on a caller-held connection,
+    /// so a write transaction (a code watcher batch) clears and re-inserts a
+    /// file's resolved edges atomically.
+    pub fn delete_resolved_edges_for_file_on(
+        conn: &crate::db::StoreConnection<'_>,
+        repo_uid: &str,
+        file_path: &str,
+    ) -> Result<(), StoreError> {
         // LadybugDB does not support `type(e) IN [...]`, so we issue one
         // DELETE per relationship type. Each query is cheap because the
         // WHERE clause narrows to a single file's symbols.
@@ -4340,7 +4350,7 @@ impl GraphStore {
                  DELETE r"
             );
             exec_params(
-                &conn,
+                conn,
                 &query,
                 vec![
                     ("repo", lbug::Value::String(repo_uid.to_string())),
@@ -4372,7 +4382,14 @@ impl GraphStore {
     /// clear.
     pub fn delete_resolved_edges_for_repo(&self, repo_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::delete_resolved_edges_for_repo_on(&conn, repo_uid)
+    }
 
+    /// [`Self::delete_resolved_edges_for_repo`] on a caller-held connection.
+    pub fn delete_resolved_edges_for_repo_on(
+        conn: &crate::db::StoreConnection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
         // Same one-DELETE-per-rel-type pattern as the per-file variant;
         // the WHERE clause is scoped to the repo instead of a single file.
         for rel in &[
@@ -4391,7 +4408,7 @@ impl GraphStore {
                  DELETE r"
             );
             exec_params(
-                &conn,
+                conn,
                 &query,
                 vec![("repo", lbug::Value::String(repo_uid.to_string()))],
             )

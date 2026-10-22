@@ -232,6 +232,12 @@ const EXIT_USAGE: i32 = 64;
 /// "stopped" (0) and "stuck" must not share a code, because only the second
 /// needs an operator.
 const EXIT_DAEMON_UNHEALTHY: i32 = 69;
+/// The command ran but its answer is incomplete: `count-patterns` ran out of
+/// its time budget, so some counts are lower bounds. `EX_TEMPFAIL` from
+/// `sysexits.h` — retrying with a larger `--max-millis` can succeed. Not 0,
+/// because a script that only checks the code would take lower bounds as
+/// totals; not 1, because nothing failed and stdout still holds the counts.
+const EXIT_INCOMPLETE: i32 = 75;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// Default `server init-tls --validity-days`.
@@ -2187,7 +2193,9 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
                   4   unauthorized (pull)      5   unavailable (pull)\n  \
                   64  usage error — unknown flag, out-of-range value, a regex pattern that does\n      \
                   not compile (regex-search / count-patterns)\n  \
-                  69  `daemon status` found the daemon unhealthy (running but unreachable)\n\n\
+                  69  `daemon status` found the daemon unhealthy (running but unreachable)\n  \
+                  75  incomplete — count-patterns ran out of its time budget; the printed\n      \
+                  counts are lower bounds (raise --max-millis)\n\n\
                   With --json, exit 2 writes {\"error\":\"not found\", ...} to stdout on the read\n      \
                   commands listed above; branch on `error`, not on prose.\n  \
                   NOT UNIVERSAL, and stated precisely because a contract that overreaches is\n      \
@@ -7095,8 +7103,11 @@ enum Commands {
     /// Companion to regex-search. Reports total matches, files matched, and the
     /// busiest files for each pattern. Reuses the same trigram pre-filter.
     /// `^` and `$` are line anchors; `(?-m)` anchors the whole candidate.
+    /// One time budget (`--max-millis`, default 10000) covers every pattern;
+    /// when it runs out the cut patterns report lower bounds and the command
+    /// exits 75.
     #[command(
-        after_help = "Examples:\n  nestweaver count-patterns 'TODO' 'FIXME'\n  nestweaver count-patterns '(?i)deprecated' --path-prefix src/"
+        after_help = "Examples:\n  nestweaver count-patterns 'TODO' 'FIXME'\n  nestweaver count-patterns '(?i)deprecated' --path-prefix src/\n  nestweaver count-patterns 'unwrap\\(' 'expect\\(' --max-millis 120000\n\nExit codes:\n  0   every count is exact\n  75  the time budget ran out: patterns marked incomplete (\"truncated\": true\n      under --json) report lower bounds; a warning goes to stderr. Raise --max-millis."
     )]
     CountPatterns {
         /// One or more regex patterns to count
@@ -7114,6 +7125,12 @@ enum Commands {
             help = "Restrict to node kinds (comma-separated): Section,Note,Symbol,Frontmatter"
         )]
         kinds: Option<Vec<String>>,
+        #[arg(
+            long = "max-millis",
+            value_parser = clap::value_parser!(u64).range(1..=600000),
+            help = "Wall-clock time budget in milliseconds for the whole call, shared by all patterns (1-600000, default 10000; matches the MCP count_patterns schema)"
+        )]
+        max_millis: Option<u64>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -12349,23 +12366,12 @@ fn pre_push_backups(hooks_dir: &Path) -> Vec<PathBuf> {
 /// git repo. Backs up any pre-existing non-nestweaver hook.
 fn install_pre_push_hook(cwd: &Path, strict: bool, db: &Path) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
-    // A custom core.hooksPath can point OUTSIDE the repo — installing a
-    // hook there affects other repos, so say so loudly. Only checked when the
+    // A hooks directory OUTSIDE the working tree affects more than this
+    // checkout, so say so — and say why, which differs. Only checked when the
     // hooks dir already exists and canonicalizes (a not-yet-created custom
     // path can't be resolved reliably).
-    if let Some(root) = git_repo_root(cwd)
-        && let Ok(hooks_canon) = hooks_dir.canonicalize()
-    {
-        let root_canon = root.canonicalize().unwrap_or(root);
-        if hooks_dir_outside_repo(&hooks_canon, &root_canon) {
-            eprintln!(
-                "warning: git hooks path {} resolves OUTSIDE the repository {} \
-                 (core.hooksPath is set) — the hook will be installed there and \
-                 may affect other repos",
-                hooks_canon.display(),
-                root_canon.display()
-            );
-        }
+    if let Some(message) = hooks_location_message(cwd, &hooks_dir) {
+        eprintln!("{message}");
     }
     let db = std::path::absolute(db)
         .with_context(|| format!("resolving database path {}", db.display()))?;
@@ -12479,18 +12485,141 @@ fn install_pre_push_hook(cwd: &Path, strict: bool, db: &Path) -> anyhow::Result<
     println!("Database: {}", db.display());
     if !db.exists() {
         eprintln!(
-            "warning: database {} does not exist yet. Index it (nestweaver index --repo . --db {}) \
-             or reinstall with --db pointing at your graph; until then the hook {}.",
-            db.display(),
-            db.display(),
-            if strict {
-                "rejects every push"
-            } else {
-                "only reports that the database is missing"
-            }
+            "{}",
+            missing_hook_db_warning(&db, git_repo_root(cwd).as_deref(), strict)
         );
     }
     Ok(EXIT_SUCCESS)
+}
+
+/// The database `hooks --install` writes into the hook when `--db` is not
+/// given. Git runs a pre-push hook from the top of the working tree, so the
+/// working-directory default (`./nestweaver.lbug`) is resolved against the
+/// repository root: from a subdirectory it used to name
+/// `<subdir>/nestweaver.lbug`, a database the index never writes. A
+/// `NESTWEAVER_DB` the user set is their path and resolves like any other.
+fn hooks_default_db(cwd: &Path, (path, source): (PathBuf, DbSource)) -> PathBuf {
+    if source == DbSource::CwdLocal
+        && path.is_relative()
+        && let Some(root) = git_repo_root(cwd)
+    {
+        return root.join(path.strip_prefix(".").unwrap_or(path.as_path()));
+    }
+    path
+}
+
+/// The warning printed when the hook's database does not exist yet. The
+/// paths in the command to run are shell-quoted, so it pastes as one command
+/// whatever they contain, and `--repo` names the repository root, not the
+/// subdirectory `hooks --install` was run from.
+fn missing_hook_db_warning(db: &Path, repo_root: Option<&Path>, strict: bool) -> String {
+    let repo = repo_root.map_or_else(
+        || ".".to_string(),
+        |root| setup::shell_quote(&root.to_string_lossy()),
+    );
+    format!(
+        "warning: database {} does not exist yet. Index it (nestweaver index --repo {repo} --db {}) \
+         or reinstall with --db pointing at your graph; until then the hook {}.",
+        db.display(),
+        setup::shell_quote(&db.to_string_lossy()),
+        if strict {
+            "rejects every push"
+        } else {
+            "only reports that the database is missing"
+        }
+    )
+}
+
+/// `git config --get <key>` as git itself resolves it for `cwd` — every
+/// scope, not the isolated view (which pins `core.hooksPath`). None when unset.
+fn git_config_value(cwd: &Path, key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", key])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// The repository's common git directory (shared by all its worktrees).
+fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Some(if dir.is_absolute() {
+        dir
+    } else {
+        cwd.join(dir)
+    })
+}
+
+/// What `hooks --install` says when the hooks directory resolves outside the
+/// working tree, or None when it does not.
+fn hooks_location_message(cwd: &Path, hooks_dir: &Path) -> Option<String> {
+    let root = git_repo_root(cwd)?;
+    let hooks_canon = hooks_dir.canonicalize().ok()?;
+    let root_canon = root.canonicalize().unwrap_or(root);
+    let hooks_path = git_config_value(cwd, "core.hooksPath");
+    let common_canon = git_common_dir(cwd).and_then(|dir| dir.canonicalize().ok());
+    let symlinked =
+        std::fs::symlink_metadata(hooks_dir).is_ok_and(|meta| meta.file_type().is_symlink());
+    hooks_location_warning(
+        &hooks_canon,
+        &root_canon,
+        hooks_path.as_deref(),
+        common_canon.as_deref(),
+        symlinked,
+    )
+}
+
+/// The explanation for a hooks directory outside the working tree. Only a
+/// configured `core.hooksPath` is reported as one: a linked worktree keeps its
+/// hooks in the main repository's git directory, and a symlinked hooks
+/// directory leads wherever its link does. All paths are canonical.
+fn hooks_location_warning(
+    hooks_canon: &Path,
+    root_canon: &Path,
+    hooks_path: Option<&str>,
+    common_dir_canon: Option<&Path>,
+    symlinked: bool,
+) -> Option<String> {
+    if !hooks_dir_outside_repo(hooks_canon, root_canon) {
+        return None;
+    }
+    let hooks = hooks_canon.display();
+    let root = root_canon.display();
+    Some(if let Some(configured) = hooks_path {
+        format!(
+            "warning: git hooks path {hooks} resolves OUTSIDE the repository {root} \
+             (core.hooksPath is set to {configured}) — the hook will be installed there \
+             and may affect other repos"
+        )
+    } else if symlinked {
+        format!(
+            "warning: git hooks path {hooks} resolves OUTSIDE the repository {root} \
+             (the hooks directory is a symbolic link) — the hook will be installed at \
+             the link's target and affects every repository that shares it"
+        )
+    } else if let Some(common) = common_dir_canon.filter(|common| hooks_canon.starts_with(common)) {
+        format!(
+            "note: git hooks path {hooks} is in the repository's shared git directory {} \
+             outside the working tree {root} (a linked worktree or a separate git \
+             directory) — the hook applies to every worktree of this repository",
+            common.display()
+        )
+    } else {
+        format!(
+            "warning: git hooks path {hooks} resolves OUTSIDE the repository {root} \
+             — the hook will be installed there and may affect other repos"
+        )
+    })
 }
 
 /// Remove the nestweaver pre-push hook and restore the most recent backed-up
@@ -12517,7 +12646,22 @@ fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing of ours was removed, so there is nothing to restore a
+            // backup over. Restoring one here resurrected a hook the user had
+            // since deleted themselves.
             println!("No pre-push hook to remove.");
+            let backups = pre_push_backups(&hooks_dir);
+            if !backups.is_empty() {
+                println!(
+                    "Backups from an earlier install were left in place: {}",
+                    backups
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            return Ok(EXIT_SUCCESS);
         }
         Err(error) => {
             return Err(error).with_context(|| format!("inspecting {}", hook_path.display()));
@@ -17512,7 +17656,14 @@ fn pre_push_changed_file_count(repo_path: &Path, diff: Option<&str>) -> usize {
         return 0;
     };
     command
-        .args(["diff", "--name-only", "-z", range, "--"])
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            nestweaver_engine::git_cmd::IGNORE_SUBMODULE_WORKTREES,
+            range,
+            "--",
+        ])
         .current_dir(repo_path)
         .output()
         .ok()
@@ -17640,6 +17791,66 @@ mod pre_push_changed_file_count_tests {
         assert!(
             !markers.path().join("ran").exists(),
             "a repository program ran"
+        );
+    }
+
+    /// A submodule's own config names programs the superproject's overrides
+    /// cannot see; the working-tree diff must not recurse into it, even when
+    /// `.gitmodules` asks for every submodule change (`ignore = none`).
+    #[test]
+    fn counts_changes_without_running_submodule_programs() {
+        let repo = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        for dir in [root, sub.as_path()] {
+            git(dir, &["init", "-q"]);
+            git(dir, &["config", "user.email", "test@example.com"]);
+            git(dir, &["config", "user.name", "Test"]);
+            git(dir, &["config", "commit.gpgsign", "false"]);
+        }
+        std::fs::write(sub.join("s.py"), "x = 1\n").unwrap();
+        std::fs::write(sub.join(".gitattributes"), "* filter=subevil\n").unwrap();
+        git(&sub, &["add", "."]);
+        git(&sub, &["commit", "-q", "-m", "sub"]);
+        let program = markers.path().join("program.sh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nexec cat\n",
+                markers.path().join("ran").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            &sub,
+            &["config", "filter.subevil.clean", program.to_str().unwrap()],
+        );
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n\tignore = none\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        git(root, &["add", "a.rs", ".gitmodules", "sub"]);
+        git(root, &["commit", "-q", "-m", "init"]);
+        std::fs::write(root.join("a.rs"), "fn b() {}\n").unwrap();
+        // Unchanged contents, future mtime: Git must rehash it to compare.
+        let s_py = sub.join("s.py");
+        std::fs::write(&s_py, "x = 1\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&s_py)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+
+        assert_eq!(pre_push_changed_file_count(root, None), 1);
+        assert!(
+            !markers.path().join("ran").exists(),
+            "a submodule program ran"
         );
     }
 }
@@ -24143,6 +24354,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             patterns,
             path_prefix,
             kinds,
+            max_millis,
             json,
             db,
             config,
@@ -24158,15 +24370,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // A budget that ran out is not a plain success: the cut patterns
+            // report lower bounds, so the command exits EXIT_INCOMPLETE with a
+            // stderr warning, on both routes.
+            let exit_for = |truncated: bool| {
+                if truncated {
+                    EXIT_INCOMPLETE
+                } else {
+                    EXIT_SUCCESS
+                }
+            };
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let mut args = serde_json::json!({ "patterns": patterns });
-                if let Some(ref pp) = path_prefix {
-                    args["path_prefix"] = serde_json::json!(pp);
-                }
-                if let Some(ref k) = kinds {
-                    args["kinds"] = serde_json::json!(k);
-                }
+                let args = count_patterns_rpc_args(
+                    &patterns,
+                    path_prefix.as_deref(),
+                    kinds.as_deref(),
+                    max_millis,
+                );
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
@@ -24188,40 +24409,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     .collect()
                             })
                             .unwrap_or_default();
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&counts)?);
-                    } else {
-                        for c in &counts {
-                            println!(
-                                "'{}': {} match(es) across {} file(s)",
-                                c.pattern, c.total_matches, c.files_matched
-                            );
-                            for f in &c.top_files {
-                                println!("    {} ({})", f.path, f.count);
-                            }
-                            println!(
-                                "    regex: {} ready / {} scanned / {} errors; {} posting hits, {} hydrated, {} verified; {} ms",
-                                c.ready_scopes,
-                                c.dirty_scopes,
-                                c.error_scopes,
-                                c.posting_hits,
-                                c.hydrated_candidates,
-                                c.scanned_candidates,
-                                c.timings.total_ms,
-                            );
-                            if c.truncated {
-                                println!(
-                                    "    (incomplete: the time budget ran out; these counts are lower bounds)"
-                                );
-                            }
-                        }
-                        // Surface in-band staleness the daemon's stderr
-                        // warning can't reach us with.
-                        if counts.iter().any(|c| c.stale_index) {
-                            print_stale_index_note();
-                        }
-                    }
-                    return Ok((EXIT_SUCCESS, None));
+                    let truncated = print_pattern_counts(&counts, json, max_millis)?;
+                    return Ok((exit_for(truncated), None));
                 }
             }
 
@@ -24231,53 +24420,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // reject them in two different ways. `patterns` is a LIST, so the
             // envelope reports the whole list as the offending value; the
             // engine's message names the one that failed to compile.
-            let counts =
-                match store.count_patterns(&patterns, path_prefix.as_deref(), kinds.as_deref()) {
-                    Ok(counts) => counts,
-                    Err(error) => {
-                        let message = format!("{error}");
-                        if json {
-                            print_json_argument_error("patterns", &patterns.join(", "), &message);
-                        }
-                        eprintln!("Error: invalid --pattern: {message}");
-                        return Ok((EXIT_USAGE, None));
+            let counts = match store.count_patterns_cancellable(
+                &patterns,
+                path_prefix.as_deref(),
+                kinds.as_deref(),
+                max_millis,
+                None,
+            ) {
+                Ok(counts) => counts,
+                Err(error) => {
+                    let message = format!("{error}");
+                    if json {
+                        print_json_argument_error("patterns", &patterns.join(", "), &message);
                     }
-                };
-            if json {
-                println!("{}", serde_json::to_string_pretty(&counts)?);
-            } else {
-                for c in &counts {
-                    println!(
-                        "'{}': {} match(es) across {} file(s)",
-                        c.pattern, c.total_matches, c.files_matched
-                    );
-                    for f in &c.top_files {
-                        println!("    {} ({})", f.path, f.count);
-                    }
-                    println!(
-                        "    regex: {} ready / {} scanned / {} errors; {} posting hits, {} hydrated, {} verified; {} ms",
-                        c.ready_scopes,
-                        c.dirty_scopes,
-                        c.error_scopes,
-                        c.posting_hits,
-                        c.hydrated_candidates,
-                        c.scanned_candidates,
-                        c.timings.total_ms,
-                    );
-                    if c.truncated {
-                        println!(
-                            "    (incomplete: the time budget ran out; these counts are lower bounds)"
-                        );
-                    }
+                    eprintln!("Error: invalid --pattern: {message}");
+                    return Ok((EXIT_USAGE, None));
                 }
-                // Surface in-band staleness (the direct path's own
-                // stderr warning is a once-per-process latch that may already
-                // have fired inside the store).
-                if counts.iter().any(|c| c.stale_index) {
-                    print_stale_index_note();
-                }
-            }
-            Ok((EXIT_SUCCESS, None))
+            };
+            let truncated = print_pattern_counts(&counts, json, max_millis)?;
+            Ok((exit_for(truncated), None))
         }
 
         Commands::ReadSymbols {
@@ -29146,7 +29307,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             if uninstall {
                 Ok((uninstall_pre_push_hook(&cwd)?, None))
             } else if install {
-                let db_path = db.unwrap_or_else(default_db_path);
+                let db_path =
+                    db.unwrap_or_else(|| hooks_default_db(&cwd, default_db_path_with_source()));
                 Ok((install_pre_push_hook(&cwd, strict, &db_path)?, None))
             } else {
                 eprintln!(
@@ -38098,6 +38260,79 @@ credential_method = "ssh"
         assert!(pattern_count_from_tool_json(&serde_json::json!({"pattern": 1})).is_none());
     }
 
+    /// `count-patterns --max-millis` exists, reaches the daemon tool and the
+    /// client's RPC wait, and a result the budget cut is flagged rather than
+    /// passed off as a plain success (it was exit 0 with no warning, and the
+    /// flag did not exist, so the CLI could never get a complete count past
+    /// the 10 s default).
+    #[test]
+    fn count_patterns_budget_is_forwarded_and_truncation_is_flagged() {
+        let parsed = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let parsed = Cli::try_parse_from([
+                    "nestweaver",
+                    "count-patterns",
+                    "a",
+                    "--max-millis",
+                    "120000",
+                ])
+                .map(|cli| match cli.command {
+                    Commands::CountPatterns { max_millis, .. } => max_millis,
+                    _ => panic!("expected count-patterns"),
+                });
+                let zero =
+                    Cli::try_parse_from(["nestweaver", "count-patterns", "a", "--max-millis", "0"]);
+                (parsed.ok(), zero.is_err())
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert_eq!(parsed, (Some(Some(120_000)), true));
+
+        let patterns = vec!["a".to_string(), "b".to_string()];
+        let args = count_patterns_rpc_args(&patterns, Some("src/"), None, Some(120_000));
+        assert_eq!(args["max_millis"], serde_json::json!(120_000));
+        assert_eq!(args["path_prefix"], serde_json::json!("src/"));
+        assert!(args.get("kinds").is_none());
+        if std::env::var_os(RPC_TIMEOUT_ENV).is_none() {
+            assert_eq!(
+                daemon_rpc_timeout(&args),
+                Some(std::time::Duration::from_millis(150_000)),
+                "the client must wait out a budget the caller raised"
+            );
+        }
+        assert!(
+            count_patterns_rpc_args(&patterns, None, None, None)
+                .get("max_millis")
+                .is_none()
+        );
+
+        let entry = |pattern: &str, truncated: bool| {
+            pattern_count_from_tool_json(&serde_json::json!({
+                "pattern": pattern,
+                "total_matches": 1,
+                "files_matched": 1,
+                "top_files": [],
+                "truncated": truncated,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            pattern_counts_truncation_warning(&[entry("a", false)], None),
+            None
+        );
+        let warning =
+            pattern_counts_truncation_warning(&[entry("a", false), entry("b", true)], Some(2500))
+                .expect("a cut count must warn");
+        for fragment in ["INCOMPLETE", "2500 ms", "1 of 2", "--max-millis", "75"] {
+            assert!(warning.contains(fragment), "{fragment:?}: {warning}");
+        }
+        let defaulted = pattern_counts_truncation_warning(&[entry("b", true)], None).unwrap();
+        assert!(defaulted.contains("10000 ms"), "{defaulted}");
+        assert_eq!(EXIT_INCOMPLETE, 75);
+    }
+
     /// Hybrid `_meta` provenance is stripped so daemon responses render
     /// identically to the direct path; other keys are untouched and
     /// non-object values pass through.
@@ -39294,6 +39529,224 @@ mod pr_impact_hook_tests {
         uninstall_pre_push_hook(&repo).expect("uninstall");
         assert_eq!(std::fs::read_link(&hook).unwrap(), outside);
         assert!(!outside.exists());
+    }
+
+    fn git_commit(repo: &Path) {
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "c0",
+            ],
+        );
+    }
+
+    /// `hooks --uninstall` with no nestweaver hook installed restored an old
+    /// `.nestweaver.bak`, resurrecting a hook the user had removed. A backup
+    /// is only restored over a hook of ours that was just removed.
+    #[test]
+    fn uninstall_without_our_hook_restores_no_backup() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        let hooks_dir = git_hooks_dir(repo).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook = hooks_dir.join("pre-push");
+        let backup = hooks_dir.join("pre-push.nestweaver.bak");
+        std::fs::write(&backup, "#!/bin/sh\necho removed-by-the-user\n").unwrap();
+
+        assert_eq!(uninstall_pre_push_hook(repo).unwrap(), EXIT_SUCCESS);
+        assert!(
+            !path_occupied(&hook),
+            "no hook may be restored when ours was not installed"
+        );
+        assert!(backup.exists(), "the backup is left where it was");
+    }
+
+    /// From a subdirectory the default database was `<subdir>/nestweaver.lbug`,
+    /// but git runs the hook from the repository root. The default resolves
+    /// against the root; a `NESTWEAVER_DB` the user set is left alone.
+    #[test]
+    fn default_hook_db_resolves_against_the_repo_root() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let sub = repo.join("crates/inner");
+        std::fs::create_dir_all(&sub).unwrap();
+        git(&repo, &["init", "-q"]);
+        let root = git_repo_root(&repo).unwrap();
+
+        let db = hooks_default_db(
+            &sub,
+            (PathBuf::from("./nestweaver.lbug"), DbSource::CwdLocal),
+        );
+        assert_eq!(db, root.join("nestweaver.lbug"));
+
+        let env = hooks_default_db(&sub, (PathBuf::from("graphs/g.lbug"), DbSource::Env));
+        assert_eq!(env, PathBuf::from("graphs/g.lbug"));
+
+        // Outside a repository there is no root to resolve against.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        if git_repo_root(&outside).is_none() {
+            assert_eq!(
+                hooks_default_db(
+                    &outside,
+                    (PathBuf::from("./nestweaver.lbug"), DbSource::CwdLocal)
+                ),
+                PathBuf::from("./nestweaver.lbug")
+            );
+        }
+
+        // End to end: the hook installed from the subdirectory names the
+        // root's database.
+        install_pre_push_hook(&sub, false, &db).expect("install");
+        let body = std::fs::read_to_string(git_hooks_dir(&repo).unwrap().join("pre-push")).unwrap();
+        let expected = setup::shell_quote(&root.join("nestweaver.lbug").to_string_lossy());
+        assert!(body.contains(&expected), "{body}");
+        assert!(!body.contains("crates/inner"), "{body}");
+    }
+
+    /// The missing-database hint printed the path unquoted, so a path with a
+    /// space did not paste as one command.
+    #[test]
+    fn missing_db_hint_quotes_its_paths() {
+        let warning = missing_hook_db_warning(
+            Path::new("/my graphs/it's.lbug"),
+            Some(Path::new("/my repo")),
+            false,
+        );
+        assert!(
+            warning.contains(r"nestweaver index --repo '/my repo' --db '/my graphs/it'\''s.lbug'"),
+            "{warning}"
+        );
+        assert!(!warning.contains("  "), "{warning}");
+        let fallback = missing_hook_db_warning(Path::new("/g.lbug"), None, true);
+        assert!(fallback.contains("--repo . --db '/g.lbug'"), "{fallback}");
+        assert!(fallback.contains("rejects every push"), "{fallback}");
+    }
+
+    /// "(core.hooksPath is set)" was printed for every hooks directory outside
+    /// the working tree; a linked worktree or a symlinked hooks directory has a
+    /// different explanation.
+    #[test]
+    fn hooks_location_warning_names_the_real_cause() {
+        let root = Path::new("/work/repo");
+        assert_eq!(
+            hooks_location_warning(Path::new("/work/repo/.git/hooks"), root, None, None, false),
+            None
+        );
+        // A core.hooksPath inside the repository is not worth a warning.
+        assert_eq!(
+            hooks_location_warning(
+                Path::new("/work/repo/.githooks"),
+                root,
+                Some(".githooks"),
+                None,
+                false
+            ),
+            None
+        );
+
+        let configured = hooks_location_warning(
+            Path::new("/shared/hooks"),
+            root,
+            Some("/shared/hooks"),
+            Some(Path::new("/work/repo/.git")),
+            false,
+        )
+        .unwrap();
+        assert!(
+            configured.contains("core.hooksPath is set to /shared/hooks"),
+            "{configured}"
+        );
+
+        let worktree = hooks_location_warning(
+            Path::new("/work/main/.git/hooks"),
+            root,
+            None,
+            Some(Path::new("/work/main/.git")),
+            false,
+        )
+        .unwrap();
+        assert!(!worktree.contains("core.hooksPath"), "{worktree}");
+        assert!(worktree.contains("linked worktree"), "{worktree}");
+
+        let linked = hooks_location_warning(
+            Path::new("/dotfiles/hooks"),
+            root,
+            None,
+            Some(Path::new("/work/repo/.git")),
+            true,
+        )
+        .unwrap();
+        assert!(!linked.contains("core.hooksPath"), "{linked}");
+        assert!(linked.contains("symbolic link"), "{linked}");
+
+        for message in [configured, worktree, linked] {
+            assert!(!message.contains("  "), "{message}");
+        }
+    }
+
+    /// The same, against real repositories: a linked worktree is not reported
+    /// as `core.hooksPath`, and a configured one is.
+    #[test]
+    fn hooks_location_message_in_a_linked_worktree_and_with_hooks_path() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git_commit(&main);
+        let linked = tmp.path().join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let hooks_dir = git_hooks_dir(&linked).unwrap();
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let message = hooks_location_message(&linked, &hooks_dir)
+            .expect("a linked worktree's hooks live outside its working tree");
+        assert!(!message.contains("core.hooksPath"), "{message}");
+        assert!(message.contains("linked worktree"), "{message}");
+
+        // The main checkout's own hooks are inside it: nothing to say.
+        let main_hooks = git_hooks_dir(&main).unwrap();
+        assert_eq!(hooks_location_message(&main, &main_hooks), None);
+
+        let shared = tmp.path().join("shared-hooks");
+        std::fs::create_dir_all(&shared).unwrap();
+        git(
+            &main,
+            &["config", "core.hooksPath", shared.to_str().unwrap()],
+        );
+        let hooks_dir = git_hooks_dir(&main).unwrap();
+        let message = hooks_location_message(&main, &hooks_dir).expect("outside");
+        assert!(message.contains("core.hooksPath is set"), "{message}");
     }
 }
 

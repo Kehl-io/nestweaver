@@ -42,6 +42,9 @@ pub fn resolve_import(
 /// class per file usually puts `Foo` in `Foo.java`, but a package-private
 /// top-level class can live in any file of its package, and a nested class
 /// `Outer.Inner` lives in `Outer.java`.
+/// A file's top-level declarations: name → line spans.
+type TopLevelSpans<'a> = HashMap<&'a str, Vec<(u32, u32)>>;
+
 pub struct JvmPackageIndex<'a> {
     /// Declared package → files declaring it.
     declared: HashMap<&'a str, Vec<&'a str>>,
@@ -51,8 +54,23 @@ pub struct JvmPackageIndex<'a> {
     /// conventional directory layout; the key keeps that lookup from scanning
     /// every such file per import.
     undeclared: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
-    /// File → its top-level declaration names.
-    top_level: HashMap<&'a str, HashSet<&'a str>>,
+    /// File → its top-level declarations: name → line spans.
+    top_level: HashMap<&'a str, TopLevelSpans<'a>>,
+}
+
+/// What one Kotlin/Java import names.
+///
+/// The two shapes rank differently against a same-package declaration
+/// (JLS 6.4.1, Kotlin name resolution): a single-type import shadows it, and
+/// it shadows an on-demand import.
+#[derive(Debug, PartialEq, Eq)]
+pub enum JvmImport<'a> {
+    /// `import a.b.C` (or `a.b.Outer.Inner`, or Kotlin `a.b.helper`): the
+    /// files of `a.b` declaring top-level `C`, each with the line spans of
+    /// that declaration. Only names inside a span are imported.
+    Declaration(Vec<(&'a str, Vec<(u32, u32)>)>),
+    /// `import a.b.*` (which may arrive as `a.b`): every file of the package.
+    OnDemand(Vec<&'a str>),
 }
 
 impl<'a> JvmPackageIndex<'a> {
@@ -84,16 +102,17 @@ impl<'a> JvmPackageIndex<'a> {
                         .push((dir, file.as_str()));
                 }
             }
-            top_level.insert(
-                file.as_str(),
-                symbols
-                    .iter()
-                    .filter(|symbol| {
-                        symbol.parent_name.is_none() && symbol.kind != SymbolKind::Method
-                    })
-                    .map(|symbol| symbol.name.as_str())
-                    .collect(),
-            );
+            let mut declarations: HashMap<&'a str, Vec<(u32, u32)>> = HashMap::new();
+            for symbol in symbols
+                .iter()
+                .filter(|symbol| symbol.parent_name.is_none() && symbol.kind != SymbolKind::Method)
+            {
+                declarations
+                    .entry(symbol.name.as_str())
+                    .or_default()
+                    .push((symbol.start_line, symbol.end_line));
+            }
+            top_level.insert(file.as_str(), declarations);
         }
         for files in declared.values_mut() {
             files.sort_unstable();
@@ -124,32 +143,33 @@ impl<'a> JvmPackageIndex<'a> {
         files
     }
 
-    /// Every file an import specifier names, sorted; empty when none.
+    /// What an import specifier names; files sorted, empty when none.
     ///
     /// `a.b.C` is the top-level `C` of package `a.b` (tried longest package
     /// first, so `a.b.Outer.Inner` reaches `Outer` in `a.b`). A specifier
     /// that names no declaration but is itself a package is a wildcard
     /// import (`import a.b.*` arrives as `a.b`), naming every file of it.
-    pub fn resolve(&self, specifier: &str) -> Vec<&'a str> {
-        let specifier = specifier.trim_end_matches(".*");
+    pub fn resolve(&self, specifier: &str) -> JvmImport<'a> {
+        if let Some(package) = specifier.strip_suffix(".*") {
+            return JvmImport::OnDemand(self.package_files(package));
+        }
         let segments: Vec<&str> = specifier.split('.').collect();
         for split in (1..segments.len()).rev() {
             let package = segments[..split].join(".");
             let name = segments[split];
-            let files: Vec<&'a str> = self
+            let files: Vec<(&'a str, Vec<(u32, u32)>)> = self
                 .package_files(&package)
                 .into_iter()
-                .filter(|file| {
-                    self.top_level
-                        .get(file)
-                        .is_some_and(|names| names.contains(name))
+                .filter_map(|file| {
+                    let spans = self.top_level.get(file)?.get(name)?;
+                    Some((file, spans.clone()))
                 })
                 .collect();
             if !files.is_empty() {
-                return files;
+                return JvmImport::Declaration(files);
             }
         }
-        self.package_files(specifier)
+        JvmImport::OnDemand(self.package_files(specifier))
     }
 }
 

@@ -197,7 +197,10 @@ fn refuse_directory_escape(base: &Path, relative: &Path) -> Result<(), anyhow::E
             .is_ok_and(|resolved| resolved.starts_with(&canonical_base));
         if !inside {
             anyhow::bail!(
-                "{} is a symbolic link that leads outside the project ({}). NestWeaver                  changed nothing for this tool: it will not create directories or write                  files outside {} through a link. Replace the link with a directory, or                  add the registration by hand.",
+                "{} is a symbolic link that leads outside the project ({}). NestWeaver \
+                 changed nothing for this tool: it will not create directories or write \
+                 files outside {} through a link. Replace the link with a directory, or \
+                 add the registration by hand.",
                 current.display(),
                 std::fs::read_link(&current)
                     .map_or_else(|_| "unresolvable".to_string(), |t| t.display().to_string()),
@@ -733,32 +736,49 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Recognisable parts of the hook commands this module generates. Used to find
-/// (and replace) NestWeaver's own entries on a re-run without touching the
-/// user's.
-const CLAUDE_SESSION_START_SIGNATURE: &str = "nestweaver brain status --db";
+/// The SessionStart command setup writes is
+/// `{PREFIX}<database as one shell word>{SUFFIX}`. Releases before the quoting
+/// fix wrote the same shape with the path unquoted; both are recognised as
+/// ours, and nothing else is.
+const CLAUDE_SESSION_START_PREFIX: &str = "nestweaver brain status --db ";
+const CLAUDE_SESSION_START_SUFFIX: &str =
+    " 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'";
+/// Opening words of the PreToolUse hint, shared by every release's hook.
 const CLAUDE_PRE_TOOL_SIGNATURE: &str = "NestWeaver is indexed";
+
+/// The PreToolUse(Bash) command written by releases before the `tool_input`
+/// fix (it read `.command`, which Claude Code never sends). Kept verbatim so a re-run of
+/// `setup` can find and replace it; nothing broader is matched.
+const LEGACY_CLAUDE_PRE_TOOL_USE_COMMAND: &str = "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.command // empty'); \
+     if echo \"$CMD\" | grep -qE '(grep|rg|find|fd|ack|ag)\\s'; then \
+       echo '{\"additionalContext\": \"NestWeaver is indexed — prefer `brain_search` (searches code + notes) or `brain_context` (ranked structural context) over grep/find. Token savings: ~90% fewer tokens than file-by-file exploration.\"}'; \
+     fi";
+
+/// The jq program the PreToolUse(Bash) hook runs on the event: `true` when a
+/// search tool is the INVOKED command of some pipeline segment.
+///
+/// Quoted strings are blanked first, in ONE left-to-right pass so whichever
+/// quote opens first wins (an apostrophe inside double quotes must not open a
+/// single-quoted run), so `git commit -m "find the bug"` has no `find` left
+/// in it; the command is then split at `|`, `;`, `&`, `(`, `)`,
+/// backticks and newlines, and each segment's first word — after `VAR=value` assignments
+/// and wrappers such as `sudo`, `xargs`, `if` — must be the tool, optionally
+/// with a directory (`/usr/bin/grep`). `echo find me` stays silent. `\u0027` is
+/// a single quote, which cannot appear inside the shell's single quotes.
+const CLAUDE_PRE_TOOL_USE_JQ: &str = r#"(.tool_input.command // "") | gsub("\u0027[^\u0027]*\u0027|\"(\\\\.|[^\"\\\\])*\""; "Q") | [splits("[|;&()`\n]")] | any(.[]; test("^\\s*([A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)*((sudo|command|exec|time|nice|env|xargs|if|then|else|elif|do|while|until|!)\\s+)*(\\S*/)?(grep|egrep|fgrep|rg|find|fd|ack|ag)(\\s|$)"))"#;
 
 fn claude_session_start_command(db_str: &str) -> String {
     // SessionStart is one of the events whose plain stdout Claude Code adds to
     // the session context, so the status text needs no JSON envelope.
     format!(
-        "{CLAUDE_SESSION_START_SIGNATURE} {} 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
+        "{CLAUDE_SESSION_START_PREFIX}{}{CLAUDE_SESSION_START_SUFFIX}",
         shell_quote(db_str)
     )
 }
 
-/// PreToolUse(Bash): when the agent is about to run a text search, add a hint
-/// pointing at the graph tools. Non-blocking: it never sets a permission
-/// decision and always exits 0.
-///
-/// Two defects are fixed here, either of which kept the hint from ever
-/// reaching the agent. Claude Code sends the tool's arguments under
-/// `tool_input` (`.tool_input.command`), not at the top level, so `.command`
-/// was always empty. And a PreToolUse hook's stdout is only read as JSON with
-/// the context under `hookSpecificOutput.additionalContext`; a top-level
-/// `additionalContext` key is ignored.
-fn claude_pre_tool_use_command() -> String {
+/// The hook's output: the hint as `hookSpecificOutput.additionalContext`,
+/// shell-quoted for `printf`.
+fn claude_pre_tool_use_context() -> String {
     let context = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -769,8 +789,38 @@ fn claude_pre_tool_use_command() -> String {
         }
     })
     .to_string();
-    // jq when present; without it, fall back to matching the raw event JSON,
-    // which still contains the command text.
+    shell_quote(&context)
+}
+
+/// PreToolUse(Bash): when the agent is about to run a text search, add a hint
+/// pointing at the graph tools. Non-blocking: it never sets a permission
+/// decision and always exits 0.
+///
+/// Claude Code sends the tool's arguments under `tool_input`
+/// (`.tool_input.command`), and reads a PreToolUse hook's stdout as JSON with
+/// the context under `hookSpecificOutput.additionalContext`.
+///
+/// The search tool must be the command being run ([`CLAUDE_PRE_TOOL_USE_JQ`]),
+/// not a word anywhere in it: `echo find me` and `git commit -m "find the
+/// bug"` are not searches. Without jq the hook does nothing. Matching the raw
+/// event JSON instead fired on the `description` field and on every argument.
+fn claude_pre_tool_use_command() -> String {
+    format!(
+        "command -v jq >/dev/null 2>&1 || exit 0; \
+         HIT=$(jq -r {} 2>/dev/null) || exit 0; \
+         if [ \"$HIT\" = true ]; then \
+           printf '%s\\n' {}; \
+         fi; \
+         exit 0",
+        shell_quote(CLAUDE_PRE_TOOL_USE_JQ),
+        claude_pre_tool_use_context()
+    )
+}
+
+/// The PreToolUse(Bash) command the first `tool_input` release wrote: it
+/// matched a search word anywhere in the command, and fell back to the raw
+/// event JSON without jq. Recognised so a re-run replaces it.
+fn previous_claude_pre_tool_use_command() -> String {
     format!(
         "INPUT=$(cat); \
          CMD=$(printf '%s' \"$INPUT\" | jq -r '.tool_input.command // empty' 2>/dev/null) || CMD=\"$INPUT\"; \
@@ -778,17 +828,44 @@ fn claude_pre_tool_use_command() -> String {
            printf '%s\\n' {}; \
          fi; \
          exit 0",
-        shell_quote(&context)
+        claude_pre_tool_use_context()
     )
 }
 
-/// True when `hook` is one of the entries this module generated.
+/// True when `word` is exactly one shell word as setup writes a database path:
+/// [`shell_quote`]d, or (releases before the quoting fix) bare with no
+/// whitespace or shell metacharacter — so `./a.lbug;my-thing` is not ours.
+/// An old unquoted install whose path held a space never worked and is not
+/// recognised; a re-run adds the working hook beside it.
+fn is_one_shell_word(word: &str) -> bool {
+    if let Some(quoted) = word.strip_prefix('\'') {
+        return quoted
+            .strip_suffix('\'')
+            .is_some_and(|inner| shell_quote(&inner.replace(r"'\''", "'")) == word);
+    }
+    !word.is_empty()
+        && !word
+            .chars()
+            .any(|c| c.is_whitespace() || ";|&$()<>'\"\\`*?[]{}".contains(c))
+}
+
+/// True when `hook` is one of the entries this module generated — the exact
+/// command shapes setup writes now or wrote before, and nothing broader. A
+/// substring match replaced a user's own hook that merely ran
+/// `nestweaver brain status --db …`.
 fn is_nestweaver_hook(hook: &serde_json::Value) -> bool {
-    hook.get("command")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| {
-            s.contains(CLAUDE_SESSION_START_SIGNATURE) || s.contains(CLAUDE_PRE_TOOL_SIGNATURE)
-        })
+    let Some(command) = hook.get("command").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    if let Some(db) = command
+        .strip_prefix(CLAUDE_SESSION_START_PREFIX)
+        .and_then(|rest| rest.strip_suffix(CLAUDE_SESSION_START_SUFFIX))
+    {
+        return is_one_shell_word(db);
+    }
+    command == claude_pre_tool_use_command()
+        || command == previous_claude_pre_tool_use_command()
+        || command == LEGACY_CLAUDE_PRE_TOOL_USE_COMMAND
 }
 
 /// Drop NestWeaver's own hooks from one event's matcher list, and any matcher
@@ -2681,6 +2758,10 @@ mod integration_fix_tests {
     #[test]
     #[cfg(unix)]
     fn pre_tool_use_hook_reads_tool_input_and_emits_hook_specific_output() {
+        if !jq_available() {
+            eprintln!("skipping: jq not on PATH");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         install_claude_hooks("/tmp/x.lbug", dir.path()).unwrap();
         let command = hook_command(&settings(dir.path()), "PreToolUse");
@@ -2770,11 +2851,15 @@ mod integration_fix_tests {
     fn rerun_replaces_legacy_hooks_and_keeps_the_users() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        // The exact commands older releases wrote: an unquoted database path,
+        // and the PreToolUse hook that read `.command`.
+        let legacy_session_start =
+            format!("{CLAUDE_SESSION_START_PREFIX}./nestweaver.lbug{CLAUDE_SESSION_START_SUFFIX}");
         let legacy = serde_json::json!({
             "hooks": {
-                "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "nestweaver brain status --db ./nestweaver.lbug 2>/dev/null"}]}],
+                "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": legacy_session_start}]}],
                 "PreToolUse": [
-                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "INPUT=$(cat); CMD=$(echo \"$INPUT\" | jq -r '.command // empty'); echo '{\"additionalContext\": \"NestWeaver is indexed — prefer\"}'"}]},
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": LEGACY_CLAUDE_PRE_TOOL_USE_COMMAND}]},
                     {"matcher": "Edit", "hooks": [{"type": "command", "command": "my-own-hook.sh"}]}
                 ]
             }
@@ -2806,6 +2891,348 @@ mod integration_fix_tests {
             install_claude_hooks("/abs/db.lbug", dir.path()).unwrap(),
             "hooks already installed"
         );
+    }
+
+    /// Only the exact command shapes setup writes are ours. A substring match
+    /// on `nestweaver brain status --db` replaced the user's own hook.
+    #[test]
+    fn only_the_commands_setup_writes_are_recognised_as_ours() {
+        let hook = |command: &str| serde_json::json!({"type": "command", "command": command});
+        for ours in [
+            claude_session_start_command("/abs/db.lbug"),
+            claude_session_start_command("/my dir/it's.lbug"),
+            format!("{CLAUDE_SESSION_START_PREFIX}./nestweaver.lbug{CLAUDE_SESSION_START_SUFFIX}"),
+            claude_pre_tool_use_command(),
+            previous_claude_pre_tool_use_command(),
+            LEGACY_CLAUDE_PRE_TOOL_USE_COMMAND.to_string(),
+        ] {
+            assert!(is_nestweaver_hook(&hook(ours.as_str())), "{ours}");
+        }
+        for users in [
+            "nestweaver brain status --db ./mine.lbug",
+            "nestweaver brain status --db ./mine.lbug --json | my-formatter",
+            "nestweaver brain status --db ./a.lbug; my-thing 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
+            "nestweaver brain status --db ./a.lbug;my-thing 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
+            "nestweaver brain status --db $(pick-db) 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
+            "nestweaver brain status --db 'a' 'b' 2>/dev/null || echo 'NestWeaver: not indexed yet (run: nestweaver index --repo .)'",
+            "echo 'NestWeaver is indexed' && my-check",
+            "my-own-hook.sh",
+        ] {
+            assert!(!is_nestweaver_hook(&hook(users)), "{users}");
+        }
+        assert!(!is_nestweaver_hook(&serde_json::json!({"type": "command"})));
+    }
+
+    /// A user's own SessionStart hook that runs `nestweaver brain status` and a
+    /// PreToolUse hook that mentions the hint text survive a re-run, and the
+    /// first `tool_input` release's PreToolUse hook is replaced.
+    #[test]
+    fn a_users_lookalike_hooks_survive_and_the_previous_release_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        let mine = "nestweaver brain status --db ./mine.lbug --json | my-formatter";
+        let my_check = "echo 'NestWeaver is indexed' && my-check";
+        let previous = previous_claude_pre_tool_use_command();
+        let before = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": mine}]}],
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": previous}]},
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": my_check}]}
+                ]
+            }
+        });
+        std::fs::write(
+            dir.path().join(".claude/settings.json"),
+            serde_json::to_string_pretty(&before).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            install_claude_hooks("/abs/db.lbug", dir.path()).unwrap(),
+            "hooks updated"
+        );
+        let after = settings(dir.path());
+        let commands = |event: &str| -> Vec<String> {
+            after["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+                .map(|h| h["command"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            commands("SessionStart"),
+            [
+                mine.to_string(),
+                claude_session_start_command("/abs/db.lbug")
+            ],
+            "{after}"
+        );
+        assert_eq!(
+            commands("PreToolUse"),
+            [my_check.to_string(), claude_pre_tool_use_command()],
+            "{after}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn jq_available() -> bool {
+        which_exists("jq")
+    }
+
+    /// The hook fired on `echo find me` and `git commit -m "find the bug"`: a
+    /// search word anywhere counted. Only a search tool that is the INVOKED
+    /// command of a pipeline segment does.
+    #[test]
+    #[cfg(unix)]
+    fn pre_tool_use_hook_fires_only_when_a_search_tool_is_the_command() {
+        if !jq_available() {
+            eprintln!("skipping: jq not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        install_claude_hooks("/tmp/x.lbug", dir.path()).unwrap();
+        let command = hook_command(&settings(dir.path()), "PreToolUse");
+        let fires = |bash: &str| {
+            let event = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                // The description names a search: it must not count.
+                "tool_input": {"command": bash, "description": "grep and find things"}
+            })
+            .to_string();
+            let out = run_sh(&command, &event, None);
+            assert!(out.status.success(), "{bash}: {out:?}");
+            !out.stdout.is_empty()
+        };
+        for search in [
+            "rg -n handleLogin src/",
+            "grep -rn \"foo bar\" src",
+            "cat x | grep foo",
+            "cd src && find . -name '*.rs'",
+            "FOO=1 /usr/bin/grep x y",
+            "ls; rg x",
+            "echo $(find . -type f)",
+            "ls | xargs grep foo",
+            // An apostrophe inside double quotes opens no single-quoted run.
+            "echo \"it's\"; grep x; echo 'y'",
+        ] {
+            assert!(fires(search), "must fire on {search:?}");
+        }
+        for other in [
+            "echo find me",
+            "git commit -m \"find the bug\"",
+            "git commit -m 'grep it; rg x'",
+            "git log --grep foo",
+            "echo grep",
+            "./find-dupes.sh",
+            "cargo build",
+        ] {
+            assert!(!fires(other), "must stay silent on {other:?}");
+        }
+    }
+
+    /// Without jq the hook matched the raw event JSON — the `description`
+    /// field, every argument. It now does nothing rather than guess.
+    #[test]
+    #[cfg(unix)]
+    fn pre_tool_use_hook_without_jq_does_nothing() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        install_claude_hooks("/tmp/x.lbug", dir.path()).unwrap();
+        let command = hook_command(&settings(dir.path()), "PreToolUse");
+        let empty_path = dir.path().join("no-tools");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        let event = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rg -n handleLogin src/", "description": "grep"}
+        })
+        .to_string();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("PATH", &empty_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// The shipped `integrations/claude-code/hooks` scripts, run with a stub
+    /// `nestweaver` that records the argv of its last call.
+    #[cfg(unix)]
+    struct ShippedHook {
+        dir: tempfile::TempDir,
+        record: std::path::PathBuf,
+        bin: std::path::PathBuf,
+        db: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ShippedHook {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let record = dir.path().join("argv");
+            let stub = bin.join("nestweaver");
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nprintf '{{\"results\": []}}'\n",
+                    record.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let db = dir.path().join("graph.lbug");
+            std::fs::write(&db, "").unwrap();
+            Self {
+                dir,
+                record,
+                bin,
+                db,
+            }
+        }
+
+        /// Run `script` on `event`; the argv of the stub's last call, if any.
+        fn run(&self, script: &str, event: &serde_json::Value) -> Option<Vec<String>> {
+            use std::io::Write as _;
+            let _ = std::fs::remove_file(&self.record);
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("integrations/claude-code/hooks")
+                .join(script);
+            let mut child = std::process::Command::new("bash")
+                .arg(&path)
+                .current_dir(self.dir.path())
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        self.bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("NESTWEAVER_DB", &self.db)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(event.to_string().as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{script}: {out:?}");
+            std::fs::read_to_string(&self.record)
+                .ok()
+                .map(|argv| argv.lines().map(str::to_string).collect())
+        }
+    }
+
+    /// `pre-search-enrich.sh` searched the LAST token — the path:
+    /// `grep -rn "foo bar" src` became `search -- src`. It must search the
+    /// pattern, and search nothing when the pattern is not on the command line.
+    #[test]
+    #[cfg(unix)]
+    fn shipped_search_hook_searches_the_pattern_not_the_path() {
+        if !jq_available() {
+            eprintln!("skipping: jq not on PATH");
+            return;
+        }
+        let hook = ShippedHook::new();
+        let searched = |command: &str| {
+            let event = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": command, "description": "find src"}
+            });
+            hook.run("pre-search-enrich.sh", &event).map(|argv| {
+                assert_eq!(argv[..2], ["search", "--json"], "{command}: {argv:?}");
+                assert_eq!(argv[argv.len() - 2], "--", "{command}: {argv:?}");
+                argv.last().unwrap().clone()
+            })
+        };
+        for (command, pattern) in [
+            ("grep -rn \"foo bar\" src", "foo bar"),
+            ("grep -rn 'it''s' src", "its"),
+            ("rg -e handleLogin src/", "handleLogin"),
+            ("rg --regexp=needle .", "needle"),
+            ("rg --regexp needle .", "needle"),
+            ("grep -efoo src", "foo"),
+            ("grep -A 3 -i 'needle' src", "needle"),
+            ("grep -A3 needle src", "needle"),
+            ("rg -g '*.rs' needle src", "needle"),
+            ("rg -tpy needle src", "needle"),
+            ("rg --type rust needle src", "needle"),
+            ("grep -rn --include=*.rs needle .", "needle"),
+            ("grep -rn needle src 2>/dev/null", "needle"),
+            ("grep -rn 2> /dev/null needle src", "needle"),
+            ("cat x | grep -v foo", "foo"),
+            ("cd src && rg needle | head -5", "needle"),
+            ("rg -- -dash src", "-dash"),
+            ("LC_ALL=C /usr/bin/grep -n needle src", "needle"),
+        ] {
+            assert_eq!(searched(command).as_deref(), Some(pattern), "{command}");
+        }
+        // No pattern on the command line, or no search at all: no search.
+        for command in [
+            "grep -f patterns.txt src",
+            "rg --files src",
+            "echo grep foo",
+            "git commit -m \"grep the bug\"",
+            "cargo build",
+        ] {
+            assert_eq!(searched(command), None, "{command}");
+        }
+    }
+
+    /// `basename "$FILE_PATH"` read a path starting with `-` as options and
+    /// produced no search term; `basename --` keeps it a path.
+    #[test]
+    #[cfg(unix)]
+    fn shipped_file_hooks_take_a_dash_path_as_a_path() {
+        if !jq_available() {
+            eprintln!("skipping: jq not on PATH");
+            return;
+        }
+        let hook = ShippedHook::new();
+        for script in ["pre-read-enrich.sh", "post-edit-impact.sh"] {
+            let event = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "--db=x.py"}
+            });
+            let argv = hook
+                .run(script, &event)
+                .unwrap_or_else(|| panic!("{script} never called nestweaver"));
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some("--db=x"),
+                "{script}: {argv:?}"
+            );
+        }
     }
 
     /// One failing tool used to abort the whole run: tools after it were never
@@ -3118,6 +3545,17 @@ mod integration_fix_tests {
             configure_tool("continue", &test_ctx(&db, &project), &mut Items::new()).unwrap_err();
         assert!(
             format!("{error:#}").contains("outside the project"),
+            "{error:#}"
+        );
+        // The message is one sentence per line of source: a string
+        // continuation without its trailing `\` kept every line's indentation
+        // as a run of spaces in the middle of the text.
+        assert!(
+            !format!("{error:#}").contains("  "),
+            "runs of spaces in the refusal: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("NestWeaver changed nothing for this tool"),
             "{error:#}"
         );
         assert!(

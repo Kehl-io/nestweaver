@@ -1545,6 +1545,8 @@ pub fn changed_files_from_git(repo_path: &Path, base_ref: Option<&str>) -> Resul
     // unless `isolated_git_in` disables them.
     let mut cmd = crate::git_cmd::isolated_git_in(repo_path)?;
     cmd.arg("diff").arg("--name-only").arg("-z");
+    // ...and a submodule's own filters unless Git stays out of submodules.
+    cmd.arg(crate::git_cmd::IGNORE_SUBMODULE_WORKTREES);
 
     if let Some(base) = base_ref {
         let oid = resolve_commit_ref(repo_path, base)?;

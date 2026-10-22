@@ -5,7 +5,7 @@ use nestweaver_schema::{
 };
 use rayon::prelude::*;
 
-use crate::imports::{ImportGraph, NamedBinding, build_import_graph_with_languages};
+use crate::imports::{ImportGraph, JvmImportRank, NamedBinding, build_import_graph_with_languages};
 use crate::types::TypeEnvironment;
 use crate::util::parent_dir;
 use crate::workspace::WorkspaceContext;
@@ -89,6 +89,83 @@ pub fn resolve_references_with_context(
 
 type ScopedCallKey<'a> = (&'a str, Option<&'a str>, usize);
 
+/// Per method `(file, start_line)`, the callee names of its
+/// `return Name(..)` / `return new Name(..)` / `return cls(..)` statements.
+/// The only evidence the unique-method fallback accepts for what an
+/// unannotated method returns (see `fallback_receiver_type`).
+type ReturnedConstructions = std::collections::HashMap<(String, u32), Vec<String>>;
+
+/// Whether a call reference's evidence line is `return Name(..)` or
+/// `return new Name(..)` for that very callee: the call IS the returned
+/// value, not an argument to it (`return Optional.of(new A())`), an element
+/// of it (`return [new Q()]`) or a receiver in it (`return A().b()`).
+fn returns_construction_of(context: &str, name: &str) -> bool {
+    let Some(rest) = context.trim_start().strip_prefix("return") else {
+        return false;
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("new ").map_or(rest, str::trim_start);
+    rest.strip_prefix(name).is_some_and(|after| {
+        let after = after.trim_start();
+        let Some(close) = after
+            .starts_with('(')
+            .then(|| matching_close_paren(after))
+            .flatten()
+        else {
+            return false;
+        };
+        // Nothing may follow the argument list but the statement's end.
+        matches!(after[close + 1..].trim(), "" | ";")
+    })
+}
+
+/// Byte index of the `)` closing the `(` that `text` starts with.
+fn matching_close_paren(text: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn returned_constructions(
+    files: &[(String, Vec<RawSymbol>, Vec<RawReference>)],
+    sorted_symbols_per_file: &[Vec<&RawSymbol>],
+) -> ReturnedConstructions {
+    let mut map = ReturnedConstructions::new();
+    for ((file, _, references), sorted_syms) in files.iter().zip(sorted_symbols_per_file) {
+        for reference in references {
+            if reference.kind != ReferenceKind::Call
+                || reference.receiver.is_some()
+                || !returns_construction_of(&reference.context, &reference.name)
+            {
+                continue;
+            }
+            if let Enclosing::Exact(symbol) =
+                find_enclosing_symbol(sorted_syms, reference.start_line)
+                && symbol.kind == SymbolKind::Method
+            {
+                map.entry((file.clone(), symbol.start_line))
+                    .or_default()
+                    .push(reference.name.clone());
+            }
+        }
+    }
+    map
+}
+
 /// Index exact AST call identities once per file. Retain duplicate references
 /// so an ambiguous assignment stays refused instead of taking an arbitrary call.
 fn scoped_call_reference_index<'a>(
@@ -171,6 +248,8 @@ pub fn resolve_references_with_file_languages(
                 .push((file_path.as_str(), sym));
         }
     }
+
+    let returned_constructions = returned_constructions(files, &sorted_symbols_per_file);
 
     // Build a parent-type lookup from Extends references for MRO walk.
     // Maps child type name → list of parent type names.
@@ -276,6 +355,7 @@ pub fn resolve_references_with_file_languages(
                     Language::Rust,
                     repo_uid,
                     _type_envs,
+                    &returned_constructions,
                 ) else {
                     continue;
                 };
@@ -372,6 +452,7 @@ pub fn resolve_references_with_file_languages(
                     language,
                     repo_uid,
                     type_envs,
+                    &returned_constructions,
                 ) {
                     if edge.target_uid.starts_with("sym:")
                         && edge.evidence.iter().any(|evidence| {
@@ -540,6 +621,11 @@ fn go_build_variant_edges(
 /// external `_test` package, so the same directory counts as the same
 /// package unless exactly one of the two is a `_test.go` file.
 fn go_same_package(graph: &ImportGraph, a: &str, b: &str) -> bool {
+    // A `//go:build ignore` file is a standalone `go run` program: it shares
+    // a package with no other file of its directory (not a build variant).
+    if graph.go_build_ignored(a) || graph.go_build_ignored(b) {
+        return a == b;
+    }
     match (graph.go_package_of(a), graph.go_package_of(b)) {
         (Some(left), Some(right)) => left == right,
         _ => a.ends_with("_test.go") == b.ends_with("_test.go"),
@@ -564,6 +650,7 @@ fn resolve_single_reference(
     language: Language,
     repo_uid: &str,
     type_envs: Option<&std::collections::HashMap<String, crate::types::TypeEnvironment>>,
+    returned_constructions: &ReturnedConstructions,
 ) -> Option<ResolvedEdge> {
     let edge_type = match reference.kind {
         ReferenceKind::Call | ReferenceKind::Macro => EdgeType::Calls,
@@ -979,8 +1066,13 @@ fn resolve_single_reference(
         && inferred_receiver.is_none()
         && let Some(receiver) = reference.receiver.as_deref()
         && is_expression_receiver(receiver)
-        && let Some((target_file, target)) =
-            unique_expression_method(&receiver_inference, receiver, &reference.name, source_sym)
+        && let Some((target_file, target)) = unique_expression_method(
+            &receiver_inference,
+            returned_constructions,
+            receiver,
+            &reference.name,
+            source_sym,
+        )
     {
         let confidence = confidence_score(MatchType::SamePackageFallback, language);
         return Some(ResolvedEdge {
@@ -1578,39 +1670,88 @@ fn resolve_single_reference(
             .collect()
     };
     imports.sort_by(|(_, a), (_, b)| a.cmp(b));
-    for (_, imported_file) in &imports {
-        if let Some(syms) = &candidates
-            && let Some((_, sym)) = syms.iter().find(|(f, sym)| {
-                f == imported_file
-                    && candidate_matches(
-                        reference,
-                        if language == Language::Rust && graph.resolves_parent(file_path, f) {
-                            f
-                        } else {
-                            file_path
-                        },
-                        f,
-                        sym,
-                        language,
-                        graph,
-                    )
+    // Kotlin/Java: a single-type import names one top-level declaration (not
+    // its whole file) and shadows a same-package declaration, which shadows
+    // an on-demand import (JLS 6.4.1; Kotlin: explicit > same package >
+    // star). `jvm_shadowed` hands an on-demand-only name to the same-package
+    // tier below.
+    let jvm_imports = binding
+        .is_none()
+        .then(|| graph.jvm_imports_of(file_path))
+        .flatten()
+        .filter(|_| matches!(language, Language::Kotlin | Language::Java));
+    let jvm_shadowed = jvm_imports.is_some()
+        && candidates.is_some_and(|syms| {
+            syms.iter().any(|(f, sym)| {
+                // A bare name denotes a package member: a top-level one.
+                *f != file_path
+                    && (reference.receiver.is_some() || sym.parent_name.is_none())
+                    && graph.jvm_same_package(file_path, f)
+                    && candidate_matches(reference, file_path, f, sym, language, graph)
+                    && !bare_call_names_member(reference, sym, language)
             })
+        });
+    let mut imported: Option<(Option<JvmImportRank>, &str, &RawSymbol)> = None;
+    for (_, imported_file) in &imports {
+        let Some(syms) = &candidates else {
+            break;
+        };
+        let found = syms.iter().find_map(|(f, sym)| {
+            if f != imported_file {
+                return None;
+            }
+            let rank = match jvm_imports {
+                None => None,
+                Some(jvm) => match jvm.rank(
+                    f,
+                    sym.start_line,
+                    reference.receiver.is_none().then_some(sym.name.as_str()),
+                )? {
+                    JvmImportRank::OnDemand if jvm_shadowed => return None,
+                    rank => Some(rank),
+                },
+            };
+            candidate_matches(
+                reference,
+                if language == Language::Rust && graph.resolves_parent(file_path, f) {
+                    f
+                } else {
+                    file_path
+                },
+                f,
+                sym,
+                language,
+                graph,
+            )
+            .then_some((rank, *f, *sym))
+        });
+        if let Some(found) = found
+            && imported.is_none_or(|(rank, _, _)| found.0 < rank)
         {
-            let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
-            let confidence = confidence_score(MatchType::ImportResolved, language);
-            return Some(ResolvedEdge {
-                source_uid,
-                target_uid,
-                edge_type,
-                confidence,
-                link_type: None,
-                evidence: vec![EdgeEvidence {
-                    kind: "import_resolved".to_string(),
-                    weight: confidence,
-                    note: None,
-                }],
-            });
+            imported = Some(found);
+            if found
+                .0
+                .is_none_or(|rank| rank == JvmImportRank::Declaration)
+            {
+                break;
+            }
         }
+    }
+    if let Some((_, imported_file, sym)) = imported {
+        let target_uid = symbol_uid(repo_uid, imported_file, &sym.name, sym.start_line);
+        let confidence = confidence_score(MatchType::ImportResolved, language);
+        return Some(ResolvedEdge {
+            source_uid,
+            target_uid,
+            edge_type,
+            confidence,
+            link_type: None,
+            evidence: vec![EdgeEvidence {
+                kind: "import_resolved".to_string(),
+                weight: confidence,
+                note: None,
+            }],
+        });
     }
 
     // Priority 3: Re-exports.
@@ -1621,7 +1762,13 @@ fn resolve_single_reference(
     // Bounded at REEXPORT_MAX_HOPS with a visited set so a cyclic barrel (which
     // TypeScript permits) cannot loop, and so the fan-out stays bounded: this
     // tier is why nw-153's guards exist.
-    let mut frontier: Vec<String> = imports.iter().map(|(_, f)| f.to_string()).collect();
+    // Kotlin/Java imports re-export nothing; a same-package name shadowed
+    // its on-demand imports and goes to the same-package tier.
+    let mut frontier: Vec<String> = if jvm_shadowed {
+        Vec::new()
+    } else {
+        imports.iter().map(|(_, f)| f.to_string()).collect()
+    };
     let mut visited: std::collections::HashSet<String> = frontier.iter().cloned().collect();
     visited.insert(file_path.to_string());
     for _ in 0..REEXPORT_MAX_HOPS {
@@ -1702,7 +1849,16 @@ fn resolve_single_reference(
         let mut same_pkg: Vec<_> = syms
             .iter()
             .filter(|(candidate_file, _)| {
-                *candidate_file != file_path && parent_dir(candidate_file) == same_dir
+                *candidate_file != file_path
+                    && if matches!(language, Language::Kotlin | Language::Java) {
+                        graph.jvm_same_package(file_path, candidate_file)
+                    } else {
+                        parent_dir(candidate_file) == same_dir
+                            // A `//go:build ignore` program shares no package.
+                            && !(language == Language::Go
+                                && (graph.go_build_ignored(file_path)
+                                    || graph.go_build_ignored(candidate_file)))
+                    }
             })
             .filter(|(candidate_file, sym)| {
                 candidate_matches(reference, file_path, candidate_file, sym, language, graph)
@@ -2058,6 +2214,9 @@ fn typed_receiver_origin(
     if !imports.is_empty() {
         return None;
     }
+    if matches!(language, Language::Kotlin | Language::Java) {
+        return jvm_type_origin(source_file, type_name, symbol_map, graph, type_kind);
+    }
     // Resolved globs may expose a class even without a named alias record.
     let imports = graph.imports_of(source_file);
     let reachable: Vec<_> = symbol_map
@@ -2073,6 +2232,58 @@ fn typed_receiver_origin(
         .collect();
     (reachable.len() == 1).then(|| TypedReceiverOrigin {
         file: reachable[0].0.into(),
+        name: type_name.into(),
+        rust_class_position: None,
+    })
+}
+
+/// The Kotlin/Java declaration a type name in `source_file` denotes, by the
+/// languages' precedence: a single-type import, then a top-level type of the
+/// same package, then an on-demand import (JLS 6.4.1; Kotlin: explicit
+/// import > same package > star import). `Foo f = new Foo(); f.hit();` in
+/// package `com.b` with `import com.a.*;` is `com.b.Foo`, and with no import
+/// at all a same-package `Foo` is still a known origin. Ambiguity at the
+/// winning tier is no origin.
+fn jvm_type_origin(
+    source_file: &str,
+    type_name: &str,
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+    graph: &ImportGraph,
+    type_kind: impl Fn(SymbolKind) -> bool,
+) -> Option<TypedReceiverOrigin> {
+    let imports = graph.imports_of(source_file);
+    let jvm_imports = graph.jvm_imports_of(source_file);
+    let mut best: Option<(u8, Vec<&str>)> = None;
+    for (file, symbol) in symbol_map.get(type_name).into_iter().flatten() {
+        if *file == source_file || !type_kind(symbol.kind) {
+            continue;
+        }
+        let import_rank = (symbol.visibility != Visibility::Private
+            && imports.iter().any(|(_, target)| target == file))
+        .then(|| {
+            jvm_imports.map_or(Some(JvmImportRank::OnDemand), |jvm| {
+                jvm.rank(file, symbol.start_line, Some(type_name))
+            })
+        })
+        .flatten();
+        let top_level = symbol.parent_name.is_none();
+        let rank = match import_rank {
+            Some(JvmImportRank::Declaration) => 0,
+            _ if top_level && graph.jvm_same_package(source_file, file) => 1,
+            Some(JvmImportRank::OnDemand) if top_level => 2,
+            _ => continue,
+        };
+        if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+            best = Some((rank, vec![*file]));
+        } else if let Some((best_rank, files)) = best.as_mut()
+            && *best_rank == rank
+        {
+            files.push(*file);
+        }
+    }
+    let (_, files) = best?;
+    (files.len() == 1).then(|| TypedReceiverOrigin {
+        file: files[0].into(),
         name: type_name.into(),
         rust_class_position: None,
     })
@@ -2524,15 +2735,22 @@ fn receiver_chain_head(receiver: &str) -> &str {
 ///   shadowed by a local (so `new Map().get(k)` or `fetch().then()` never
 ///   reach this), and
 /// - exactly one method of that name exists in the whole repository, no free
-///   function shares the name, it is accessible from this file, and it is
-///   declared on that head type or one of its ancestors.
+///   function shares the name, it is accessible from this file, and
+/// - every step of the chain is typed by evidence the fallback accepts (see
+///   [`fallback_receiver_type`]), and the receiver's resulting type is the
+///   method's owner or a subtype of it.
 ///
 /// A function head (`q().get(k)`) is refused: an unannotated repo function
 /// can return anything, including an external type, so the repository's one
 /// `get` is no evidence (the nw-150 `buildQuery().where(..)` shape). A common
-/// name such as `get` that is declared twice anywhere links nothing.
+/// name such as `get` that is declared twice anywhere links nothing. A static
+/// method declared to return a library type (`Optional<A>`, `List<A>`,
+/// `Promise<Q[]>`, `Q[]`) or left unannotated without returning a
+/// construction of a repository type links nothing either: `A.find().get()`
+/// is `Optional.get`, not `A.get`.
 fn unique_expression_method<'s>(
     inference: &ReceiverInference<'_, 's, '_>,
+    returned_constructions: &ReturnedConstructions,
     receiver: &str,
     method: &str,
     source: &RawSymbol,
@@ -2581,28 +2799,208 @@ fn unique_expression_method<'s>(
     {
         return None;
     }
-    // The method's owner must be the head type or one of its ancestors.
+    // The receiver's type must be the method's owner or a subtype of it.
     let owner = symbol.parent_name.as_deref()?;
-    let mut current = vec![head.to_string()];
+    let receiver_type = fallback_receiver_type(inference, returned_constructions, receiver, 0)?;
+    is_same_or_subtype(inference.extends_map, &receiver_type, owner).then_some((file, symbol))
+}
+
+/// Whether `ty` is `ancestor` or reaches it through `extends`.
+fn is_same_or_subtype(
+    extends_map: &std::collections::HashMap<String, Vec<String>>,
+    ty: &str,
+    ancestor: &str,
+) -> bool {
+    let mut current = vec![ty.to_string()];
     let mut visited = std::collections::HashSet::new();
     for _ in 0..=RECEIVER_INFERENCE_DEPTH {
-        if current.iter().any(|ty| ty == owner) {
-            return Some((file, symbol));
+        if current.iter().any(|ty| ty == ancestor) {
+            return true;
         }
         let mut next = Vec::new();
         for ty in current {
             if visited.insert(ty.clone())
-                && let Some(parents) = inference.extends_map.get(&ty)
+                && let Some(parents) = extends_map.get(&ty)
             {
                 next.extend(parents.iter().cloned());
             }
         }
         if next.is_empty() {
-            return None;
+            return false;
+        }
+        current = next;
+    }
+    false
+}
+
+/// The repository type the unique-method fallback may assume a receiver
+/// expression evaluates to, or `None` to refuse the link.
+///
+/// Exact inference ([`ReceiverInference::infer`]) is tried first. Beyond it
+/// only a static call on a repository type (`Child.make()`, or a call on an
+/// expression this function itself typed) is followed, and its method must
+///
+/// - declare a return type that names a repository type (a declared
+///   `Optional<A>`, `List<A>`, `Promise<Q[]>`, `Q[]`, `dict` or `void` is
+///   evidence AGAINST the link, never for it), or
+/// - declare none, not be `async`, and return a construction of exactly one
+///   repository type: `return Child()`, `return new K()`, or Python's
+///   `return cls(..)` (the static receiver type).
+///
+/// An unannotated method with no such return (`return json.loads(s)`) can
+/// return anything, so it is refused like an unannotated free function.
+fn fallback_receiver_type(
+    inference: &ReceiverInference<'_, '_, '_>,
+    returned_constructions: &ReturnedConstructions,
+    expr: &str,
+    depth: u8,
+) -> Option<String> {
+    if depth > RECEIVER_INFERENCE_DEPTH {
+        return None;
+    }
+    if let Some(inferred) = inference.infer(expr, depth) {
+        return Some(inferred);
+    }
+    let expr = expr.trim();
+    let callee = split_trailing_call(expr)?;
+    if callee.is_empty() {
+        return fallback_receiver_type(
+            inference,
+            returned_constructions,
+            &expr[1..expr.len() - 1],
+            depth + 1,
+        );
+    }
+    let callee = strip_type_arguments(callee);
+    let (base, method) = split_member(callee)?;
+    if !is_identifier(method) {
+        return None;
+    }
+    let base = base.trim();
+    let owner = if is_identifier(base) {
+        // Only a static call on a repository type; a value or a module
+        // qualifier is `infer`'s business, and it found nothing.
+        (!is_self_receiver(base)
+            && inference.type_exists(base)
+            && active_lexical_binding(
+                inference.scope_index,
+                inference.reference,
+                base,
+                inference.language,
+            )
+            .is_none()
+            && inference.identifier_type(base).is_none())
+        .then(|| base.to_string())?
+    } else {
+        fallback_receiver_type(inference, returned_constructions, base, depth + 1)?
+    };
+    fallback_method_return_type(inference, returned_constructions, &owner, method)
+}
+
+/// The return type of `receiver_type.method(..)` under the evidence rules of
+/// [`fallback_receiver_type`]. The method is looked up on `receiver_type`
+/// first and then on its ancestors, nearest level wins.
+fn fallback_method_return_type(
+    inference: &ReceiverInference<'_, '_, '_>,
+    returned_constructions: &ReturnedConstructions,
+    receiver_type: &str,
+    method: &str,
+) -> Option<String> {
+    let mut current = vec![receiver_type.to_string()];
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..=RECEIVER_INFERENCE_DEPTH {
+        let mut next = Vec::new();
+        for owner in &current {
+            if !visited.insert(owner.clone()) {
+                continue;
+            }
+            let methods: Vec<(&str, &RawSymbol)> = inference
+                .symbol_map
+                .get(method)
+                .into_iter()
+                .flatten()
+                .filter(|(_, symbol)| {
+                    symbol.kind == SymbolKind::Method
+                        && symbol.parent_name.as_deref() == Some(owner.as_str())
+                })
+                .copied()
+                .collect();
+            if !methods.is_empty() {
+                return agreed_fallback_return(
+                    inference,
+                    returned_constructions,
+                    &methods,
+                    owner,
+                    receiver_type,
+                );
+            }
+            if let Some(parents) = inference.extends_map.get(owner) {
+                next.extend(parents.iter().cloned());
+            }
+        }
+        if next.is_empty() {
+            break;
         }
         current = next;
     }
     None
+}
+
+/// The one type every declaration of a method returns, under the rules of
+/// [`fallback_receiver_type`]. `owner` is the declaring type (`Self`);
+/// `receiver_type` is what a Python `cls(..)` constructs.
+fn agreed_fallback_return(
+    inference: &ReceiverInference<'_, '_, '_>,
+    returned_constructions: &ReturnedConstructions,
+    methods: &[(&str, &RawSymbol)],
+    owner: &str,
+    receiver_type: &str,
+) -> Option<String> {
+    let mut agreed: Option<String> = None;
+    for (file, symbol) in methods {
+        let declared = symbol
+            .type_info
+            .as_ref()
+            .and_then(|info| info.return_type.as_deref())
+            .map(|raw| raw.trim().trim_matches(['"', '\'']).trim())
+            .filter(|raw| !raw.is_empty());
+        let returned = match declared {
+            // A declared type that is not a repository type (a wrapper, a
+            // collection, a primitive, `void`) refuses: `normalize_return_type`
+            // yields `None` for it.
+            Some(raw) => normalize_return_type(raw, Some(owner), inference.symbol_map)?,
+            None => {
+                if symbol
+                    .signature
+                    .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                    .any(|token| token == "async")
+                {
+                    return None;
+                }
+                let names = returned_constructions.get(&(file.to_string(), symbol.start_line))?;
+                let mut constructed: Option<String> = None;
+                for name in names {
+                    let ty = if name == "cls" && inference.language == Language::Python {
+                        receiver_type.to_string()
+                    } else if inference.type_exists(name) {
+                        name.clone()
+                    } else {
+                        return None;
+                    };
+                    match &constructed {
+                        Some(existing) if *existing != ty => return None,
+                        _ => constructed = Some(ty),
+                    }
+                }
+                constructed?
+            }
+        };
+        match &agreed {
+            Some(existing) if *existing != returned => return None,
+            _ => agreed = Some(returned),
+        }
+    }
+    agreed
 }
 
 fn method_belongs_to_origin(
@@ -11951,6 +12349,86 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
                 .any(|evidence| evidence.kind == "unique_method_name")),
             "the fallback must say what it is: {edges:#?}"
         );
+    }
+
+    #[test]
+    fn unique_method_fallback_refuses_java_library_return_types() {
+        let path = "src/A.java";
+        let source = "import java.util.List;\nimport java.util.Optional;\nclass A {\n    static Optional<A> find() { return Optional.of(new A()); }\n    static List<A> all() { return List.of(new A()); }\n    static List<String> names() { return List.of(); }\n    A get() { return this; }\n    boolean isEmpty() { return false; }\n    int size() { return 0; }\n}\nclass U {\n    void use() {\n        A.find().get();\n        A.all().isEmpty();\n        A.names().size();\n    }\n}\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Java);
+        for (method, line) in [("get", 7), ("isEmpty", 8), ("size", 9)] {
+            assert!(
+                !qa_calls(&files, &edges, (path, "use"), (path, method, line)),
+                "`{method}` is called on an Optional/List, not on an A: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unique_method_fallback_refuses_ts_promise_and_array_returns() {
+        let path = "a.ts";
+        let source = "export class Q {\n  static all(): Promise<Q[]> { return Promise.resolve([new Q()]); }\n  static list(): Q[] { return [new Q()]; }\n  static rows() {\n    return [new Q()];\n  }\n  then(): number { return 1; }\n  each(): number { return 2; }\n  map(): number { return 3; }\n}\nexport function user() {\n  Q.all().then();\n  Q.list().each();\n  Q.rows().map();\n}\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+        for (method, line) in [("then", 7), ("each", 8), ("map", 9)] {
+            assert!(
+                !qa_calls(&files, &edges, (path, "user"), (path, method, line)),
+                "`{method}` is called on a Promise/array, not on a Q: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unique_method_fallback_follows_an_unannotated_ts_factory_returning_new() {
+        let path = "a.ts";
+        let source = "export class K {\n  static make() {\n    return new K();\n  }\n  each(): number { return 2; }\n}\nexport function user() { K.make().each(); }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::TypeScript);
+        assert!(
+            qa_calls(&files, &edges, (path, "user"), (path, "each", 5)),
+            "`make` returns `new K()`: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn unique_method_fallback_refuses_python_factories_not_returning_the_type() {
+        let path = "pkg/engine.py";
+        let source = "import json\n\nclass Engine:\n    def items(self):\n        return []\n\n    @classmethod\n    def from_json(cls, s):\n        return json.loads(s)\n\n    @classmethod\n    def from_dict(cls, d) -> dict:\n        return cls(d)\n\n    @staticmethod\n    def wrapped():\n        return [Engine()]\n\ndef load(s):\n    return Engine.from_json(s).items()\n\ndef load_dict(s):\n    return Engine.from_dict(s).items()\n\ndef load_wrapped():\n    return Engine.wrapped().items()\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Python);
+        for caller in ["load", "load_dict", "load_wrapped"] {
+            assert!(
+                !qa_calls(&files, &edges, (path, caller), (path, "items", 4)),
+                "{caller}: the factory does not return an Engine: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unique_method_fallback_follows_a_python_classmethod_returning_cls() {
+        let path = "pkg/engine.py";
+        let source = "import json\n\nclass Engine:\n    def items(self):\n        return []\n\n    @classmethod\n    def from_json(cls, s):\n        return cls(json.loads(s))\n\ndef load(s):\n    return Engine.from_json(s).items()\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Python);
+        assert!(
+            qa_calls(&files, &edges, (path, "load"), (path, "items", 4)),
+            "`from_json` returns `cls(..)`, an Engine: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn returns_construction_of_needs_the_call_to_be_the_returned_value() {
+        assert!(returns_construction_of("return Child()", "Child"));
+        assert!(returns_construction_of("return new K();", "K"));
+        assert!(returns_construction_of("return cls(json.loads(s))", "cls"));
+        assert!(!returns_construction_of("return [Child()]", "Child"));
+        assert!(!returns_construction_of("[new Q()]", "Q"));
+        assert!(!returns_construction_of(
+            "return Child().configure()",
+            "Child"
+        ));
+        assert!(!returns_construction_of("return Children()", "Child"));
+        assert!(!returns_construction_of("returned = Child()", "Child"));
+        assert!(!returns_construction_of(
+            "return Child() if x else None",
+            "Child"
+        ));
     }
 
     #[test]

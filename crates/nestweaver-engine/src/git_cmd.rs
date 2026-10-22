@@ -94,6 +94,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// - `log.showSignature=false`: a repository's config would otherwise run
 ///   `gpg.program` on every `git log`.
 /// - `protocol.ext.allow=never`: an `ext::` remote URL is a shell command.
+/// - `diff.ignoreSubmodules=dirty`, `diff.submodule=short`,
+///   `status.submoduleSummary=false` and `submodule.recurse=false`: a
+///   submodule is a repository with its own config, and Git recursing into
+///   one runs the programs that config names. See
+///   [`IGNORE_SUBMODULE_WORKTREES`].
 /// - `GIT_PAGER=cat`: outranks `core.pager` and `pager.<cmd>` when a caller
 ///   leaves stdout on a terminal.
 /// - `GIT_SSH_COMMAND=ssh` unless the operator set `GIT_SSH_COMMAND` or
@@ -135,7 +140,40 @@ const ISOLATION_CONFIG: &[(&str, &str)] = &[
     ("core.askPass", ""),
     ("log.showSignature", "false"),
     ("protocol.ext.allow", "never"),
+    // A submodule's own config names its own clean filters, textconv and
+    // fsmonitor, and the overrides `isolated_git_in` derives from the
+    // superproject never name those. `status`/`diff` run `git status` inside
+    // a checked-out submodule to see whether its working tree is dirty;
+    // `dirty` skips that and still reports a gitlink whose commit changed.
+    // `submodule.<name>.ignore` outranks this key, so status/diff call sites
+    // also pass `IGNORE_SUBMODULE_WORKTREES`.
+    ("diff.ignoreSubmodules", "dirty"),
+    // `diff`/`log` patches would run `git diff` inside the submodule.
+    ("diff.submodule", "short"),
+    // Long-form `status` would run `git submodule summary`.
+    ("status.submoduleSummary", "false"),
+    // `checkout` and friends would update submodules, running their smudge
+    // filters and hooks.
+    ("submodule.recurse", "false"),
 ];
+
+/// The `status`/`diff` option every working-tree comparison passes, so Git
+/// never runs a command inside a submodule.
+///
+/// Without it `git status` and `git diff` against the working tree spawn
+/// `git status` in each checked-out submodule, and that child runs whatever
+/// filters, textconv drivers and fsmonitor the *submodule's* config names —
+/// none of which [`isolated_git_in`] can see from the superproject. The
+/// `diff.ignoreSubmodules` key in the isolation config is not enough on its
+/// own: a repository's `submodule.<name>.ignore` (in `.gitmodules` or its
+/// config) outranks it, and only the command-line option outranks that.
+///
+/// `dirty` rather than `all`: a gitlink whose recorded commit differs is
+/// still reported (Git compares it to the submodule's `HEAD` in-process), so
+/// a submodule pointer change still reads as a change. Only edits inside the
+/// submodule's working tree go unreported, and NestWeaver never indexes a
+/// submodule's contents as part of the superproject (gitlinks are skipped).
+pub const IGNORE_SUBMODULE_WORKTREES: &str = "--ignore-submodules=dirty";
 
 fn apply_isolation_with(cmd: &mut Command, extra: &[(OsString, OsString)]) {
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
@@ -213,6 +251,11 @@ pub fn isolated_git() -> Command {
 /// match the index can read as modified. A patch diff of a path with a
 /// textconv or external driver fails instead of running it, so callers that
 /// print patches should also pass `--no-textconv --no-ext-diff`.
+///
+/// Only the superproject's config is listed: a checked-out submodule's own
+/// drivers stay live, so every `status`/`diff` that touches the working tree
+/// must also pass [`IGNORE_SUBMODULE_WORKTREES`] to keep Git from running a
+/// command inside the submodule.
 ///
 /// The caller still sets `current_dir(repo)` (or `-C repo`): this only
 /// inspects `repo`. Fails when the configuration cannot be listed, rather
@@ -526,7 +569,75 @@ pub(crate) mod hostile_repo {
         path
     }
 
-    /// Committed `a.rs`, `b.rs`, `c.rs`, then each modified in the working
+    /// Make `root/sub` a checked-out submodule whose own config gives its
+    /// tracked `s.py` a marker clean filter (`ran-subclean`), with
+    /// `.gitmodules` asking for every submodule change to be reported
+    /// (`ignore = none`, which outranks `diff.ignoreSubmodules`). `s.py` is
+    /// left stat-dirty with unchanged content, so a superproject `status` or
+    /// working-tree `diff` that recurses has the submodule hash it through
+    /// the filter. The caller commits `.gitmodules` and `sub`.
+    pub(crate) fn add_hostile_submodule(root: &Path, markers: &Path) -> PathBuf {
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        git(sub.as_path(), &["init", "-q"]);
+        git(sub.as_path(), &["config", "user.email", "test@example.com"]);
+        git(sub.as_path(), &["config", "user.name", "Test"]);
+        git(sub.as_path(), &["config", "commit.gpgsign", "false"]);
+        git(sub.as_path(), &["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(sub.join("s.py"), "x = 1\n").unwrap();
+        std::fs::write(sub.join(".gitattributes"), "* filter=subevil\n").unwrap();
+        git(sub.as_path(), &["add", "."]);
+        git(sub.as_path(), &["commit", "-q", "-m", "sub"]);
+        let clean = script(markers, "subclean");
+        git(
+            sub.as_path(),
+            &["config", "filter.subevil.clean", clean.to_str().unwrap()],
+        );
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n\tignore = none\n",
+        )
+        .unwrap();
+        git(
+            root,
+            &[
+                "-c",
+                "advice.addEmbeddedRepo=false",
+                "add",
+                ".gitmodules",
+                "sub",
+            ],
+        );
+        mark_stat_dirty(&sub.join("s.py"));
+        sub
+    }
+
+    /// Rewrite `path` with its own contents and a future mtime, so Git must
+    /// rehash it (through its clean filter) to learn it is unchanged.
+    pub(crate) fn mark_stat_dirty(path: &Path) {
+        let contents = std::fs::read(path).unwrap();
+        std::fs::write(path, contents).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    /// Committed `a.rs`, `b.rs`, `c.rs` and a hostile submodule `sub` (see
+    /// [`add_hostile_submodule`]), then each `.rs` modified in the working
     /// tree (`a.rs` keeps its size so only content comparison can tell).
     pub(crate) fn hostile_repo() -> HostileRepo {
         let repo = tempfile::tempdir().unwrap();
@@ -545,7 +656,8 @@ pub(crate) mod hostile_repo {
         std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
         std::fs::write(root.join("c.rs"), "fn c() {}\n").unwrap();
-        git(&["add", "."]);
+        git(&["add", "a.rs", "b.rs", "c.rs"]);
+        add_hostile_submodule(root, hostile.markers.path());
         git(&["commit", "-q", "-m", "init"]);
         // Attributes from the tree, from info/attributes, and for a driver
         // defined only in an included file.
@@ -603,6 +715,8 @@ pub(crate) mod hostile_repo {
         std::fs::write(root.join("a.rs"), "fn x() {}\n").unwrap();
         std::fs::write(root.join("b.rs"), "fn y() {}\n").unwrap();
         std::fs::write(root.join("c.rs"), "fn z() {}\n").unwrap();
+        // The commit above may have refreshed the submodule's index entry.
+        mark_stat_dirty(&root.join("sub/s.py"));
         hostile
     }
 }
@@ -689,7 +803,7 @@ mod tests {
         repo.plain_git(&["diff", "HEAD"]);
         repo.plain_git(&["diff", "--stat", "HEAD"]);
         let ran = repo.ran();
-        for program in ["ran-clean", "ran-extdiff", "ran-process"] {
+        for program in ["ran-clean", "ran-extdiff", "ran-process", "ran-subclean"] {
             assert!(ran.iter().any(|name| name == program), "{program}: {ran:?}");
         }
         repo.clear();
@@ -711,7 +825,9 @@ mod tests {
     }
 
     /// No attribute-selected program runs through `isolated_git_in`, for
-    /// status, name-only/stat/patch diffs, patch logs and checkouts.
+    /// status, name-only/stat/patch diffs, patch logs and checkouts — the
+    /// superproject's nor a submodule's, when working-tree comparisons pass
+    /// [`IGNORE_SUBMODULE_WORKTREES`] as every production call does.
     #[test]
     fn isolated_git_in_runs_no_attribute_programs() {
         let repo = hostile_repo::hostile_repo();
@@ -720,9 +836,22 @@ mod tests {
             command.args(args).current_dir(repo.path());
             run_git_with_timeout(command, Duration::from_secs(30)).unwrap()
         };
-        let status = run(&["status", "--porcelain", "-z", "--untracked-files=all"]);
+        let status = run(&[
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            IGNORE_SUBMODULE_WORKTREES,
+        ]);
         assert!(status.status.success(), "{status:?}");
-        let names = run(&["diff", "--name-only", "-z", "HEAD", "--"]);
+        let names = run(&[
+            "diff",
+            "--name-only",
+            "-z",
+            IGNORE_SUBMODULE_WORKTREES,
+            "HEAD",
+            "--",
+        ]);
         assert!(names.status.success(), "{names:?}");
         let listed = String::from_utf8_lossy(&names.stdout).into_owned();
         for file in ["a.rs", "b.rs", "c.rs"] {
@@ -731,15 +860,98 @@ mod tests {
                 "{file} must read as changed: {listed:?}"
             );
         }
-        run(&["diff", "--stat", "HEAD"]);
-        run(&["diff", "--numstat", "HEAD"]);
-        run(&["diff", "HEAD"]);
+        assert!(!listed.contains("sub"), "{listed:?}");
+        run(&["diff", "--stat", IGNORE_SUBMODULE_WORKTREES, "HEAD"]);
+        run(&["diff", "--numstat", IGNORE_SUBMODULE_WORKTREES, "HEAD"]);
+        run(&["diff", IGNORE_SUBMODULE_WORKTREES, "HEAD"]);
+        // Long-form status would also run `git submodule summary`.
+        run(&["status", IGNORE_SUBMODULE_WORKTREES]);
         let commit = run(&["commit", "-q", "-a", "-m", "two"]);
         assert!(commit.status.success(), "{commit:?}");
         run(&["log", "-2", "-p"]);
         run(&["show", "HEAD"]);
         run(&["diff", "HEAD~1", "HEAD"]);
         run(&["checkout", "-q", "HEAD~1", "--", "a.rs"]);
+        assert_eq!(repo.ran(), Vec::<String>::new());
+    }
+
+    /// A submodule's own config is out of the superproject's reach: without
+    /// [`IGNORE_SUBMODULE_WORKTREES`], an isolated status still has Git run
+    /// `git status` inside the submodule, and that runs its clean filter.
+    /// The option is what stops it — even against `ignore = none`.
+    #[test]
+    fn submodule_programs_run_only_without_the_ignore_option() {
+        let repo = hostile_repo::hostile_repo();
+        let run = |args: &[&str]| {
+            let mut command = isolated_git_in(repo.path()).unwrap();
+            command.args(args).current_dir(repo.path());
+            let output = run_git_with_timeout(command, Duration::from_secs(30)).unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            output
+        };
+        run(&["status", "--porcelain"]);
+        assert_eq!(repo.ran(), vec!["ran-subclean".to_string()]);
+        repo.clear();
+        hostile_repo::mark_stat_dirty(&repo.path().join("sub/s.py"));
+        run(&["status", "--porcelain", IGNORE_SUBMODULE_WORKTREES]);
+        run(&["diff", "--name-only", IGNORE_SUBMODULE_WORKTREES, "HEAD"]);
+        run(&[
+            "diff",
+            "--name-only",
+            IGNORE_SUBMODULE_WORKTREES,
+            "--cached",
+        ]);
+        assert_eq!(repo.ran(), Vec::<String>::new());
+    }
+
+    /// `dirty` keeps a submodule pointer change visible: a gitlink whose
+    /// checked-out commit moved still reads as changed.
+    #[test]
+    fn ignoring_submodule_worktrees_still_reports_a_moved_gitlink() {
+        let repo = hostile_repo::hostile_repo();
+        let sub = repo.path().join("sub");
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "filter.subevil.clean=",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "moved",
+            ])
+            .current_dir(&sub)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        repo.clear();
+        let mut command = isolated_git_in(repo.path()).unwrap();
+        command
+            .args([
+                "diff",
+                "--name-only",
+                "-z",
+                IGNORE_SUBMODULE_WORKTREES,
+                "HEAD",
+                "--",
+            ])
+            .current_dir(repo.path());
+        let output = run_git_with_timeout(command, Duration::from_secs(30)).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let listed: Vec<&[u8]> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .collect();
+        assert!(listed.contains(&&b"sub"[..]), "{listed:?}");
         assert_eq!(repo.ran(), Vec::<String>::new());
     }
 
@@ -788,7 +1000,10 @@ mod tests {
             .find(|(key, _)| *key == OsStr::new("GIT_CONFIG_COUNT"))
             .and_then(|(_, value)| value)
             .map(|value| value.to_string_lossy().into_owned());
-        assert_eq!(count.as_deref(), Some("9"));
+        assert_eq!(
+            count.as_deref(),
+            Some((ISOLATION_CONFIG.len() + 1).to_string().as_str())
+        );
     }
 
     #[test]
@@ -888,7 +1103,7 @@ mod tests {
         assert_eq!(get("GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
         // credential.helper= (empty) injected via the GIT_CONFIG_* env form —
         // the equivalent of `-c credential.helper=`, disabling all helpers.
-        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("8"));
+        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("12"));
         assert_eq!(
             get("GIT_CONFIG_KEY_0").as_deref(),
             Some("credential.helper")
@@ -919,6 +1134,26 @@ mod tests {
             Some("protocol.ext.allow")
         );
         assert_eq!(get("GIT_CONFIG_VALUE_7").as_deref(), Some("never"));
+        // Git never runs a command inside a submodule on our behalf.
+        for (index, (key, value)) in [
+            ("diff.ignoreSubmodules", "dirty"),
+            ("diff.submodule", "short"),
+            ("status.submoduleSummary", "false"),
+            ("submodule.recurse", "false"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let index = index + 8;
+            assert_eq!(
+                get(&format!("GIT_CONFIG_KEY_{index}")).as_deref(),
+                Some(key)
+            );
+            assert_eq!(
+                get(&format!("GIT_CONFIG_VALUE_{index}")).as_deref(),
+                Some(value)
+            );
+        }
         assert_eq!(get("GIT_PAGER").as_deref(), Some("cat"));
     }
 

@@ -71,6 +71,7 @@ pub fn compute_diff_changes(
             "--name-status",
             "-z",
             "--diff-filter=ACMR",
+            crate::git_cmd::IGNORE_SUBMODULE_WORKTREES,
             diff_spec,
         ])
         .current_dir(repo_path)
@@ -141,7 +142,14 @@ pub fn compute_diff_changes(
 
     // Get deleted files. `--name-only -z` emits just NUL-separated paths.
     let del_output = crate::git_cmd::isolated_git_in(repo_path)?
-        .args(["diff", "--name-only", "-z", "--diff-filter=D", diff_spec])
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--diff-filter=D",
+            crate::git_cmd::IGNORE_SUBMODULE_WORKTREES,
+            diff_spec,
+        ])
         .current_dir(repo_path)
         .output()
         .context("git diff --name-only --diff-filter=D")?;
@@ -373,6 +381,15 @@ mod tests {
         let changes =
             compute_diff_changes(repo.path(), "HEAD~1..HEAD", "https://example.com/r").unwrap();
         assert!(!changes.is_empty(), "the edits must still be seen");
+        assert_eq!(repo.ran(), Vec::<String>::new());
+    }
+
+    /// A spec without `..` (`--diff HEAD`) diffs against the working tree,
+    /// which must not recurse into the hostile submodule and run its filter.
+    #[test]
+    fn working_tree_diff_runs_no_submodule_programs() {
+        let repo = crate::git_cmd::hostile_repo::hostile_repo();
+        compute_diff_changes(repo.path(), "HEAD", "https://example.com/r").unwrap();
         assert_eq!(repo.ran(), Vec::<String>::new());
     }
 
