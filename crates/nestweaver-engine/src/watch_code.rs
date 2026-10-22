@@ -1516,18 +1516,28 @@ impl CodeWatcher {
                 PreparedPath::Delete { .. } => None,
             })
             .collect();
-        let batch_resolution = match crate::index::prepare_watcher_batch_resolution(
-            &reader,
-            store,
-            &self.db_path,
-            r_uid,
-            crate::index::WatcherBatchResolutionInputs {
-                changed: &changed,
-                removed: &removed,
-                graph_dependents: &rdeps,
-                parses,
-            },
-        ) {
+        let cache_path = crate::sidecar_path(&self.db_path, ".parsed_cache.bin");
+        let shared_cache = shared_parsed_cache(&cache_path);
+        let batch_resolution = {
+            let mut parsed_cache = shared_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            parsed_cache.refresh(&cache_path);
+            crate::index::prepare_watcher_batch_resolution(
+                &reader,
+                store,
+                &self.db_path,
+                r_uid,
+                crate::index::WatcherBatchResolutionInputs {
+                    changed: &changed,
+                    removed: &removed,
+                    graph_dependents: &rdeps,
+                    parses,
+                    parsed_cache: &parsed_cache,
+                },
+            )
+        };
+        let batch_resolution = match batch_resolution {
             Ok(resolution) => resolution,
             Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
         };
@@ -3373,6 +3383,28 @@ fn apply_prepared_code_file(
         .collect();
     nestweaver_store::GraphStore::batch_insert_file_symbol_edges_on(txn, &file_symbol_edges)?;
     Ok((prepared.symbols.len(), deleted_symbol_uids))
+}
+
+/// The parse cache a code watcher batch resolves against: one per database
+/// for every watcher in the process, caught up per batch with
+/// [`crate::parsed_cache::ParsedCache::refresh`] (only the log records added
+/// since, or a reload once an index replaced the base) instead of
+/// deserializing the whole sidecar on every save.
+fn shared_parsed_cache(path: &Path) -> Arc<std::sync::Mutex<crate::parsed_cache::ParsedCache>> {
+    type Caches =
+        std::collections::HashMap<PathBuf, Arc<std::sync::Mutex<crate::parsed_cache::ParsedCache>>>;
+    static CACHES: std::sync::LazyLock<std::sync::Mutex<Caches>> =
+        std::sync::LazyLock::new(Default::default);
+    CACHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_insert_with(|| {
+            Arc::new(std::sync::Mutex::new(
+                crate::parsed_cache::ParsedCache::empty(),
+            ))
+        })
+        .clone()
 }
 
 fn reject_recovered_publication(
@@ -6019,6 +6051,107 @@ mod tests {
         );
         assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
         assert_fresh(&store, "re-export target edited again");
+    }
+
+    /// A graphed file the batch cannot re-parse as the graph holds it (no
+    /// parse-cache entry, and its disk content has moved on while its own
+    /// event is still queued) keeps the edges into it and out of it through
+    /// a batch that re-resolves its importer. Both the filtered resolution
+    /// (dependency rows present) and the unfiltered one (rows missing) are
+    /// covered; then the file's own batch brings the graph to a full index.
+    #[test]
+    fn watcher_batch_keeps_edges_of_a_file_it_cannot_reparse() {
+        let files = [
+            ("pkg/__init__.py", "__all__ = []\n".to_string()),
+            ("pkg/h.py", "def h_fn():\n    return 3\n".to_string()),
+            (
+                "pkg/p.py",
+                "from pkg.h import h_fn\n\n\ndef p_fn():\n    return h_fn()\n".to_string(),
+            ),
+            ("pkg/c.py", "def c_fn():\n    return 2\n".to_string()),
+            (
+                "app/a.py",
+                "from pkg.p import p_fn\nfrom pkg.c import c_fn\n\n\ndef a_fn():\n    return p_fn() + c_fn()\n"
+                    .to_string(),
+            ),
+        ];
+        for drop_dependency_rows in [false, true] {
+            let what = if drop_dependency_rows {
+                "unfiltered"
+            } else {
+                "filtered"
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let repo_root = dir.path().join("repo");
+            for (rel, body) in &files {
+                let path = repo_root.join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, body).unwrap();
+            }
+            let root = std::fs::canonicalize(&repo_root).unwrap();
+            let repo_url = format!("file://{}", root.display());
+            let r_uid = nestweaver_schema::repo_uid("test", &repo_url);
+            let db_path = dir.path().join("graph.lbug");
+            crate::index::index_directory(&root, &db_path, "test", &repo_url, "sha1").unwrap();
+            let store = GraphStore::open_or_create(&db_path).unwrap();
+            let calls = |db: &GraphStore, from: &str, to: &str| {
+                db.callees_of(&uid_of(db, &r_uid, from))
+                    .unwrap()
+                    .iter()
+                    .any(|symbol| symbol.name == to)
+            };
+            assert!(
+                calls(&store, "a_fn", "p_fn")
+                    && calls(&store, "a_fn", "c_fn")
+                    && calls(&store, "p_fn", "h_fn"),
+                "precondition: the index binds a_fn -> p_fn, c_fn and p_fn -> h_fn"
+            );
+
+            // A cold parse cache, and (second pass) no dependency rows.
+            let cache = crate::sidecar_path(&db_path, ".parsed_cache.bin");
+            let _ = std::fs::remove_file(crate::parsed_cache::log_path(&cache));
+            let _ = std::fs::remove_file(&cache);
+            if drop_dependency_rows {
+                std::fs::remove_file(crate::sidecar_path(&db_path, ".resolution_deps.bin"))
+                    .unwrap();
+            }
+            // p.py moves past the graph; its event is not in this batch.
+            let p_body = format!("{}\n\ndef p_new():\n    return 4\n", files[2].1);
+            std::fs::write(root.join("pkg/p.py"), &p_body).unwrap();
+            // c.py line-shifts, so a.py is re-resolved.
+            std::fs::write(root.join("pkg/c.py"), format!("# shifted\n{}", files[3].1)).unwrap();
+
+            let watcher = CodeWatcher::new(&db_path, &root, "test");
+            let outcome =
+                process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("pkg/c.py")]);
+            assert!(
+                matches!(outcome, WatchBatchOutcome::Published { .. }),
+                "{what}: the batch publishes"
+            );
+            assert!(
+                calls(&store, "a_fn", "c_fn"),
+                "{what}: the edge into the changed file is rebuilt"
+            );
+            assert!(
+                calls(&store, "a_fn", "p_fn"),
+                "{what}: the edge into the file the batch could not re-parse survives"
+            );
+            assert!(
+                calls(&store, "p_fn", "h_fn"),
+                "{what}: that file's own edge survives"
+            );
+
+            let outcome =
+                process_fixture_batch(&watcher, &store, &r_uid, &root, &[root.join("pkg/p.py")]);
+            assert!(matches!(outcome, WatchBatchOutcome::Published { .. }));
+            let (_, fresh) =
+                crate::index::index_directory_in_memory(&root, "test", &repo_url, "fresh").unwrap();
+            assert_eq!(
+                edge_evidence_multiset(&store),
+                edge_evidence_multiset(&fresh),
+                "{what}: after the file's own batch the graph is a full index's"
+            );
+        }
     }
 
     /// The two barrel shapes: a local re-export and a `from` re-export.

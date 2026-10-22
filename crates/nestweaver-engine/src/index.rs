@@ -4656,11 +4656,15 @@ fn build_type_environments(
 
 /// Record the dependency rows `resolution` establishes, for the next
 /// incremental run (index or code watcher) to find dependents by.
+///
+/// Files in `keep` keep their previous rows: the resolution saw them without
+/// content it could resolve (the code watcher's graph-symbol stand-ins).
 fn record_resolution_deps(
     rd: &mut crate::resolution_cache::ResolutionDeps,
     r_uid: &str,
     parsed_files_for_resolver: &[ParsedFileEntry],
     resolution: &IndexResolution,
+    keep: &HashSet<String>,
 ) {
     // Build symbol UID → file path map from ALL files (including cached)
     // so incremental runs don't lose edges from CachedParsed files.
@@ -4715,7 +4719,7 @@ fn record_resolution_deps(
                     .map(|(p, _, _, _)| p)
                     .collect();
                 for file in filter {
-                    if resolved.contains(file) {
+                    if resolved.contains(file) && !keep.contains(file) {
                         let deps = file_deps.remove(file).unwrap_or_default();
                         rd.set_deps_for_repo(r_uid, file.clone(), deps);
                         if let Some(specs) = resolution.unresolved_imports.get(file) {
@@ -4726,6 +4730,9 @@ fn record_resolution_deps(
             }
             None => {
                 for (path, _, _, _) in parsed_files_for_resolver {
+                    if keep.contains(path) {
+                        continue;
+                    }
                     let deps = file_deps.remove(path).unwrap_or_default();
                     rd.set_deps_for_repo(r_uid, path.clone(), deps);
                     if let Some(specs) = resolution.unresolved_imports.get(path) {
@@ -6176,7 +6183,13 @@ where
 
         // Record file-level dependency information for future incremental runs.
         if let Some(ref mut rd) = resolution_deps {
-            record_resolution_deps(rd, &r_uid, &parsed_files_for_resolver, &resolution);
+            record_resolution_deps(
+                rd,
+                &r_uid,
+                &parsed_files_for_resolver,
+                &resolution,
+                &HashSet::new(),
+            );
         }
 
         // ── Phase 4 (F2-core): derive the API contract graph ──────────────────
@@ -10278,6 +10291,9 @@ pub(crate) struct WatcherBatchResolutionInputs<'a> {
     /// before the batch's `DETACH DELETE` removes those edges.
     pub(crate) graph_dependents: &'a HashSet<String>,
     pub(crate) parses: Vec<WatcherBatchParse>,
+    /// The watcher's parse cache, caught up for this batch
+    /// ([`crate::parsed_cache::ParsedCache::refresh`]) rather than reloaded.
+    pub(crate) parsed_cache: &'a crate::parsed_cache::ParsedCache,
 }
 
 /// A code watcher batch's resolution, prepared before publication by the
@@ -10293,12 +10309,22 @@ pub(crate) struct WatcherBatchResolution {
     resolution: IndexResolution,
     /// The resolver view, kept for the dependency rows.
     resolver_files: Vec<ParsedFileEntry>,
-    /// Files the resolution parsed from disk without knowing the graph holds
-    /// that content (a dependent outside the verified view). Their symbol
-    /// UIDs may not exist in the graph, so no edge touching them is
-    /// published and their existing outgoing edges are kept.
-    unverified_files: HashSet<String>,
+    /// Files this resolution cannot re-resolve from content the graph holds:
+    /// graphed files present only as their graph symbols (no parse of the
+    /// graphed content was available) and filter members parsed from disk
+    /// outside the verified view. Their outgoing edges are neither cleared
+    /// nor re-published, and their dependency rows are kept.
+    protected_files: HashSet<String>,
+    /// Symbol UIDs of the protected files: never the source of a published
+    /// edge.
+    protected_uids: HashSet<String>,
+    /// Symbol UIDs of the unverified disk parses, which the graph may not
+    /// hold: never an endpoint of a published edge.
     unverified_uids: HashSet<String>,
+    /// Every graphed file outside the batch is in the view with content the
+    /// graph holds, so an unfiltered resolution may clear the repository's
+    /// resolved edges wholesale.
+    view_covers_repo: bool,
 }
 
 impl WatcherBatchResolution {
@@ -10315,19 +10341,30 @@ impl WatcherBatchResolution {
         if self.resolution.skip_resolution {
             return Ok(0);
         }
+        // A changed file's symbols were just replaced, and their
+        // `DETACH DELETE` took every incident edge with them.
+        let clears =
+            |file: &String| !changed.contains(file) && !self.protected_files.contains(file);
         match &self.resolution.resolve_filter {
             Some(filter) => {
-                // A changed file's symbols were just replaced, and their
-                // `DETACH DELETE` took every incident edge with them.
-                for file in filter.iter().filter(|file| {
-                    !changed.contains(*file) && !self.unverified_files.contains(*file)
-                }) {
+                for file in filter.iter().filter(|file| clears(*file)) {
                     GraphStore::delete_resolved_edges_for_file_on(conn, r_uid, file)
                         .with_context(|| format!("clear re-resolved edges of {file}"))?;
                 }
             }
-            None => GraphStore::delete_resolved_edges_for_repo_on(conn, r_uid)
-                .context("clear resolved edges for an unfiltered watcher resolution")?,
+            None if self.view_covers_repo && self.protected_files.is_empty() => {
+                GraphStore::delete_resolved_edges_for_repo_on(conn, r_uid)
+                    .context("clear resolved edges for an unfiltered watcher resolution")?;
+            }
+            // A graphed file outside the view keeps its edges: clear only
+            // the files this resolution rebuilds.
+            None => {
+                for (file, _, _, _) in self.resolver_files.iter().filter(|(file, ..)| clears(file))
+                {
+                    GraphStore::delete_resolved_edges_for_file_on(conn, r_uid, file)
+                        .with_context(|| format!("clear re-resolved edges of {file}"))?;
+                }
+            }
         }
         let edges: Vec<nestweaver_schema::ResolvedEdge> = self
             .resolution
@@ -10335,7 +10372,7 @@ impl WatcherBatchResolution {
             .iter()
             .chain(&self.resolution.member_of_edges)
             .filter(|edge| {
-                !self.unverified_uids.contains(&edge.source_uid)
+                !self.protected_uids.contains(&edge.source_uid)
                     && !self.unverified_uids.contains(&edge.target_uid)
             })
             .cloned()
@@ -10349,7 +10386,7 @@ impl WatcherBatchResolution {
 
     /// After the commit: record the dependency rows and unresolved import
     /// specifiers this resolution established, as the index does, and drop
-    /// the rows of removed files.
+    /// the rows of removed files. Protected files keep their rows.
     pub(crate) fn persist_resolution_deps(
         &self,
         db_path: &Path,
@@ -10361,7 +10398,13 @@ impl WatcherBatchResolution {
         if !removed.is_empty() {
             deps.drop_files_for_repo(r_uid, removed);
         }
-        record_resolution_deps(&mut deps, r_uid, &self.resolver_files, &self.resolution);
+        record_resolution_deps(
+            &mut deps,
+            r_uid,
+            &self.resolver_files,
+            &self.resolution,
+            &self.protected_files,
+        );
         if let Err(error) = deps.save(&path) {
             tracing::warn!("failed to save watcher resolution dependencies: {error:#}");
         }
@@ -10369,17 +10412,15 @@ impl WatcherBatchResolution {
 }
 
 /// Parse an unchanged file the parse cache does not hold, for the watcher's
-/// resolver view. `None` leaves it out of the view, as the index leaves out
-/// an unchanged file whose parse it cannot recover, or whose content is no
-/// longer the content the graph holds.
+/// resolver view. `None` when its content is no longer the content the graph
+/// holds (an edit whose event is still queued) or cannot be parsed; the
+/// caller then stands its graph symbols in for it.
 fn parse_unchanged_for_watcher(
     reader: &dyn crate::content_reader::ContentReader,
     rel_path: &str,
     content_hash: &str,
 ) -> Option<(ParsedFileEntry, Vec<AstTypeBinding>)> {
     let source = reader.read_file(Path::new(rel_path)).ok()?;
-    // Content the graph does not hold (an edit whose event is still queued)
-    // would name symbol UIDs the graph lacks.
     if content_hash_hex(&source) != content_hash {
         return None;
     }
@@ -10392,7 +10433,7 @@ fn parse_unchanged_for_watcher(
             rel_path.to_string(),
             parsed.symbols,
             parsed.references,
-            None,
+            Some(source),
         ),
         parsed.type_bindings,
     ))
@@ -10400,14 +10441,17 @@ fn parse_unchanged_for_watcher(
 
 /// Resolve a code watcher batch the way an index resolves its changed files.
 ///
-/// Builds the whole-repository resolver view an index would (the batch's
-/// own parses; every other graphed file from the parse cache under its
-/// stored content hash, or parsed from disk when the cache lacks it), then
-/// runs [`prepare_index_resolution`] with the dependency sidecar and the
-/// live-graph dependents. The resolve filter is therefore the index's:
-/// changed files, files whose dependency rows (edges or import targets,
-/// including re-export barrels) reach a changed or removed file, importers
-/// whose unresolved specifiers name an added file, plus `graph_dependents`.
+/// Builds the whole-repository resolver view an index would: the batch's own
+/// parses, and every other graphed file from the parse cache under its
+/// stored content hash, or parsed from disk when the cache lacks it and the
+/// disk content still has that hash. A graphed file neither route can supply
+/// stands in with its graph symbols and no references, so edges into it are
+/// rebuilt against UIDs the graph holds while its own edges are left alone.
+/// Then runs [`prepare_index_resolution`] with the dependency sidecar and the
+/// live-graph dependents, so the resolve filter is the index's: changed
+/// files, files whose dependency rows (edges or import targets, including
+/// re-export barrels) reach a changed or removed file, importers whose
+/// unresolved specifiers name an added file, plus `graph_dependents`.
 ///
 /// Runs before publication and never mutates the graph. `Ok(None)` when
 /// the batch changes no graphed source.
@@ -10425,6 +10469,7 @@ pub(crate) fn prepare_watcher_batch_resolution(
         removed,
         graph_dependents,
         parses,
+        parsed_cache,
     } = inputs;
     let stored = store
         .list_file_hashes_by_repo(r_uid)
@@ -10463,18 +10508,21 @@ pub(crate) fn prepare_watcher_batch_resolution(
         ));
     }
 
-    let parsed_cache =
-        crate::parsed_cache::ParsedCache::load(&crate::sidecar_path(db_path, ".parsed_cache.bin"));
+    let mut view_covers_repo = true;
     let mut files_unchanged = 0usize;
+    // Graphed content hash of every unchanged file in the view.
+    let mut graphed_hashes: HashMap<String, String> = HashMap::new();
     let mut uncached: Vec<(String, String)> = Vec::new();
     for (path, content_hash) in stored {
         if changed.contains(&path) || removed.contains(&path) {
             continue;
         }
         if !reader.accepts_path(Path::new(&path)) {
+            view_covers_repo = false;
             continue;
         }
         let Some(language) = detect_language(&reader.root().join(&path)) else {
+            view_covers_repo = false;
             continue;
         };
         file_languages.insert(path.clone(), language);
@@ -10485,16 +10533,18 @@ pub(crate) fn prepare_watcher_batch_resolution(
                     ast_bindings_by_file.insert(path.clone(), cached.type_bindings.clone());
                 }
                 resolver_files.push((
-                    path,
+                    path.clone(),
                     cached.symbols.clone(),
                     cached.references.clone(),
                     None,
                 ));
             }
-            None => uncached.push((path, content_hash)),
+            None => uncached.push((path.clone(), content_hash.clone())),
         }
+        graphed_hashes.insert(path, content_hash);
     }
-    drop(parsed_cache);
+    let mut protected_files: HashSet<String> = HashSet::new();
+    let mut protected_uids: HashSet<String> = HashSet::new();
     if !uncached.is_empty() {
         tracing::debug!(
             files = uncached.len(),
@@ -10507,11 +10557,55 @@ pub(crate) fn prepare_watcher_batch_resolution(
                     .filter_map(|(path, hash)| parse_unchanged_for_watcher(reader, path, hash))
                     .collect()
             });
+        let mut unparsed: HashSet<String> = uncached.into_iter().map(|(path, _)| path).collect();
         for (entry, type_bindings) in parsed {
+            unparsed.remove(&entry.0);
             if !type_bindings.is_empty() {
                 ast_bindings_by_file.insert(entry.0.clone(), type_bindings);
             }
             resolver_files.push(entry);
+        }
+        if !unparsed.is_empty() {
+            // The graph's own symbols stand in: an edge into the file then
+            // names a UID the graph holds, and the file's own edges, which
+            // nothing here can rebuild, stay as they are.
+            tracing::debug!(
+                files = unparsed.len(),
+                "graphed files without a parse of their graphed content; using their graph symbols"
+            );
+            view_covers_repo = false;
+            let mut stubs: HashMap<String, Vec<RawSymbol>> = unparsed
+                .iter()
+                .map(|path| (path.clone(), Vec::new()))
+                .collect();
+            for symbol in store
+                .lookup_symbols_by_repo(r_uid)
+                .context("graph symbols for unparsed files in the watcher resolution")?
+            {
+                let Some(symbols) = stubs.get_mut(&symbol.file_path) else {
+                    continue;
+                };
+                protected_uids.insert(symbol.uid.clone());
+                symbols.push(RawSymbol {
+                    name: symbol.name,
+                    kind: symbol.kind,
+                    start_line: symbol.start_line,
+                    end_line: symbol.end_line,
+                    signature: symbol.signature,
+                    content_hash: symbol.content_hash,
+                    is_entry_point: symbol.is_entry_point,
+                    entry_point_kind: symbol.entry_point_kind,
+                    visibility: symbol.visibility,
+                    type_info: None,
+                    parent_name: None,
+                    scope_chain: None,
+                });
+            }
+            for (path, symbols) in stubs {
+                ast_bindings_by_file.remove(&path);
+                protected_files.insert(path.clone());
+                resolver_files.push((path, symbols, Vec::new(), None));
+            }
         }
     }
 
@@ -10546,28 +10640,47 @@ pub(crate) fn prepare_watcher_batch_resolution(
     } else {
         None
     };
-    let env_files: Vec<ParsedFileEntry> = match &env_scope {
-        Some(scope) => resolver_files
-            .iter()
-            .filter(|(path, _, _, _)| scope.contains(path))
-            .cloned()
-            .collect(),
-        None => Vec::new(),
-    };
+    // An environment must come from the content the file's symbols were
+    // parsed from. A cached file carries no source: read it, and build no
+    // environment when the disk no longer holds the graphed content. The
+    // source is kept on the entry so return-type seeding reads the same text.
+    let mut env_files: Vec<ParsedFileEntry> = Vec::new();
+    for entry in &mut resolver_files {
+        let (path, symbols, references, source) = entry;
+        if protected_files.contains(path.as_str())
+            || env_scope
+                .as_ref()
+                .is_some_and(|scope| !scope.contains(path.as_str()))
+        {
+            continue;
+        }
+        if source.is_none() {
+            let Some(expected) = graphed_hashes.get(path.as_str()) else {
+                continue;
+            };
+            match reader.read_file(Path::new(path.as_str())) {
+                Ok(text) if content_hash_hex(&text) == *expected => *source = Some(text),
+                _ => continue,
+            }
+        }
+        env_files.push((
+            path.clone(),
+            symbols.clone(),
+            references.clone(),
+            source.clone(),
+        ));
+    }
     // The watcher holds the write gate here, so the inert throttle: a
     // throttle wait must never hold the gate (nw-812).
     let type_envs = build_type_environments(
         reader,
-        if env_scope.is_some() {
-            &env_files
-        } else {
-            &resolver_files
-        },
+        &env_files,
         &file_languages,
         &ast_bindings_by_file,
         crate::cpu_throttle::CpuThrottle::inert(),
         None,
     )?;
+    drop(env_files);
     let resolution = prepare_index_resolution(
         PrepareIndexResolution {
             store,
@@ -10587,24 +10700,26 @@ pub(crate) fn prepare_watcher_batch_resolution(
     )?;
     // `prepare_index_resolution` parses a filter member missing from the
     // view straight from disk; nothing ties that parse to the graph.
-    let mut unverified_files = HashSet::new();
     let mut unverified_uids = HashSet::new();
     for (path, symbols, _, _) in &resolver_files {
         if verified.contains(path) {
             continue;
         }
-        unverified_files.insert(path.clone());
+        protected_files.insert(path.clone());
         unverified_uids.extend(
             symbols
                 .iter()
                 .map(|symbol| symbol_uid(r_uid, path, &symbol.name, symbol.start_line)),
         );
     }
+    protected_uids.extend(unverified_uids.iter().cloned());
     Ok(Some(WatcherBatchResolution {
         resolution,
         resolver_files,
-        unverified_files,
+        protected_files,
+        protected_uids,
         unverified_uids,
+        view_covers_repo,
     }))
 }
 
