@@ -3,7 +3,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1568,6 +1567,7 @@ pub fn changed_files_from_git(repo_path: &Path, base_ref: Option<&str>) -> Resul
 mod tests {
     use super::*;
     use crate::cluster_dispatch::CommunityInfo;
+    use std::process::Command;
 
     /// Listing working-tree changes never runs a repository's clean filters.
     #[test]
