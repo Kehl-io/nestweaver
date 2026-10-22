@@ -13124,7 +13124,11 @@ fn read_symbols_unreadable_root_is_exit_1_not_a_missing_target() {
     // the refusal names the root.
     let wrong_tree = dir.path().join("elsewhere");
     std::fs::create_dir_all(&wrong_tree).unwrap();
-    std::fs::write(wrong_tree.join("main.js"), "function nw539ReadTarget() {}\n").unwrap();
+    std::fs::write(
+        wrong_tree.join("main.js"),
+        "function nw539ReadTarget() {}\n",
+    )
+    .unwrap();
     let (code, payload, output) = read("nw539ReadTarget", Some(&wrong_tree));
     assert_eq!(code, Some(1), "{payload}");
     let stderr = String::from_utf8_lossy(&output.stderr);
