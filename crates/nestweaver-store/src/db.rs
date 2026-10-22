@@ -10712,8 +10712,7 @@ mod backing_file_tests {
         assert!(error.contains("was deleted"), "{error}");
         let error = store
             .acquire_index_publication_lease()
-            .err()
-            .expect("an orphaned store must not publish")
+            .expect_err("an orphaned store must not publish")
             .to_string();
         assert!(error.contains("orphaned"), "{error}");
     }

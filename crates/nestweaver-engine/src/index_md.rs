@@ -8197,7 +8197,10 @@ sub b body
             "bad\u{7}name",
             &[],
         );
-        let message = format!("{:#}", full.err().expect("control character must be refused"));
+        let message = format!(
+            "{:#}",
+            full.err().expect("control character must be refused")
+        );
         assert!(message.contains("--name"), "{message}");
         assert!(!marker.exists(), "a refused add must not leave {marker:?}");
 

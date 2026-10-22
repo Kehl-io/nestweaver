@@ -1893,6 +1893,7 @@ fn rust_public_type_origin(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn typed_receiver_origin(
     source_file: &str,
     type_name: &str,
