@@ -10834,7 +10834,7 @@ fn the_refusals_remedy_runs_on_the_very_file_that_triggered_it() {
         .success();
     let printed = String::from_utf8_lossy(&dry.get_output().stdout).to_string();
     let delta: serde_json::Value = serde_json::from_str(&printed).unwrap();
-    assert_eq!(delta["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(delta["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
     assert_eq!(
         std::fs::read_to_string(&settings).unwrap(),
         original,
@@ -10855,7 +10855,7 @@ fn the_refusals_remedy_runs_on_the_very_file_that_triggered_it() {
     let after: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(after["env"]["MY_API_KEY"], "sk-live-do-not-lose-me");
-    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task");
+    assert_eq!(after["hooks"]["PreToolUse"][0]["matcher"], "Task|Agent");
 }
 
 /// Well-formed JSON that NestWeaver does not own survives — in both shapes it
