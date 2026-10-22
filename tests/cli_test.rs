@@ -4356,6 +4356,37 @@ fn doc_stats_top_tags_limit_enforces_the_brain_doc_stats_schema_bound() {
         .stderr(contains("1001 is not in 1..=1000"));
 }
 
+/// `count-patterns` had no `--max-millis`, so the CLI could never get a
+/// complete count past the 10 s whole-call budget, and a budget-cut result
+/// exited 0. The flag now exists with the MCP `count_patterns` schema's
+/// bound, and `--help` documents the exit-75 incomplete-result code.
+#[test]
+fn count_patterns_max_millis_enforces_the_count_patterns_schema_bound() {
+    nestweaver_cmd()
+        .args(["count-patterns", "x", "--max-millis", "0"])
+        .assert()
+        .code(64)
+        .stderr(contains("0 is not in 1..=600000"));
+
+    nestweaver_cmd()
+        .args(["count-patterns", "x", "--max-millis", "600001"])
+        .assert()
+        .code(64)
+        .stderr(contains("600001 is not in 1..=600000"));
+
+    nestweaver_cmd()
+        .args(["count-patterns", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--max-millis").and(contains("75")));
+
+    nestweaver_cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(contains("75  incomplete"));
+}
+
 /// nw-379: an empty query used to mean "match everything" on `search` and
 /// `investigate` while `regex-search`/`count-patterns` already refused it BY
 /// NAME -- the project had already decided an empty query is invalid on two

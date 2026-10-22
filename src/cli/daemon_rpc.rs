@@ -740,6 +740,100 @@ pub(crate) fn pattern_count_from_tool_json(
     })
 }
 
+/// `count-patterns`' arguments for the daemon's `count_patterns` tool.
+///
+/// `max_millis` is the tool's whole-call budget, and [`daemon_rpc_timeout`]
+/// reads the same key so the client waits that long plus a margin instead of
+/// giving up on a budget the caller raised.
+pub(crate) fn count_patterns_rpc_args(
+    patterns: &[String],
+    path_prefix: Option<&str>,
+    kinds: Option<&[String]>,
+    max_millis: Option<u64>,
+) -> serde_json::Value {
+    let mut args = serde_json::json!({ "patterns": patterns });
+    if let Some(prefix) = path_prefix {
+        args["path_prefix"] = serde_json::json!(prefix);
+    }
+    if let Some(kinds) = kinds {
+        args["kinds"] = serde_json::json!(kinds);
+    }
+    if let Some(max_millis) = max_millis {
+        args["max_millis"] = serde_json::json!(max_millis);
+    }
+    args
+}
+
+/// The stderr warning for a `count-patterns` result whose budget ran out,
+/// or `None` when every count is exact. Written in `--json` mode too: the
+/// array on stdout carries `truncated` per pattern, but a script that only
+/// checks for a zero exit must not read lower bounds as answers.
+pub(crate) fn pattern_counts_truncation_warning(
+    counts: &[nestweaver_store::regex::PatternCount],
+    max_millis: Option<u64>,
+) -> Option<String> {
+    let cut = counts.iter().filter(|count| count.truncated).count();
+    if cut == 0 {
+        return None;
+    }
+    let budget = max_millis.unwrap_or(nestweaver_store::regex::COUNT_PATTERNS_DEFAULT_MAX_MILLIS);
+    Some(format!(
+        "warning: INCOMPLETE COUNTS — the {budget} ms time budget ran out, so {cut} of {} \
+         pattern(s) report lower bounds, not totals. Raise --max-millis (up to 600000), \
+         narrow --path-prefix/--kinds, or pass fewer patterns. Exit code 75.",
+        counts.len()
+    ))
+}
+
+/// Render `count-patterns` results, identically for the daemon and direct
+/// routes. Returns `true` when any count is truncated (a lower bound), which
+/// the caller turns into exit 75.
+pub(crate) fn print_pattern_counts(
+    counts: &[nestweaver_store::regex::PatternCount],
+    json: bool,
+    max_millis: Option<u64>,
+) -> anyhow::Result<bool> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(counts)?);
+    } else {
+        for c in counts {
+            println!(
+                "'{}': {} match(es) across {} file(s)",
+                c.pattern, c.total_matches, c.files_matched
+            );
+            for f in &c.top_files {
+                println!("    {} ({})", f.path, f.count);
+            }
+            println!(
+                "    regex: {} ready / {} scanned / {} errors; {} posting hits, {} hydrated, {} verified; {} ms",
+                c.ready_scopes,
+                c.dirty_scopes,
+                c.error_scopes,
+                c.posting_hits,
+                c.hydrated_candidates,
+                c.scanned_candidates,
+                c.timings.total_ms,
+            );
+            if c.truncated {
+                println!(
+                    "    (incomplete: the time budget ran out; these counts are lower bounds — raise --max-millis)"
+                );
+            }
+        }
+        // Surface in-band staleness: the daemon's stderr warning cannot reach
+        // us, and the direct path's is a once-per-process latch that may
+        // already have fired inside the store.
+        if counts.iter().any(|c| c.stale_index) {
+            print_stale_index_note();
+        }
+    }
+    let warning = pattern_counts_truncation_warning(counts, max_millis);
+    if let Some(warning) = &warning {
+        eprintln!("{warning}");
+    }
+    Ok(warning.is_some())
+}
+
 /// One-line staleness note rendered (text mode only) when a search
 /// reports that it bypassed a stale trigram posting table. JSON mode carries
 /// the signal in-band via the `stale_index` field instead.

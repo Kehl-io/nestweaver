@@ -232,6 +232,12 @@ const EXIT_USAGE: i32 = 64;
 /// "stopped" (0) and "stuck" must not share a code, because only the second
 /// needs an operator.
 const EXIT_DAEMON_UNHEALTHY: i32 = 69;
+/// The command ran but its answer is incomplete: `count-patterns` ran out of
+/// its time budget, so some counts are lower bounds. `EX_TEMPFAIL` from
+/// `sysexits.h` — retrying with a larger `--max-millis` can succeed. Not 0,
+/// because a script that only checks the code would take lower bounds as
+/// totals; not 1, because nothing failed and stdout still holds the counts.
+const EXIT_INCOMPLETE: i32 = 75;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// Default `server init-tls --validity-days`.
@@ -2187,7 +2193,9 @@ const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
                   4   unauthorized (pull)      5   unavailable (pull)\n  \
                   64  usage error — unknown flag, out-of-range value, a regex pattern that does\n      \
                   not compile (regex-search / count-patterns)\n  \
-                  69  `daemon status` found the daemon unhealthy (running but unreachable)\n\n\
+                  69  `daemon status` found the daemon unhealthy (running but unreachable)\n  \
+                  75  incomplete — count-patterns ran out of its time budget; the printed\n      \
+                  counts are lower bounds (raise --max-millis)\n\n\
                   With --json, exit 2 writes {\"error\":\"not found\", ...} to stdout on the read\n      \
                   commands listed above; branch on `error`, not on prose.\n  \
                   NOT UNIVERSAL, and stated precisely because a contract that overreaches is\n      \
@@ -7095,8 +7103,11 @@ enum Commands {
     /// Companion to regex-search. Reports total matches, files matched, and the
     /// busiest files for each pattern. Reuses the same trigram pre-filter.
     /// `^` and `$` are line anchors; `(?-m)` anchors the whole candidate.
+    /// One time budget (`--max-millis`, default 10000) covers every pattern;
+    /// when it runs out the cut patterns report lower bounds and the command
+    /// exits 75.
     #[command(
-        after_help = "Examples:\n  nestweaver count-patterns 'TODO' 'FIXME'\n  nestweaver count-patterns '(?i)deprecated' --path-prefix src/"
+        after_help = "Examples:\n  nestweaver count-patterns 'TODO' 'FIXME'\n  nestweaver count-patterns '(?i)deprecated' --path-prefix src/\n  nestweaver count-patterns 'unwrap\\(' 'expect\\(' --max-millis 120000\n\nExit codes:\n  0   every count is exact\n  75  the time budget ran out: patterns marked incomplete (\"truncated\": true\n      under --json) report lower bounds; a warning goes to stderr. Raise --max-millis."
     )]
     CountPatterns {
         /// One or more regex patterns to count
@@ -7114,6 +7125,12 @@ enum Commands {
             help = "Restrict to node kinds (comma-separated): Section,Note,Symbol,Frontmatter"
         )]
         kinds: Option<Vec<String>>,
+        #[arg(
+            long = "max-millis",
+            value_parser = clap::value_parser!(u64).range(1..=600000),
+            help = "Wall-clock time budget in milliseconds for the whole call, shared by all patterns (1-600000, default 10000; matches the MCP count_patterns schema)"
+        )]
+        max_millis: Option<u64>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -24337,6 +24354,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             patterns,
             path_prefix,
             kinds,
+            max_millis,
             json,
             db,
             config,
@@ -24352,15 +24370,24 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             }
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            // A budget that ran out is not a plain success: the cut patterns
+            // report lower bounds, so the command exits EXIT_INCOMPLETE with a
+            // stderr warning, on both routes.
+            let exit_for = |truncated: bool| {
+                if truncated {
+                    EXIT_INCOMPLETE
+                } else {
+                    EXIT_SUCCESS
+                }
+            };
             // ── daemon guard ──────────────────────────────────────
             if use_daemon {
-                let mut args = serde_json::json!({ "patterns": patterns });
-                if let Some(ref pp) = path_prefix {
-                    args["path_prefix"] = serde_json::json!(pp);
-                }
-                if let Some(ref k) = kinds {
-                    args["kinds"] = serde_json::json!(k);
-                }
+                let args = count_patterns_rpc_args(
+                    &patterns,
+                    path_prefix.as_deref(),
+                    kinds.as_deref(),
+                    max_millis,
+                );
                 if let Some(value) = try_hybrid_json_rpc_checked(
                     true,
                     &db_path,
@@ -24382,40 +24409,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                     .collect()
                             })
                             .unwrap_or_default();
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&counts)?);
-                    } else {
-                        for c in &counts {
-                            println!(
-                                "'{}': {} match(es) across {} file(s)",
-                                c.pattern, c.total_matches, c.files_matched
-                            );
-                            for f in &c.top_files {
-                                println!("    {} ({})", f.path, f.count);
-                            }
-                            println!(
-                                "    regex: {} ready / {} scanned / {} errors; {} posting hits, {} hydrated, {} verified; {} ms",
-                                c.ready_scopes,
-                                c.dirty_scopes,
-                                c.error_scopes,
-                                c.posting_hits,
-                                c.hydrated_candidates,
-                                c.scanned_candidates,
-                                c.timings.total_ms,
-                            );
-                            if c.truncated {
-                                println!(
-                                    "    (incomplete: the time budget ran out; these counts are lower bounds)"
-                                );
-                            }
-                        }
-                        // Surface in-band staleness the daemon's stderr
-                        // warning can't reach us with.
-                        if counts.iter().any(|c| c.stale_index) {
-                            print_stale_index_note();
-                        }
-                    }
-                    return Ok((EXIT_SUCCESS, None));
+                    let truncated = print_pattern_counts(&counts, json, max_millis)?;
+                    return Ok((exit_for(truncated), None));
                 }
             }
 
@@ -24425,53 +24420,25 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // reject them in two different ways. `patterns` is a LIST, so the
             // envelope reports the whole list as the offending value; the
             // engine's message names the one that failed to compile.
-            let counts =
-                match store.count_patterns(&patterns, path_prefix.as_deref(), kinds.as_deref()) {
-                    Ok(counts) => counts,
-                    Err(error) => {
-                        let message = format!("{error}");
-                        if json {
-                            print_json_argument_error("patterns", &patterns.join(", "), &message);
-                        }
-                        eprintln!("Error: invalid --pattern: {message}");
-                        return Ok((EXIT_USAGE, None));
+            let counts = match store.count_patterns_cancellable(
+                &patterns,
+                path_prefix.as_deref(),
+                kinds.as_deref(),
+                max_millis,
+                None,
+            ) {
+                Ok(counts) => counts,
+                Err(error) => {
+                    let message = format!("{error}");
+                    if json {
+                        print_json_argument_error("patterns", &patterns.join(", "), &message);
                     }
-                };
-            if json {
-                println!("{}", serde_json::to_string_pretty(&counts)?);
-            } else {
-                for c in &counts {
-                    println!(
-                        "'{}': {} match(es) across {} file(s)",
-                        c.pattern, c.total_matches, c.files_matched
-                    );
-                    for f in &c.top_files {
-                        println!("    {} ({})", f.path, f.count);
-                    }
-                    println!(
-                        "    regex: {} ready / {} scanned / {} errors; {} posting hits, {} hydrated, {} verified; {} ms",
-                        c.ready_scopes,
-                        c.dirty_scopes,
-                        c.error_scopes,
-                        c.posting_hits,
-                        c.hydrated_candidates,
-                        c.scanned_candidates,
-                        c.timings.total_ms,
-                    );
-                    if c.truncated {
-                        println!(
-                            "    (incomplete: the time budget ran out; these counts are lower bounds)"
-                        );
-                    }
+                    eprintln!("Error: invalid --pattern: {message}");
+                    return Ok((EXIT_USAGE, None));
                 }
-                // Surface in-band staleness (the direct path's own
-                // stderr warning is a once-per-process latch that may already
-                // have fired inside the store).
-                if counts.iter().any(|c| c.stale_index) {
-                    print_stale_index_note();
-                }
-            }
-            Ok((EXIT_SUCCESS, None))
+            };
+            let truncated = print_pattern_counts(&counts, json, max_millis)?;
+            Ok((exit_for(truncated), None))
         }
 
         Commands::ReadSymbols {
@@ -38291,6 +38258,79 @@ credential_method = "ssh"
 
         // Malformed entries are skipped (None), not panicked on.
         assert!(pattern_count_from_tool_json(&serde_json::json!({"pattern": 1})).is_none());
+    }
+
+    /// `count-patterns --max-millis` exists, reaches the daemon tool and the
+    /// client's RPC wait, and a result the budget cut is flagged rather than
+    /// passed off as a plain success (it was exit 0 with no warning, and the
+    /// flag did not exist, so the CLI could never get a complete count past
+    /// the 10 s default).
+    #[test]
+    fn count_patterns_budget_is_forwarded_and_truncation_is_flagged() {
+        let parsed = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let parsed = Cli::try_parse_from([
+                    "nestweaver",
+                    "count-patterns",
+                    "a",
+                    "--max-millis",
+                    "120000",
+                ])
+                .map(|cli| match cli.command {
+                    Commands::CountPatterns { max_millis, .. } => max_millis,
+                    _ => panic!("expected count-patterns"),
+                });
+                let zero =
+                    Cli::try_parse_from(["nestweaver", "count-patterns", "a", "--max-millis", "0"]);
+                (parsed.ok(), zero.is_err())
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert_eq!(parsed, (Some(Some(120_000)), true));
+
+        let patterns = vec!["a".to_string(), "b".to_string()];
+        let args = count_patterns_rpc_args(&patterns, Some("src/"), None, Some(120_000));
+        assert_eq!(args["max_millis"], serde_json::json!(120_000));
+        assert_eq!(args["path_prefix"], serde_json::json!("src/"));
+        assert!(args.get("kinds").is_none());
+        if std::env::var_os(RPC_TIMEOUT_ENV).is_none() {
+            assert_eq!(
+                daemon_rpc_timeout(&args),
+                Some(std::time::Duration::from_millis(150_000)),
+                "the client must wait out a budget the caller raised"
+            );
+        }
+        assert!(
+            count_patterns_rpc_args(&patterns, None, None, None)
+                .get("max_millis")
+                .is_none()
+        );
+
+        let entry = |pattern: &str, truncated: bool| {
+            pattern_count_from_tool_json(&serde_json::json!({
+                "pattern": pattern,
+                "total_matches": 1,
+                "files_matched": 1,
+                "top_files": [],
+                "truncated": truncated,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            pattern_counts_truncation_warning(&[entry("a", false)], None),
+            None
+        );
+        let warning =
+            pattern_counts_truncation_warning(&[entry("a", false), entry("b", true)], Some(2500))
+                .expect("a cut count must warn");
+        for fragment in ["INCOMPLETE", "2500 ms", "1 of 2", "--max-millis", "75"] {
+            assert!(warning.contains(fragment), "{fragment:?}: {warning}");
+        }
+        let defaulted = pattern_counts_truncation_warning(&[entry("b", true)], None).unwrap();
+        assert!(defaulted.contains("10000 ms"), "{defaulted}");
+        assert_eq!(EXIT_INCOMPLETE, 75);
     }
 
     /// Hybrid `_meta` provenance is stripped so daemon responses render
