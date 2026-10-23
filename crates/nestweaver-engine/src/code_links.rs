@@ -1102,7 +1102,9 @@ pub fn reconcile_code_links_with_folders_scoped(
         return reconciler.reconcile(store, None, &|| false);
     };
     let path = PathBuf::from(format!("{}.publication-links.json", db_path.display()));
-    let identity = store.publication_identity()?;
+    let identity = store.publication_identity()?.context(
+        "staged publication link coverage requires a database-bound publication identity",
+    )?;
     let config_signature = crate::hash::blake3_hex(&format!(
         "{}:{}:{folders:?}",
         CROSS_DOMAIN_RULES_VERSION,

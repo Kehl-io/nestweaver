@@ -4577,7 +4577,9 @@ pub fn index_compatibility_json(
         Some(nestweaver_engine::authz::VisibleRepos::Only(_))
     ) {
         if let Some(db_path) = store.db_path() {
-            let identity = store.publication_identity()?;
+            let identity = store.publication_identity()?.context(
+                "vault compatibility disclosure requires a database-bound publication identity",
+            )?;
             let instance = store
                 .data_instance_id()?
                 .unwrap_or_else(|| "default".to_string());

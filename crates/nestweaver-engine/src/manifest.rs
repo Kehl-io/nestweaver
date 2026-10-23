@@ -3486,10 +3486,18 @@ pub fn prepare_recreated_store_sidecars(
     data_instance_id: &str,
 ) -> Result<bool, anyhow::Error> {
     use nestweaver_store::artifact_envelope::{ArtifactEnvelope, ArtifactExpectation};
+    // In-memory graph callers have no durable sidecar identity to recover.
+    if store.db_path().is_none() {
+        return Ok(false);
+    }
     if !store.list_repos(None)?.is_empty() || !store.list_vaults(None)?.is_empty() {
         return Ok(false);
     }
-    let identity = store.publication_identity()?;
+    let identity = store.publication_identity()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "recreated-store sidecar recovery requires a database-bound publication identity"
+        )
+    })?;
     let manifest_path = manifest_cache_path(db_path);
     let foreign_manifest = match std::fs::read(&manifest_path) {
         Ok(bytes) => {
@@ -3544,6 +3552,20 @@ mod recreated_store_regressions {
     use super::*;
 
     #[test]
+    fn in_memory_sidecar_recovery_does_not_consult_an_unrelated_database_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("unrelated.lbug");
+        let sidecar = manifest_cache_path(&db);
+        std::fs::write(&sidecar, b"corrupt unrelated sidecar").unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        assert!(!prepare_recreated_store_sidecars(&store, &db, "default").unwrap());
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            b"corrupt unrelated sidecar"
+        );
+    }
+
+    #[test]
     fn recreated_store_quarantines_verified_physical_sidecars_before_publication() {
         let dir = tempfile::tempdir().unwrap();
         let old_db = dir.path().join("old.lbug");
@@ -3551,7 +3573,7 @@ mod recreated_store_regressions {
         let old = nestweaver_store::GraphStore::create(&old_db).unwrap();
         let new = nestweaver_store::GraphStore::create(&new_db).unwrap();
         save_manifest_cache_for_db(&HashMap::new(), &old, &old_db).unwrap();
-        let old_identity = old.publication_identity().unwrap();
+        let old_identity = old.publication_identity().unwrap().unwrap();
         crate::markdown_derivation::save_records(
             &old_db,
             &Default::default(),
