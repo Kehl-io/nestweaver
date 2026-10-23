@@ -98,6 +98,22 @@ const MANIFEST_VERSION: u32 = 2;
 /// generous while still bounding a hostile or corrupt header (nw-144).
 const MAX_PUBLICATION_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
+/// An expected refusal of a destructive or conflicting backup invocation.
+/// Kept typed across CLI and daemon boundaries so callers can report usage
+/// errors without classifying corruption or I/O failures as user mistakes.
+#[derive(Debug)]
+pub struct BackupRefusal(pub String);
+impl std::fmt::Display for BackupRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for BackupRefusal {}
+
+macro_rules! refuse_backup {
+    ($($arg:tt)*) => { return Err(BackupRefusal(format!($($arg)*)).into()) };
+}
+
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
     pub db_path: PathBuf,
@@ -769,7 +785,7 @@ pub enum RestorePhase {
 /// Bumped when the on-disk journal shape changes. A journal this build cannot
 /// read is treated as ABSENT, which routes it to the no-proof branch of
 /// [`recover_interrupted_restore`] — preserve, never delete.
-const RESTORE_JOURNAL_VERSION: u32 = 1;
+const RESTORE_JOURNAL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RestoreJournal {
@@ -778,6 +794,56 @@ struct RestoreJournal {
     data_dir: PathBuf,
     restoring_dir: PathBuf,
     snapshot_path: PathBuf,
+    #[serde(default)]
+    destination_identity: Option<(u64, u64)>,
+    #[serde(default)]
+    restoring_identity: Option<(u64, u64)>,
+    #[serde(default)]
+    destination_paths: Vec<String>,
+    #[serde(default)]
+    restoring_paths: Vec<String>,
+}
+
+fn restore_directory_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        metadata
+            .is_dir()
+            .then_some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn restore_tree_paths(path: &Path) -> anyhow::Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    walkdir::WalkDir::new(path)
+        .min_depth(1)
+        .into_iter()
+        .map(|entry| {
+            let entry = entry?;
+            anyhow::ensure!(
+                !entry.file_type().is_symlink(),
+                "restore ownership is ambiguous at {}",
+                entry.path().display()
+            );
+            normalized_relative_path(path, entry.path())
+        })
+        .collect()
+}
+
+fn journal_proves_owned_tree(path: &Path, identity: Option<(u64, u64)>, paths: &[String]) -> bool {
+    identity.is_some()
+        && restore_directory_identity(path) == identity
+        && restore_tree_paths(path)
+            .is_ok_and(|present| present.iter().all(|path| paths.contains(path)))
 }
 
 /// Where the incumbent data directory is moved to while the replacement lands.
@@ -846,7 +912,11 @@ fn publish_restore_phase(journal: &RestoreJournal) -> anyhow::Result<()> {
 fn read_restore_journal(data_dir: &Path) -> Option<RestoreJournal> {
     let bytes = std::fs::read(restore_journal_path(data_dir)).ok()?;
     let journal: RestoreJournal = serde_json::from_slice(&bytes).ok()?;
-    (journal.version == RESTORE_JOURNAL_VERSION).then_some(journal)
+    (journal.version == RESTORE_JOURNAL_VERSION
+        && absolute_lexically(&journal.data_dir) == absolute_lexically(data_dir)
+        && absolute_lexically(&journal.restoring_dir)
+            == absolute_lexically(&restoring_dir_for(data_dir)))
+    .then_some(journal)
 }
 
 /// Durably retire the journal. The unlink is followed by a parent `fsync` for
@@ -1019,6 +1089,17 @@ fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<RestoreRecover
         // worth doing is discarding a destination the journal PROVES is
         // partial, so the retry does not copy into debris.
         if phase == Some(RestorePhase::CopyInProgress) && data_dir.exists() {
+            let journal = journal.as_ref().unwrap();
+            if !journal_proves_owned_tree(
+                data_dir,
+                journal.destination_identity,
+                &journal.destination_paths,
+            ) {
+                refuse_backup!(
+                    "backup restore refused: stale or ambiguous recovery journal cannot authorize deleting {}; its contents were preserved",
+                    data_dir.display()
+                );
+            }
             std::fs::remove_dir_all(data_dir).with_context(|| {
                 format!(
                     "discard the partial restore destination {}",
@@ -1037,6 +1118,17 @@ fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<RestoreRecover
         // discarding something nothing can rebuild.
         Some(RestorePhase::CopyInProgress) => {
             if data_dir.exists() {
+                let journal = journal.as_ref().unwrap();
+                if !journal_proves_owned_tree(
+                    data_dir,
+                    journal.destination_identity,
+                    &journal.destination_paths,
+                ) {
+                    refuse_backup!(
+                        "backup restore refused: stale or ambiguous recovery journal cannot authorize deleting {}; both copies were preserved",
+                        data_dir.display()
+                    );
+                }
                 std::fs::remove_dir_all(data_dir).with_context(|| {
                     format!(
                         "discard the unfinished restore destination {}",
@@ -1061,6 +1153,18 @@ fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<RestoreRecover
         // PROVABLY redundant: the journal was published only after the
         // replacement was durable and validated.
         Some(RestorePhase::CutoverValidated | RestorePhase::Cleanup) => {
+            let journal = journal.as_ref().unwrap();
+            if !journal_proves_owned_tree(
+                &restoring_dir,
+                journal.restoring_identity,
+                &journal.restoring_paths,
+            ) {
+                let preserved = preserve_unproven_copy(&restoring_dir)?;
+                clear_restore_journal(data_dir);
+                return Ok(RestoreRecovery {
+                    preserved: Some(preserved),
+                });
+            }
             std::fs::remove_dir_all(&restoring_dir).with_context(|| {
                 format!(
                     "remove the superseded pre-restore copy {}",
@@ -1088,7 +1192,9 @@ fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<RestoreRecover
                 }
                 clear_restore_journal(data_dir);
                 Ok(RestoreRecovery::default())
-            } else if restored_dataset_is_self_proving(data_dir) {
+            } else if restored_dataset_is_self_proving(data_dir)
+                && is_recognisable_data_dir(&restoring_dir)?
+            {
                 std::fs::remove_dir_all(&restoring_dir).with_context(|| {
                     format!(
                         "remove the superseded pre-restore copy {}",
@@ -1438,14 +1544,14 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
                         path.display()
                     )
                 });
-            anyhow::bail!(
+            refuse_backup!(
                 "backup restore refused: {} is not empty. An interrupted restore was reconciled \
                  first, and the archive was not applied.{preserved} Re-run with --force to replace \
                  this directory.",
                 config.data_dir.display()
             );
         }
-        anyhow::bail!(
+        refuse_backup!(
             "backup restore refused: {} is not empty. Restore renames that directory aside and \
              deletes it after the new data is in place. Re-run with --force to replace it. \
              Nothing in {} was changed.",
@@ -1456,11 +1562,7 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     // A directory an earlier restore was interrupted on was already chosen as
     // a restore target, and recovery has just put its previous contents
     // back; replacing it is what that earlier --force asked for.
-    if config.replace
-        && !interrupted_restore
-        && recovery.preserved.is_none()
-        && restore_target_occupied(&config.data_dir)?
-    {
+    if config.replace && restore_target_occupied(&config.data_dir)? {
         refuse_replacing_foreign_directory(&config.data_dir)?;
     }
 
@@ -1612,6 +1714,10 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
         data_dir: config.data_dir.clone(),
         restoring_dir: restoring_dir.clone(),
         snapshot_path: config.snapshot_path.clone(),
+        destination_identity: restore_directory_identity(temp_dir.path()),
+        restoring_identity: restore_directory_identity(&config.data_dir),
+        destination_paths: restore_tree_paths(temp_dir.path())?,
+        restoring_paths: restore_tree_paths(&config.data_dir)?,
     };
     publish_restore_phase(&journal)?;
     maybe_crash_for_test(RestorePhase::StagingVerified);
@@ -1642,6 +1748,8 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     let cross_device_copy = force_cross_device_copy_for_test()
         || std::fs::rename(temp_dir.path(), &config.data_dir).is_err();
     if cross_device_copy {
+        std::fs::create_dir_all(&config.data_dir)?;
+        journal.destination_identity = restore_directory_identity(&config.data_dir);
         // Published BEFORE the first byte lands. Over-claiming "the
         // destination is not authoritative" costs a retry; under-claiming it
         // costs the user's only complete dataset.
@@ -2365,18 +2473,18 @@ fn validate_restored_logical_identity(
 
 /// Whether `path` already holds something restore would rename aside.
 /// `--force` replaces a data directory, which ends in deleting it. Only do
-/// that to a directory that is recognisably NestWeaver's: one holding a graph
-/// database file (`*.lbug`, or a legacy `*.kuzu`) or the `publication.json`
-/// a restore leaves. Any other non-empty directory (a home directory, a
+/// that to a directory whose database has an exact physical format marker
+/// and whose complete contents belong to known database artifacts. Any other
+/// non-empty directory (a home directory, a
 /// source tree, a typo) is refused even with `--force`, because the cost of
 /// guessing wrong is the user's files.
 fn refuse_replacing_foreign_directory(data_dir: &Path) -> anyhow::Result<()> {
     if is_recognisable_data_dir(data_dir)? {
         return Ok(());
     }
-    anyhow::bail!(
+    refuse_backup!(
         "backup restore refused: {} is not empty and does not look like a NestWeaver data \
-         directory (no *.lbug database or publication.json in it). --force only replaces a \
+         directory with verified ownership of every entry. --force only replaces a \
          NestWeaver data directory, because replacing deletes the old contents. Restore into an \
          empty or new directory instead. Nothing in {} was changed.",
         data_dir.display(),
@@ -2385,33 +2493,135 @@ fn refuse_replacing_foreign_directory(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn is_recognisable_data_dir(data_dir: &Path) -> anyhow::Result<bool> {
-    let metadata = std::fs::symlink_metadata(data_dir)
-        .with_context(|| format!("inspect restore target {}", data_dir.display()))?;
-    if !metadata.is_dir() {
+    if !std::fs::symlink_metadata(data_dir)?.is_dir() {
         return Ok(false);
     }
-    let entries = std::fs::read_dir(data_dir)
-        .with_context(|| format!("inspect restore target {}", data_dir.display()))?;
-    for entry in entries {
-        let entry =
-            entry.with_context(|| format!("inspect restore target {}", data_dir.display()))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        // A database may be a symlink to the real file, and a legacy Kuzu
-        // database is a directory.
-        let is_marker = (name == crate::publication::PUBLICATION_MANIFEST_FILE && kind.is_file())
-            || (name.ends_with(".lbug") && (kind.is_file() || kind.is_symlink()))
-            || (name.ends_with(".kuzu") && (kind.is_file() || kind.is_dir() || kind.is_symlink()));
-        if is_marker {
-            return Ok(true);
-        }
+    let entries = std::fs::read_dir(data_dir)?.collect::<Result<Vec<_>, _>>()?;
+    // A filename or copied manifest is not evidence that arbitrary adjacent
+    // files belong to NestWeaver. Require an inode-bound engine marker and an
+    // exhaustive set of owned top-level artifacts before recursive deletion.
+    let databases: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if (name.ends_with(".lbug") || name.ends_with(".kuzu"))
+                && entry.file_type().ok()?.is_file()
+                && nestweaver_store::engine_format::has_current_file_marker(&entry.path()).ok()?
+            {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if databases.is_empty() {
+        return Ok(false);
     }
-    Ok(false)
+    let manifest_path = data_dir.join(crate::publication::PUBLICATION_MANIFEST_FILE);
+    let inventory = if manifest_path.exists() {
+        if std::fs::symlink_metadata(&manifest_path)?.len() > MAX_PUBLICATION_MANIFEST_BYTES {
+            return Ok(false);
+        }
+        let Ok(bundle) = serde_json::from_slice::<crate::publication::PublicationBundleV3>(
+            &std::fs::read(&manifest_path)?,
+        ) else {
+            return Ok(false);
+        };
+        if ![
+            crate::snapshot::SNAPSHOT_FORMAT_VERSION,
+            crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION,
+        ]
+        .contains(&bundle.format_version)
+            || bundle.validate_metadata(bundle.format_version).is_err()
+        {
+            return Ok(false);
+        }
+        bundle
+            .artifacts
+            .into_iter()
+            .map(|artifact| artifact.path)
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        std::collections::HashSet::new()
+    };
+    for entry in entries {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Ok(false);
+        };
+        if entry.file_type()?.is_symlink() {
+            return Ok(false);
+        }
+        if databases.contains(&name) {
+            continue;
+        }
+        let owned_sidecar = databases.iter().any(|db| {
+            name.strip_prefix(db.as_str()).is_some_and(|suffix| {
+                SIDECAR_SUFFIXES.contains(&suffix)
+                    || [
+                        ".wal",
+                        ".write.lock",
+                        ".publications",
+                        ".vault-registrations.json",
+                    ]
+                    .contains(&suffix)
+            })
+        });
+        if owned_sidecar && entry.file_type()?.is_file() {
+            continue;
+        }
+        if name == "manifest.json" {
+            if serde_json::from_slice::<BackupManifest>(&std::fs::read(entry.path())?).is_err() {
+                return Ok(false);
+            }
+            continue;
+        }
+        if name == crate::publication::PUBLICATION_MANIFEST_FILE {
+            continue;
+        }
+        // Full archives include instance.toml and clone workspaces. Their
+        // names alone confer no ownership: every payload must be inventoried,
+        // including files nested below a recognized directory.
+        if inventory.contains(&name) && entry.file_type()?.is_file() {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            let prefix = format!("{name}/");
+            if inventory.iter().any(|path| path.starts_with(&prefix)) {
+                for child in walkdir::WalkDir::new(entry.path()).min_depth(1) {
+                    let child = child?;
+                    if child.file_type().is_symlink() {
+                        return Ok(false);
+                    }
+                    if child.file_type().is_file()
+                        && !inventory.contains(&normalized_relative_path(data_dir, child.path())?)
+                    {
+                        return Ok(false);
+                    }
+                    if child.file_type().is_dir() {
+                        let prefix =
+                            format!("{}/", normalized_relative_path(data_dir, child.path())?);
+                        if !inventory.iter().any(|path| path.starts_with(&prefix)) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn has_database_header(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut header = [0; 4];
+    let mut file = std::fs::File::open(path)?;
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(&header == b"LBUG" || &header == b"KUZU"),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Refuse a backup destination that IS the database or one of its files.
@@ -2430,7 +2640,7 @@ fn refuse_output_in_database_footprint(db_path: &Path, output: &Path) -> anyhow:
     };
     let db_name = db_name.to_string_lossy().into_owned();
     let refuse = || -> anyhow::Result<()> {
-        anyhow::bail!(
+        refuse_backup!(
             "backup refused: the destination {} is the database {} or one of its files. Choose \
              a path outside the database's files; nothing was written.",
             output.display(),
@@ -2449,6 +2659,32 @@ fn refuse_output_in_database_footprint(db_path: &Path, output: &Path) -> anyhow:
     // except for an archive name: no sidecar ends `.nwsnap.zst`, and a backup
     // called `<db>.2026-10-21.nwsnap.zst` beside the database is legitimate.
     let resolved = resolve_output_path(output);
+    // A different database's sidecars are destructive destinations too.
+    for ancestor in resolved.ancestors() {
+        let Some(parent) = ancestor.parent() else {
+            continue;
+        };
+        let Some(name) = ancestor.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let candidate = entry.file_name();
+                let Some(db_name) = candidate.to_str() else {
+                    continue;
+                };
+                if (db_name.ends_with(".lbug") || db_name.ends_with(".kuzu"))
+                    && name
+                        .strip_prefix(db_name)
+                        .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('-'))
+                    && !name.ends_with(".nwsnap.zst")
+                {
+                    return refuse();
+                }
+            }
+        }
+    }
+
     if let Ok(rest) = resolved.strip_prefix(db_parent) {
         let mut components = rest.components();
         if let Some(std::path::Component::Normal(first)) = components.next() {
@@ -2480,6 +2716,16 @@ fn refuse_output_in_database_footprint(db_path: &Path, output: &Path) -> anyhow:
             }
         }
     }
+    // Protect every database, not only the source. Magic catches a database
+    // hidden behind a differently named hard link; canonical paths catch links.
+    if [output, resolved.as_path()].iter().any(|path| {
+        path.extension()
+            .is_some_and(|ext| ext == "lbug" || ext == "kuzu")
+    }) || (resolved.is_file() && has_database_header(&resolved)?)
+    {
+        return refuse();
+    }
+
     Ok(())
 }
 
@@ -2564,7 +2810,7 @@ fn publish_backup_archive(staging: &Path, output: &Path, overwrite: bool) -> any
 }
 
 fn archive_exists(output: &Path) -> anyhow::Result<()> {
-    anyhow::bail!(
+    refuse_backup!(
         "backup refused: {} already exists; re-run with --force to overwrite it. \
          The existing archive was not modified.",
         output.display()
@@ -3576,6 +3822,7 @@ mod tests {
         );
         assert!(!data_dir.join("graph.lbug").exists());
 
+        std::fs::remove_file(data_dir.join("sentinel.txt")).unwrap();
         backup_restore(&RestoreConfig {
             snapshot_path: snapshot,
             data_dir: data_dir.clone(),
@@ -3623,6 +3870,10 @@ mod tests {
             data_dir: data_dir.clone(),
             restoring_dir: restoring.clone(),
             snapshot_path: snapshot.clone(),
+            destination_identity: restore_directory_identity(&data_dir),
+            restoring_identity: restore_directory_identity(&restoring),
+            destination_paths: restore_tree_paths(&data_dir).unwrap(),
+            restoring_paths: restore_tree_paths(&restoring).unwrap(),
         })
         .unwrap();
 
@@ -3643,6 +3894,7 @@ mod tests {
         assert!(!restoring.exists());
         assert!(!restore_journal_path(&data_dir).exists());
 
+        std::fs::remove_file(data_dir.join("good.txt")).unwrap();
         backup_restore(&RestoreConfig {
             snapshot_path: snapshot,
             data_dir: data_dir.clone(),
@@ -4045,8 +4297,54 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             restoring_dir: restoring_dir_for(data_dir),
             snapshot_path: PathBuf::from("/nonexistent.nwsnap.zst"),
+            destination_identity: restore_directory_identity(data_dir),
+            restoring_identity: restore_directory_identity(&restoring_dir_for(data_dir)),
+            destination_paths: restore_tree_paths(data_dir).unwrap(),
+            restoring_paths: restore_tree_paths(&restoring_dir_for(data_dir)).unwrap(),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn stale_or_copied_journal_cannot_delete_a_reused_foreign_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        seed_dataset(&data, b"PARTIAL");
+        journal_at(&data, RestorePhase::CopyInProgress);
+        let original = tmp.path().join("original");
+        std::fs::rename(&data, &original).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("thesis.txt"), b"mine").unwrap();
+        assert!(recover_interrupted_restore(&data).is_err());
+        assert_eq!(std::fs::read(data.join("thesis.txt")).unwrap(), b"mine");
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::write(copied.join("thesis.txt"), b"mine too").unwrap();
+        std::fs::copy(restore_journal_path(&data), restore_journal_path(&copied)).unwrap();
+        recover_interrupted_restore(&copied).unwrap();
+        assert_eq!(
+            std::fs::read(copied.join("thesis.txt")).unwrap(),
+            b"mine too"
+        );
+    }
+
+    #[test]
+    fn journal_does_not_authorize_unknown_files_added_after_it_was_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let restoring = restoring_dir_for(&data);
+        seed_dataset(&data, b"RESTORED");
+        seed_dataset(&restoring, b"SUPERSEDED");
+        journal_at(&data, RestorePhase::Cleanup);
+        std::fs::write(restoring.join("thesis.txt"), b"mine").unwrap();
+        let preserved = recover_interrupted_restore(&data)
+            .unwrap()
+            .preserved
+            .unwrap();
+        assert_eq!(
+            std::fs::read(preserved.join("thesis.txt")).unwrap(),
+            b"mine"
+        );
     }
 
     /// THE DEFECT, reproduced.
@@ -4147,7 +4445,7 @@ mod tests {
     /// embedded `manifest.json`, which is a complete-dataset proof that owes
     /// nothing to nonemptiness.
     #[test]
-    fn a_self_proving_destination_retires_the_aside_copy_without_a_journal() {
+    fn a_self_proving_destination_preserves_an_unowned_aside_copy_without_a_journal() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data = tmp.path().join("data");
         let restoring = tmp.path().join("data.restoring");
@@ -4156,11 +4454,18 @@ mod tests {
         seed_dataset(&restoring, b"SUPERSEDED");
         write_self_proof(&data);
 
-        recover_interrupted_restore(&data).unwrap();
+        let recovery = recover_interrupted_restore(&data).unwrap();
 
         assert!(
             !restoring.exists(),
-            "a self-proving destination retires the orphan"
+            "the orphan is moved to a reported preserved path"
+        );
+        let preserved = recovery
+            .preserved
+            .expect("replacement proof is not ownership of the old directory");
+        assert_eq!(
+            std::fs::read(preserved.join("brain.lbug")).unwrap(),
+            b"SUPERSEDED"
         );
         assert_eq!(std::fs::read(data.join("brain.lbug")).unwrap(), b"RESTORED");
     }
@@ -5600,6 +5905,91 @@ mod hardening_statistics_tests {
 mod destination_guard_tests {
     use super::*;
 
+    #[test]
+    fn output_protects_another_database_and_its_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.lbug");
+        let other = dir.path().join("other.lbug");
+        std::fs::write(&source, b"LBUGsource").unwrap();
+        std::fs::write(&other, b"LBUGother").unwrap();
+        let mut targets = vec![
+            other.clone(),
+            dir.path().join("new.kuzu"),
+            dir.path().join("other.lbug.wal"),
+        ];
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("archive.zst");
+            std::fs::hard_link(&other, &alias).unwrap();
+            targets.push(alias);
+            let link = dir.path().join("linked.zst");
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+            targets.push(link);
+        }
+        for target in targets {
+            let error = refuse_output_in_database_footprint(&source, &target).unwrap_err();
+            assert!(error.downcast_ref::<BackupRefusal>().is_some(), "{error:#}");
+        }
+        assert_eq!(std::fs::read(other).unwrap(), b"LBUGother");
+        refuse_output_in_database_footprint(
+            &source,
+            &dir.path().join("other.lbug.daily.nwsnap.zst"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn marker_filenames_do_not_authorize_recursive_restore_deletion() {
+        for marker in ["publication.json", "fake.lbug", "fake.kuzu"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(marker), b"{}").unwrap();
+            std::fs::write(dir.path().join("thesis.txt"), b"irreplaceable").unwrap();
+            let error = refuse_replacing_foreign_directory(dir.path()).unwrap_err();
+            assert!(error.downcast_ref::<BackupRefusal>().is_some());
+            assert_eq!(
+                std::fs::read(dir.path().join("thesis.txt")).unwrap(),
+                b"irreplaceable"
+            );
+        }
+    }
+
+    #[test]
+    fn copied_physical_marker_does_not_authorize_restore_over_a_fake_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let db = make_db(&source);
+        let target = dir.path().join("foreign");
+        std::fs::create_dir(&target).unwrap();
+        let fake = target.join("brain.lbug");
+        std::fs::write(&fake, b"LBUGnot-a-database").unwrap();
+        std::fs::copy(
+            nestweaver_store::engine_format::sidecar_path(&db),
+            nestweaver_store::engine_format::sidecar_path(&fake),
+        )
+        .unwrap();
+        assert!(!is_recognisable_data_dir(&target).unwrap());
+        std::fs::write(target.join("thesis.txt"), b"mine").unwrap();
+        assert!(refuse_replacing_foreign_directory(&target).is_err());
+        assert_eq!(std::fs::read(target.join("thesis.txt")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn unknown_contents_nested_in_a_sidecar_directory_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db(dir.path());
+        assert!(is_recognisable_data_dir(dir.path()).unwrap());
+        for suffix in [".publications", ".tantivy"] {
+            let sidecar = crate::sidecar_path(&db, suffix);
+            std::fs::create_dir_all(&sidecar).unwrap();
+            let personal = sidecar.join("thesis.txt");
+            std::fs::write(&personal, b"mine").unwrap();
+            assert!(refuse_replacing_foreign_directory(dir.path()).is_err());
+            assert_eq!(std::fs::read(&personal).unwrap(), b"mine");
+            std::fs::remove_dir_all(sidecar).unwrap();
+        }
+    }
+
     fn save_config(db: &Path, output: PathBuf) -> BackupConfig {
         BackupConfig {
             db_path: db.to_path_buf(),
@@ -5716,6 +6106,15 @@ mod destination_guard_tests {
         std::fs::create_dir_all(&data).unwrap();
         make_db(&data);
         std::fs::write(data.join("stale.txt"), "old").unwrap();
+        let refusal = backup_restore(&RestoreConfig {
+            snapshot_path: archive.clone(),
+            data_dir: data.clone(),
+            replace: true,
+        })
+        .unwrap_err();
+        assert!(refusal.downcast_ref::<BackupRefusal>().is_some());
+        assert_eq!(std::fs::read(data.join("stale.txt")).unwrap(), b"old");
+        std::fs::remove_file(data.join("stale.txt")).unwrap();
         backup_restore(&RestoreConfig {
             snapshot_path: archive,
             data_dir: data.clone(),
@@ -5723,7 +6122,6 @@ mod destination_guard_tests {
         })
         .unwrap();
         assert!(data.join("brain.lbug").exists());
-        assert!(!data.join("stale.txt").exists());
     }
 
     /// QA (LOW): a killed save left `<archive>.partial.<pid>.<n>` and a

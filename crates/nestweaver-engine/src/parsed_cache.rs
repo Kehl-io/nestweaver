@@ -60,7 +60,8 @@ use serde::{Deserialize, Serialize};
 ///     decorators, Go method `parent_name` (the receiver type), return types
 ///     that end before a one-line body, and one JS/TS `this.x =` property
 ///     per class.
-const CACHE_VERSION: u32 = 8;
+/// 9 — scoped Go bindings and pointer/qualified composite literal evidence.
+const CACHE_VERSION: u32 = 9;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;

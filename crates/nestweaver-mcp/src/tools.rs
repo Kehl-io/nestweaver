@@ -4410,6 +4410,19 @@ pub fn dispatch_cancellable(
         wait_out_index_publication(store, cancel);
     }
 
+    let compatibility = index_compatibility_json(store, visible)?;
+    // Edge-completeness claims cannot be made from a repository whose index
+    // publication did not finish, even after its global marker was cleared.
+    if matches!(
+        name,
+        "brain_impact" | "flow_trace" | "blast_radius" | "dead_code" | "affected_tests"
+    ) {
+        if let Some(mut refusal) = index_incomplete_refusal_for_args(store, name, &args, visible)? {
+            refusal["_meta"] = json!({"index_compatibility": compatibility});
+            return Ok(refusal);
+        }
+    }
+
     // F16: serve cacheable read tools from (or populate) the response cache.
     // Correctness rests on the cache KEY — see `maybe_cached`.
     let live_note_body = name == "note_get"
@@ -4463,6 +4476,15 @@ pub fn dispatch_cancellable(
             let identity_error = store.embedding_identity_error();
             annotate_lexical_embedding_identity_degradation(identity_error.as_deref(), &mut value);
         }
+        if let Some(object) = value.as_object_mut() {
+            let meta = object.entry("_meta").or_insert_with(|| json!({}));
+            if let Some(meta) = meta.as_object_mut() {
+                meta.insert("index_compatibility".to_string(), compatibility.clone());
+            }
+            if name == "brain_status" {
+                object.insert("index_compatibility".to_string(), compatibility.clone());
+            }
+        }
         // nw-475 (Task 5.2, owner decision Q7): a successful response served
         // while a watcher-batch marker is still open must disclose it — this
         // is the honesty half of the serve-with-disclosure exception in
@@ -4497,6 +4519,99 @@ pub fn dispatch_cancellable(
     // publication, so the classification is applied to the ERROR rather than
     // used to fail early.
     result.map_err(|error| classify_index_publication_error(store, error))
+}
+
+/// Completeness preflight shared by MCP and direct CLI. These tools traverse
+/// the whole visible graph even when `repo` disambiguates their seed or `repos`
+/// filters their output population. Missing edges in any visible repository can
+/// change the answer; only authorization narrows the dependency population.
+pub fn index_incomplete_refusal_for_args(
+    store: &GraphStore,
+    _tool: &str,
+    _args: &Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Option<Value>, anyhow::Error> {
+    let mut incomplete = Vec::new();
+    for repo in store.list_repos(None)? {
+        if repo_is_visible(&repo.uid, visible) && store.repo_index_incomplete(&repo)? {
+            incomplete.push(json!({"repo_uid": repo.uid, "url": repo.url,
+                "remedy": "Re-index this repository to finish its interrupted publication"}));
+        }
+    }
+    Ok((!incomplete.is_empty()).then(|| json!({"refused": true,
+        "reason": "repo_index_incomplete", "incomplete_repos": incomplete,
+        "message": "Repository indexing did not complete; call-graph completeness is unavailable. Re-index the affected repositories before retrying."})))
+}
+
+/// Current derivation compatibility, separate from Git staleness and from
+/// federation's `_meta.stale_repos`. Computed after authorization and outside
+/// response caches so durable debt cannot be hidden by a warm response.
+pub fn index_compatibility_json(
+    store: &GraphStore,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
+    let repos: Vec<_> = store
+        .list_repos(None)?
+        .into_iter()
+        .filter(|repo| repo_is_visible(&repo.uid, visible))
+        .collect();
+    let resolver = store
+        .db_path()
+        .map(nestweaver_engine::resolver_generation::load);
+    let incompatible = resolver
+        .as_ref()
+        .map(|generation| generation.stale_repos(repos.iter().map(|r| r.uid.as_str())))
+        .unwrap_or_default();
+    let mut incomplete = Vec::new();
+    for repo in &repos {
+        if store.repo_index_incomplete(repo)? {
+            incomplete.push(json!({"repo_uid": repo.uid, "url": repo.url,
+                "remedy": "Re-index this repository to finish its interrupted publication"}));
+        }
+    }
+    let mut vault_refresh_required = Vec::new();
+    // Vault derivation is not a repository visibility domain. Do not disclose
+    // its inventory through a restricted repository identity.
+    if !matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    ) {
+        if let Some(db_path) = store.db_path() {
+            let identity = store.publication_identity()?;
+            let instance = store
+                .data_instance_id()?
+                .unwrap_or_else(|| "default".to_string());
+            let records = nestweaver_engine::markdown_derivation::load_records(
+                db_path,
+                &nestweaver_engine::markdown_derivation::RecordExpectation {
+                    identity: &identity,
+                    data_instance_id: &instance,
+                },
+            );
+            for vault in store.list_vaults(None)? {
+                let current = records
+                    .as_ref()
+                    .ok()
+                    .and_then(|records| records.as_ref())
+                    .and_then(|records| records.vaults.get(&vault.uid))
+                    .is_some_and(|record| {
+                        record.derivation_version
+                            == nestweaver_engine::markdown_derivation::DERIVATION_VERSION
+                            && record.phase
+                                == nestweaver_engine::markdown_derivation::DerivationPhase::Current
+                            && record.witness.is_some()
+                    });
+                if !current {
+                    vault_refresh_required.push(json!({"vault_uid": vault.uid,
+                    "remedy": "Run a full brain refresh for this vault under its matching configuration"}));
+                }
+            }
+        }
+    }
+    Ok(
+        json!({ "scope": "visible_repositories", "resolver_incompatible_repos": incompatible,
+        "incomplete_repos": incomplete, "vault_refresh_required": vault_refresh_required }),
+    )
 }
 
 /// Bounded wait for `NESTWEAVER_INDEX_PUBLICATION_WAIT_MS` (default 3000,
@@ -5654,9 +5769,7 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .and_then(|v| v.as_u64())
         .map(|n| n as usize);
     let explicit_root = arg_root_opt(store, &args)?;
-    let fallback_root = explicit_root
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let fallback_root = explicit_root.clone().unwrap_or_default();
 
     // In server mode, try to read source spans from bare clones via
     // GitBareReader instead of the filesystem (which has no checkout tree).
@@ -5754,9 +5867,9 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
     }
 
     // Non-server mode: if any returned symbol's source span could not be read
-    // (file not found from the working directory), the body is an empty string
+    // (missing owning-repository root or source file), the body is an empty string
     // that looks identical to a genuinely empty symbol. Surface an honest note so
-    // an agent in the wrong cwd knows to pass `root` instead of trusting "".
+    // an agent knows to repair the recorded root or supply an explicit `root`.
     if !is_server_mode() {
         let count = |pred: &dyn Fn(&serde_json::Value) -> bool| {
             value
@@ -5777,8 +5890,8 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         if unreadable > 0 {
             notes.push(format!(
                 "{unreadable} symbol(s) returned an empty body because their source file could \
-                 not be read from the owning repo's local_root or the working directory ({}). \
-                 Pass `root` (the repo path) or run from the repo root to get source spans.",
+                 not be read from the owning repo's local_root or the supplied explicit root ({}). \
+                 Re-index a moved checkout or pass `root` (the repo path) to get source spans.",
                 fallback_root.display()
             ));
         }
@@ -5985,7 +6098,7 @@ fn resolve_repo_for_spec(store: &GraphStore, spec: &str) -> Option<String> {
 fn tool_schema_read_symbols() -> Value {
     json!({
         "name": "read_symbols",
-        "description": "Read indexed symbol source spans. MCP output is bounded to 20KB logical / 40KB escaped; read truncation metadata and narrow targets or sections to continue.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, FQNs, `path::name`, `Class::method` or `path::Class::method` (narrowed by file and container like brain_impact); a qualifier that names no file or container is not found, with `path::name` suggestions in `did_you_mean` (it is never dropped to the bare name; only a shorter reading that is still qualified, `zzz::Svc::run` as `Svc::run`, is tried, and is listed in `qualifier_ignored`; a qualifier that could be a file, such as `nothere.ts`, is never dropped and the shorter reading is offered first in `did_you_mean`); ambiguous names return candidates with uid and file_path plus a `hint` on how to pick one\n- `path::<module>` reads a file's top-level code (the module owner), with function, class and method bodies elided as `⋮`; a file with no top-level calls has no owner and is not found\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size; a first symbol larger than the budget is cut to fit and flagged `body_truncated` (a budget of 0 returns the first symbol whole)\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- When `root` is omitted, file paths resolve from the owning repo's `local_root` in the graph, then the server working directory\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
+        "description": "Read indexed symbol source spans. MCP output is bounded to 20KB logical / 40KB escaped; read truncation metadata and narrow targets or sections to continue.\n\nGuidelines:\n- Accepts UIDs (sym:...), bare names, FQNs, `path::name`, `Class::method` or `path::Class::method` (narrowed by file and container like brain_impact); a qualifier that names no file or container is not found, with `path::name` suggestions in `did_you_mean` (it is never dropped to the bare name; only a shorter reading that is still qualified, `zzz::Svc::run` as `Svc::run`, is tried, and is listed in `qualifier_ignored`; a qualifier that could be a file, such as `nothere.ts`, is never dropped and the shorter reading is offered first in `did_you_mean`); ambiguous names return candidates with uid and file_path plus a `hint` on how to pick one\n- `path::<module>` reads a file's top-level code (the module owner), with function, class and method bodies elided as `⋮`; a file with no top-level calls has no owner and is not found\n- Use include_neighbors to also return adjacent symbols in the same file\n- Use token_budget to cap combined output size; a first symbol larger than the budget is cut to fit and flagged `body_truncated` (a budget of 0 returns the first symbol whole)\n\nLimitations:\n- Only reads indexed code symbols, not markdown notes (use note_get for those)\n- When `root` is omitted, file paths resolve from the owning repo's `local_root` in the graph; a missing root leaves the body unavailable\n- Refused for repository-scoped identities because a caller-selected filesystem root cannot prove the source bytes belong to the authorized repository\n\nIn server mode (bare clones), bodies may be empty with a server_note explaining the limitation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6027,7 +6140,7 @@ fn tool_schema_read_symbols() -> Value {
                 },
                 "root": {
                     "type": "string",
-                    "description": "Repository root for resolving file paths. When omitted, each symbol is read from its owning repo's local_root in the graph; falls back to the server working directory if that path is missing."
+                    "description": "Repository root for resolving file paths. When omitted, each symbol is read from its owning repo's local_root in the graph; reports the body unavailable if that path is missing."
                 }
             },
             // nw-410: the either/or requirement, declared where the
@@ -7828,7 +7941,7 @@ fn tool_schema_brain_context() -> Value {
                 },
                 "root": {
                     "type": "string",
-                    "description": "Filesystem root used to read symbol source spans for inline bodies. Defaults to the server's working directory. Only relevant with include_bodies=true."
+                    "description": "Filesystem root used to read symbol source spans for inline bodies. When omitted, uses each symbol's owning repository local_root; missing roots leave bodies unavailable. Only relevant with include_bodies=true."
                 },
                 "prf": {
                     "type": "boolean",
@@ -8376,7 +8489,7 @@ fn tool_brain_context(
     if include_bodies {
         let response_config = configured_response();
         let root = arg_root_opt(store, &args)?.unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            std::path::PathBuf::from(nestweaver_engine::query::OWNING_REPO_SOURCE_ROOT)
         });
         let reader_resolver = inline_body_reader_resolver(store);
         populate_inline_bodies(
@@ -8729,7 +8842,7 @@ fn tool_schema_brain_search() -> Value {
                 },
                 "root": {
                     "type": "string",
-                    "description": "Filesystem root used to read symbol source spans for inline bodies. Defaults to the server's working directory. Only relevant with include_bodies=true."
+                    "description": "Filesystem root used to read symbol source spans for inline bodies. When omitted, uses each symbol's owning repository local_root; missing roots leave bodies unavailable. Only relevant with include_bodies=true."
                 },
                 "prf": {
                     "type": "boolean",
@@ -9225,7 +9338,7 @@ fn tool_brain_search(
     if include_bodies && !concise {
         let response_config = configured_response();
         let root = arg_root_opt(store, &args)?.unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            std::path::PathBuf::from(nestweaver_engine::query::OWNING_REPO_SOURCE_ROOT)
         });
         let mut nodes: Vec<nestweaver_engine::BrainNode> = note_results
             .iter()
@@ -11467,6 +11580,10 @@ fn scope_brain_status_to_visible_repos(
         json!(instance_ids.into_iter().collect::<Vec<_>>()),
     );
     object.insert(
+        "index_compatibility".to_string(),
+        index_compatibility_json(store, visible)?,
+    );
+    object.insert(
         "visibility".to_string(),
         json!({
             "scoped": true,
@@ -11877,6 +11994,7 @@ pub fn brain_status_json(
         .unwrap_or_else(|| json!([]));
 
     let mut status = json!({
+        "index_compatibility": index_compatibility_json(store, None)?,
         // `db` and `instance_ids` were direct-path-only keys; the daemon
         // path gains them additively so both paths serve one schema.
         "db": db_path.as_ref().map(|p| p.display().to_string()),
@@ -22985,11 +23103,11 @@ fn dispatch_via_daemon_inner(
             }
         }
     };
-    let result_json: String = if crate::http::MUTATING_TOOLS.contains(&name) {
-        rt.block_on(request_future)?
-    } else {
-        rt.block_on(crate::session::await_cancellable(cancel, request_future))?
-    };
+    // The daemon owns admitted mutation workers independently of this RPC.
+    // Cancelling a queued mutation releases admission promptly; cancelling an
+    // admitted RPC drops only delivery while its worker finishes publication.
+    let result_json: String =
+        rt.block_on(crate::session::await_cancellable(cancel, request_future))?;
 
     serde_json::from_str(&result_json)
         .map(Unstamped::new)
@@ -23596,6 +23714,9 @@ fn git_checkout_position(path: &Path) -> Option<GitCheckoutPosition> {
     if lines.next().is_some() {
         return None;
     }
+    // A gitfile can point at an unrelated indexed checkout. Sharing its
+    // common directory is evidence only after Git metadata ownership agrees.
+    nestweaver_engine::ensure_own_git_metadata(&toplevel).ok()?;
     let relative = std::fs::canonicalize(path)
         .ok()?
         .strip_prefix(&toplevel)
@@ -23636,7 +23757,7 @@ fn tool_schema_investigate() -> Value {
                 "query": { "type": "string", "description": "The topic/feature/subsystem to orient on (e.g. \"device pairing\", \"how indexing works\")." },
                 "scope": { "type": "string", "description": "Optional scope. \"project:<slug>\" and \"repo:<name>\" genuinely restrict results; \"vault\" and \"all\" are PASS-THROUGHS that restrict nothing (default: \"all\"). Read `scope_filtered` in the response to know whether a filter was actually applied — `scope` only echoes what you asked for. NOTE on vault notes: a repo has no note-to-repo association in the schema, so \"repo:<name>\" EXCLUDES vault notes/sections/tags from the map entirely (symbols are restricted to the named repo). \"project:<slug>\" is different: it genuinely admits the project's own member notes (seeded from its vault_folder) alongside its member symbols." },
                 "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the map (chars/4). Hard-capped at 16000." },
-                "root": { "type": "string", "description": "Filesystem root for reading inline source bodies. Defaults to the server's working directory." },
+                "root": { "type": "string", "description": "Filesystem root for reading inline source bodies. When omitted, uses each symbol's owning repository local_root; missing roots leave bodies unavailable." },
                 "no_embed": {
                     "type": "boolean",
                     "default": false,
@@ -23729,7 +23850,10 @@ pub fn investigate_body_root(
     args: &Value,
 ) -> Result<(std::path::PathBuf, Option<String>), anyhow::Error> {
     let Some(root) = args.get("root").and_then(Value::as_str) else {
-        return Ok((std::env::current_dir().unwrap_or_default(), None));
+        return Ok((
+            std::path::PathBuf::from(nestweaver_engine::query::OWNING_REPO_SOURCE_ROOT),
+            None,
+        ));
     };
     Ok(investigate_root_or_none(store, Path::new(root)))
 }
@@ -23785,7 +23909,7 @@ fn tool_schema_investigate_expand() -> Value {
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
                 "targets": { "type": "array", "maxItems": MAX_EXPAND_TARGETS, "items": { "type": "string" }, "description": "asset_ids (from the investigate map) or raw node uids to expand. At most 256 entries." },
-                "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); falls back to the server working directory if that path is missing." }
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); reports the body unavailable if that path is missing." }
             },
             "required": ["bundle_id", "targets"]
         }
@@ -23826,7 +23950,7 @@ fn tool_schema_investigate_hydrate() -> Value {
             "properties": {
                 "bundle_id": { "type": "string", "description": "The bundle_id returned by a prior `investigate` call." },
                 "token_budget": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 4000, "description": "Approximate token cap for the hydrated bodies (chars/4). Hard-capped at 16000." },
-                "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); falls back to the server working directory if that path is missing." }
+                "root": { "type": "string", "description": "Filesystem root for reading source bodies. When omitted, each symbol is read from its owning repo's local_root in the graph (like read_symbols); reports the body unavailable if that path is missing." }
             },
             "required": ["bundle_id"]
         }
@@ -37956,6 +38080,20 @@ mod ambiguous_name_contract_tests {
             "{error:#}"
         );
 
+        // A planted gitfile is not a linked worktree, even though Git says
+        // its common directory is the indexed repository's .git directory.
+        std::fs::write(
+            outside.path().join(".git"),
+            format!("gitdir: {}\n", repo.join(".git").display()),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(
+                read(outside.path()).is_err(),
+                "forged source bytes must never be admitted or cached"
+            );
+        }
+
         // A linked worktree of the indexed repository is still accepted.
         let worktree = dir.path().join("linked");
         git(
@@ -38856,5 +38994,111 @@ mod daemon_supervision_tests {
         }
         #[cfg(not(target_os = "macos"))]
         assert_eq!(hidden.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod compatibility_regressions {
+    use super::*;
+
+    fn repo(uid: &str) -> nestweaver_schema::Repo {
+        nestweaver_schema::Repo {
+            uid: uid.into(),
+            url: format!("https://example.com/{uid}"),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: "default".into(),
+            name: Some(uid.into()),
+            root_path: None,
+        }
+    }
+
+    #[test]
+    fn compatibility_discloses_missing_corrupt_future_generations_separately_from_git_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store.insert_repo(&repo("repo:visible")).unwrap();
+        let path = nestweaver_engine::sidecar_path(
+            &db,
+            nestweaver_engine::resolver_generation::RESOLVER_GENERATION_SIDECAR,
+        );
+        for bytes in [
+            None,
+            Some("not JSON".to_string()),
+            Some(json!({"repos":{"repo:visible":u32::MAX}}).to_string()),
+        ] {
+            if let Some(bytes) = bytes {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let value = index_compatibility_json(&store, None).unwrap();
+            assert_eq!(
+                value["resolver_incompatible_repos"],
+                json!(["repo:visible"])
+            );
+            assert_eq!(value["incomplete_repos"], json!([]));
+            assert!(
+                value.get("stale_repos").is_none(),
+                "federation/Git freshness has a separate meaning"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_publication_refuses_edge_claims_and_scopes_disclosure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store.insert_repo(&repo("repo:visible")).unwrap();
+        store.insert_repo(&repo("repo:hidden")).unwrap();
+        store
+            .set_repo_publication_incomplete("repo:hidden", "interrupted source publication")
+            .unwrap();
+        let value = dispatch(&store, None, "flow_trace", json!({}), None).unwrap();
+        assert_eq!(value["refused"], true);
+        assert_eq!(value["reason"], "repo_index_incomplete");
+        for tool in [
+            "brain_impact",
+            "flow_trace",
+            "dead_code",
+            "blast_radius",
+            "affected_tests",
+        ] {
+            let args = json!({"repo":"repo:visible", "repos":["repo:visible"], "symbol":"complete-seed", "changed_files":["main.js"]});
+            assert!(
+                index_incomplete_refusal_for_args(&store, tool, &args, None)
+                    .unwrap()
+                    .is_some(),
+                "{tool}: a complete selected seed does not bound a global traversal"
+            );
+            let response = dispatch(&store, None, tool, args, None).unwrap();
+            assert_eq!(
+                response["reason"], "repo_index_incomplete",
+                "{tool}: {response}"
+            );
+        }
+        let visible = nestweaver_engine::authz::VisibleRepos::Only(
+            ["repo:visible".to_string()].into_iter().collect(),
+        );
+        assert!(
+            index_incomplete_refusal_for_args(
+                &store,
+                "brain_impact",
+                &json!({"repo":"repo:visible"}),
+                Some(&visible)
+            )
+            .unwrap()
+            .is_none()
+        );
+        let scoped = index_compatibility_json(&store, Some(&visible)).unwrap();
+        assert_eq!(scoped["incomplete_repos"], json!([]));
+        assert!(!scoped.to_string().contains("repo:hidden"));
+        store
+            .clear_repo_publication_incomplete("repo:hidden")
+            .unwrap();
+        assert_eq!(
+            index_compatibility_json(&store, None).unwrap()["incomplete_repos"],
+            json!([])
+        );
     }
 }

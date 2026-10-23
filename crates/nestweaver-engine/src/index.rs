@@ -10,7 +10,7 @@ use nestweaver_parser::{
     parse_source,
 };
 use nestweaver_resolver::{
-    discover_workspace_context_with, resolve_references_with_file_languages,
+    discover_workspace_context_with_files, resolve_references_with_file_languages,
 };
 use nestweaver_schema::{
     File, Language, Repo, Service, Symbol, canonical_symbol_id, file_uid, repo_uid, service_uid,
@@ -3492,6 +3492,9 @@ fn index_directory_with_store_inner(
     let force = opts.force;
     let name = opts.name.as_deref();
     let limits = opts.limits;
+    let r_uid = repo_uid(instance_id, repo_url);
+    crate::bare_clone::ensure_repo_root_matches_identity(store, &r_uid, repo_path)?;
+    crate::manifest::prepare_recreated_store_sidecars(store, db_path, instance_id)?;
     // A leftover `brain watcher batch` marker must not keep the Q7 ranking
     // exception for the whole parse of a full `index` (hours, live). Rewrite
     // it as an ordinary dirty publication as soon as this run owns the work.
@@ -3499,7 +3502,6 @@ fn index_directory_with_store_inner(
     reclassify_leftover_watcher_batch_marker(db_path);
     let filemeta_path = crate::sidecar_path(db_path, ".filemeta.json");
     crate::migrate_sidecar(db_path, "filemeta.json", ".filemeta.json");
-    let r_uid = repo_uid(instance_id, repo_url);
     // D2: the data instance id is recorded INSIDE the write gate (nw-246/
     // nw-277, `index_into_store_with_write_gate`). A second, ungated call here
     // opened a write transaction before scan and could take the single write
@@ -4779,18 +4781,7 @@ fn prepare_index_resolution(
     resolve_pb.set_message("Resolving cross-file references...");
     resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let workspace_ctx = if file_languages
-        .values()
-        .any(|language| language_uses_workspace_context(*language))
-    {
-        discover_workspace_context_with(|rel_path| {
-            reader
-                .read_file(rel_path)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        })
-    } else {
-        Default::default()
-    };
+    let workspace_ctx = workspace_context_for_languages(reader, file_languages.values().copied())?;
 
     // A deletion changes its dependents' export view just as an edit does, so
     // it seeds the dependency expansion too (it is then dropped from the
@@ -4828,7 +4819,10 @@ fn prepare_index_resolution(
         // filter member, and naming the importer earlier drops edges this
         // pass cannot rebuild.
         let mut seeded =
-            unresolved_importers_of_added_files(reader, deps, r_uid, added_files, file_languages);
+            unresolved_importers_of_added_files(reader, deps, r_uid, added_files, file_languages)?;
+        // A restored barrel regains its own export and changes every importer
+        // above it. Expand before selecting parses and deleting outgoing edges.
+        affected.extend(deps.affected_files_for_repo(r_uid, &seeded));
         // Dependents reached through dependency rows obey the same rule: an
         // unchanged one with a cold parsed cache is not in the resolver view,
         // and naming it in the filter would delete edges nothing rebuilds.
@@ -5109,6 +5103,9 @@ where
     // scan/parse/collection so worker threads can fan out expensive parsing and
     // only serialize LadybugDB writes.
     let r_uid = repo_uid(instance_id, repo_url);
+    if let Some(root) = root_path {
+        crate::bare_clone::ensure_repo_root_matches_identity(store, &r_uid, Path::new(root))?;
+    }
 
     // Re-identify detection MUST happen before the scan/parse phases: the
     // filemeta sidecar was recorded when this working tree's graph rows
@@ -5750,6 +5747,9 @@ where
     let _write_reservation = cpu_throttle.reserve_write_headroom(cancel.map(|c| c.as_ref()));
 
     let mut write_guard = Some(acquire_write_guard()?);
+    if let Some(root) = root_path {
+        crate::bare_clone::ensure_repo_root_matches_identity(store, &r_uid, Path::new(root))?;
+    }
 
     // nw-246/nw-277: minted INSIDE the write guard, not ~600 lines earlier.
     //
@@ -5830,6 +5830,9 @@ where
         },
     )?;
     let _write_guard = write_guard;
+    if let Some(root) = root_path {
+        crate::bare_clone::ensure_repo_root_matches_identity(store, &r_uid, Path::new(root))?;
+    }
     let graph_mutation_attempted = std::cell::Cell::new(false);
     let graph_result = (|| -> Result<IndexResult, anyhow::Error> {
         // The filesystem walk cannot enumerate a tracked source deleted from a
@@ -7876,6 +7879,7 @@ fn incremental_index_with_name_and_io_and_authority(
     let store = open_store_for_writing_with_authority(db_path, authority)?;
 
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
+    crate::bare_clone::ensure_repo_root_matches_identity(&store, &r_uid, repo_path)?;
 
     // 1. Look up existing Repo.
     let existing_repo = store
@@ -8154,7 +8158,7 @@ fn incremental_index_with_name_and_io_and_authority(
         &changed_files,
         &removed_files,
         &mut rdeps,
-    );
+    )?;
     let publication = establish_index_publication_marker_with_io(
         &store,
         Some(db_path),
@@ -8185,7 +8189,7 @@ fn incremental_index_with_name_and_io_and_authority(
             &changed_files,
             &removed_files,
             &mut rdeps,
-        );
+        )?;
         let prepared_files = prepare_incremental_files(&reader, &changes)
             .context("rebuild incremental source files after publication lease")?;
         let contract_plan = match prepare_incremental_contract_derivation(
@@ -8475,7 +8479,7 @@ fn incremental_index_with_name_and_io_and_authority(
         &changed_files,
         &removed_files,
         &rdeps,
-    );
+    )?;
 
     // AFTER the commit, never before: a modified file has its symbols deleted
     // and re-inserted under the same UIDs, so the pre-commit graph would report
@@ -8519,6 +8523,7 @@ where
     F: FnMut() -> Result<G, anyhow::Error>,
 {
     let r_uid = nestweaver_schema::repo_uid(instance_id, repo_url);
+    crate::bare_clone::ensure_repo_root_matches_identity(store, &r_uid, git_repo_path)?;
     let old_sha = store
         .lookup_repo(&r_uid)
         .with_context(|| "lookup_repo failed")?
@@ -8676,7 +8681,7 @@ where
         &changed_files,
         &removed_files,
         &mut rdeps,
-    );
+    )?;
     let contract_plan_result = prepare_incremental_contract_derivation(
         reader,
         &r_uid,
@@ -8734,7 +8739,7 @@ where
                 &changed_files,
                 &removed_files,
                 &mut rdeps,
-            );
+            )?;
             prepared_files = prepare_incremental_files(reader, &changes)
                 .context("rebuild server incremental source files after publication yield")?;
             contract_plan = match prepare_incremental_contract_derivation(
@@ -8761,6 +8766,7 @@ where
         },
     )?;
     let _write_guard = write_guard;
+    crate::bare_clone::ensure_repo_root_matches_identity(store, &r_uid, git_repo_path)?;
     let txn = store
         .begin_transaction()
         .with_context(|| "begin incremental transaction")?;
@@ -9010,7 +9016,7 @@ where
             &changed_files,
             &removed_files,
             &rdeps,
-        );
+        )?;
     }
 
     // See the note at the sibling call site: this must follow the commit.
@@ -9466,7 +9472,7 @@ fn write_prepared_incremental_file_txn(
     conn: &nestweaver_store::DbConnection<'_>,
 ) -> Result<IncrementalFileOutcome, anyhow::Error> {
     use nestweaver_parser::{RawReference, RawSymbol};
-    use nestweaver_resolver::{discover_workspace_context_with, resolve_references_with_context};
+    use nestweaver_resolver::resolve_references_with_context;
     use nestweaver_schema::{File, Symbol, canonical_symbol_id, file_uid, symbol_uid};
 
     let abs_path = &prepared.abs_path;
@@ -9536,15 +9542,7 @@ fn write_prepared_incremental_file_txn(
     let lang = nestweaver_parser::detect_language(abs_path)
         .unwrap_or(nestweaver_schema::Language::JavaScript);
 
-    let workspace_ctx = if language_uses_workspace_context(lang) {
-        discover_workspace_context_with(|p| {
-            reader
-                .read_file(p)
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        })
-    } else {
-        Default::default()
-    };
+    let workspace_ctx = workspace_context_for_languages(reader, [lang])?;
 
     let file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = vec![(
         rel_str.clone(),
@@ -9653,12 +9651,12 @@ pub(crate) fn extend_rdeps_for_added_files(
     changed: &HashSet<String>,
     removed: &HashSet<String>,
     rdeps: &mut HashSet<String>,
-) {
+) -> anyhow::Result<()> {
     let Some(db_path) = db_path else {
-        return;
+        return Ok(());
     };
     if changed.is_empty() && removed.is_empty() {
-        return;
+        return Ok(());
     }
     let deps = crate::resolution_cache::ResolutionDeps::load(&crate::sidecar_path(
         db_path,
@@ -9666,7 +9664,7 @@ pub(crate) fn extend_rdeps_for_added_files(
     ));
     let Ok(listed) = store.list_files_by_repo(r_uid) else {
         tracing::warn!("listing files for unresolved-import re-resolution failed");
-        return;
+        return Ok(());
     };
     let existing: HashSet<String> = listed.into_iter().map(|(_, path)| path).collect();
 
@@ -9700,13 +9698,13 @@ pub(crate) fn extend_rdeps_for_added_files(
     // Added paths are a subset of `changed`. A delete-only batch has nothing
     // for an unresolved specifier to start naming.
     if changed.is_empty() {
-        return;
+        return Ok(());
     }
     let Some(unresolved) = deps.unresolved_for_repo(r_uid) else {
-        return;
+        return Ok(());
     };
     if unresolved.is_empty() {
-        return;
+        return Ok(());
     }
     let added: HashSet<String> = changed
         .iter()
@@ -9714,22 +9712,23 @@ pub(crate) fn extend_rdeps_for_added_files(
         .cloned()
         .collect();
     if added.is_empty() {
-        return;
+        return Ok(());
     }
     let mut known = existing;
     for path in removed {
         known.remove(path);
     }
     known.extend(changed.iter().cloned());
-    let seeded = importers_of_added_paths(reader, unresolved, &added, &known);
+    let seeded = importers_of_added_paths(reader, unresolved, &added, &known)?;
     if seeded.is_empty() {
-        return;
+        return Ok(());
     }
     tracing::info!(
         count = seeded.len(),
         "re-resolving files whose unresolved imports name an added file"
     );
     rdeps.extend(seeded);
+    Ok(())
 }
 
 /// After a committed incremental or watcher batch, refresh unresolved import
@@ -9745,14 +9744,14 @@ pub(crate) fn persist_unresolved_imports(
     changed: &HashSet<String>,
     removed: &HashSet<String>,
     rdeps: &HashSet<String>,
-) {
+) -> anyhow::Result<()> {
     let mut refresh = rdeps.clone();
     refresh.extend(changed.iter().cloned());
     for path in removed {
         refresh.remove(path);
     }
     if refresh.is_empty() && removed.is_empty() {
-        return;
+        return Ok(());
     }
     let path = crate::sidecar_path(db_path, ".resolution_deps.bin");
     let mut deps = crate::resolution_cache::ResolutionDeps::load(&path);
@@ -9763,7 +9762,7 @@ pub(crate) fn persist_unresolved_imports(
         match store.list_files_by_repo(r_uid) {
             Ok(listed) => {
                 let known: HashSet<String> = listed.into_iter().map(|(_, file)| file).collect();
-                let survey = import_survey_on_disk(reader, &known, &refresh);
+                let survey = import_survey_on_disk(reader, &known, &refresh)?;
                 for (file, specifiers) in survey.unresolved {
                     deps.set_unresolved_for_repo(r_uid, file, specifiers);
                 }
@@ -9783,6 +9782,7 @@ pub(crate) fn persist_unresolved_imports(
     if let Err(error) = deps.save(&path) {
         tracing::warn!("failed to save unresolved import specifiers: {error:#}");
     }
+    Ok(())
 }
 
 pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
@@ -9804,15 +9804,29 @@ pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
 fn workspace_context_for_languages(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
-) -> nestweaver_resolver::WorkspaceContext {
-    if languages.into_iter().any(language_uses_workspace_context) {
-        discover_workspace_context_with(|path| {
+) -> anyhow::Result<nestweaver_resolver::WorkspaceContext> {
+    let languages: Vec<_> = languages.into_iter().collect();
+    if languages
+        .iter()
+        .copied()
+        .any(language_uses_workspace_context)
+    {
+        // Only Go module discovery needs repository inventory. Other workspace
+        // languages keep their read-only manifest callback and hot-path cost.
+        let files = if languages.contains(&Language::Go) {
+            reader
+                .list_files()
+                .context("enumerate required Go workspace manifests")?
+        } else {
+            Vec::new()
+        };
+        Ok(discover_workspace_context_with_files(&files, |path| {
             reader
                 .read_file(path)
                 .map_err(|error| std::io::Error::other(error.to_string()))
-        })
+        }))
     } else {
-        nestweaver_resolver::WorkspaceContext::default()
+        Ok(nestweaver_resolver::WorkspaceContext::default())
     }
 }
 
@@ -9827,15 +9841,15 @@ fn unresolved_importers_of_added_files(
     r_uid: &str,
     added: &HashSet<String>,
     file_languages: &HashMap<String, Language>,
-) -> HashSet<String> {
+) -> anyhow::Result<HashSet<String>> {
     if added.is_empty() {
-        return HashSet::new();
+        return Ok(HashSet::new());
     }
     let Some(unresolved) = deps
         .unresolved_for_repo(r_uid)
         .filter(|slice| !slice.is_empty())
     else {
-        return HashSet::new();
+        return Ok(HashSet::new());
     };
     let known: HashSet<String> = file_languages.keys().cloned().collect();
     importers_of_added_paths(reader, unresolved, added, &known)
@@ -9972,7 +9986,7 @@ fn importers_of_added_paths(
     unresolved: &HashMap<String, HashSet<String>>,
     added: &HashSet<String>,
     known_files: &HashSet<String>,
-) -> HashSet<String> {
+) -> anyhow::Result<HashSet<String>> {
     let mut by_lang: HashMap<Language, Vec<String>> = HashMap::new();
     for file in unresolved.keys() {
         let Some(language) = detect_language(Path::new(file)) else {
@@ -9980,7 +9994,7 @@ fn importers_of_added_paths(
         };
         by_lang.entry(language).or_default().push(file.clone());
     }
-    let workspace = workspace_context_for_languages(reader, by_lang.keys().copied());
+    let workspace = workspace_context_for_languages(reader, by_lang.keys().copied())?;
     let known: HashSet<&str> = known_files.iter().map(String::as_str).collect();
     let targets = nestweaver_resolver::imports::ImportTargets::new(&known);
     let mut seeded = HashSet::new();
@@ -10000,14 +10014,14 @@ fn importers_of_added_paths(
             }
         }
     }
-    seeded
+    Ok(seeded)
 }
 
 fn import_survey_on_disk(
     reader: &dyn crate::content_reader::ContentReader,
     known_files: &HashSet<String>,
     refresh: &HashSet<String>,
-) -> ImportSurvey {
+) -> anyhow::Result<ImportSurvey> {
     let mut languages = HashMap::new();
     let mut references = HashMap::new();
     let mut parsed = HashSet::new();
@@ -10025,8 +10039,14 @@ fn import_survey_on_disk(
         parsed.insert(rel.clone());
         references.insert(rel.clone(), parsed_file.references);
     }
-    let workspace = workspace_context_for_languages(reader, languages.values().copied());
-    survey_import_specifiers(&references, known_files, &languages, &workspace, &parsed)
+    let workspace = workspace_context_for_languages(reader, languages.values().copied())?;
+    Ok(survey_import_specifiers(
+        &references,
+        known_files,
+        &languages,
+        &workspace,
+        &parsed,
+    ))
 }
 
 /// Per importer: the specifiers that did not resolve, and the files the ones
@@ -10629,13 +10649,14 @@ pub(crate) fn prepare_watcher_batch_resolution(
         let changed_or_removed: HashSet<String> = changed.union(&removed_files).cloned().collect();
         let mut scope = resolution_deps.affected_files_for_repo(r_uid, &changed_or_removed);
         scope.extend(graph_dependents.iter().cloned());
-        scope.extend(unresolved_importers_of_added_files(
+        let recovered = unresolved_importers_of_added_files(
             reader,
             &resolution_deps,
             r_uid,
             &added_files,
             &file_languages,
-        ));
+        )?;
+        scope.extend(resolution_deps.affected_files_for_repo(r_uid, &recovered));
         Some(scope)
     } else {
         None
@@ -10895,7 +10916,7 @@ fn build_reresolve_edges_unlogged(
         }
     }
 
-    let workspace_ctx = workspace_context_for_languages(reader, file_languages.values().copied());
+    let workspace_ctx = workspace_context_for_languages(reader, file_languages.values().copied())?;
 
     // Unchanged JS/TS targets need their exact public keys, not just stored
     // symbol visibility. Hydrate direct targets of scoped files, then only
@@ -23965,6 +23986,316 @@ impl Counter {
     /// (`util/index.ts`: `export * from "./strings"`). Renaming the barrel's
     /// target and updating the barrel lost the hello -> greet edge on every
     /// later incremental index.
+    #[test]
+    fn go_inventory_failure_refuses_index_and_watcher_without_promoting_generation() {
+        struct FaultReader {
+            root: PathBuf,
+            successful_lists: usize,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::content_reader::ContentReader for FaultReader {
+            fn read_file(&self, path: &Path) -> anyhow::Result<String> {
+                Ok(fs::read_to_string(self.root.join(path))?)
+            }
+            fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    >= self.successful_lists
+                {
+                    anyhow::bail!("injected required manifest inventory failure");
+                }
+                Ok(vec![PathBuf::from("main.go")])
+            }
+            fn file_meta_nanos(&self, _: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+                Ok(None)
+            }
+            fn root(&self) -> &Path {
+                &self.root
+            }
+            fn version_id(&self) -> &str {
+                "inventory-fault"
+            }
+        }
+        for watcher in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().join("repo");
+            fs::create_dir(&repo).unwrap();
+            let source = "package app\nfunc Run() {}\n";
+            fs::write(repo.join("main.go"), source).unwrap();
+            let db = dir.path().join("graph.lbug");
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let url = "https://example.test/inventory-fault";
+            let uid = repo_uid("test", url);
+            let reader = FaultReader {
+                root: repo.clone(),
+                successful_lists: if watcher { 0 } else { 1 },
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            // Other languages must not require Go's inventory capability.
+            assert!(workspace_context_for_languages(&reader, [Language::JavaScript]).is_ok());
+            let required_fault = FaultReader {
+                root: repo.clone(),
+                successful_lists: 0,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let required_error =
+                workspace_context_for_languages(&required_fault, [Language::Go]).unwrap_err();
+            assert!(
+                format!("{required_error:#}").contains("enumerate required Go workspace manifests")
+            );
+            let error = if watcher {
+                let parsed = parse_source(&repo.join("main.go"), source).unwrap();
+                let cache = crate::parsed_cache::ParsedCache::load(&crate::sidecar_path(
+                    &db,
+                    ".parsed_cache.bin",
+                ));
+                prepare_watcher_batch_resolution(
+                    &reader,
+                    &store,
+                    &db,
+                    &uid,
+                    WatcherBatchResolutionInputs {
+                        changed: &HashSet::from(["main.go".into()]),
+                        removed: &HashSet::new(),
+                        graph_dependents: &HashSet::new(),
+                        parses: vec![WatcherBatchParse {
+                            rel_path: "main.go".into(),
+                            symbols: parsed.symbols,
+                            references: parsed.references,
+                            type_bindings: parsed.type_bindings,
+                            source: source.into(),
+                        }],
+                        parsed_cache: &cache,
+                    },
+                )
+                .err()
+                .expect("watcher must refuse incomplete Go inventory")
+            } else {
+                index_with_reader(&reader, &store, "test", url, "s0", None)
+                    .err()
+                    .expect("index must refuse incomplete Go inventory")
+            };
+            assert!(
+                format!("{error:#}").contains("injected required manifest inventory failure"),
+                "{error:#}"
+            );
+            assert_eq!(
+                crate::resolver_generation::load(&db).generation_for(&uid),
+                0
+            );
+            assert!(store.lookup_symbols_by_name("Run").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn go_pointer_receiver_edges_recover_affected_tests_without_unrelated_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("go.mod"), "module example.test/store\n").unwrap();
+        fs::write(
+            root.join("store.go"),
+            "package store\ntype Store struct{}\nfunc (s *Store) Get() int { return 1 }\n",
+        )
+        .unwrap();
+        fs::write(root.join("store_test.go"), "package store\nimport \"testing\"\nfunc TestGet(t *testing.T) { x := &Store{}; x.Get() }\nfunc TestUnrelated(t *testing.T) {}\n").unwrap();
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/affected-go";
+        index_directory(&root, &db, "test", url, "s0").unwrap();
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let result = crate::affected_tests::affected_tests_in_repo(
+            &store,
+            &repo_uid("test", url),
+            &["store.go".into()],
+        )
+        .unwrap();
+        let names: Vec<_> = result
+            .tier_1
+            .iter()
+            .chain(&result.tier_2)
+            .chain(&result.tier_3)
+            .flat_map(|file| file.tests.iter().map(String::as_str))
+            .collect();
+        assert!(names.contains(&"TestGet"), "{result:?}");
+        assert!(!names.contains(&"TestUnrelated"), "{result:?}");
+        let test = store.lookup_symbols_by_name("TestGet").unwrap()[0]
+            .uid
+            .clone();
+        let get = store.lookup_symbols_by_name("Get").unwrap()[0].uid.clone();
+        assert!(store.load_typed_edges().unwrap().iter().any(
+            |(source, target, kind, _, _)| source == &test && target == &get && kind == "CALLS"
+        ));
+    }
+
+    #[test]
+    fn bare_reader_discovers_nested_go_module_without_worktree_or_root_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("tools/worker/lib")).unwrap();
+        fs::write(
+            repo.join("tools/worker/go.mod"),
+            "module example.test/worker\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("tools/worker/lib/lib.go"),
+            "package lib\nfunc Hello() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("tools/worker/app.go"),
+            "package app\nimport \"example.test/worker/lib\"\nfunc Run() { lib.Hello() }\n",
+        )
+        .unwrap();
+        let git = commit_all_in(&repo, "nested module");
+        let sha = git(&["rev-parse", "HEAD"]);
+        let bare = dir.path().join("bare.git");
+        git(&["clone", "--bare", ".", bare.to_str().unwrap()]);
+        fs::remove_dir_all(&repo).unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        index_with_reader(
+            &crate::content_reader::GitBareReader::new(&bare, &sha),
+            &store,
+            "test",
+            "https://example.test/bare-nested",
+            &sha,
+            None,
+        )
+        .unwrap();
+        let run = store.lookup_symbols_by_name("Run").unwrap()[0].uid.clone();
+        let hello = store.lookup_symbols_by_name("Hello").unwrap()[0]
+            .uid
+            .clone();
+        assert!(store.load_typed_edges().unwrap().iter().any(
+            |(source, target, kind, _, _)| source == &run && target == &hello && kind == "CALLS"
+        ));
+    }
+
+    #[test]
+    fn full_index_discovers_nested_go_module_without_root_go_mod() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("graph.lbug");
+        fs::create_dir_all(repo.join("tools/worker/lib")).unwrap();
+        fs::write(
+            repo.join("tools/worker/go.mod"),
+            "module example.test/worker\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("tools/worker/lib/lib.go"),
+            "package lib\nfunc Hello() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("tools/worker/app.go"),
+            "package app\nimport \"example.test/worker/lib\"\nfunc Run() { lib.Hello() }\n",
+        )
+        .unwrap();
+        index_directory(&repo, &db, "test", "https://example.test/nested-mod", "s0").unwrap();
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let run = store.lookup_symbols_by_name("Run").unwrap()[0].uid.clone();
+        let hello = store.lookup_symbols_by_name("Hello").unwrap()[0]
+            .uid
+            .clone();
+        drop(store);
+        assert!(resolved_edge_set(&db).contains(&(run, hello, "CALLS".into())));
+    }
+
+    #[test]
+    fn full_index_recreated_barrel_target_recovers_untouched_transitive_callers() {
+        for cold_cache in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().join("repo");
+            let db = dir.path().join("graph.lbug");
+            fs::create_dir_all(repo.join("src/util")).unwrap();
+            fs::write(
+                repo.join("src/util/strings.ts"),
+                "export function greet(): string { return 'hi'; }\n",
+            )
+            .unwrap();
+            fs::write(
+                repo.join("src/util/index.ts"),
+                "export * from './strings';\n",
+            )
+            .unwrap();
+            fs::write(repo.join("src/main.ts"), "import { greet } from './util';\nexport function hello(): string { return greet(); }\n").unwrap();
+            fs::write(repo.join("src/other.ts"), "export function other() {}\n").unwrap();
+            let url = "https://example.test/barrel-recreated";
+            index_directory(&repo, &db, "test", url, "s0").unwrap();
+            fs::remove_file(repo.join("src/util/strings.ts")).unwrap();
+            index_directory(&repo, &db, "test", url, "s1").unwrap();
+            if cold_cache {
+                let _ = fs::remove_file(crate::sidecar_path(&db, ".parsed_cache.bin"));
+                let _ = fs::remove_file(crate::parsed_cache::log_path(&crate::sidecar_path(
+                    &db,
+                    ".parsed_cache.bin",
+                )));
+            }
+            fs::write(
+                repo.join("src/util/strings.ts"),
+                "export function greet(): string { return 'back'; }\n",
+            )
+            .unwrap();
+            let result = index_directory(&repo, &db, "test", url, "s2").unwrap();
+            assert!(
+                result.files_unchanged > 0,
+                "must exercise the incremental resolve filter"
+            );
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let hello = store.lookup_symbols_by_name("hello").unwrap()[0]
+                .uid
+                .clone();
+            let greet = store.lookup_symbols_by_name("greet").unwrap()[0]
+                .uid
+                .clone();
+            drop(store);
+            assert!(
+                resolved_edge_set(&db).contains(&(hello, greet, "CALLS".into())),
+                "untouched importer above restored barrel must recover; cold cache={cold_cache}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_index_refuses_independent_checkout_with_the_same_origin_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let db = dir.path().join("graph.lbug");
+        for (root, symbol) in [(&first, "first_only"), (&second, "second_only")] {
+            fs::create_dir_all(root).unwrap();
+            fs::write(
+                root.join("lib.js"),
+                format!("export function {symbol}() {{}}\n"),
+            )
+            .unwrap();
+            let git = commit_all_in(root, "initial");
+            git(&["remote", "add", "origin", "https://example.test/shared.git"]);
+        }
+        let url = "https://example.test/shared.git";
+        index_directory(&first, &db, "test", url, "s0").unwrap();
+        let before = resolved_edge_set(&db);
+        assert!(index_directory(&second, &db, "test", url, "s1").is_err());
+        assert_eq!(resolved_edge_set(&db), before);
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert_eq!(store.lookup_symbols_by_name("first_only").unwrap().len(), 1);
+        assert!(
+            store
+                .lookup_symbols_by_name("second_only")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .lookup_repo(&repo_uid("test", url))
+                .unwrap()
+                .unwrap()
+                .root_path
+                .as_deref(),
+            first.to_str()
+        );
+    }
+
     #[test]
     fn incremental_index_keeps_edges_through_a_barrel_whose_target_is_renamed() {
         let dir = tempfile::tempdir().unwrap();

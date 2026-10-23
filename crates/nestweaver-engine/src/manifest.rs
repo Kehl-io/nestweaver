@@ -3472,3 +3472,145 @@ mod release_manifest_tests {
         );
     }
 }
+
+/// Prepare derivable identity-bound sidecars before the first mutation of an
+/// empty, recreated store. Readers still refuse foreign artifacts. Mutation
+/// recovery preserves verified old bytes in quarantine and rebuilds coverage;
+/// it never re-stamps old coverage against the new physical graph.
+///
+/// The caller must hold the store's exclusive writer authority. A populated
+/// store, a corrupt artifact, and another logical instance are not reset here.
+pub fn prepare_recreated_store_sidecars(
+    store: &nestweaver_store::GraphStore,
+    db_path: &Path,
+    data_instance_id: &str,
+) -> Result<bool, anyhow::Error> {
+    use nestweaver_store::artifact_envelope::{ArtifactEnvelope, ArtifactExpectation};
+    if !store.list_repos(None)?.is_empty() || !store.list_vaults(None)?.is_empty() {
+        return Ok(false);
+    }
+    let identity = store.publication_identity()?;
+    let manifest_path = manifest_cache_path(db_path);
+    let foreign_manifest = match std::fs::read(&manifest_path) {
+        Ok(bytes) => {
+            let envelope: ArtifactEnvelope = serde_json::from_slice(&bytes)?;
+            let previous = nestweaver_store::PublicationIdentity {
+                brain_uuid: envelope.brain_uuid.clone(),
+                publication_uuid: envelope.publication_uuid.clone(),
+            };
+            let _: ManifestPayload = envelope.validate_and_decode(ArtifactExpectation {
+                artifact_kind: MANIFEST_ARTIFACT_KIND,
+                artifact_schema_version: MANIFEST_ARTIFACT_SCHEMA_VERSION,
+                identity: &previous,
+                producer_version: &envelope.producer_version,
+                source_graph_generation: envelope.source_graph_generation,
+                algorithm_fingerprint: MANIFEST_ALGORITHM_FINGERPRINT,
+            })?;
+            previous != identity
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let foreign_markdown = crate::markdown_derivation::is_previous_physical_store(
+        db_path,
+        &identity,
+        data_instance_id,
+    )?;
+    // Validate both first, so a logical mismatch cannot partially reset state.
+    let mut changed = false;
+    for (path, foreign) in [
+        (manifest_path, foreign_manifest),
+        (
+            crate::markdown_derivation::record_path(db_path),
+            foreign_markdown,
+        ),
+    ] {
+        if foreign {
+            let quarantine = PathBuf::from(format!(
+                "{}.previous-store-{}",
+                path.display(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::rename(&path, &quarantine)?;
+            nestweaver_store::durable_sidecar::sync_parent_directory_durable(&path)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+#[cfg(test)]
+mod recreated_store_regressions {
+    use super::*;
+
+    #[test]
+    fn recreated_store_quarantines_verified_physical_sidecars_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_db = dir.path().join("old.lbug");
+        let new_db = dir.path().join("new.lbug");
+        let old = nestweaver_store::GraphStore::create(&old_db).unwrap();
+        let new = nestweaver_store::GraphStore::create(&new_db).unwrap();
+        save_manifest_cache_for_db(&HashMap::new(), &old, &old_db).unwrap();
+        let old_identity = old.publication_identity().unwrap();
+        crate::markdown_derivation::save_records(
+            &old_db,
+            &Default::default(),
+            &crate::markdown_derivation::RecordExpectation {
+                identity: &old_identity,
+                data_instance_id: "same-logical-instance",
+            },
+        )
+        .unwrap();
+        std::fs::copy(manifest_cache_path(&old_db), manifest_cache_path(&new_db)).unwrap();
+        std::fs::copy(
+            crate::markdown_derivation::record_path(&old_db),
+            crate::markdown_derivation::record_path(&new_db),
+        )
+        .unwrap();
+        assert!(
+            load_manifest_snapshot_for_db(&new, &new_db).is_err(),
+            "readers do not bless foreign coverage"
+        );
+        assert!(prepare_recreated_store_sidecars(&new, &new_db, "same-logical-instance").unwrap());
+        assert!(!manifest_cache_path(&new_db).exists());
+        assert!(!crate::markdown_derivation::record_path(&new_db).exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("previous-store-"))
+                .count(),
+            2
+        );
+        assert!(!prepare_recreated_store_sidecars(&new, &new_db, "same-logical-instance").unwrap());
+        save_manifest_cache_for_db(&HashMap::new(), &new, &new_db).unwrap();
+        load_manifest_snapshot_for_db(&new, &new_db).unwrap();
+    }
+
+    #[test]
+    fn recreated_store_preserves_logical_mismatch_and_corrupt_incumbents() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        let foreign = nestweaver_store::PublicationIdentity::new_brain();
+        crate::markdown_derivation::save_records(
+            &db,
+            &Default::default(),
+            &crate::markdown_derivation::RecordExpectation {
+                identity: &foreign,
+                data_instance_id: "another-instance",
+            },
+        )
+        .unwrap();
+        let path = crate::markdown_derivation::record_path(&db);
+        let original = std::fs::read(&path).unwrap();
+        assert!(prepare_recreated_store_sidecars(&store, &db, "this-instance").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::write(&path, b"broken JSON").unwrap();
+        assert!(prepare_recreated_store_sidecars(&store, &db, "this-instance").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"broken JSON");
+    }
+}

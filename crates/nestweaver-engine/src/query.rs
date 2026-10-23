@@ -5214,6 +5214,10 @@ pub fn populate_inline_bodies_with_overrides(
 
 /// Resolve a node UID to its source body for inline embedding. Returns `None`
 /// for kinds without a meaningful body (Heading, Tag) or on lookup failure.
+/// Sentinel used by callers that omit a source root. An empty root remains
+/// a refused reader (for an explicitly rejected root).
+pub const OWNING_REPO_SOURCE_ROOT: &str = "nestweaver:owning-repository-root";
+
 fn fetch_node_body(
     store: &GraphStore,
     uid: &str,
@@ -5239,6 +5243,14 @@ fn fetch_node_body(
             );
             return res.symbols.into_iter().next().map(|w| w.body);
         }
+        let local_root;
+        let root = if root == std::path::Path::new(OWNING_REPO_SOURCE_ROOT) {
+            let symbol = store.lookup_symbol(uid).ok()?;
+            local_root = crate::read_symbols::repo_local_root(store, &symbol.repo_uid)?;
+            local_root.as_path()
+        } else {
+            root
+        };
         let reader = crate::content_reader::FilesystemReader::new(root);
         let res = crate::read_symbols::read_symbols(store, &[uid.to_string()], &reader, 0, None);
         return res.symbols.into_iter().next().map(|w| w.body);
@@ -6199,6 +6211,55 @@ mod inline_body_tests {
             relevance,
             inline_body: None,
             body_complete: true,
+        }
+    }
+
+    #[test]
+    fn omitted_inline_root_uses_each_symbols_repository_and_preserves_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let merged = GraphStore::in_memory().unwrap();
+        let mut uids = Vec::new();
+        for (name, canary) in [("one", "first-repo-canary"), ("two", "second-repo-canary")] {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("main.js"),
+                format!("function sharedName() {{ return '{canary}'; }}\n"),
+            )
+            .unwrap();
+            let (_, store) = crate::index::index_directory_in_memory(
+                &root,
+                name,
+                &format!("https://example.com/{name}"),
+                "sha",
+            )
+            .unwrap();
+            for repo in store.list_repos(None).unwrap() {
+                merged.insert_repo(&repo).unwrap();
+            }
+            for symbol in store.list_all_symbols().unwrap() {
+                if symbol.name == "sharedName" {
+                    uids.push((symbol.uid.clone(), canary));
+                }
+                merged.insert_symbol(&symbol).unwrap();
+            }
+        }
+        assert_eq!(uids.len(), 2);
+        for (uid, canary) in uids {
+            let body = super::fetch_node_body(
+                &merged,
+                &uid,
+                std::path::Path::new(super::OWNING_REPO_SOURCE_ROOT),
+                None,
+            )
+            .unwrap();
+            assert!(body.contains(canary));
+            let refused = super::fetch_node_body(&merged, &uid, std::path::Path::new(""), None)
+                .unwrap_or_default();
+            assert!(
+                refused.is_empty(),
+                "an explicit rejected root stays refused"
+            );
         }
     }
 

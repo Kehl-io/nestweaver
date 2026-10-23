@@ -1727,7 +1727,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     // within-tree lexical inventory; append order remains unchanged below.
     let share_locals = matches!(
         lang,
-        Language::Rust | Language::JavaScript | Language::TypeScript
+        Language::Rust | Language::JavaScript | Language::TypeScript | Language::Go
     );
     let mut local_bindings = Vec::new();
     if share_locals {
@@ -2344,7 +2344,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 references.push(RawReference {
                     scope: if matches!(
                         lang,
-                        Language::JavaScript | Language::TypeScript | Language::Rust
+                        Language::JavaScript | Language::TypeScript | Language::Rust | Language::Go
                     ) {
                         lexical_scope(node)
                     } else {
@@ -3401,13 +3401,29 @@ fn collect_local_bindings(
     TEST_LOCAL_BINDING_WALK_COUNT.with(|count| count.set(count.get() + 1));
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if is_local_binding_site(node.kind()) || is_js_clause_binding_site(node, lang) {
+        if is_local_binding_site(node.kind())
+            || is_js_clause_binding_site(node, lang)
+            || lang == Language::Go
+                && matches!(
+                    node.kind(),
+                    "short_var_declaration" | "var_spec" | "parameter_declaration"
+                )
+            || lang == Language::Go && go_range_declares_names(node)
+        {
             emit_binding_names(node, source_bytes, references, lang);
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push(child);
         }
+    }
+}
+
+/// `for x := range xs` declares loop locals; `for x = range xs` assigns.
+fn go_range_declares_names(node: tree_sitter::Node<'_>) -> bool {
+    node.kind() == "range_clause" && {
+        let mut cursor = node.walk();
+        node.children(&mut cursor).any(|child| child.kind() == ":=")
     }
 }
 
@@ -3460,6 +3476,8 @@ fn emit_binding_names(
     let root = match node.kind() {
         "let_declaration" | "for_expression" => node.child_by_field_name("pattern"),
         "variable_declarator" => node.child_by_field_name("name"),
+        "short_var_declaration" | "range_clause" => node.child_by_field_name("left"),
+        "var_spec" | "parameter_declaration" => node.child_by_field_name("name"),
         "catch_clause" => node.child_by_field_name("parameter"),
         "for_in_statement" => node.child_by_field_name("left"),
         "arrow_function" => node.child_by_field_name("parameter"),
@@ -3500,7 +3518,7 @@ fn emit_binding_names(
             references.push(RawReference {
                 scope: if matches!(
                     lang,
-                    Language::JavaScript | Language::TypeScript | Language::Rust
+                    Language::JavaScript | Language::TypeScript | Language::Rust | Language::Go
                 ) {
                     lexical_scope(current)
                 } else {
@@ -3658,7 +3676,14 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
     let mut hoisted_var = false;
     let mut initialized_at = node.start_byte();
     while let Some(parent) = current {
-        if matches!(parent.kind(), "variable_declarator" | "let_declaration") {
+        if matches!(
+            parent.kind(),
+            "variable_declarator"
+                | "let_declaration"
+                | "short_var_declaration"
+                | "var_spec"
+                | "range_clause"
+        ) {
             initialized_at = parent.end_byte();
         }
         if parent.kind() == "variable_declaration" || is_var_loop_variable(parent, node) {
@@ -3673,6 +3698,7 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
                 | "parameters"
                 | "parameter"
                 | "closure_parameters"
+                | "parameter_declaration"
         ) || is_bare_arrow_parameter(parent, node)
         {
             function_scoped = true;
@@ -3687,6 +3713,8 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
                 | "method_definition"
                 | "function_item"
                 | "closure_expression"
+                | "method_declaration"
+                | "func_literal"
         ) && function_scoped
         {
             return Some(LexicalScope {
@@ -4101,6 +4129,67 @@ fn rust_type_module_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<V
         ancestor = parent.parent();
     }
     None
+}
+
+/// Exact scalar Go call assignments; return types are attached only after
+/// the resolver selects the callee declaration, never by a file-global name.
+pub fn scoped_go_assignment_evidence(source: &str) -> ScopedRustEvidence {
+    let mut parser = tree_sitter::Parser::new();
+    let language = build_ts_language(Language::Go, Path::new("source.go"));
+    if parser.set_language(&language).is_err() {
+        return Default::default();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Default::default();
+    };
+    let mut result = ScopedRustEvidence::default();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "short_var_declaration"
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+            && left.named_child_count() == 1
+            && right.named_child_count() == 1
+            && let (Some(name), Some(call)) = (left.named_child(0), right.named_child(0))
+            && name.kind() == "identifier"
+            && call.kind() == "call_expression"
+            && let Some(function) = call.child_by_field_name("function")
+            && let Some(callee) = if function.kind() == "identifier" {
+                Some(function)
+            } else if function.kind() == "selector_expression" {
+                function.child_by_field_name("field")
+            } else {
+                None
+            }
+            && let (Ok(variable), Ok(callee), Some(scope)) = (
+                name.utf8_text(source.as_bytes()),
+                callee.utf8_text(source.as_bytes()),
+                lexical_scope(name),
+            )
+        {
+            result.call_assignments.push(ScopedCallAssignment {
+                variable: variable.into(),
+                scope,
+                line: name.start_position().row as u32 + 1,
+                callee: callee.into(),
+                receiver: function
+                    .child_by_field_name("operand")
+                    .and_then(|receiver| receiver.utf8_text(source.as_bytes()).ok())
+                    .map(str::to_string),
+                local_callee_line: None,
+                local_callee_exists: false,
+                import_positions: Vec::new(),
+                import_paths: Vec::new(),
+                call_position: call.start_byte(),
+                awaited: false,
+            });
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    result
 }
 
 pub fn scoped_rust_assignment_evidence(
@@ -4534,7 +4623,7 @@ fn extract_types_from_tree(
                 "var.name" => {
                     binding_scope = if matches!(
                         lang,
-                        Language::JavaScript | Language::TypeScript | Language::Rust
+                        Language::JavaScript | Language::TypeScript | Language::Rust | Language::Go
                     ) {
                         lexical_scope(capture.node)
                     } else {
@@ -4555,7 +4644,7 @@ fn extract_types_from_tree(
                 "ctor.name" => {
                     binding_scope = if matches!(
                         lang,
-                        Language::JavaScript | Language::TypeScript | Language::Rust
+                        Language::JavaScript | Language::TypeScript | Language::Rust | Language::Go
                     ) {
                         lexical_scope(capture.node)
                     } else {
@@ -4570,14 +4659,14 @@ fn extract_types_from_tree(
                     let base = text.rsplit("::").next().unwrap_or(text);
                     // Only accept PascalCase types — filters out module-scoped
                     // function calls like io::stdin() or env::var().
-                    if base.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    if lang == Language::Go || base.starts_with(|c: char| c.is_ascii_uppercase()) {
                         var_type = Some(base.to_string());
                     }
                 }
                 "return.name" => {
                     binding_scope = if matches!(
                         lang,
-                        Language::JavaScript | Language::TypeScript | Language::Rust
+                        Language::JavaScript | Language::TypeScript | Language::Rust | Language::Go
                     ) {
                         lexical_scope(capture.node)
                     } else {
@@ -4598,7 +4687,7 @@ fn extract_types_from_tree(
                 "param.name" => {
                     binding_scope = if matches!(
                         lang,
-                        Language::JavaScript | Language::TypeScript | Language::Rust
+                        Language::JavaScript | Language::TypeScript | Language::Rust | Language::Go
                     ) {
                         lexical_scope(capture.node)
                     } else {
@@ -12633,6 +12722,91 @@ fn main() {
             parsed.type_bindings
         );
         assert_eq!(binding.unwrap().type_name, "GraphStore");
+    }
+
+    #[test]
+    fn go_range_short_declarations_are_loop_scoped_and_assignments_are_not_declarations() {
+        let source = "package app\nfunc run(items []interface{}) {\n x := &Store{}\n for _, x := range items { x.Get() }\n for _, x = range items { x.Get() }\n x.Get()\n}\n";
+        let parsed = parse_source(Path::new("app.go"), source).unwrap();
+        let locals: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|reference| {
+                reference.kind == ReferenceKind::LocalBinding && reference.name == "x"
+            })
+            .collect();
+        assert_eq!(locals.len(), 2, "{locals:?}");
+        let outer = locals
+            .iter()
+            .find(|reference| reference.start_line == 3)
+            .unwrap()
+            .scope
+            .unwrap();
+        let range = locals
+            .iter()
+            .find(|reference| reference.start_line == 4)
+            .unwrap()
+            .scope
+            .unwrap();
+        assert!(outer.start < range.start && range.end < outer.end);
+        assert!(range.initialized_at > range.position);
+        let final_call = parsed
+            .references
+            .iter()
+            .find(|reference| {
+                reference.kind == ReferenceKind::Call
+                    && reference.name == "Get"
+                    && reference.start_line == 6
+            })
+            .unwrap()
+            .scope
+            .unwrap();
+        assert!(range.end <= final_call.position);
+    }
+
+    #[test]
+    fn go_pointer_literals_keep_qualified_types_and_block_scopes() {
+        let source = "package app\nfunc one() { x := &store.Store{}; x.Get() }\nfunc two() { x := &Store{}; x.Get() }\n";
+        let parsed = parse_source(Path::new("app.go"), source).unwrap();
+        let bindings: Vec<_> = parsed
+            .type_bindings
+            .iter()
+            .filter(|binding| binding.var_name == "x")
+            .collect();
+        assert_eq!(bindings.len(), 2, "{:?}", parsed.type_bindings);
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.type_name == "store.Store")
+        );
+        assert!(bindings.iter().any(|binding| binding.type_name == "Store"));
+        let first = bindings
+            .iter()
+            .find(|binding| binding.line == 2)
+            .unwrap()
+            .scope
+            .unwrap();
+        let second = bindings
+            .iter()
+            .find(|binding| binding.line == 3)
+            .unwrap()
+            .scope
+            .unwrap();
+        assert!(first.end <= second.start);
+        for binding in bindings {
+            let scope = binding.scope.unwrap();
+            assert!(
+                parsed
+                    .references
+                    .iter()
+                    .any(|reference| reference.kind == ReferenceKind::LocalBinding
+                        && reference.name == "x"
+                        && reference.scope == Some(scope))
+            );
+        }
+        let calls = scoped_go_assignment_evidence("package app\nfunc run() { x := store.New() }\n");
+        assert_eq!(calls.call_assignments.len(), 1);
+        assert_eq!(calls.call_assignments[0].receiver.as_deref(), Some("store"));
     }
 
     #[test]

@@ -257,6 +257,54 @@ impl CodeWatcher {
         Ok(reader)
     }
 
+    /// A watch-first graph can claim this resolver only after proving that
+    /// every eligible source in a complete inventory has its current hash.
+    /// This witness is used only by the initial publication, never hot edits.
+    fn record_initial_resolver_generation(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        repo_url: &str,
+    ) -> anyhow::Result<bool> {
+        let reader = self.reader_for(repo_url)?.strict_enumeration();
+        let files = reader.list_files()?;
+        let indexed: std::collections::HashMap<_, _> =
+            store.list_file_hashes_by_repo(r_uid)?.into_iter().collect();
+        let mut expected = HashSet::new();
+        for relative in files {
+            let absolute = self.repo_root.join(&relative);
+            if !is_supported_source(&absolute)
+                || source_policy_exclusion(&reader, &self.repo_root, &absolute)?.is_some()
+            {
+                continue;
+            }
+            let source = match reader.read_file(&relative) {
+                Ok(source) => source,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::content_reader::BinarySource>()
+                        .is_some()
+                        || error
+                            .downcast_ref::<crate::content_reader::SourceTooLarge>()
+                            .is_some() =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let path = relative.to_string_lossy().into_owned();
+            if indexed.get(&path) != Some(&crate::hash::blake3_hex(&source)) {
+                return Ok(false);
+            }
+            expected.insert(path);
+        }
+        if indexed.keys().any(|path| !expected.contains(path)) {
+            return Ok(false);
+        }
+        crate::resolver_generation::record_strict(&self.db_path, r_uid)?;
+        Ok(true)
+    }
+
     // Used only by `one_code_edit_settles_after_one_hot_batch`, which is
     // `#[cfg(target_os = "linux")]` because it depends on inotify coalescing
     // behaviour. macOS clippy therefore sees these as dead and, under
@@ -1545,6 +1593,7 @@ impl CodeWatcher {
         // No graph mutation, including a failure marker, occurs before the
         // complete plan above exists. Once publication starts, every failure
         // intentionally leaves the dirty marker for reopen reconciliation.
+        crate::bare_clone::ensure_repo_root_matches_identity(store, r_uid, &self.repo_root)?;
         let publication = self
             .establish_graph_publication_with_io(store, epilogue_io)
             .map_err(anyhow::Error::from)?;
@@ -1720,6 +1769,17 @@ impl CodeWatcher {
                 &crate::sidecar_path(&self.db_path, ".parsed_cache.bin"),
                 parses.iter().map(|(hash, entry)| (hash.as_str(), entry)),
             )?;
+            if insert_initial_repo {
+                match self.record_initial_resolver_generation(store, r_uid, repo_url) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(repo = %r_uid, "initial watcher graph has partial source coverage; resolver generation remains unrecorded")
+                    }
+                    Err(error) => {
+                        tracing::warn!(repo = %r_uid, %error, "cannot prove initial watcher resolver coverage")
+                    }
+                }
+            }
             Ok(())
         })();
         if let Err(reason) = evidence {
@@ -2724,6 +2784,7 @@ fn resolve_watch_identity(
         file_url.clone()
     };
     let r_uid = nestweaver_schema::repo_uid(instance_id, &repo_url);
+    crate::bare_clone::ensure_repo_root_matches_identity(store, &r_uid, repo_root)?;
     Ok((repo_url, r_uid))
 }
 
@@ -6456,6 +6517,149 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "helper" || s.name == "gamma"),
         );
+    }
+
+    #[test]
+    fn watcher_recreated_barrel_target_recovers_untouched_transitive_callers() {
+        for cold_cache in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(root.join("util")).unwrap();
+            let leaf = root.join("util/strings.ts");
+            let barrel = root.join("util/index.ts");
+            let main = root.join("main.ts");
+            std::fs::write(&leaf, "export function greet(): string { return 'hi'; }\n").unwrap();
+            std::fs::write(&barrel, "export * from './strings';\n").unwrap();
+            std::fs::write(&main, "import { greet } from './util';\nexport function hello(): string { return greet(); }\n").unwrap();
+            let db = dir.path().join("watch.lbug");
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let url = format!("file://{}", root.display());
+            let uid = nestweaver_schema::repo_uid("test", &url);
+            let watcher = CodeWatcher::new(&db, &root, "test");
+            watcher
+                .process_batch_with_io(
+                    &store,
+                    &uid,
+                    &url,
+                    &[leaf.clone(), barrel, main],
+                    &crate::index::FileSystemIndexEpilogueIo,
+                )
+                .unwrap();
+            std::fs::remove_file(&leaf).unwrap();
+            watcher
+                .process_batch_with_io(
+                    &store,
+                    &uid,
+                    &url,
+                    std::slice::from_ref(&leaf),
+                    &crate::index::FileSystemIndexEpilogueIo,
+                )
+                .unwrap();
+            if cold_cache {
+                let cache = crate::sidecar_path(&db, ".parsed_cache.bin");
+                let _ = std::fs::remove_file(&cache);
+                let _ = std::fs::remove_file(crate::parsed_cache::log_path(&cache));
+            }
+            std::fs::write(
+                &leaf,
+                "export function greet(): string { return 'back'; }\n",
+            )
+            .unwrap();
+            watcher
+                .process_batch_with_io(
+                    &store,
+                    &uid,
+                    &url,
+                    &[leaf],
+                    &crate::index::FileSystemIndexEpilogueIo,
+                )
+                .unwrap();
+            let hello = store.lookup_symbols_by_name("hello").unwrap()[0]
+                .uid
+                .clone();
+            let greet = store.lookup_symbols_by_name("greet").unwrap()[0]
+                .uid
+                .clone();
+            let edges = store.load_typed_edges().unwrap();
+            assert!(
+                edges
+                    .iter()
+                    .any(|(source, target, kind, _, _)| source == &hello
+                        && target == &greet
+                        && kind == "CALLS"),
+                "cold cache={cold_cache}: {edges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_first_records_generation_only_for_complete_initial_source_coverage() {
+        for partial in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(&root).unwrap();
+            let first = root.join("first.js");
+            let second = root.join("second.js");
+            std::fs::write(&first, "export function first() {}\n").unwrap();
+            std::fs::write(&second, "export function second() {}\n").unwrap();
+            let db = dir.path().join("watch.lbug");
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let url = format!("file://{}", root.display());
+            let uid = nestweaver_schema::repo_uid("test", &url);
+            let watcher = CodeWatcher::new(&db, &root, "test");
+            let paths = if partial {
+                vec![first.clone()]
+            } else {
+                vec![first.clone(), second]
+            };
+            let outcome = watcher
+                .process_batch_with_io(
+                    &store,
+                    &uid,
+                    &url,
+                    &paths,
+                    &crate::index::FileSystemIndexEpilogueIo,
+                )
+                .unwrap();
+            assert!(
+                matches!(outcome, WatchBatchOutcome::Published { .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                crate::resolver_generation::load(&db).generation_for(&uid),
+                if partial {
+                    0
+                } else {
+                    crate::resolver_generation::RESOLVER_GENERATION
+                }
+            );
+            let old = crate::resolver_generation::ResolverGenerations {
+                repos: std::collections::BTreeMap::from([(
+                    uid.clone(),
+                    crate::resolver_generation::RESOLVER_GENERATION - 1,
+                )]),
+            };
+            std::fs::write(
+                crate::sidecar_path(&db, crate::resolver_generation::RESOLVER_GENERATION_SIDECAR),
+                serde_json::to_vec(&old).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(&first, "export function first() { return 2; }\n").unwrap();
+            watcher
+                .process_batch_with_io(
+                    &store,
+                    &uid,
+                    &url,
+                    &[first],
+                    &crate::index::FileSystemIndexEpilogueIo,
+                )
+                .unwrap();
+            assert_eq!(
+                crate::resolver_generation::load(&db).generation_for(&uid),
+                crate::resolver_generation::RESOLVER_GENERATION - 1,
+                "ordinary edits must not claim a full generation upgrade"
+            );
+        }
     }
 
     #[test]

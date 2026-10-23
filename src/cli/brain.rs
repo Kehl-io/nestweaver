@@ -177,6 +177,14 @@ pub(crate) fn run_brain(
             // refused first add must not leave an empty database behind.
             nestweaver_engine::load_brain_ignore(&path, &extra_patterns)?;
             let write_lease = require_exclusive_store_access(&db_path, "add a vault")?;
+            {
+                let store = GraphStore::open_or_create_with_authority(&db_path, &write_lease)?;
+                nestweaver_engine::manifest::prepare_recreated_store_sidecars(
+                    &store,
+                    &db_path,
+                    instance_id,
+                )?;
+            }
             let result = index_markdown_directory_with_ignore_and_write_lease_and_note_limits(
                 &path,
                 &db_path,
@@ -375,6 +383,12 @@ pub(crate) fn run_brain(
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
                     println!("Brain status:");
+                    if let Some(compatibility) = value
+                        .get("index_compatibility")
+                        .or_else(|| value.pointer("/_meta/index_compatibility"))
+                    {
+                        print_index_compatibility(compatibility);
+                    }
                     println!("  Database:  {}", db_path.display());
                     let vault_count = value
                         .get("vault_count")
@@ -737,6 +751,8 @@ pub(crate) fn run_brain(
                 // stderr warnings block below serves text mode only.
                 nestweaver_mcp::tools::set_current_db_path(db_path.to_path_buf());
                 let mut value = nestweaver_mcp::tools::brain_status_json(&store, None)?;
+                value["index_compatibility"] =
+                    nestweaver_mcp::tools::index_compatibility_json(&store, None)?;
                 let cause = if use_daemon {
                     last_daemon_bypass_cause()
                         .unwrap_or_else(|| "the daemon did not serve this request".to_string())
@@ -749,6 +765,9 @@ pub(crate) fn run_brain(
                 return Ok((EXIT_SUCCESS, None));
             } else {
                 println!("Brain status:");
+                print_index_compatibility(&nestweaver_mcp::tools::index_compatibility_json(
+                    &store, None,
+                )?);
                 println!("  Database:  {}", db_path.display());
                 println!("  Vaults:    {}", vaults.len());
                 // When two rows share a name + root_path we surface
@@ -1790,6 +1809,14 @@ pub(crate) fn run_brain(
             // Both refresh arms below write the graph and rebuild Tantivy on
             // the direct path.
             let write_lease = require_exclusive_store_access(&db_path, "refresh a vault")?;
+            {
+                let store = GraphStore::open_or_create_with_authority(&db_path, &write_lease)?;
+                nestweaver_engine::manifest::prepare_recreated_store_sidecars(
+                    &store,
+                    &db_path,
+                    &instance_id,
+                )?;
+            }
             // (summary text, skip rows, frontmatter-unparsed rows), rendered by
             // `finish_vault_refresh` once the link and search rebuilds ran.
             let refresh_outcome: (String, Vec<RefreshSkipRow>, Vec<RefreshSkipRow>);
@@ -2939,7 +2966,7 @@ pub(crate) fn run_brain(
                     // caller opted in. Off by default → output unchanged.
                     if inline_bodies {
                         let root = root.clone().unwrap_or_else(|| {
-                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                            PathBuf::from(nestweaver_engine::query::OWNING_REPO_SOURCE_ROOT)
                         });
                         nestweaver_engine::populate_inline_bodies(
                             &store,
@@ -4030,4 +4057,25 @@ fn render_broken_links_payload(value: &serde_json::Value, offset: usize) -> anyh
         }
     }
     Ok(())
+}
+
+/// Separate compatibility causes from Git HEAD freshness in human status too.
+fn print_index_compatibility(value: &serde_json::Value) {
+    for (key, label) in [
+        (
+            "resolver_incompatible_repos",
+            "Resolver incompatible repositories",
+        ),
+        ("incomplete_repos", "Incomplete repository publications"),
+        ("vault_refresh_required", "Vaults requiring a full refresh"),
+    ] {
+        if let Some(rows) = value.get(key).and_then(serde_json::Value::as_array)
+            && !rows.is_empty()
+        {
+            println!("  {label}: {}", rows.len());
+            for row in rows {
+                println!("    {}", row);
+            }
+        }
+    }
 }

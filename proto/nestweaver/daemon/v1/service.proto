@@ -22,6 +22,10 @@ message HealthCheckResponse {
   bool embedding_identity_repair = 8;
   WatcherStatus watcher = 9;
   string supervision = 10;
+  // Absent on older daemons. An unhealthy backing file keeps this RPC
+  // responsive for diagnosis and shutdown; it must not trigger autostart.
+  optional bool backing_file_valid = 11;
+  string backing_file_error = 12;
 }
 
 message ShutdownRequest {}

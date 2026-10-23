@@ -75,7 +75,17 @@ pub(crate) fn run_backup(command: BackupCommands) -> anyhow::Result<i32> {
                             })
                             .await
                     })
-                    .map_err(|e| anyhow::anyhow!("Backup RPC failed: {e}"))?
+                    .map_err(|e| {
+                        if e.code() == tonic::Code::InvalidArgument
+                            && e.message().starts_with("backup_refused:")
+                        {
+                            anyhow::Error::new(nestweaver_engine::backup::BackupRefusal(
+                                e.message().to_string(),
+                            ))
+                        } else {
+                            anyhow::anyhow!("Backup RPC failed: {e}")
+                        }
+                    })?
                     .into_inner();
 
                 for warning in &resp.warnings {

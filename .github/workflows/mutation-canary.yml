@@ -4,13 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       expected_sha:
-        description: Current main full SHA with successful actual normal CI runtime jobs
+        description: Exact candidate SHA (runtime mode additionally requires current main CI)
         required: true
         type: string
       prerequisite_run_id:
         description: Newest same-SHA main push ci.yml run ID
-        required: true
+        required: false
         type: string
+      mode:
+        description: Runtime fixture or no-build synthetic production outcome policy
+        type: choice
+        default: runtime
+        options: [runtime, conclusion-only]
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ concurrency:
 
 jobs:
   canary-cases:
+    if: inputs.mode != 'conclusion-only'
     name: Canary cases (outer-budget negative MUST fail this job)
     runs-on: ubuntu-latest
     timeout-minutes: 8
@@ -55,7 +61,7 @@ jobs:
   canary-verdict:
     name: Canary verdict (green means the expected red job was proven)
     needs: canary-cases
-    if: always()
+    if: always() && inputs.mode != 'conclusion-only'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     env:
@@ -81,3 +87,93 @@ jobs:
             --run-id "$PREREQUISITE_RUN_ID" --previous "$RUNNER_TEMP/mutation-evidence/prerequisite.json" \
             --output "$RUNNER_TEMP/mutation-prerequisite-final.json"
           echo 'Synthetic mutation infrastructure accepted. The upstream negative job is intentionally red; product PR mutation coverage remains separate.' >> "$GITHUB_STEP_SUMMARY"
+
+  conclusion-negative:
+    if: inputs.mode == 'conclusion-only'
+    name: Synthetic ${{ matrix.case }} policy MUST fail
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [prewarm, malformed, outer]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Invoke shared production policy with synthetic evidence
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          CASE: ${{ matrix.case }}
+        run: python3 scripts/mutation-conclusion-canary.py --sha "$EXPECTED_SHA" --case "$CASE" --evidence "$RUNNER_TEMP/synthetic"
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: synthetic-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/synthetic/
+          if-no-files-found: error
+
+  conclusion-controls:
+    if: inputs.mode == 'conclusion-only'
+    name: Synthetic ${{ matrix.case }} control
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [zero, complete]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Invoke shared production policy with synthetic evidence
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          CASE: ${{ matrix.case }}
+        run: python3 scripts/mutation-conclusion-canary.py --sha "$EXPECTED_SHA" --case "$CASE" --evidence "$RUNNER_TEMP/synthetic"
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: synthetic-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/synthetic/
+          if-no-files-found: error
+
+  conclusion-verdict:
+    if: always() && inputs.mode == 'conclusion-only'
+    needs: [conclusion-negative, conclusion-controls]
+    name: Verify actual synthetic policy job conclusions
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: synthetic-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/synthetic-evidence/
+      - name: Verify artifact contracts bound to this source and production policy
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: python3 scripts/verify-mutation-conclusion.py --sha "$EXPECTED_SHA" --evidence "$RUNNER_TEMP/synthetic-evidence"
+      - name: Verify each actual hosted job via GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          NEGATIVE_RESULT: ${{ needs.conclusion-negative.result }}
+          CONTROL_RESULT: ${{ needs.conclusion-controls.result }}
+        run: |
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+          test "$NEGATIVE_RESULT" = failure
+          test "$CONTROL_RESULT" = success
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" > "$RUNNER_TEMP/jobs.json"
+          python3 - "$RUNNER_TEMP/jobs.json" <<'PYTHON'
+          import json, sys
+          jobs = json.load(open(sys.argv[1]))['jobs']
+          expected = {**{f'Synthetic {case} policy MUST fail': 'failure' for case in ('prewarm', 'malformed', 'outer')},
+                      **{f'Synthetic {case} control': 'success' for case in ('zero', 'complete')}}
+          for name, conclusion in expected.items():
+              matches = [job for job in jobs if job['name'] == name]
+              assert len(matches) == 1 and matches[0]['conclusion'] == conclusion, (name, matches)
+          PYTHON
+          echo 'Synthetic production outcome policy proven against actual hosted job conclusions. No product build or mutation coverage was performed.' >> "$GITHUB_STEP_SUMMARY"

@@ -358,6 +358,16 @@ pub fn build_symbol_index_with_config(
     let symbols = store
         .list_symbols_for_linking()
         .context("list_symbols_for_linking")?;
+    build_symbol_index_from_rows(store, config, &symbols)
+}
+
+pub(crate) type LinkSymbolRow = (String, String, String, String, String);
+
+pub(crate) fn build_symbol_index_from_rows(
+    store: &GraphStore,
+    config: &CrossDomainConfig,
+    symbols: &[LinkSymbolRow],
+) -> Result<SymbolIndex, anyhow::Error> {
     let (note_projects, project_repos) =
         store.project_link_scopes().context("project_link_scopes")?;
     // nw-670 re-review F1 / nw-678: a project's repos come from its durable
@@ -369,7 +379,7 @@ pub fn build_symbol_index_with_config(
         .db_path()
         .map(|db_path| unscoped_projects(db_path, &note_projects, &project_repos))
         .unwrap_or_default();
-    let mut index = SymbolIndex::build_with_config(&symbols, config)
+    let mut index = SymbolIndex::build_with_config(symbols, config)
         .with_project_scopes(&note_projects, &project_repos);
     index.unscoped_projects = unscoped_projects;
     Ok(index)
@@ -482,6 +492,48 @@ struct MentionedName {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NoteMentions {
     names: Vec<MentionedName>,
+}
+
+// The durable publication cache records lookup names even when no symbol
+// currently resolves them. A later definition must invalidate that note.
+impl NoteMentions {
+    pub(crate) fn to_cache(&self) -> serde_json::Value {
+        let flags = |f: MentionFlags| [f.span, f.code, f.call, f.prose];
+        serde_json::json!(
+            self.names
+                .iter()
+                .map(|n| (
+                    &n.name,
+                    flags(n.flags),
+                    n.lines
+                        .iter()
+                        .map(|(l, f)| (*l, flags(*f)))
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    pub(crate) fn from_cache(value: serde_json::Value) -> Option<Self> {
+        type Row = (String, [bool; 4], Vec<(u32, [bool; 4])>);
+        let flags = |f: [bool; 4]| MentionFlags {
+            span: f[0],
+            code: f[1],
+            call: f[2],
+            prose: f[3],
+        };
+        let rows: Vec<Row> = serde_json::from_value(value).ok()?;
+        Some(Self {
+            names: rows
+                .into_iter()
+                .map(|(name, f, lines)| MentionedName {
+                    name,
+                    flags: flags(f),
+                    lines: lines.into_iter().map(|(l, f)| (l, flags(f))).collect(),
+                })
+                .collect(),
+        })
+    }
 }
 
 /// Collect a note's mentions (see [`NoteMentions`]).
@@ -846,6 +898,70 @@ impl SymbolIndex {
             self.note_scope.insert(note.to_string(), id);
         }
         self
+    }
+
+    /// A complete lookup dependency witness, including absent lookups and
+    /// project scope. Order-independent so unrelated source changes do not
+    /// force a note through resolution again.
+    pub(crate) fn dependency_signature(&self, note_uid: &str, mentions: &NoteMentions) -> String {
+        let mut rows = Vec::new();
+        for mention in &mentions.names {
+            rows.push(format!("lookup:{}", mention.name));
+            if let Some(candidates) = self.by_name.get(&mention.name) {
+                rows.extend(
+                    candidates
+                        .iter()
+                        .filter(|c| {
+                            self.scope_of(note_uid)
+                                .is_none_or(|scope| scope.contains(&c.repo_uid))
+                        })
+                        .map(|c| {
+                            format!(
+                                "{}|{}|{:?}|{}|{}|{}|{}|{}",
+                                mention.name,
+                                c.uid,
+                                c.kind,
+                                c.repo_uid,
+                                c.file_path,
+                                c.in_test,
+                                c.definition,
+                                c.kind_base
+                            )
+                        }),
+                );
+            }
+        }
+        if let Some(scope) = self.scope_of(note_uid) {
+            rows.extend(scope.iter().map(|repo| format!("scope:{repo}")));
+        } else {
+            rows.push("unscoped".to_string());
+        }
+        rows.sort();
+        crate::hash::blake3_hex(&serde_json::to_string(&rows).expect("string rows serialize"))
+    }
+
+    pub(crate) fn depends_on_checkpoints(
+        &self,
+        note_uid: &str,
+        mentions: &NoteMentions,
+        invalidated: &[String],
+    ) -> bool {
+        mentions
+            .names
+            .iter()
+            .filter_map(|m| self.by_name.get(&m.name))
+            .flatten()
+            .filter(|candidate| {
+                self.scope_of(note_uid)
+                    .is_none_or(|scope| scope.contains(&candidate.repo_uid))
+            })
+            .any(|candidate| {
+                let checkpoint = format!(
+                    "graph/repo/{}.done",
+                    crate::hash::blake3_hex(&candidate.repo_uid)
+                );
+                invalidated.contains(&checkpoint)
+            })
     }
 
     fn scope_of(&self, note_uid: &str) -> Option<&HashSet<Arc<str>>> {

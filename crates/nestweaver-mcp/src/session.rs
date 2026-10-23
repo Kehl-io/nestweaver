@@ -124,7 +124,8 @@ fn admit(value: Value, pending: &Pending) -> Option<Item> {
 /// Serve stdio with independent control-frame ingestion. The dispatch closure
 /// runs serially on THIS thread, and receives a flag for both active and queued
 /// cancellation. Pass it to direct cooperative reads or `await_cancellable` for
-/// read RPCs. Mutation RPCs must keep awaiting their retained daemon worker.
+/// RPCs. The daemon retains ownership of admitted mutation workers even when
+/// their client RPC is cancelled; queued RPCs release admission immediately.
 pub fn run_stdio(dispatch: impl FnMut(&Request, &CancelFlag) -> Value) -> anyhow::Result<()> {
     run_with_io(
         std::io::BufReader::new(std::io::stdin()),
@@ -406,9 +407,9 @@ where
     Ok(())
 }
 
-/// Drop a cancelled READ future so the remote handler observes disconnect and
-/// signals its cooperative worker. Do not use for mutation dispatch: dropping a
-/// future cannot abort spawn_blocking or undo an already committed write.
+/// Drop a cancelled RPC future so queued daemon admission is removed promptly.
+/// Admitted mutation workers retain their daemon-side ownership until they
+/// finish; cancellation does not undo committed work or abort a native writer.
 pub async fn await_cancellable<T>(
     cancel: Option<&CancelFlag>,
     future: impl std::future::Future<Output = anyhow::Result<T>>,
@@ -704,6 +705,61 @@ mod tests {
         assert!(
             dropped.load(Ordering::Acquire),
             "cancel only abandoned a handle, not its RPC future"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancelled_active_rpc_frees_same_session_for_followup_read() {
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (writer, output) = writer();
+        let (started_tx, started_rx) = mpsc::channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed_drop = dropped.clone();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            run_with_io(std::io::BufReader::new(server), writer, |req, cancel| {
+                if req.id == Some(json!("waiting-write")) {
+                    struct DropSignal(Arc<AtomicBool>);
+                    impl Drop for DropSignal {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::Release);
+                        }
+                    }
+                    let signal = DropSignal(dropped.clone());
+                    started_tx.send(()).unwrap();
+                    let result: anyhow::Result<()> =
+                        rt.block_on(await_cancellable(Some(cancel), async move {
+                            let _signal = signal;
+                            std::future::pending().await
+                        }));
+                    assert!(result.unwrap_err().to_string().contains("cancelled"));
+                }
+                json!({"jsonrpc":"2.0","id":req.id,"result":{}})
+            })
+            .unwrap();
+        });
+        writeln!(client, "{}", json!({"jsonrpc":"2.0","id":"waiting-write","method":"tools/call","params":{"name":"prune_stale"}})).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for value in [
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"waiting-write"}}),
+            json!({"jsonrpc":"2.0","id":"read","method":"tools/call","params":{"name":"brain_status"}}),
+            json!({"jsonrpc":"2.0","id":"ping","method":"ping"}),
+        ] {
+            writeln!(client, "{value}").unwrap();
+        }
+        let responses = [
+            output.recv_timeout(Duration::from_secs(2)).unwrap(),
+            output.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ];
+        assert!(responses.iter().any(|value| value["id"] == "read"));
+        assert!(responses.iter().any(|value| value["id"] == "ping"));
+        assert!(observed_drop.load(Ordering::Acquire));
+        drop(client);
+        thread.join().unwrap();
+        assert!(
+            output.try_recv().is_err(),
+            "cancelled RPC emitted a late response"
         );
     }
 }

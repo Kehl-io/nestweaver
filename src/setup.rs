@@ -164,25 +164,24 @@ fn project_paths(name: &str, base: &Path) -> Result<Vec<std::path::PathBuf>, any
     Ok(paths)
 }
 
-/// Refuse when a DIRECTORY on the way to `relative` (below `base`) is a
+/// Refuse when any component on the way to `relative` (below `base`) is a
 /// symbolic link that resolves outside the project.
 ///
 /// `create_dir_all` and the atomic write both follow directory links, so a
 /// cloned repository shipping `.continue -> ~/.config/<app>` (or `.kiro`,
 /// `.claude`, …) made `setup` — and the auto-setup `index` runs — create
 /// directories and write a registration outside the project. A link that
-/// stays inside the project is fine. The final FILE may still be a symlink:
-/// a dotfiles-managed `.mcp.json` is a documented workflow, resolved by
-/// `user_config`.
+/// stays inside the project is fine. Explicit global/user configuration writes
+/// retain their dotfiles support in `user_config`; project setup cannot infer
+/// consent to an external write from a link supplied by the repository.
 fn refuse_directory_escape(base: &Path, relative: &Path) -> Result<(), anyhow::Error> {
-    let Some(parent) = relative.parent() else {
-        return Ok(());
-    };
     let canonical_base = base
         .canonicalize()
         .with_context(|| format!("resolve project directory {}", base.display()))?;
     let mut current = base.to_path_buf();
-    for component in parent.components() {
+    // Include the final file: following an external dotfiles link is a write
+    // outside the project just as following a directory link is.
+    for component in relative.components() {
         current.push(component);
         let Ok(metadata) = std::fs::symlink_metadata(&current) else {
             // Absent: everything below it will be created inside `current`'s
@@ -3569,6 +3568,32 @@ mod integration_fix_tests {
         std::os::unix::fs::symlink(&inside, project.join(".kiro")).unwrap();
         configure_tool("kiro", &test_ctx(&db, &project), &mut Items::new()).unwrap();
         assert!(inside.join("settings/mcp.json").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn final_config_link_outside_project_is_refused_before_any_tool_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let external = tmp.path().join("global.json");
+        std::fs::write(&external, "{}").unwrap();
+        std::os::unix::fs::symlink(&external, project.join(".mcp.json")).unwrap();
+        let db = tmp.path().join("t.lbug");
+        let error =
+            configure_tool("claude", &test_ctx(&db, &project), &mut Items::new()).unwrap_err();
+        assert!(error.to_string().contains("outside the project"));
+        assert_eq!(std::fs::read_to_string(&external).unwrap(), "{}");
+        assert!(!project.join(".claude").exists());
+        std::fs::remove_file(project.join(".mcp.json")).unwrap();
+        std::fs::write(project.join("real.json"), "{}").unwrap();
+        std::os::unix::fs::symlink("real.json", project.join(".mcp.json")).unwrap();
+        configure_tool("claude", &test_ctx(&db, &project), &mut Items::new()).unwrap();
+        assert!(
+            std::fs::read_to_string(project.join("real.json"))
+                .unwrap()
+                .contains("nestweaver")
+        );
     }
 
     /// Only what older releases appended is removed; CRLF endings and an
