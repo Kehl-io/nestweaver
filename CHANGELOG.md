@@ -7,7 +7,6 @@
 
 * address PR 501 review findings ([9646249](https://github.com/Kehl-io/nestweaver/commit/964624909f0ef5de427f1563facab090d1b93db6))
 * **audit:** ignore zip extract advisories pinned by candle-core ([df31d1c](https://github.com/Kehl-io/nestweaver/commit/df31d1c3a5cfd7b951fa78aacf55119b141f581c))
-* **audit:** ignore zip extract advisories pinned by candle-core ([b5262fe](https://github.com/Kehl-io/nestweaver/commit/b5262fedcc6c9793c283c99de1693cb5d8b401fd))
 * block fsmonitor execution in base_ref diffs; fail closed on unreadable resolver generations ([b64f2e2](https://github.com/Kehl-io/nestweaver/commit/b64f2e2f2c30e473f0a6d1a28276fe6b0e08e9ee))
 * **cli:** accept project-context scope filters ([f70c640](https://github.com/Kehl-io/nestweaver/commit/f70c6408b7928be90c9deb7f1aa70ea783f0df8e))
 * **cli:** add count-patterns --max-millis and exit 75 on truncated counts ([b44b05f](https://github.com/Kehl-io/nestweaver/commit/b44b05faff10979ceb891ba67b00ce8dd970bafb))
@@ -33,7 +32,6 @@
 * **daemon:** record last_indexed_at after a vault index ([a5a6fd3](https://github.com/Kehl-io/nestweaver/commit/a5a6fd3f3a2f899d67fdc3e73243c1e9574526c0))
 * **daemon:** stop a vault watcher when its vault is removed ([f87029e](https://github.com/Kehl-io/nestweaver/commit/f87029ef27a418ce5cc0449d5d528db31a1e8b44))
 * **deps:** bump rustls-webpki and webpki roots for new advisories ([29c1a01](https://github.com/Kehl-io/nestweaver/commit/29c1a011c3956221252feaec7e02b07ced2d8f81))
-* **deps:** bump rustls-webpki and webpki roots for new advisories ([aadcf77](https://github.com/Kehl-io/nestweaver/commit/aadcf7728c85be9614b1b0547c62c2f72914ec8c))
 * **deps:** clear Security Audit on main ([646f3e4](https://github.com/Kehl-io/nestweaver/commit/646f3e43db8b7ad1dd6ef5ec9a2ef425730c0078))
 * **docs:** match publication rebuild's cancelled-operation contract ([77ad277](https://github.com/Kehl-io/nestweaver/commit/77ad277fd16b2a3cb36d509aa8b6ba426da62fc1))
 * **engine,mcp:** preserve source coverage and validate live Git diffs ([a0ae0ce](https://github.com/Kehl-io/nestweaver/commit/a0ae0ce06ad5c27e045c920889e387f6d955e0cb))
