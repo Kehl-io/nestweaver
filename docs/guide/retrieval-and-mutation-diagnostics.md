@@ -248,6 +248,14 @@ admitted, and startup reconciliation drops graphed files the walk now hides.
 that cannot publish a batch is reported by `brain status` instead of staying
 silent.
 
+A code watcher batch resolves the files it changed the same way a full index
+does: it builds the resolver's view of the whole repository from the parse
+cache, so re-exports (for example through a Python `__init__.py`) and
+type-aware member calls into unchanged files keep their edges, and it records
+the same dependency rows. A file the batch cannot re-parse keeps its existing
+edges. The daemon keeps one parse cache per database in memory and refreshes it
+each batch instead of reloading it from disk on every save.
+
 An incremental index that is killed part-way leaves a per-repo "publication
 incomplete" record: `stale-check` reports that repository as `incomplete` and
 the next index rebuilds it in full, so a partial graph never reads as current.

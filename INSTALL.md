@@ -197,15 +197,19 @@ resolver must be fully re-indexed before you trust its edges and rankings.
 ```sh
 nestweaver stale-check --db /path/to/nestweaver.lbug
 nestweaver index --repo /path/to/repo --db /path/to/nestweaver.lbug --force
+nestweaver brain refresh /path/to/vault --db /path/to/nestweaver.lbug
 ```
 
 `stale-check` reports `outdated_resolver` and exits 2 for a resolver mismatch.
-Upgrading from 12.2.x or earlier moves the generation from 11 to 12 (Go,
-Python and Kotlin/Java import resolution and method-call resolution changed),
-so every repository needs this forced re-index once.
+Upgrading to 12.2.2 from an earlier release moves the generation from 11 to
+12 (Go, Python and Kotlin/Java import resolution and method-call resolution
+changed), so every repository needs this forced re-index once.
 **`--force` is required** for each repository: an incremental index at git
 HEAD can report no changes and leave the old generation in place. Vaults are
-not repositories and carry no code resolver generation.
+not repositories and carry no code resolver generation, but 12.2.2 also needs
+one `brain refresh <vault>` per vault: frontmatter `[[wikilink]]`
+relationships and `[[Note#^id]]` block references resolve only after a vault
+is re-derived, which does not happen automatically.
 
 See the [README upgrade notes](README.md#upgrading--re-index-before-you-trust-a-ranking)
 for the resolver history, Markdown derivation changes, and script/HTTP-client

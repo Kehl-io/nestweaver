@@ -371,12 +371,15 @@ truncated; seed lists are deduplicated first.
 | changed-file lists (`changed_files` / `files`) and `read_symbols` targets | 1000 |
 | `count_patterns` `patterns` | 64 |
 | `brain_add_source` `name` | 255 characters, no control characters |
-| `set_extension` | `uid` 1 KiB and `key` 256 bytes, both without control characters; `value` 64 KiB of JSON; at most 256 properties per node, 100,000 annotated nodes and a 32 MiB sidecar. `last_indexed_at` is a reserved key |
+| `set_extension` | `uid` 1 KiB, not blank, without control characters or invisible Unicode format/bidi characters (ZWJ/ZWNJ are allowed); `key` 256 bytes without control characters; `value` at most 64 KiB of compact JSON and 64 levels deep; at most 256 properties per node, 100,000 annotated nodes and a 32 MiB sidecar (written as compact JSON; an older pretty-printed sidecar still loads). `last_indexed_at` is a reserved key |
 | One MCP stdio frame | 64 MiB |
 
 `count_patterns` also has a whole-call `max_millis` budget (default 10,000 ms,
 at most 600,000), shared by all patterns, and stops when the request is
-cancelled or the client disconnects. Error messages and gRPC status details
+cancelled or the client disconnects. A pattern cut by the budget is marked
+`truncated: true` and reports lower-bound counts. The CLI twin takes
+`count-patterns --max-millis` (same range) and exits **75** (`EX_TEMPFAIL`)
+when any count is incomplete. Error messages and gRPC status details
 that echo an input are bounded, so a long argument cannot overflow HTTP/2
 trailers.
 
@@ -1029,7 +1032,8 @@ immediately in normal operation.
 > rebuilt:
 > `stale-check` exits 2 and `dead-code` refuses until it matches. Re-index
 > every repo — `nestweaver index --repo <path> --force` — before trusting any
-> ranking on this server.
+> ranking on this server. After upgrading to 12.2.2, also run
+> `nestweaver brain refresh <vault>` once for each vault.
 >
 > **`stale-check` detects this as of 9.0.0.** A generation-stale repo reports
 > `status: "outdated_resolver"` with `resolver_stale: true` and

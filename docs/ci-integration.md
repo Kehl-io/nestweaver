@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0            # full history needed for diff
-      - uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.1
+      - uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.2
         with:
           server: ${{ secrets.NESTWEAVER_URL }}
           token: ${{ secrets.NESTWEAVER_TOKEN }}
@@ -35,7 +35,7 @@ That's it. The action diffs the PR against the base branch, sends the changed
 symbols to your NestWeaver server, and posts a comment with the results.
 
 **Pin the action to a release tag.** There is no moving major tag (`@v1`,
-`@v12`); reference an exact release such as `@v12.2.1` (or a commit SHA) and
+`@v12`); reference an exact release such as `@v12.2.2` (or a commit SHA) and
 bump it when you upgrade. The `version` input (default `latest`) separately
 selects which CLI release the action installs; set it to the same release to
 keep the action and the CLI in step.
@@ -96,7 +96,7 @@ pipeline availability to the NestWeaver server.
 
 GitHub Actions:
 ```yaml
-- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.1
+- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.2
   with:
     server: ${{ secrets.NESTWEAVER_URL }}
     token: ${{ secrets.NESTWEAVER_TOKEN }}
@@ -119,7 +119,7 @@ treat a missing report as a pipeline failure.
 
 GitHub Actions:
 ```yaml
-- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.1
+- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.2
   with:
     server: ${{ secrets.NESTWEAVER_URL }}
     token: ${{ secrets.NESTWEAVER_TOKEN }}
@@ -372,7 +372,10 @@ strict_block_on_high_risk = false # default — the risk score stays advisory
 **Locally**, the same output is one command away — `nestweaver hooks --install`
 adds an advisory pre-push check (`nestweaver hooks --help`; it runs
 `nestweaver pr-impact --base` against the merge-base), and `--sarif` can be opened
-in the VS Code *SARIF Viewer* extension for inline review before you push.
+in the VS Code *SARIF Viewer* extension for inline review before you push. Run
+from a subdirectory, `hooks --install` binds the database at the repository
+root unless you pass `--db`. `hooks --uninstall` removes only NestWeaver's own
+hook; when it is not installed, an older backup is left alone.
 
 ## Selecting tests with `affected-tests`
 
@@ -406,7 +409,9 @@ that repository only:
 
 `--json` names the repository it diffed, and each changed symbol carries its
 `repo_uid`. The Git calls that compute the diff run with the repository's own
-programs (fsmonitor, hooks, filter and diff drivers) disabled.
+programs (fsmonitor, hooks, filter and diff drivers) disabled, and pass
+`--ignore-submodules=dirty`, so a submodule's own filter programs never run
+either. A submodule whose recorded commit moved still shows as changed.
 
 ## Measuring your own miss rate
 
