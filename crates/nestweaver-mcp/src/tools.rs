@@ -4410,15 +4410,16 @@ pub fn dispatch_cancellable(
         wait_out_index_publication(store, cancel);
     }
 
-    let compatibility = index_compatibility_json(store, visible)?;
-    // Edge-completeness claims cannot be made from a repository whose index
-    // publication did not finish, even after its global marker was cleared.
+    let compatibility = IndexCompatibilityAdmission::read(store, visible)?;
+    // Admission and its disclosure consume the SAME visibility-filtered debt
+    // observation. A second scan can cross a writer boundary and contradict
+    // this metadata in either direction. This is an admission witness, not a
+    // promise that the graph cannot change during subsequent query execution.
     if matches!(
         name,
         "brain_impact" | "flow_trace" | "blast_radius" | "dead_code" | "affected_tests"
-    ) && let Some(mut refusal) = index_incomplete_refusal_for_args(store, name, &args, visible)?
+    ) && let Some(refusal) = compatibility.incomplete_refusal()
     {
-        refusal["_meta"] = json!({"index_compatibility": compatibility});
         return Ok(refusal);
     }
 
@@ -4478,10 +4479,16 @@ pub fn dispatch_cancellable(
         if let Some(object) = value.as_object_mut() {
             let meta = object.entry("_meta").or_insert_with(|| json!({}));
             if let Some(meta) = meta.as_object_mut() {
-                meta.insert("index_compatibility".to_string(), compatibility.clone());
+                meta.insert(
+                    "index_compatibility".to_string(),
+                    compatibility.as_json().clone(),
+                );
             }
             if name == "brain_status" {
-                object.insert("index_compatibility".to_string(), compatibility.clone());
+                object.insert(
+                    "index_compatibility".to_string(),
+                    compatibility.as_json().clone(),
+                );
             }
         }
         // nw-475 (Task 5.2, owner decision Q7): a successful response served
@@ -4530,16 +4537,42 @@ pub fn index_incomplete_refusal_for_args(
     _args: &Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Option<Value>, anyhow::Error> {
-    let mut incomplete = Vec::new();
-    for repo in store.list_repos(None)? {
-        if repo_is_visible(&repo.uid, visible) && store.repo_index_incomplete(&repo)? {
-            incomplete.push(json!({"repo_uid": repo.uid, "url": repo.url,
-                "remedy": "Re-index this repository to finish its interrupted publication"}));
-        }
+    // The direct caller receives already-bound metadata, so a presentation
+    // layer never needs to resample publication debt after the decision.
+    Ok(IndexCompatibilityAdmission::read(store, visible)?.incomplete_refusal())
+}
+
+/// Private admission evidence: only an authorized store observation can
+/// construct it. Tool arguments and cached/wire JSON cannot supply this proof.
+/// Resolver/vault fields retain their existing meanings; incomplete_repos is
+/// the exact observation used by both the decision and its disclosure.
+struct IndexCompatibilityAdmission(Value);
+
+impl IndexCompatibilityAdmission {
+    fn read(
+        store: &GraphStore,
+        visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+    ) -> Result<Self, anyhow::Error> {
+        Ok(Self(index_compatibility_json(store, visible)?))
     }
-    Ok((!incomplete.is_empty()).then(|| json!({"refused": true,
-        "reason": "repo_index_incomplete", "incomplete_repos": incomplete,
-        "message": "Repository indexing did not complete; call-graph completeness is unavailable. Re-index the affected repositories before retrying."})))
+
+    fn as_json(&self) -> &Value {
+        &self.0
+    }
+
+    fn incomplete_refusal(&self) -> Option<Value> {
+        let incomplete = self.0["incomplete_repos"]
+            .as_array()
+            .expect("compatibility admission always carries an incomplete repository array");
+        if incomplete.is_empty() {
+            return None;
+        }
+        let refusal = json!({"refused": true,
+            "reason": "repo_index_incomplete", "incomplete_repos": incomplete,
+            "message": "Repository indexing did not complete; call-graph completeness is unavailable. Re-index the affected repositories before retrying.",
+            "_meta": {"index_compatibility": self.as_json()}});
+        Some(provenance_seam::stamp(Unstamped::new(refusal)))
+    }
 }
 
 /// Current derivation compatibility, separate from Git staleness and from
@@ -39121,6 +39154,124 @@ mod compatibility_regressions {
             name: Some(uid.into()),
             root_path: None,
         }
+    }
+
+    #[test]
+    fn compatibility_admission_snapshot_stays_consistent_when_publication_starts() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&repo("repo:visible")).unwrap();
+        let admitted = IndexCompatibilityAdmission::read(&store, None).unwrap();
+        store
+            .set_repo_publication_incomplete("repo:visible", "writer started after admission")
+            .unwrap();
+        // The already-captured clean witness cannot acquire a contradictory
+        // refusal by re-reading the store after its metadata was captured.
+        assert!(admitted.incomplete_refusal().is_none());
+        assert_eq!(admitted.as_json()["incomplete_repos"], json!([]));
+        // A NEW admission observes the new debt and refuses with matching rows.
+        let fresh = IndexCompatibilityAdmission::read(&store, None).unwrap();
+        let refusal = fresh.incomplete_refusal().unwrap();
+        assert_eq!(refusal["refused"], true);
+        assert_eq!(refusal["reason"], "repo_index_incomplete");
+        assert_eq!(
+            refusal["incomplete_repos"],
+            refusal["_meta"]["index_compatibility"]["incomplete_repos"]
+        );
+        assert_eq!(refusal["incomplete_repos"][0]["repo_uid"], "repo:visible");
+    }
+
+    #[test]
+    fn compatibility_admission_snapshot_stays_consistent_when_publication_finishes() {
+        let store = GraphStore::in_memory().unwrap();
+        store.insert_repo(&repo("repo:visible")).unwrap();
+        store
+            .set_repo_publication_incomplete("repo:visible", "writer active at admission")
+            .unwrap();
+        let admitted = IndexCompatibilityAdmission::read(&store, None).unwrap();
+        store
+            .clear_repo_publication_incomplete("repo:visible")
+            .unwrap();
+        // Retain the conservative refusal AND its evidence after the writer
+        // finishes; never pair a new success with the old incomplete metadata.
+        let refusal = admitted.incomplete_refusal().unwrap();
+        assert_eq!(refusal["refused"], true);
+        assert_eq!(refusal["_meta"]["index_compatibility"], *admitted.as_json());
+        assert_eq!(refusal["_meta"]["scope"], "local");
+        let fresh = IndexCompatibilityAdmission::read(&store, None).unwrap();
+        assert!(fresh.incomplete_refusal().is_none());
+        assert_eq!(fresh.as_json()["incomplete_repos"], json!([]));
+    }
+
+    #[test]
+    fn compatibility_admission_refusal_preserves_authorized_disclosure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        for uid in ["repo:visible", "repo:hidden"] {
+            store.insert_repo(&repo(uid)).unwrap();
+            store
+                .set_repo_publication_incomplete(uid, "publication active")
+                .unwrap();
+        }
+        let visible = nestweaver_engine::authz::VisibleRepos::Only(
+            ["repo:visible".to_string()].into_iter().collect(),
+        );
+        let admission = IndexCompatibilityAdmission::read(&store, Some(&visible)).unwrap();
+        let refusal = admission.incomplete_refusal().unwrap();
+        // Preserve the FULL authorized resolver/vault/scope disclosure, not a
+        // replacement containing only debt rows or a reconstructed empty map.
+        assert_eq!(
+            refusal["_meta"]["index_compatibility"],
+            *admission.as_json()
+        );
+        assert_eq!(refusal["_meta"]["scope"], "local");
+        assert_eq!(refusal["incomplete_repos"].as_array().unwrap().len(), 1);
+        assert!(!refusal.to_string().contains("repo:hidden"));
+        assert_eq!(
+            refusal["_meta"]["index_compatibility"]["resolver_incompatible_repos"],
+            json!(["repo:visible"])
+        );
+        // The public direct-CLI guard creates its OWN witness and supplies
+        // the same bound metadata before any CLI/federation presentation seam.
+        let direct = index_incomplete_refusal_for_args(
+            &store,
+            "brain_impact",
+            &json!({"repo":"repo:hidden"}),
+            Some(&visible),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(direct, refusal);
+        store
+            .clear_repo_publication_incomplete("repo:visible")
+            .unwrap();
+        assert!(
+            index_incomplete_refusal_for_args(
+                &store,
+                "brain_impact",
+                &json!({"repo":"repo:hidden"}),
+                Some(&visible),
+            )
+            .unwrap()
+            .is_none(),
+            "hidden debt cannot refuse an authorized clean population"
+        );
+        let unrestricted = index_incomplete_refusal_for_args(
+            &store,
+            "brain_impact",
+            &json!({"repo":"repo:visible"}),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            unrestricted["incomplete_repos"][0]["repo_uid"],
+            "repo:hidden"
+        );
+        assert_eq!(
+            unrestricted["incomplete_repos"],
+            unrestricted["_meta"]["index_compatibility"]["incomplete_repos"]
+        );
     }
 
     #[test]
