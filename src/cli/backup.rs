@@ -345,50 +345,7 @@ pub(crate) fn find_lbug_in_dir(dir: &Path) -> Option<PathBuf> {
 /// only at `data_dir` would create a brand-new, trivially-free lease file
 /// beside a partial copy and conclude that nobody was writing.
 pub(crate) fn restore_lease_targets(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let mut targets = Vec::new();
-
-    for dir in [data_dir.to_path_buf(), data_dir.with_extension("restoring")] {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                anyhow::bail!(
-                    "cannot enumerate incumbent databases in {} before destructive restore: {error}",
-                    dir.display()
-                )
-            }
-        };
-
-        for entry in entries {
-            let entry = entry.with_context(|| {
-                format!(
-                    "cannot enumerate every incumbent database in {} before destructive restore",
-                    dir.display()
-                )
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("lbug") {
-                continue;
-            }
-
-            let metadata = std::fs::metadata(&path).with_context(|| {
-                format!(
-                    "cannot inspect possible incumbent database {} before destructive restore",
-                    path.display()
-                )
-            })?;
-            if metadata.is_file() {
-                targets.push(nestweaver_daemon::lifecycle::canonical_db_path(&path));
-            }
-        }
-    }
-
-    // Every restore takes leases in the same canonical order, so two recovery
-    // attempts cannot deadlock by discovering directory entries differently.
-    // Canonicalisation also collapses symlink aliases to one lock identity.
-    targets.sort();
-    targets.dedup();
-    Ok(targets)
+    nestweaver_engine::backup::restore_lease_targets(data_dir)
 }
 
 /// Hold the canonical database write lease over every database a restore is
@@ -1001,5 +958,52 @@ pub(crate) fn run_snapshot(command: SnapshotCommands, _use_daemon: bool) -> anyh
             );
             Ok(EXIT_SUCCESS)
         }
+    }
+}
+
+#[cfg(test)]
+mod restore_authority_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn outer_restore_inventory_matches_engine_for_custom_kuzu_partial_and_aside_databases() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let aside = data.with_extension("restoring");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&aside).unwrap();
+        let partial = data.join("partial.lbug");
+        let kuzu = data.join("legacy.kuzu");
+        std::fs::write(&partial, b"partial legacy graph").unwrap();
+        std::fs::write(&kuzu, b"partial kuzu graph").unwrap();
+        let custom = data.join("graph.db");
+        let aside_custom = aside.join("prior.db");
+        drop(nestweaver_store::GraphStore::create(&custom).unwrap());
+        drop(nestweaver_store::GraphStore::create(&aside_custom).unwrap());
+        let fake = data.join("foreign.db");
+        std::fs::write(&fake, b"unrelated").unwrap();
+        std::fs::copy(
+            nestweaver_store::engine_format::sidecar_path(&custom),
+            nestweaver_store::engine_format::sidecar_path(&fake),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&partial, data.join("alias.lbug")).unwrap();
+        let mut expected = vec![partial, kuzu, custom, aside_custom]
+            .into_iter()
+            .map(|path| nestweaver_store::canonical_db_path(&path))
+            .collect::<Vec<_>>();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(restore_lease_targets(&data).unwrap(), expected);
+        assert_eq!(
+            restore_lease_targets(&data).unwrap(),
+            nestweaver_engine::backup::restore_lease_targets(&data).unwrap()
+        );
+        assert!(
+            !restore_lease_targets(&data)
+                .unwrap()
+                .contains(&nestweaver_store::canonical_db_path(&fake))
+        );
     }
 }
