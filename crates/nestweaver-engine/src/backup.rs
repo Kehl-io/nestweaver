@@ -1319,7 +1319,9 @@ fn prepare_restored_write_lock(
                     .source_checksums
                     .as_ref()
                     .and_then(|checksums| checksums.get(&relative))
-                    .is_some_and(|hash| *hash == format!("{:x}", Sha256::digest(b"")));
+                    .is_some_and(|hash| {
+                        *hash == format!("sha256:{}", hex_encode(&Sha256::digest(b"")))
+                    });
             let previously_owned = journal.destination_paths.contains(&relative)
                 && journal
                     .destination_file_witnesses
@@ -5911,6 +5913,26 @@ mod tests {
             std::fs::read(restore_journal_path(&data)).unwrap(),
             journal_bytes
         );
+    }
+
+    #[test]
+    fn source_inventoried_empty_operational_lock_is_admitted_without_finalized_witness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        marker_replay_journal(&data, &snapshot, "brain.lbug", RestorePhase::CopyInProgress);
+        let mut journal = read_restore_journal(&data).unwrap();
+        journal.destination_file_witnesses = None;
+        journal.source_checksums.as_mut().unwrap().insert(
+            "brain.lbug.write.lock".into(),
+            sha256_stream(std::io::empty()).unwrap(),
+        );
+        publish_restore_phase(&journal).unwrap();
+        let before = std::fs::read(restore_journal_path(&data)).unwrap();
+        let lock = data.join("brain.lbug.write.lock");
+        let witness = restore_file_witness(&lock).unwrap();
+        prepare_restored_write_lock(&data, &mut journal).unwrap();
+        assert_eq!(restore_file_witness(&lock).unwrap(), witness);
+        assert_eq!(std::fs::read(restore_journal_path(&data)).unwrap(), before);
     }
 
     #[test]
