@@ -4826,7 +4826,9 @@ mod tests {
         let source = root.join("source");
         std::fs::create_dir_all(&source).unwrap();
         let db = source.join(graph);
-        drop(nestweaver_store::GraphStore::create(&db).unwrap());
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        store.ensure_data_instance_id("default").unwrap();
+        drop(store);
         let snapshot = root.join("source.nwsnap.zst");
         backup_save(&BackupConfig {
             db_path: db.clone(),
