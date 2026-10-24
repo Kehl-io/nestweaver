@@ -2300,15 +2300,14 @@ impl BodyUnavailable {
             BodyUnavailable::RecordedLocalRootMissing { path, root } => {
                 format!(
                     "this symbol's repo was indexed at {root}, which no longer exists (moved or \
-                     deleted); tried the server's working directory and could not read: {path}. \
+                     deleted); source bytes are unavailable: {path}. \
                      Re-index the repo from its current location, or supply its checkout as the \
                      root"
                 )
             }
             BodyUnavailable::NoRecordedLocalRoot { path } => {
                 format!(
-                    "no recorded local_root for this symbol's repo; tried the server's \
-                     working directory and could not read: {path}"
+                    "no recorded local_root for this symbol's repo; source bytes are unavailable and could not read: {path}"
                 )
             }
             BodyUnavailable::StaleSpan { path } => {
@@ -2335,11 +2334,11 @@ enum SymbolRootSource {
     RepoLocalRoot(std::path::PathBuf),
     /// `root` was omitted AND no repo `local_root` could be resolved (unknown
     /// repo, no recorded root, or a root that no longer exists on disk), so
-    /// this fell back to the server's own working directory.
-    FallbackCwd(std::path::PathBuf),
-    /// As [`Self::FallbackCwd`], but the repo DOES record a `local_root`: it
+    /// source bytes are unavailable; the empty root refuses filesystem reads.
+    MissingLocalRoot(std::path::PathBuf),
+    /// As [`Self::MissingLocalRoot`], but the repo DOES record a `local_root`: it
     /// is gone from disk. Carries that recorded root for the reason text.
-    FallbackCwdRecordedRootMissing(std::path::PathBuf, String),
+    RecordedRootMissing(std::path::PathBuf, String),
 }
 
 impl SymbolRootSource {
@@ -2347,8 +2346,8 @@ impl SymbolRootSource {
         match self {
             SymbolRootSource::Explicit(p)
             | SymbolRootSource::RepoLocalRoot(p)
-            | SymbolRootSource::FallbackCwd(p)
-            | SymbolRootSource::FallbackCwdRecordedRootMissing(p, _) => p,
+            | SymbolRootSource::MissingLocalRoot(p)
+            | SymbolRootSource::RecordedRootMissing(p, _) => p,
         }
     }
 }
@@ -2382,7 +2381,7 @@ fn resolve_symbol_body_root(
     {
         return SymbolRootSource::RepoLocalRoot(local_root);
     }
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let unavailable_root = std::path::PathBuf::new();
     // A recorded root that is no longer a directory is a moved checkout, not
     // a missing record: say which.
     let recorded = repo_uid
@@ -2390,8 +2389,8 @@ fn resolve_symbol_body_root(
         .and_then(|repo_uid| store.lookup_repo(repo_uid).ok().flatten())
         .and_then(|repo| repo.local_root().map(str::to_string));
     match recorded {
-        Some(root) => SymbolRootSource::FallbackCwdRecordedRootMissing(cwd, root),
-        None => SymbolRootSource::FallbackCwd(cwd),
+        Some(root) => SymbolRootSource::RecordedRootMissing(unavailable_root, root),
+        None => SymbolRootSource::MissingLocalRoot(unavailable_root),
     }
 }
 
@@ -2456,10 +2455,10 @@ fn fetch_full_body(
                     Err(BodyUnavailable::StaleSpan { path: window.path })
                 }
                 Some(window) if !window.body_available => Err(match resolved_root {
-                    SymbolRootSource::FallbackCwd(_) => {
+                    SymbolRootSource::MissingLocalRoot(_) => {
                         BodyUnavailable::NoRecordedLocalRoot { path: window.path }
                     }
-                    SymbolRootSource::FallbackCwdRecordedRootMissing(_, root) => {
+                    SymbolRootSource::RecordedRootMissing(_, root) => {
                         BodyUnavailable::RecordedLocalRootMissing {
                             path: window.path,
                             root,

@@ -142,8 +142,12 @@ pub enum RecordError {
     LimitExceeded,
     #[error("Markdown derivation record is corrupt: {0}")]
     Corrupt(&'static str),
-    #[error("Markdown derivation record belongs to another data identity")]
+    #[error("Markdown derivation record belongs to another logical data instance")]
     ForeignIdentity,
+    #[error(
+        "Markdown derivation record belongs to a previous physical graph; rebuild derivation for the recreated store"
+    )]
+    ForeignStoreIdentity,
     #[error("Markdown derivation record has unsupported schema {0}")]
     UnsupportedSchema(u64),
     #[error("Markdown derivation version {0} is newer than this reader")]
@@ -182,6 +186,7 @@ pub enum AdmissionReason {
     UpstreamRequired,
     RecordInvalid,
     ForeignRecord,
+    ForeignStoreRecord,
     UnsupportedSchema,
     FutureVersion,
     UnsupportedProvider,
@@ -216,6 +221,9 @@ fn admission_remedy(reason: AdmissionReason) -> &'static str {
              database's, restart it under the database's own: `nestweaver daemon stop`, then \
              `nestweaver daemon start --reset` (or --config naming the matching instance). \
              Otherwise run a full `nestweaver brain refresh <vault>` to re-derive it"
+        }
+        AdmissionReason::ForeignStoreRecord => {
+            "; records belong to a previous physical graph; run a full `nestweaver brain refresh <vault>` under the database's matching configuration"
         }
         AdmissionReason::SourceBlocked | AdmissionReason::RecordInvalid => {
             "; run a full `nestweaver brain refresh <vault>` to re-derive it"
@@ -262,6 +270,7 @@ impl DerivationUnavailable {
             code: "vault_derivation_unavailable",
             reason: match error {
                 RecordError::ForeignIdentity => AdmissionReason::ForeignRecord,
+                RecordError::ForeignStoreIdentity => AdmissionReason::ForeignStoreRecord,
                 RecordError::UnsupportedSchema(_) => AdmissionReason::UnsupportedSchema,
                 RecordError::FutureVersion(_) => AdmissionReason::FutureVersion,
                 RecordError::UnsupportedProvider => AdmissionReason::UnsupportedProvider,
@@ -452,10 +461,11 @@ pub fn decode_records(
         .identity
         .validate()
         .map_err(|_| RecordError::InvalidIdentity)?;
-    if &envelope.identity != expected.identity
-        || envelope.data_instance_id != expected.data_instance_id
-    {
+    if envelope.data_instance_id != expected.data_instance_id {
         return Err(RecordError::ForeignIdentity);
+    }
+    if &envelope.identity != expected.identity {
+        return Err(RecordError::ForeignStoreIdentity);
     }
     verify_payload_checksum(&envelope)?;
     records_from_envelope(&envelope)
@@ -629,7 +639,9 @@ pub fn rebind_ambient_default_records(
     let ambient = expectation(identity, AMBIENT_DEFAULT_INSTANCE);
     let records = match load_records(db_path, &ambient) {
         Ok(Some(records)) => records,
-        Ok(None) | Err(RecordError::ForeignIdentity) => return Ok(false),
+        Ok(None) | Err(RecordError::ForeignIdentity | RecordError::ForeignStoreIdentity) => {
+            return Ok(false);
+        }
         Err(error) => return Err(error),
     };
     if let Some(record) = records
@@ -1015,6 +1027,29 @@ pub fn stamp_rebuilt_vault(
 ) -> anyhow::Result<bool> {
     let store = nestweaver_store::GraphStore::open_read_only_without_migration(db_path)
         .map_err(|error| anyhow::anyhow!("open staged graph for derivation records: {error}"))?;
+    stamp_full_refresh_with_store(
+        &store,
+        result,
+        data_instance_id,
+        extra_ignore_patterns,
+        max_note_bytes,
+    )
+}
+
+/// Certify an explicitly full refresh after its caller reconciled search.
+/// Reuse the caller's store: opening/closing another database descriptor while
+/// a writer lease is held can release process-wide POSIX record locks.
+/// An incomplete publication removes any prior record and remains owed.
+pub fn stamp_full_refresh_with_store(
+    store: &nestweaver_store::GraphStore,
+    result: &crate::index_md::MarkdownRefreshResult,
+    data_instance_id: &str,
+    extra_ignore_patterns: &[String],
+    max_note_bytes: u64,
+) -> anyhow::Result<bool> {
+    let db_path = store
+        .db_path()
+        .ok_or_else(|| anyhow::anyhow!("derivation records require a persistent graph"))?;
     let identity = store
         .publication_identity()
         .map_err(|error| anyhow::anyhow!("read staged publication identity: {error}"))?
@@ -1033,7 +1068,6 @@ pub fn stamp_rebuilt_vault(
     let notes = store
         .list_notes(Some(&vault.uid))
         .map_err(|error| anyhow::anyhow!("list staged notes: {error}"))?;
-    drop(store);
     let expected = expectation(&identity, data_instance_id);
     let mut records = load_records(db_path, &expected)?.unwrap_or_default();
     let source = filesystem_source(Path::new(&vault.root_path))?;
@@ -1119,10 +1153,70 @@ pub fn admit_all_vaults(
     Ok(())
 }
 
+/// Validate an incumbent before an empty recreated store discards its physical
+/// coverage. Logical-instance mismatches and malformed bytes are never healed.
+pub(crate) fn is_previous_physical_store(
+    db_path: &Path,
+    identity: &PublicationIdentity,
+    data_instance_id: &str,
+) -> Result<bool, RecordError> {
+    let bytes = match std::fs::read(record_path(db_path)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(RecordError::Io(error.kind())),
+    };
+    let envelope = decode_envelope(&bytes)?;
+    let records = records_from_envelope(&envelope)?;
+    if let Some(future) = records
+        .vaults
+        .values()
+        .find(|record| record.derivation_version > DERIVATION_VERSION)
+    {
+        return Err(RecordError::FutureVersion(future.derivation_version));
+    }
+    if envelope.data_instance_id != data_instance_id {
+        return Err(RecordError::ForeignIdentity);
+    }
+    Ok(envelope.identity != *identity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nestweaver_schema::vault_uid;
+
+    #[test]
+    fn previous_physical_store_recovery_refuses_checksum_valid_semantic_corruption_and_future_records()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.path().join("brain.lbug");
+        let old = identity();
+        let new = identity();
+        let record = pending_record("default", &root);
+        let uid = record.vault_uid.clone();
+        let mut records = DerivationRecords::default();
+        records.vaults.insert(uid.clone(), record);
+        let original = encode_records(&records, &expectation(&old, "default")).unwrap();
+        for future in [false, true] {
+            let mut envelope: RecordEnvelope = serde_json::from_slice(&original).unwrap();
+            if future {
+                envelope.payload["vaults"][&uid]["derivation_version"] =
+                    serde_json::json!(DERIVATION_VERSION + 1);
+            } else {
+                envelope.payload["vaults"][&uid]["vault_uid"] = serde_json::json!("forged-vault");
+            }
+            envelope.payload_checksum =
+                blake3::hash(&serde_json::to_vec(&envelope.payload).unwrap())
+                    .to_hex()
+                    .to_string();
+            let bytes = serde_json::to_vec(&envelope).unwrap();
+            std::fs::write(record_path(&db), &bytes).unwrap();
+            assert!(is_previous_physical_store(&db, &new, "default").is_err());
+            assert_eq!(std::fs::read(record_path(&db)).unwrap(), bytes);
+        }
+    }
 
     fn identity() -> PublicationIdentity {
         PublicationIdentity::new_brain()
@@ -1171,6 +1265,18 @@ mod tests {
         assert!(!stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
         assert_eq!(record_of(), None);
         result.index.notes_count -= 1;
+
+        result
+            .index
+            .skipped
+            .push(nestweaver_parser::SkippedFile::new(
+                "unreadable.md",
+                nestweaver_parser::SkipReasonCode::ReadError,
+                "injected coverage gap",
+            ));
+        assert!(!stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
+        assert_eq!(record_of(), None);
+        result.index.skipped.clear();
 
         assert!(stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
         assert_eq!(record_of().unwrap().phase, DerivationPhase::Current);

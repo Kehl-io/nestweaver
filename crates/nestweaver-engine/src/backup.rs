@@ -98,6 +98,22 @@ const MANIFEST_VERSION: u32 = 2;
 /// generous while still bounding a hostile or corrupt header (nw-144).
 const MAX_PUBLICATION_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
+/// An expected refusal of a destructive or conflicting backup invocation.
+/// Kept typed across CLI and daemon boundaries so callers can report usage
+/// errors without classifying corruption or I/O failures as user mistakes.
+#[derive(Debug)]
+pub struct BackupRefusal(pub String);
+impl std::fmt::Display for BackupRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for BackupRefusal {}
+
+macro_rules! refuse_backup {
+    ($($arg:tt)*) => { return Err(BackupRefusal(format!($($arg)*)).into()) };
+}
+
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
     pub db_path: PathBuf,
@@ -769,7 +785,52 @@ pub enum RestorePhase {
 /// Bumped when the on-disk journal shape changes. A journal this build cannot
 /// read is treated as ABSENT, which routes it to the no-proof branch of
 /// [`recover_interrupted_restore`] — preserve, never delete.
-const RESTORE_JOURNAL_VERSION: u32 = 1;
+const RESTORE_JOURNAL_VERSION: u32 = 3;
+
+/// Metadata-only origin witness: stat does not open/close a leased database
+/// descriptor (which would release this process's POSIX record locks).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RestoreFileWitness {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+fn restore_file_witness(path: &Path) -> anyhow::Result<RestoreFileWitness> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "restore file witness requires a regular file: {}",
+        path.display()
+    );
+    restore_file_witness_from_metadata(&metadata)
+}
+
+fn restore_file_witness_from_metadata(
+    metadata: &std::fs::Metadata,
+) -> anyhow::Result<RestoreFileWitness> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(RestoreFileWitness {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("physical restore file witnesses are unsupported on this platform")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RestoreJournal {
@@ -778,6 +839,131 @@ struct RestoreJournal {
     data_dir: PathBuf,
     restoring_dir: PathBuf,
     snapshot_path: PathBuf,
+    #[serde(default)]
+    destination_identity: Option<(u64, u64)>,
+    #[serde(default)]
+    restoring_identity: Option<(u64, u64)>,
+    #[serde(default)]
+    destination_paths: Vec<String>,
+    #[serde(default)]
+    restoring_paths: Vec<String>,
+    // Content authority captured from the validated archive BEFORE cutover.
+    // Older journals remain readable but cannot authorize marker synthesis.
+    #[serde(default)]
+    graph_path: Option<String>,
+    #[serde(default)]
+    source_checksums: Option<HashMap<String, String>>,
+    #[serde(default)]
+    restoring_file_witnesses: Option<HashMap<String, RestoreFileWitness>>,
+    #[serde(default)]
+    destination_file_witnesses: Option<HashMap<String, RestoreFileWitness>>,
+    #[serde(default)]
+    legacy_engine: bool,
+}
+
+fn restore_directory_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        metadata
+            .is_dir()
+            .then_some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn restore_tree_paths(path: &Path) -> anyhow::Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    walkdir::WalkDir::new(path)
+        .min_depth(1)
+        .into_iter()
+        .map(|entry| {
+            let entry = entry?;
+            anyhow::ensure!(
+                !entry.file_type().is_symlink(),
+                "restore ownership is ambiguous at {}",
+                entry.path().display()
+            );
+            normalized_relative_path(path, entry.path())
+        })
+        .collect()
+}
+
+fn journal_proves_owned_tree(path: &Path, identity: Option<(u64, u64)>, paths: &[String]) -> bool {
+    identity.is_some()
+        && restore_directory_identity(path) == identity
+        && restore_tree_paths(path)
+            .is_ok_and(|present| present.iter().all(|path| paths.contains(path)))
+}
+
+/// Rollback needs the entire original aside, not merely an owned subset.
+/// Partial destinations/cleanup still use the subset proof above.
+fn journal_proves_complete_owned_tree(
+    path: &Path,
+    identity: Option<(u64, u64)>,
+    paths: &[String],
+) -> bool {
+    identity.is_some()
+        && restore_directory_identity(path) == identity
+        && restore_tree_paths(path).is_ok_and(|present| {
+            present.iter().collect::<std::collections::BTreeSet<_>>()
+                == paths.iter().collect::<std::collections::BTreeSet<_>>()
+        })
+}
+
+/// Capture the leased incumbent before any destructive cutover. Directory
+/// inode/path proofs alone cannot distinguish later same-name replacements.
+fn restore_tree_witnesses(path: &Path) -> anyhow::Result<HashMap<String, RestoreFileWitness>> {
+    let mut witnesses = HashMap::new();
+    if !path.exists() {
+        return Ok(witnesses);
+    }
+    for entry in walkdir::WalkDir::new(path).min_depth(1) {
+        let entry = entry?;
+        anyhow::ensure!(
+            entry.file_type().is_file() || entry.file_type().is_dir(),
+            "cannot establish restore content ownership at {}",
+            entry.path().display()
+        );
+        if entry.file_type().is_file() {
+            witnesses.insert(
+                normalized_relative_path(path, entry.path())?,
+                restore_file_witness(entry.path())?,
+            );
+        }
+    }
+    Ok(witnesses)
+}
+
+/// Rollback needs a complete incumbent; interrupted cleanup may have removed
+/// entries already, but every survivor must still have its original witness.
+fn journal_proves_original_aside(path: &Path, journal: &RestoreJournal, complete: bool) -> bool {
+    let Some(expected) = journal.restoring_file_witnesses.as_ref() else {
+        return false;
+    };
+    let tree_owned = if complete {
+        journal_proves_complete_owned_tree(
+            path,
+            journal.restoring_identity,
+            &journal.restoring_paths,
+        )
+    } else {
+        journal_proves_owned_tree(path, journal.restoring_identity, &journal.restoring_paths)
+    };
+    tree_owned
+        && restore_tree_witnesses(path).is_ok_and(|present| {
+            (!complete || present.len() == expected.len())
+                && present
+                    .iter()
+                    .all(|(path, hash)| expected.get(path) == Some(hash))
+        })
 }
 
 /// Where the incumbent data directory is moved to while the replacement lands.
@@ -846,7 +1032,11 @@ fn publish_restore_phase(journal: &RestoreJournal) -> anyhow::Result<()> {
 fn read_restore_journal(data_dir: &Path) -> Option<RestoreJournal> {
     let bytes = std::fs::read(restore_journal_path(data_dir)).ok()?;
     let journal: RestoreJournal = serde_json::from_slice(&bytes).ok()?;
-    (journal.version == RESTORE_JOURNAL_VERSION).then_some(journal)
+    ([2, RESTORE_JOURNAL_VERSION].contains(&journal.version)
+        && absolute_lexically(&journal.data_dir) == absolute_lexically(data_dir)
+        && absolute_lexically(&journal.restoring_dir)
+            == absolute_lexically(&restoring_dir_for(data_dir)))
+    .then_some(journal)
 }
 
 /// Durably retire the journal. The unlink is followed by a parent `fsync` for
@@ -937,6 +1127,7 @@ fn verify_restored_dataset(dest: &Path, manifest: &BackupManifest) -> anyhow::Re
 /// journal, or one whose journal was lost, can still be cleaned up when the
 /// replacement really did land — without ever inferring completeness from
 /// nonemptiness.
+#[cfg(test)]
 fn restored_dataset_is_self_proving(dest: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dest.join("manifest.json")) else {
         return false;
@@ -947,8 +1138,8 @@ fn restored_dataset_is_self_proving(dest: &Path) -> bool {
     verify_restored_dataset(dest, &manifest).is_ok()
 }
 
-/// A `<data>.restoring` whose redundancy could not be PROVEN, renamed aside
-/// rather than deleted.
+/// An interrupted restore copy whose redundancy could not be proven, renamed
+/// to a reported sibling rather than deleted.
 fn preserve_unproven_copy(restoring_dir: &Path) -> anyhow::Result<PathBuf> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -975,12 +1166,14 @@ fn preserve_unproven_copy(restoring_dir: &Path) -> anyhow::Result<PathBuf> {
         )
     })?;
     if let Some(parent) = candidate.parent() {
-        let _ = fsync_dir(parent);
+        fsync_dir(parent).with_context(|| format!(
+            "unproven copy is preserved at {}, but its rename could not be made durable; recovery journal retained",
+            candidate.display()
+        ))?;
     }
     tracing::warn!(
         preserved = %candidate.display(),
-        "a previous restore left a copy of your data whose redundancy could not be proven; \
-         it has been preserved rather than deleted"
+        "an interrupted restore left an unproven copy; it has been preserved rather than deleted"
     );
     Ok(candidate)
 }
@@ -988,22 +1181,296 @@ fn preserve_unproven_copy(restoring_dir: &Path) -> anyhow::Result<PathBuf> {
 /// What reconciling a previously interrupted restore did.
 #[derive(Debug, Default)]
 struct RestoreRecovery {
-    /// A pre-restore copy that could not be proven redundant and was therefore
-    /// renamed aside instead of deleted. The caller surfaces this path so the
+    /// An unproven copy (incumbent or destination) that was renamed aside
+    /// instead of deleted. The caller surfaces this path so the
     /// operator can remove it once satisfied.
     preserved: Option<PathBuf>,
 }
+
+/// Finish the sole archive graph's physical marker using exact archive proof.
+/// Already rebound markers are the only checksum exception: their graph still
+/// has to match the archive. No names discovered by a recursive walk confer
+/// authority, and a foreign/missing modern marker cannot synthesize ownership.
+fn finalize_restored_engine_marker(
+    data_dir: &Path,
+    journal: &RestoreJournal,
+    manifest: &BackupManifest,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        journal_proves_owned_tree(
+            data_dir,
+            journal.destination_identity,
+            &journal.destination_paths
+        ),
+        "restore marker finalization refused: destination identity or exact inventory changed; both copies preserved"
+    );
+    let source_checksums = journal.source_checksums.as_ref().context(
+        "validated restore journal has no pre-cutover content proof; both copies preserved",
+    )?;
+    anyhow::ensure!(
+        manifest.checksums == *source_checksums,
+        "restored manifest differs from pre-cutover content proof; both copies preserved"
+    );
+    let graph = journal
+        .graph_path
+        .as_deref()
+        .context("validated restore journal has no exact graph role; both copies preserved")?;
+    anyhow::ensure!(
+        source_checksums.contains_key(graph),
+        "graph role lacks a captured checksum"
+    );
+    anyhow::ensure!(
+        Path::new(graph).components().count() == 1
+            && normalized_relative_path(data_dir, &data_dir.join(graph))? == graph,
+        "restore graph must be a root inventory member"
+    );
+    let marker = format!(
+        "{graph}{}",
+        nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX
+    );
+    let db = data_dir.join(graph);
+    let already_bound = nestweaver_store::engine_format::has_current_file_marker(&db)?;
+    for (filename, expected) in &manifest.checksums {
+        let mut path = data_dir.join(filename);
+        // Validate components before reading anything, including legacy paths.
+        normalized_relative_path(data_dir, &path)?;
+        if !path.exists()
+            && let Some(rest) = filename.strip_prefix("clones/")
+        {
+            path = data_dir.join("workspace").join(rest);
+        }
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&path)?.is_file(),
+            "restore inventory member is not a regular file: {filename}"
+        );
+        if filename == &marker && already_bound {
+            continue;
+        }
+        anyhow::ensure!(
+            sha256_stream_path(&path)? == *expected,
+            "restore marker finalization refused: archive content mismatch for {filename}; both copies preserved"
+        );
+    }
+    if !manifest.checksums.contains_key(&marker) {
+        anyhow::ensure!(
+            journal.legacy_engine,
+            "modern restore is missing its inventoried engine-format marker"
+        );
+        return Ok(());
+    }
+    let marker_path = data_dir.join(&marker);
+    let marker_text = std::fs::read_to_string(&marker_path)?;
+    if marker_text.lines().next() != Some(nestweaver_store::engine_format::ENGINE_FORMAT_VALUE) {
+        anyhow::ensure!(
+            journal.legacy_engine,
+            "modern restore has a foreign engine-format marker"
+        );
+        return Ok(());
+    }
+    maybe_crash_restore_step_for_test("before-marker-rebind");
+    nestweaver_store::engine_format::restamp_after_copy(&db)
+        .with_context(|| format!("durably rebind restored engine marker {}", db.display()))?;
+    anyhow::ensure!(
+        nestweaver_store::engine_format::has_current_file_marker(&db)?,
+        "restored graph marker did not bind the exact copied file"
+    );
+    maybe_crash_restore_step_for_test("after-marker-rebind");
+    Ok(())
+}
+
+/// Establish the exact operational lock BEFORE journaling authority over its
+/// name. A crash before registration preserves an unproven file; it never
+/// grants recovery permission to delete a competing creator's bytes.
+fn prepare_restored_write_lock(
+    data_dir: &Path,
+    journal: &mut RestoreJournal,
+) -> anyhow::Result<()> {
+    let graph = journal
+        .graph_path
+        .as_deref()
+        .context("restore graph role is absent")?;
+    anyhow::ensure!(
+        Path::new(graph).components().count() == 1,
+        "restore lock requires a root graph inventory member"
+    );
+    let relative = format!("{graph}.write.lock");
+    let path = data_dir.join(&relative);
+    normalized_relative_path(data_dir, &path)?;
+    let initial = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.len() != 0 {
+                refuse_backup!(
+                    "backup restore refused: operational lock contains foreign bytes or is not a regular file: {}",
+                    path.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    refuse_backup!(
+                        "backup restore refused: operational lock has a foreign hardlink"
+                    );
+                }
+            }
+            let witness = restore_file_witness_from_metadata(&metadata)?;
+            let source_owned = journal.destination_paths.contains(&relative)
+                && journal
+                    .source_checksums
+                    .as_ref()
+                    .and_then(|checksums| checksums.get(&relative))
+                    .is_some_and(|hash| {
+                        *hash == format!("sha256:{}", hex_encode(&Sha256::digest(b"")))
+                    });
+            let previously_owned = journal.destination_paths.contains(&relative)
+                && journal
+                    .destination_file_witnesses
+                    .as_ref()
+                    .and_then(|files| files.get(&relative))
+                    == Some(&witness);
+            if !source_owned && !previously_owned {
+                refuse_backup!(
+                    "backup restore refused: preexisting empty operational lock has no original ownership proof: {}",
+                    path.display()
+                );
+            }
+            Some(witness)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("inspect restored operational lock"),
+    };
+    let file = if let Some(expected) = initial.as_ref() {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&path)?;
+        anyhow::ensure!(
+            restore_file_witness_from_metadata(&file.metadata()?)? == *expected,
+            "operational lock changed during ownership admission"
+        );
+        file
+    } else {
+        maybe_inject_operational_lock_race_for_test(&path)?;
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                refuse_backup!(
+                    "backup restore refused: a foreign operational lock appeared during creation; no ownership authority was recorded"
+                );
+            }
+            Err(error) => return Err(error).context("prepare restored operational lock"),
+        }
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() == 0,
+        "restored operational lock is not an empty regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.nlink() == 1,
+            "restored operational lock has a foreign hardlink"
+        );
+    }
+    file.sync_all()?;
+    fsync_dir(data_dir)?;
+    anyhow::ensure!(
+        restore_file_witness(&path)? == restore_file_witness_from_metadata(&file.metadata()?)?,
+        "restored operational lock changed before durable registration"
+    );
+    if !journal.destination_paths.contains(&relative) {
+        journal.destination_paths.push(relative);
+        publish_restore_phase(journal)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_inject_operational_lock_race_for_test(path: &Path) -> anyhow::Result<()> {
+    if std::env::var_os("NW_RESTORE_TEST_OPERATIONAL_LOCK_RACE").is_some() {
+        std::fs::write(path, b"foreign creator's irreplaceable bytes")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_inject_operational_lock_race_for_test(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Validated recovery uses only the immutable metadata receipt published after
+/// archive validation and durable marker finalization. Reading/hashing a leased
+/// graph would close a descriptor and release process-wide POSIX writer locks.
+/// An older journal cannot prove this boundary: preserve it and both copies.
+fn finalize_validated_restore_recovery(
+    data_dir: &Path,
+    journal: &RestoreJournal,
+) -> anyhow::Result<()> {
+    let (Some(graph), Some(expected)) = (
+        journal.graph_path.as_deref(),
+        journal.destination_file_witnesses.as_ref(),
+    ) else {
+        refuse_backup!(
+            "validated restore journal lacks finalized destination proof; data, aside copy and journal preserved for manual recovery"
+        );
+    };
+    if journal.source_checksums.is_none()
+        || !journal_proves_complete_owned_tree(
+            data_dir,
+            journal.destination_identity,
+            &journal.destination_paths,
+        )
+    {
+        refuse_backup!(
+            "validated restore destination identity or inventory changed; data, aside copy and journal preserved for manual recovery"
+        );
+    }
+    let current = restore_tree_witnesses(data_dir)?;
+    if current != *expected || !expected.contains_key(graph) {
+        refuse_backup!(
+            "validated restore destination file proof changed; data, aside copy and journal preserved for manual recovery"
+        );
+    }
+    if !journal.legacy_engine
+        && !nestweaver_store::engine_format::has_current_file_marker(&data_dir.join(graph))?
+    {
+        refuse_backup!(
+            "validated restore destination lacks its finalized physical marker; data, aside copy and journal preserved for manual recovery"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_crash_restore_step_for_test(label: &str) {
+    if std::env::var("NW_RESTORE_TEST_CRASH_AT").as_deref() == Ok(label) {
+        // SAFETY: test-only exact process-death seam, no destructors.
+        unsafe { libc::_exit(9) };
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_crash_restore_step_for_test(_label: &str) {}
 
 /// Reconcile a leftover `<data>.restoring` from a previously interrupted
 /// restore, before starting a new one.
 ///
 /// The restore uses a rename-aside dance: move `data_dir` -> `.restoring`,
 /// land the new data at `data_dir`, then delete `.restoring`. What decides
-/// whether `.restoring` may be deleted is DURABLE COMPLETION PROOF, and only
-/// two things count as proof:
-///
-/// 1. the fsynced journal says the cutover was validated, or
-/// 2. `data_dir` validates against its own embedded `manifest.json`.
+/// whether `.restoring` may be deleted is DURABLE COMPLETION PROOF: the
+/// validated journal's original-file witnesses for both copies. A destination's
+/// own checksum manifest never authorizes deleting an unproven aside copy.
 ///
 /// Nonemptiness is not proof and never was. A cross-device copy that died
 /// after one file leaves `data_dir` nonempty and worthless while `.restoring`
@@ -1015,52 +1482,113 @@ fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<RestoreRecover
     let phase = journal.as_ref().map(|journal| journal.phase);
 
     if !restoring_dir.exists() {
-        // Nothing was preserved, so nothing can be lost. The one thing still
-        // worth doing is discarding a destination the journal PROVES is
-        // partial, so the retry does not copy into debris.
-        if phase == Some(RestorePhase::CopyInProgress) && data_dir.exists() {
-            std::fs::remove_dir_all(data_dir).with_context(|| {
-                format!(
-                    "discard the partial restore destination {}",
-                    data_dir.display()
+        if matches!(
+            phase,
+            Some(RestorePhase::CutoverValidated | RestorePhase::Cleanup)
+        ) {
+            finalize_validated_restore_recovery(data_dir, journal.as_ref().unwrap())?;
+        }
+        // No incumbent exists. Keep every byte of an unvalidated destination
+        // in a reported sibling rather than treating its names as file proof.
+        let mut preserved = None;
+        if matches!(
+            phase,
+            Some(
+                RestorePhase::CopyInProgress
+                    | RestorePhase::OldDataPreserved
+                    | RestorePhase::StagingVerified
+            )
+        ) && data_dir.exists()
+        {
+            let journal = journal.as_ref().unwrap();
+            if journal_proves_owned_tree(
+                data_dir,
+                journal.destination_identity,
+                &journal.destination_paths,
+            ) {
+                preserved = Some(preserve_unproven_copy(data_dir)?);
+            } else if phase != Some(RestorePhase::StagingVerified)
+                || !journal_proves_owned_tree(
+                    data_dir,
+                    journal.restoring_identity,
+                    &journal.restoring_paths,
                 )
-            })?;
+            {
+                refuse_backup!(
+                    "backup restore refused: stale or ambiguous recovery journal cannot authorize deleting {}; its contents were preserved",
+                    data_dir.display()
+                );
+            }
+            // StagingVerified may precede the rename-aside: the exact recorded
+            // incumbent is still at data_dir, so it must remain untouched.
         }
         clear_restore_journal(data_dir);
-        return Ok(RestoreRecovery::default());
+        return Ok(RestoreRecovery { preserved });
     }
 
     match phase {
-        // PROVABLY not authoritative. Discard the destination and put the
-        // preserved copy back. If the copy had in fact just finished, we have
-        // discarded something the archive can rebuild; the alternative is
-        // discarding something nothing can rebuild.
-        Some(RestorePhase::CopyInProgress) => {
+        // Not authoritative: retain the entire destination, then reinstate
+        // the independently proven incumbent. Names/directory identity never
+        // authorize deleting potentially replaced destination file contents.
+        Some(RestorePhase::CopyInProgress | RestorePhase::OldDataPreserved) => {
+            let journal = journal.as_ref().unwrap();
+            if !journal_proves_original_aside(&restoring_dir, journal, true) {
+                refuse_backup!(
+                    "backup restore refused: recovery cannot prove ownership of the preserved aside copy {}; destination, aside copy and journal were preserved",
+                    restoring_dir.display()
+                );
+            }
+            let mut preserved = None;
             if data_dir.exists() {
-                std::fs::remove_dir_all(data_dir).with_context(|| {
-                    format!(
-                        "discard the unfinished restore destination {}",
+                if !journal_proves_owned_tree(
+                    data_dir,
+                    journal.destination_identity,
+                    &journal.destination_paths,
+                ) {
+                    refuse_backup!(
+                        "backup restore refused: stale or ambiguous recovery journal cannot authorize deleting {}; both copies were preserved",
                         data_dir.display()
-                    )
-                })?;
+                    );
+                }
+                preserved = Some(preserve_unproven_copy(data_dir)?);
             }
             std::fs::rename(&restoring_dir, data_dir).with_context(|| {
                 format!(
-                    "recover interrupted restore: rename {} back to {}",
+                    "recover interrupted restore: rename {} back to {}{}",
                     restoring_dir.display(),
-                    data_dir.display()
+                    data_dir.display(),
+                    preserved.as_ref().map_or_else(String::new, |path| format!(
+                        "; the unvalidated destination remains preserved at {}",
+                        path.display()
+                    ))
                 )
             })?;
             if let Some(parent) = data_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-                let _ = fsync_dir(parent);
+                fsync_dir(parent).with_context(|| {
+                    format!(
+                        "make incumbent promotion durable; journal retained{}",
+                        preserved.as_ref().map_or_else(String::new, |path| format!(
+                            "; unvalidated destination preserved at {}",
+                            path.display()
+                        ))
+                    )
+                })?;
             }
             clear_restore_journal(data_dir);
-            Ok(RestoreRecovery::default())
+            Ok(RestoreRecovery { preserved })
         }
 
         // PROVABLY redundant: the journal was published only after the
         // replacement was durable and validated.
         Some(RestorePhase::CutoverValidated | RestorePhase::Cleanup) => {
+            let journal = journal.as_ref().unwrap();
+            if !journal_proves_original_aside(&restoring_dir, journal, false) {
+                refuse_backup!(
+                    "backup restore refused: recovery cannot prove original content of the preserved aside copy {}; destination, aside copy and journal were preserved",
+                    restoring_dir.display()
+                );
+            }
+            finalize_validated_restore_recovery(data_dir, journal)?;
             std::fs::remove_dir_all(&restoring_dir).with_context(|| {
                 format!(
                     "remove the superseded pre-restore copy {}",
@@ -1073,9 +1601,14 @@ fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<RestoreRecover
 
         // No proof either way — including every `.restoring` written by a
         // build that had no journal at all.
-        Some(RestorePhase::StagingVerified | RestorePhase::OldDataPreserved) | None => {
-            if !dir_is_present(data_dir) {
-                // `.restoring` holds the only surviving copy.
+        Some(RestorePhase::StagingVerified) | None => {
+            if !dir_is_present(data_dir)
+                && journal.as_ref().is_some_and(|journal| {
+                    journal_proves_original_aside(&restoring_dir, journal, true)
+                })
+            {
+                // Promotion requires independently captured original-file proof;
+                // relocation must never grant a foreign directory force ownership.
                 std::fs::rename(&restoring_dir, data_dir).with_context(|| {
                     format!(
                         "recover interrupted restore: rename {} back to {}",
@@ -1084,17 +1617,9 @@ fn recover_interrupted_restore(data_dir: &Path) -> anyhow::Result<RestoreRecover
                     )
                 })?;
                 if let Some(parent) = data_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    let _ = fsync_dir(parent);
+                    fsync_dir(parent)
+                        .context("make incumbent recovery durable before retiring its journal")?;
                 }
-                clear_restore_journal(data_dir);
-                Ok(RestoreRecovery::default())
-            } else if restored_dataset_is_self_proving(data_dir) {
-                std::fs::remove_dir_all(&restoring_dir).with_context(|| {
-                    format!(
-                        "remove the superseded pre-restore copy {}",
-                        restoring_dir.display()
-                    )
-                })?;
                 clear_restore_journal(data_dir);
                 Ok(RestoreRecovery::default())
             } else {
@@ -1197,22 +1722,27 @@ fn maybe_corrupt_after_copy_for_test(dest: &Path) {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.is_file() && path.file_name().is_some_and(|name| name != "manifest.json")
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "lbug" || extension == "kuzu")
             })
             .min()
     {
-        let _ = std::fs::write(&victim, b"corrupted by the test");
+        std::fs::write(&victim, b"corrupted by the test").expect("inject copied graph corruption");
+        eprintln!("test injected graph corruption into {}", victim.display());
     }
 }
 
 #[cfg(not(test))]
 fn maybe_corrupt_after_copy_for_test(_dest: &Path) {}
 
-/// Enumerate every canonical `.lbug` database directly beneath `data_dir` and
+/// Enumerate legacy `.lbug`/`.kuzu` candidates and exact physically marked
+/// custom-basename databases directly beneath `data_dir` and
 /// its `.restoring` rename-aside sibling — the exact set a restore is about to
 /// destroy or has just destroyed, and therefore the exact set that needs a
 /// held write lease for the whole operation.
-fn restore_lease_targets(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub fn restore_lease_targets(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut targets = Vec::new();
 
     for dir in [data_dir.to_path_buf(), restoring_dir_for(data_dir)] {
@@ -1235,7 +1765,13 @@ fn restore_lease_targets(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
                 )
             })?;
             let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("lbug") {
+            let legacy_candidate = matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("lbug" | "kuzu")
+            );
+            if !legacy_candidate
+                && !nestweaver_store::engine_format::has_current_file_marker(&path)?
+            {
                 continue;
             }
 
@@ -1427,6 +1963,35 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     // later refusal does not claim the directory was left untouched.
     let interrupted_restore = restoring_dir_for(&config.data_dir).exists();
     let recovery = recover_interrupted_restore(&config.data_dir)?;
+    let preserved = recovery.preserved.clone();
+    let result = restore_archive_under_authority(
+        config,
+        start,
+        restoring_dir,
+        recovery,
+        interrupted_restore,
+        &_authority,
+    );
+    match (result, preserved) {
+        (Err(error), Some(path)) => {
+            let message = format!(
+                "{error}; unproven restore copy preserved at {}",
+                path.display()
+            );
+            Err(error.context(message))
+        }
+        (result, _) => result,
+    }
+}
+
+fn restore_archive_under_authority(
+    config: &RestoreConfig,
+    start: Instant,
+    restoring_dir: PathBuf,
+    recovery: RestoreRecovery,
+    interrupted_restore: bool,
+    _authority: &RestoreAuthority,
+) -> anyhow::Result<RestoreResult> {
     if !config.replace && restore_target_occupied(&config.data_dir)? {
         if interrupted_restore || recovery.preserved.is_some() {
             let preserved = recovery
@@ -1438,14 +2003,14 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
                         path.display()
                     )
                 });
-            anyhow::bail!(
+            refuse_backup!(
                 "backup restore refused: {} is not empty. An interrupted restore was reconciled \
                  first, and the archive was not applied.{preserved} Re-run with --force to replace \
                  this directory.",
                 config.data_dir.display()
             );
         }
-        anyhow::bail!(
+        refuse_backup!(
             "backup restore refused: {} is not empty. Restore renames that directory aside and \
              deletes it after the new data is in place. Re-run with --force to replace it. \
              Nothing in {} was changed.",
@@ -1456,11 +2021,7 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     // A directory an earlier restore was interrupted on was already chosen as
     // a restore target, and recovery has just put its previous contents
     // back; replacing it is what that earlier --force asked for.
-    if config.replace
-        && !interrupted_restore
-        && recovery.preserved.is_none()
-        && restore_target_occupied(&config.data_dir)?
-    {
+    if config.replace && restore_target_occupied(&config.data_dir)? {
         refuse_replacing_foreign_directory(&config.data_dir)?;
     }
 
@@ -1498,6 +2059,7 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     // and their rollback path), read only through the store's legacy
     // exemption, and the operator is told it must be rebuilt before use.
     let mut pre_cutover_engine = false;
+    let mut restored_graph_path = None;
 
     // Verify integrity before committing to the target directory.
     if let Err(e) = verify_backup_checksums(temp_dir.path(), &manifest) {
@@ -1536,6 +2098,7 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
             .iter()
             .find(|artifact| artifact.kind == crate::publication::ArtifactKind::Graph)
             .ok_or_else(|| anyhow::anyhow!("backup publication has no graph artifact"))?;
+        restored_graph_path = Some(graph.path.clone());
         let graph_store = nestweaver_store::GraphStore::open_read_only_allowing_legacy_engine(
             &temp_dir.path().join(&graph.path),
         )
@@ -1572,6 +2135,7 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
                 "legacy backup has no unambiguous graph payload for logical identity validation"
             );
         };
+        restored_graph_path = Some((*graph).clone());
         let store = nestweaver_store::GraphStore::open_read_only_allowing_legacy_engine(
             &temp_dir.path().join(graph),
         )
@@ -1612,6 +2176,15 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
         data_dir: config.data_dir.clone(),
         restoring_dir: restoring_dir.clone(),
         snapshot_path: config.snapshot_path.clone(),
+        destination_identity: restore_directory_identity(temp_dir.path()),
+        restoring_identity: restore_directory_identity(&config.data_dir),
+        destination_paths: restore_tree_paths(temp_dir.path())?,
+        restoring_paths: restore_tree_paths(&config.data_dir)?,
+        graph_path: restored_graph_path,
+        source_checksums: Some(manifest.checksums.clone()),
+        restoring_file_witnesses: Some(restore_tree_witnesses(&config.data_dir)?),
+        destination_file_witnesses: None,
+        legacy_engine: pre_cutover_engine,
     };
     publish_restore_phase(&journal)?;
     maybe_crash_for_test(RestorePhase::StagingVerified);
@@ -1632,6 +2205,7 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
         {
             let _ = fsync_dir(dir);
         }
+        maybe_crash_restore_step_for_test("old-data-renamed-before-journal");
         journal.phase = RestorePhase::OldDataPreserved;
         publish_restore_phase(&journal)?;
         maybe_crash_for_test(RestorePhase::OldDataPreserved);
@@ -1642,6 +2216,8 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
     let cross_device_copy = force_cross_device_copy_for_test()
         || std::fs::rename(temp_dir.path(), &config.data_dir).is_err();
     if cross_device_copy {
+        std::fs::create_dir_all(&config.data_dir)?;
+        journal.destination_identity = restore_directory_identity(&config.data_dir);
         // Published BEFORE the first byte lands. Over-claiming "the
         // destination is not authoritative" costs a retry; under-claiming it
         // costs the user's only complete dataset.
@@ -1695,12 +2271,26 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
             "restored data at {} failed validation after the cutover{}",
             config.data_dir.display(),
             match recovered {
-                Ok(_) => "; the pre-restore data has been reinstated".to_string(),
+                Ok(recovery) => match recovery.preserved {
+                    Some(path) => format!(
+                        "; the pre-restore data has been reinstated; unproven restore copy preserved at {}",
+                        path.display()
+                    ),
+                    None => "; the pre-restore data has been reinstated".to_string(),
+                },
                 Err(problem) =>
                     format!("; reinstating the pre-restore data also failed: {problem}"),
             }
         )));
     }
+
+    // Rebinding changes a checksummed marker, so do it only AFTER validating
+    // the archive bytes, but BEFORE claiming a complete cutover. A death here
+    // remains CopyInProgress (copy) or OldDataPreserved (rename): recovery keeps
+    // the incumbent rather than treating a partly finalized copy as complete.
+    prepare_restored_write_lock(&config.data_dir, &mut journal)?;
+    finalize_restored_engine_marker(&config.data_dir, &journal, &manifest)?;
+    journal.destination_file_witnesses = Some(restore_tree_witnesses(&config.data_dir)?);
 
     journal.phase = RestorePhase::CutoverValidated;
     publish_restore_phase(&journal)?;
@@ -1708,6 +2298,11 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
 
     // Step 3: only NOW is the preserved copy provably redundant.
     if restoring_dir.exists() {
+        if !journal_proves_original_aside(&restoring_dir, &journal, false) {
+            refuse_backup!(
+                "backup restore refused: original aside content changed before cleanup; destination, aside copy and journal were preserved"
+            );
+        }
         journal.phase = RestorePhase::Cleanup;
         publish_restore_phase(&journal)?;
         maybe_crash_for_test(RestorePhase::Cleanup);
@@ -1719,33 +2314,6 @@ pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
         }
     }
     clear_restore_journal(&config.data_dir);
-
-    // The restored databases are new files, so their engine-format sidecars
-    // (which name the file they were written for) are re-bound to them. Done
-    // after the cutover validated the archive's bytes, so it cannot disturb
-    // that check; without it a restored database that later crashed with a
-    // log beside it would be refused as unverifiable.
-    for entry in walkdir::WalkDir::new(&config.data_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
-        let name = entry.file_name().to_string_lossy();
-        let Some(db_name) =
-            name.strip_suffix(nestweaver_store::engine_format::ENGINE_FORMAT_SIDECAR_SUFFIX)
-        else {
-            continue;
-        };
-        let db = entry.path().with_file_name(db_name);
-        if let Err(error) = nestweaver_store::engine_format::restamp_after_copy(&db) {
-            manifest.warnings.push(format!(
-                "could not re-bind the engine-format marker of the restored database {} \
-                 ({error}); it still opens, but if it crashes before its first clean open it \
-                 will be refused until the marker file is rewritten",
-                db.display()
-            ));
-        }
-    }
 
     Ok(RestoreResult {
         manifest,
@@ -2365,18 +2933,18 @@ fn validate_restored_logical_identity(
 
 /// Whether `path` already holds something restore would rename aside.
 /// `--force` replaces a data directory, which ends in deleting it. Only do
-/// that to a directory that is recognisably NestWeaver's: one holding a graph
-/// database file (`*.lbug`, or a legacy `*.kuzu`) or the `publication.json`
-/// a restore leaves. Any other non-empty directory (a home directory, a
+/// that to a directory whose database has an exact physical format marker
+/// and whose complete contents belong to known database artifacts. Any other
+/// non-empty directory (a home directory, a
 /// source tree, a typo) is refused even with `--force`, because the cost of
 /// guessing wrong is the user's files.
 fn refuse_replacing_foreign_directory(data_dir: &Path) -> anyhow::Result<()> {
     if is_recognisable_data_dir(data_dir)? {
         return Ok(());
     }
-    anyhow::bail!(
+    refuse_backup!(
         "backup restore refused: {} is not empty and does not look like a NestWeaver data \
-         directory (no *.lbug database or publication.json in it). --force only replaces a \
+         directory with verified ownership of every entry. --force only replaces a \
          NestWeaver data directory, because replacing deletes the old contents. Restore into an \
          empty or new directory instead. Nothing in {} was changed.",
         data_dir.display(),
@@ -2385,33 +2953,134 @@ fn refuse_replacing_foreign_directory(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn is_recognisable_data_dir(data_dir: &Path) -> anyhow::Result<bool> {
-    let metadata = std::fs::symlink_metadata(data_dir)
-        .with_context(|| format!("inspect restore target {}", data_dir.display()))?;
-    if !metadata.is_dir() {
+    if !std::fs::symlink_metadata(data_dir)?.is_dir() {
         return Ok(false);
     }
-    let entries = std::fs::read_dir(data_dir)
-        .with_context(|| format!("inspect restore target {}", data_dir.display()))?;
-    for entry in entries {
-        let entry =
-            entry.with_context(|| format!("inspect restore target {}", data_dir.display()))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        // A database may be a symlink to the real file, and a legacy Kuzu
-        // database is a directory.
-        let is_marker = (name == crate::publication::PUBLICATION_MANIFEST_FILE && kind.is_file())
-            || (name.ends_with(".lbug") && (kind.is_file() || kind.is_symlink()))
-            || (name.ends_with(".kuzu") && (kind.is_file() || kind.is_dir() || kind.is_symlink()));
-        if is_marker {
-            return Ok(true);
-        }
+    let entries = std::fs::read_dir(data_dir)?.collect::<Result<Vec<_>, _>>()?;
+    // A filename or copied manifest is not evidence that arbitrary adjacent
+    // files belong to NestWeaver. Require an inode-bound engine marker and an
+    // exhaustive set of owned top-level artifacts before recursive deletion.
+    let databases: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if entry.file_type().ok()?.is_file()
+                && nestweaver_store::engine_format::has_current_file_marker(&entry.path()).ok()?
+            {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if databases.is_empty() {
+        return Ok(false);
     }
-    Ok(false)
+    let manifest_path = data_dir.join(crate::publication::PUBLICATION_MANIFEST_FILE);
+    let inventory = if manifest_path.exists() {
+        if std::fs::symlink_metadata(&manifest_path)?.len() > MAX_PUBLICATION_MANIFEST_BYTES {
+            return Ok(false);
+        }
+        let Ok(bundle) = serde_json::from_slice::<crate::publication::PublicationBundleV3>(
+            &std::fs::read(&manifest_path)?,
+        ) else {
+            return Ok(false);
+        };
+        if ![
+            crate::snapshot::SNAPSHOT_FORMAT_VERSION,
+            crate::snapshot::LEGACY_ENGINE_SNAPSHOT_FORMAT_VERSION,
+        ]
+        .contains(&bundle.format_version)
+            || bundle.validate_metadata(bundle.format_version).is_err()
+        {
+            return Ok(false);
+        }
+        bundle
+            .artifacts
+            .into_iter()
+            .map(|artifact| artifact.path)
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        std::collections::HashSet::new()
+    };
+    for entry in entries {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Ok(false);
+        };
+        if entry.file_type()?.is_symlink() {
+            return Ok(false);
+        }
+        if databases.contains(&name) {
+            continue;
+        }
+        let owned_sidecar = databases.iter().any(|db| {
+            name.strip_prefix(db.as_str()).is_some_and(|suffix| {
+                SIDECAR_SUFFIXES.contains(&suffix)
+                    || [
+                        ".wal",
+                        ".write.lock",
+                        ".publications",
+                        ".vault-registrations.json",
+                    ]
+                    .contains(&suffix)
+            })
+        });
+        if owned_sidecar && entry.file_type()?.is_file() {
+            continue;
+        }
+        if name == "manifest.json" {
+            if serde_json::from_slice::<BackupManifest>(&std::fs::read(entry.path())?).is_err() {
+                return Ok(false);
+            }
+            continue;
+        }
+        if name == crate::publication::PUBLICATION_MANIFEST_FILE {
+            continue;
+        }
+        // Full archives include instance.toml and clone workspaces. Their
+        // names alone confer no ownership: every payload must be inventoried,
+        // including files nested below a recognized directory.
+        if inventory.contains(&name) && entry.file_type()?.is_file() {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            let prefix = format!("{name}/");
+            if inventory.iter().any(|path| path.starts_with(&prefix)) {
+                for child in walkdir::WalkDir::new(entry.path()).min_depth(1) {
+                    let child = child?;
+                    if child.file_type().is_symlink() {
+                        return Ok(false);
+                    }
+                    if child.file_type().is_file()
+                        && !inventory.contains(&normalized_relative_path(data_dir, child.path())?)
+                    {
+                        return Ok(false);
+                    }
+                    if child.file_type().is_dir() {
+                        let prefix =
+                            format!("{}/", normalized_relative_path(data_dir, child.path())?);
+                        if !inventory.iter().any(|path| path.starts_with(&prefix)) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn has_database_header(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut header = [0; 4];
+    let mut file = std::fs::File::open(path)?;
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(&header == b"LBUG" || &header == b"KUZU"),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Refuse a backup destination that IS the database or one of its files.
@@ -2430,7 +3099,7 @@ fn refuse_output_in_database_footprint(db_path: &Path, output: &Path) -> anyhow:
     };
     let db_name = db_name.to_string_lossy().into_owned();
     let refuse = || -> anyhow::Result<()> {
-        anyhow::bail!(
+        refuse_backup!(
             "backup refused: the destination {} is the database {} or one of its files. Choose \
              a path outside the database's files; nothing was written.",
             output.display(),
@@ -2449,6 +3118,32 @@ fn refuse_output_in_database_footprint(db_path: &Path, output: &Path) -> anyhow:
     // except for an archive name: no sidecar ends `.nwsnap.zst`, and a backup
     // called `<db>.2026-10-21.nwsnap.zst` beside the database is legitimate.
     let resolved = resolve_output_path(output);
+    // A different database's sidecars are destructive destinations too.
+    for ancestor in resolved.ancestors() {
+        let Some(parent) = ancestor.parent() else {
+            continue;
+        };
+        let Some(name) = ancestor.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let candidate = entry.file_name();
+                let Some(db_name) = candidate.to_str() else {
+                    continue;
+                };
+                if (db_name.ends_with(".lbug") || db_name.ends_with(".kuzu"))
+                    && name
+                        .strip_prefix(db_name)
+                        .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('-'))
+                    && !name.ends_with(".nwsnap.zst")
+                {
+                    return refuse();
+                }
+            }
+        }
+    }
+
     if let Ok(rest) = resolved.strip_prefix(db_parent) {
         let mut components = rest.components();
         if let Some(std::path::Component::Normal(first)) = components.next() {
@@ -2480,6 +3175,16 @@ fn refuse_output_in_database_footprint(db_path: &Path, output: &Path) -> anyhow:
             }
         }
     }
+    // Protect every database, not only the source. Magic catches a database
+    // hidden behind a differently named hard link; canonical paths catch links.
+    if [output, resolved.as_path()].iter().any(|path| {
+        path.extension()
+            .is_some_and(|ext| ext == "lbug" || ext == "kuzu")
+    }) || (resolved.is_file() && has_database_header(&resolved)?)
+    {
+        return refuse();
+    }
+
     Ok(())
 }
 
@@ -2564,7 +3269,7 @@ fn publish_backup_archive(staging: &Path, output: &Path, overwrite: bool) -> any
 }
 
 fn archive_exists(output: &Path) -> anyhow::Result<()> {
-    anyhow::bail!(
+    refuse_backup!(
         "backup refused: {} already exists; re-run with --force to overwrite it. \
          The existing archive was not modified.",
         output.display()
@@ -3576,6 +4281,7 @@ mod tests {
         );
         assert!(!data_dir.join("graph.lbug").exists());
 
+        std::fs::remove_file(data_dir.join("sentinel.txt")).unwrap();
         backup_restore(&RestoreConfig {
             snapshot_path: snapshot,
             data_dir: data_dir.clone(),
@@ -3617,12 +4323,24 @@ mod tests {
         // The pre-restore copy is a NestWeaver data directory: a later
         // `--force` only replaces one of those.
         drop(nestweaver_store::GraphStore::create(&restoring.join("prior.lbug")).unwrap());
+        // A real restore takes its write lease before capturing the journal.
+        // Simulate that crashed owner's stable operational lock before proof.
+        drop(nestweaver_store::acquire_db_write_lease(&restoring.join("prior.lbug")).unwrap());
         publish_restore_phase(&RestoreJournal {
             version: RESTORE_JOURNAL_VERSION,
             phase: RestorePhase::CopyInProgress,
             data_dir: data_dir.clone(),
             restoring_dir: restoring.clone(),
             snapshot_path: snapshot.clone(),
+            destination_identity: restore_directory_identity(&data_dir),
+            restoring_identity: restore_directory_identity(&restoring),
+            destination_paths: restore_tree_paths(&data_dir).unwrap(),
+            restoring_paths: restore_tree_paths(&restoring).unwrap(),
+            graph_path: None,
+            source_checksums: None,
+            restoring_file_witnesses: Some(restore_tree_witnesses(&restoring).unwrap()),
+            destination_file_witnesses: None,
+            legacy_engine: false,
         })
         .unwrap();
 
@@ -3643,6 +4361,7 @@ mod tests {
         assert!(!restoring.exists());
         assert!(!restore_journal_path(&data_dir).exists());
 
+        std::fs::remove_file(data_dir.join("good.txt")).unwrap();
         backup_restore(&RestoreConfig {
             snapshot_path: snapshot,
             data_dir: data_dir.clone(),
@@ -3986,25 +4705,21 @@ mod tests {
     }
 
     #[test]
-    fn restore_recovers_from_leftover_restoring_dir() {
-        // Prior restore crashed after moving data aside but before the new data
-        // landed: data dir is gone, `.restoring` holds the only surviving copy.
+    fn unjournaled_leftover_restoring_dir_is_preserved_without_promoting_it() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data = tmp.path().join("data");
         let restoring = tmp.path().join("data.restoring");
         std::fs::create_dir_all(&restoring).unwrap();
         std::fs::write(restoring.join("brain.lbug"), b"RECOVERED").unwrap();
-
-        recover_interrupted_restore(&data).expect("recover");
-
+        let recovery = recover_interrupted_restore(&data).unwrap();
+        let preserved = recovery
+            .preserved
+            .expect("unjournaled bytes cannot be granted implicit restore ownership");
+        assert!(!data.exists());
+        assert!(!restoring.exists());
         assert_eq!(
-            std::fs::read(data.join("brain.lbug")).unwrap(),
-            b"RECOVERED",
-            "the only surviving copy must be recovered into place"
-        );
-        assert!(
-            !restoring.exists(),
-            ".restoring must be consumed by the recovery, not left behind"
+            std::fs::read(preserved.join("brain.lbug")).unwrap(),
+            b"RECOVERED"
         );
     }
 
@@ -4045,8 +4760,350 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             restoring_dir: restoring_dir_for(data_dir),
             snapshot_path: PathBuf::from("/nonexistent.nwsnap.zst"),
+            destination_identity: restore_directory_identity(data_dir),
+            restoring_identity: restore_directory_identity(&restoring_dir_for(data_dir)),
+            destination_paths: restore_tree_paths(data_dir).unwrap(),
+            restoring_paths: restore_tree_paths(&restoring_dir_for(data_dir)).unwrap(),
+            graph_path: None,
+            source_checksums: None,
+            restoring_file_witnesses: Some(
+                restore_tree_witnesses(&restoring_dir_for(data_dir)).unwrap(),
+            ),
+            destination_file_witnesses: None,
+            legacy_engine: false,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn stale_or_copied_journal_cannot_delete_a_reused_foreign_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        seed_dataset(&data, b"PARTIAL");
+        journal_at(&data, RestorePhase::CopyInProgress);
+        let original = tmp.path().join("original");
+        std::fs::rename(&data, &original).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("thesis.txt"), b"mine").unwrap();
+        assert!(recover_interrupted_restore(&data).is_err());
+        assert_eq!(std::fs::read(data.join("thesis.txt")).unwrap(), b"mine");
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::write(copied.join("thesis.txt"), b"mine too").unwrap();
+        std::fs::copy(restore_journal_path(&data), restore_journal_path(&copied)).unwrap();
+        recover_interrupted_restore(&copied).unwrap();
+        assert_eq!(
+            std::fs::read(copied.join("thesis.txt")).unwrap(),
+            b"mine too"
+        );
+    }
+
+    #[test]
+    fn journal_does_not_authorize_unknown_files_added_after_it_was_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let restoring = restoring_dir_for(&data);
+        seed_dataset(&data, b"RESTORED");
+        seed_dataset(&restoring, b"SUPERSEDED");
+        journal_at(&data, RestorePhase::Cleanup);
+        std::fs::write(restoring.join("thesis.txt"), b"mine").unwrap();
+        let before_journal = std::fs::read(restore_journal_path(&data)).unwrap();
+        assert!(recover_interrupted_restore(&data).is_err());
+        assert_eq!(
+            std::fs::read(restoring.join("thesis.txt")).unwrap(),
+            b"mine"
+        );
+        assert_eq!(
+            std::fs::read(restoring.join("brain.lbug")).unwrap(),
+            b"SUPERSEDED"
+        );
+        assert_eq!(std::fs::read(data.join("brain.lbug")).unwrap(), b"RESTORED");
+        assert_eq!(
+            std::fs::read(restore_journal_path(&data)).unwrap(),
+            before_journal
+        );
+    }
+
+    /// A real archived/restored graph, including its original copied marker.
+    fn seed_marker_replay_dataset(root: &Path, graph: &str) -> (PathBuf, PathBuf, Vec<u8>) {
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let db = source.join(graph);
+        let store = nestweaver_store::GraphStore::create(&db).unwrap();
+        store.ensure_data_instance_id("default").unwrap();
+        drop(store);
+        let snapshot = root.join("source.nwsnap.zst");
+        backup_save(&BackupConfig {
+            db_path: db.clone(),
+            output_path: snapshot.clone(),
+            include_clones: false,
+            instance_id: "default".into(),
+            workspace_path: None,
+            overwrite: false,
+        })
+        .unwrap();
+        let original_marker =
+            std::fs::read(nestweaver_store::engine_format::sidecar_path(&db)).unwrap();
+        let data = root.join("data");
+        backup_restore(&RestoreConfig {
+            snapshot_path: snapshot.clone(),
+            data_dir: data.clone(),
+            replace: true,
+        })
+        .unwrap();
+        (data, snapshot, original_marker)
+    }
+
+    fn marker_replay_journal(data: &Path, snapshot: &Path, graph: &str, phase: RestorePhase) {
+        journal_at(data, phase);
+        let mut journal = read_restore_journal(data).unwrap();
+        journal.snapshot_path = snapshot.to_path_buf();
+        journal.graph_path = Some(graph.into());
+        journal.source_checksums = Some(backup_inspect(snapshot).unwrap().checksums);
+        journal.destination_file_witnesses = Some(restore_tree_witnesses(data).unwrap());
+        publish_restore_phase(&journal).unwrap();
+    }
+
+    #[test]
+    fn valid_custom_basename_restore_can_be_restored_again_but_preserves_unknown_nested_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "graph.db");
+        for _ in 0..2 {
+            backup_restore(&RestoreConfig {
+                snapshot_path: snapshot.clone(),
+                data_dir: data.clone(),
+                replace: true,
+            })
+            .unwrap();
+            assert!(
+                nestweaver_store::engine_format::has_current_file_marker(&data.join("graph.db"))
+                    .unwrap()
+            );
+            assert!(is_recognisable_data_dir(&data).unwrap());
+        }
+        let original_hash = sha256_stream_path(data.join("graph.db")).unwrap();
+        let personal = data.join("graph.db.publications").join("thesis.txt");
+        std::fs::create_dir_all(personal.parent().unwrap()).unwrap();
+        std::fs::write(&personal, b"irreplaceable").unwrap();
+        let error = backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data.clone(),
+            replace: true,
+        })
+        .unwrap_err();
+        assert!(error.downcast_ref::<BackupRefusal>().is_some(), "{error:#}");
+        assert_eq!(std::fs::read(personal).unwrap(), b"irreplaceable");
+        assert_eq!(
+            sha256_stream_path(data.join("graph.db")).unwrap(),
+            original_hash
+        );
+    }
+
+    #[test]
+    fn finalized_marker_replay_is_idempotent_with_or_without_an_aside_copy() {
+        for with_aside in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+            let original_hash = sha256_stream_path(data.join("brain.lbug")).unwrap();
+            if with_aside {
+                seed_dataset(&restoring_dir_for(&data), b"SUPERSEDED");
+            }
+            marker_replay_journal(&data, &snapshot, "brain.lbug", RestorePhase::Cleanup);
+            let immutable_receipt = read_restore_journal(&data)
+                .unwrap()
+                .destination_file_witnesses;
+            std::fs::remove_file(snapshot).unwrap();
+            for _ in 0..2 {
+                recover_interrupted_restore(&data).unwrap();
+            }
+            assert!(
+                nestweaver_store::engine_format::has_current_file_marker(&data.join("brain.lbug"))
+                    .unwrap()
+            );
+            assert_eq!(
+                sha256_stream_path(data.join("brain.lbug")).unwrap(),
+                original_hash
+            );
+            assert_eq!(
+                Some(restore_tree_witnesses(&data).unwrap()),
+                immutable_receipt
+            );
+            assert!(!restoring_dir_for(&data).exists());
+            assert!(!restore_journal_path(&data).exists());
+        }
+    }
+
+    #[test]
+    fn validated_marker_replay_preserves_replaced_graph_legacy_receipt_and_unknown_contents() {
+        for fault in [
+            "replaced_graph_and_archive",
+            "legacy_receipt",
+            "unknown_nested",
+            "unbound_marker",
+        ] {
+            for with_aside in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (data, snapshot, copied_marker) =
+                    seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+                let db = data.join("brain.lbug");
+                let marker = nestweaver_store::engine_format::sidecar_path(&db);
+                if with_aside {
+                    seed_dataset(&restoring_dir_for(&data), b"ONLY INCUMBENT");
+                }
+                marker_replay_journal(
+                    &data,
+                    &snapshot,
+                    "brain.lbug",
+                    RestorePhase::CutoverValidated,
+                );
+                match fault {
+                    "replaced_graph_and_archive" => {
+                        let foreign_dir = tmp.path().join("foreign");
+                        std::fs::create_dir(&foreign_dir).unwrap();
+                        let foreign_db = foreign_dir.join("brain.lbug");
+                        let foreign = nestweaver_store::GraphStore::create(&foreign_db).unwrap();
+                        foreign.ensure_data_instance_id("foreign").unwrap();
+                        drop(foreign);
+                        let foreign_archive = tmp.path().join("foreign.nwsnap.zst");
+                        backup_save(&BackupConfig {
+                            db_path: foreign_db.clone(),
+                            output_path: foreign_archive.clone(),
+                            include_clones: false,
+                            instance_id: "foreign".into(),
+                            workspace_path: None,
+                            overwrite: false,
+                        })
+                        .unwrap();
+                        std::fs::copy(foreign_db, &db).unwrap();
+                        std::fs::copy(foreign_archive, &snapshot).unwrap();
+                    }
+                    "legacy_receipt" => {
+                        let mut journal = read_restore_journal(&data).unwrap();
+                        journal.version = 2;
+                        journal.source_checksums = None;
+                        journal.graph_path = None;
+                        journal.destination_file_witnesses = None;
+                        publish_restore_phase(&journal).unwrap();
+                    }
+                    "unbound_marker" => {
+                        std::fs::write(&marker, &copied_marker).unwrap();
+                        assert!(
+                            !nestweaver_store::engine_format::has_current_file_marker(&db).unwrap()
+                        );
+                    }
+                    "unknown_nested" => {
+                        let personal = data.join("brain.lbug.publications/thesis.txt");
+                        std::fs::create_dir_all(personal.parent().unwrap()).unwrap();
+                        std::fs::write(personal, b"mine").unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let before_graph = sha256_stream_path(&db).unwrap();
+                let before_marker = std::fs::read(&marker).unwrap();
+                let before_journal = std::fs::read(restore_journal_path(&data)).unwrap();
+                for _ in 0..2 {
+                    assert!(
+                        recover_interrupted_restore(&data).is_err(),
+                        "{fault}, aside={with_aside}"
+                    );
+                    assert_eq!(sha256_stream_path(&db).unwrap(), before_graph);
+                    assert_eq!(std::fs::read(&marker).unwrap(), before_marker);
+                    assert_eq!(
+                        std::fs::read(restore_journal_path(&data)).unwrap(),
+                        before_journal
+                    );
+                    if with_aside {
+                        assert_eq!(
+                            std::fs::read(restoring_dir_for(&data).join("brain.lbug")).unwrap(),
+                            b"ONLY INCUMBENT"
+                        );
+                    }
+                    if fault == "unknown_nested" {
+                        assert_eq!(
+                            std::fs::read(data.join("brain.lbug.publications/thesis.txt")).unwrap(),
+                            b"mine"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lost_journal_before_marker_finalization_preserves_both_complete_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, _, copied_marker) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        let db = data.join("brain.lbug");
+        let marker = nestweaver_store::engine_format::sidecar_path(&db);
+        std::fs::write(&marker, &copied_marker).unwrap();
+        assert!(restored_dataset_is_self_proving(&data));
+        let aside = restoring_dir_for(&data);
+        std::fs::create_dir(&aside).unwrap();
+        let incumbent = nestweaver_store::GraphStore::create(&aside.join("brain.lbug")).unwrap();
+        incumbent.ensure_data_instance_id("last-incumbent").unwrap();
+        drop(incumbent);
+        let graph_hash = sha256_stream_path(&db).unwrap();
+        let recovery = recover_interrupted_restore(&data).unwrap();
+        let preserved = recovery
+            .preserved
+            .expect("unbound marker is not completion proof");
+        assert_eq!(sha256_stream_path(&db).unwrap(), graph_hash);
+        assert_eq!(std::fs::read(marker).unwrap(), copied_marker);
+        assert_eq!(
+            nestweaver_store::GraphStore::open_read_only(&preserved.join("brain.lbug"))
+                .unwrap()
+                .data_instance_id()
+                .unwrap()
+                .as_deref(),
+            Some("last-incumbent")
+        );
+        recover_interrupted_restore(&data).unwrap();
+        assert!(preserved.exists());
+    }
+
+    #[test]
+    fn checksum_self_proof_without_journal_never_authorizes_deleting_an_owned_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, _, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        let manifest_path = data.join("manifest.json");
+        let mut manifest: BackupManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        for (path, checksum) in &mut manifest.checksums {
+            *checksum = sha256_stream_path(data.join(path)).unwrap();
+        }
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(restored_dataset_is_self_proving(&data));
+        assert!(is_recognisable_data_dir(&data).unwrap());
+        let aside = restoring_dir_for(&data);
+        std::fs::create_dir(&aside).unwrap();
+        let old = nestweaver_store::GraphStore::create(&aside.join("brain.lbug")).unwrap();
+        old.ensure_data_instance_id("unproven-owned-aside").unwrap();
+        drop(old);
+        assert!(is_recognisable_data_dir(&aside).unwrap());
+        let destination_hash = sha256_stream_path(data.join("brain.lbug")).unwrap();
+        let original_hash = sha256_stream_path(aside.join("brain.lbug")).unwrap();
+        let recovery = recover_interrupted_restore(&data).unwrap();
+        let preserved = recovery
+            .preserved
+            .expect("even marked aside needs independent original-file proof");
+        assert_eq!(
+            sha256_stream_path(data.join("brain.lbug")).unwrap(),
+            destination_hash
+        );
+        assert_eq!(
+            sha256_stream_path(preserved.join("brain.lbug")).unwrap(),
+            original_hash
+        );
+        assert_eq!(
+            nestweaver_store::GraphStore::open_read_only(&preserved.join("brain.lbug"))
+                .unwrap()
+                .data_instance_id()
+                .unwrap()
+                .as_deref(),
+            Some("unproven-owned-aside")
+        );
+        recover_interrupted_restore(&data).unwrap();
+        assert!(preserved.exists());
     }
 
     /// THE DEFECT, reproduced.
@@ -4120,13 +5177,16 @@ mod tests {
     #[test]
     fn a_journalled_validated_cutover_retires_the_aside_copy() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let data = tmp.path().join("data");
         let restoring = tmp.path().join("data.restoring");
-
-        seed_dataset(&data, b"RESTORED");
+        let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        let original_hash = sha256_stream_path(data.join("brain.lbug")).unwrap();
         seed_dataset(&restoring, b"SUPERSEDED");
-        journal_at(&data, RestorePhase::CutoverValidated);
-
+        marker_replay_journal(
+            &data,
+            &snapshot,
+            "brain.lbug",
+            RestorePhase::CutoverValidated,
+        );
         for pass in 0..3 {
             recover_interrupted_restore(&data).unwrap_or_else(|e| panic!("pass {pass}: {e}"));
             assert!(
@@ -4134,20 +5194,17 @@ mod tests {
                 "pass {pass}: proven-redundant copy removed"
             );
             assert_eq!(
-                std::fs::read(data.join("brain.lbug")).unwrap(),
-                b"RESTORED",
-                "pass {pass}: the restored dataset must be untouched"
+                sha256_stream_path(data.join("brain.lbug")).unwrap(),
+                original_hash
             );
             assert!(!restore_journal_path(&data).exists(), "pass {pass}");
         }
     }
 
-    /// The second admissible proof, for a `.restoring` written by a build that
-    /// had no journal at all: the destination validates against its OWN
-    /// embedded `manifest.json`, which is a complete-dataset proof that owes
-    /// nothing to nonemptiness.
+    /// A destination checksum manifest without an independently captured
+    /// journal does not authorize deleting an unowned aside copy.
     #[test]
-    fn a_self_proving_destination_retires_the_aside_copy_without_a_journal() {
+    fn a_self_proving_destination_preserves_an_unowned_aside_copy_without_a_journal() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data = tmp.path().join("data");
         let restoring = tmp.path().join("data.restoring");
@@ -4156,11 +5213,18 @@ mod tests {
         seed_dataset(&restoring, b"SUPERSEDED");
         write_self_proof(&data);
 
-        recover_interrupted_restore(&data).unwrap();
+        let recovery = recover_interrupted_restore(&data).unwrap();
 
         assert!(
             !restoring.exists(),
-            "a self-proving destination retires the orphan"
+            "the orphan is moved to a reported preserved path"
+        );
+        let preserved = recovery
+            .preserved
+            .expect("replacement proof is not ownership of the old directory");
+        assert_eq!(
+            std::fs::read(preserved.join("brain.lbug")).unwrap(),
+            b"SUPERSEDED"
         );
         assert_eq!(std::fs::read(data.join("brain.lbug")).unwrap(), b"RESTORED");
     }
@@ -4284,7 +5348,7 @@ mod tests {
             data_dir: PathBuf::from(data_dir),
             replace: true,
         }) {
-            eprintln!("child restore returned an error: {error}");
+            eprintln!("child restore returned an error: {error:#}");
             // A distinct code, so the parent can tell "the restore refused"
             // from "the injected crash fired" (9) and from "it succeeded" (0).
             std::process::exit(3);
@@ -4305,6 +5369,25 @@ mod tests {
         crash_at: &str,
         extra_env: &[(&str, &str)],
     ) -> std::process::ExitStatus {
+        run_restore_in_child_with_output(snapshot, data_dir, crash_at, extra_env).status
+    }
+
+    fn run_restore_in_child_with_output(
+        snapshot: &Path,
+        data_dir: &Path,
+        crash_at: &str,
+        extra_env: &[(&str, &str)],
+    ) -> std::process::Output {
+        run_restore_in_child_copy_mode(snapshot, data_dir, crash_at, extra_env, true)
+    }
+
+    fn run_restore_in_child_copy_mode(
+        snapshot: &Path,
+        data_dir: &Path,
+        crash_at: &str,
+        extra_env: &[(&str, &str)],
+        force_copy: bool,
+    ) -> std::process::Output {
         let mut command =
             std::process::Command::new(std::env::current_exe().expect("this test binary"));
         command
@@ -4322,13 +5405,17 @@ mod tests {
             // the CLI's own path construction makes it very hard to reach on
             // purpose, so it is injected here rather than staged on a second
             // real filesystem.
-            .env("NW_RESTORE_TEST_FORCE_COPY", "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if force_copy {
+            command.env("NW_RESTORE_TEST_FORCE_COPY", "1");
+        } else {
+            command.env_remove("NW_RESTORE_TEST_FORCE_COPY");
+        }
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        command.status().expect("spawn the crash child")
+        command.output().expect("spawn the crash child")
     }
 
     /// Kill a REAL restore process at every phase of a cross-device cutover
@@ -4345,6 +5432,8 @@ mod tests {
             ("old-data-preserved", true),
             ("copy-in-progress", true),
             ("copy-midway", true),
+            ("before-marker-rebind", true),
+            ("after-marker-rebind", true),
             ("cutover-validated", false),
             ("cleanup", false),
         ] {
@@ -4369,8 +5458,12 @@ mod tests {
             // store, plus a marker that only the incumbent carries.
             let data_dir = tmp.path().join("data");
             std::fs::create_dir_all(&data_dir).unwrap();
-            drop(nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap());
-            std::fs::write(data_dir.join("INCUMBENT"), b"the user's own data").unwrap();
+            let incumbent =
+                nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap();
+            incumbent
+                .ensure_data_instance_id("incumbent-restore-fixture")
+                .unwrap();
+            drop(incumbent);
 
             let status = run_restore_in_child(&snapshot, &data_dir, crash_at);
             assert_eq!(
@@ -4387,8 +5480,13 @@ mod tests {
                 "after a death at {crash_at} the data directory must hold an openable graph"
             );
             if incumbent_must_survive {
-                assert!(
-                    data_dir.join("INCUMBENT").exists(),
+                assert_eq!(
+                    nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug"))
+                        .unwrap()
+                        .data_instance_id()
+                        .unwrap()
+                        .as_deref(),
+                    Some("incumbent-restore-fixture"),
                     "a death at {crash_at} lost the user's own pre-restore data — the one \
                      thing no archive can rebuild"
                 );
@@ -4411,6 +5509,982 @@ mod tests {
                 "a completed restore after {crash_at} must retire its aside copy"
             );
             assert!(!restore_journal_path(&data_dir).exists());
+        }
+    }
+
+    #[test]
+    fn rename_marker_finalization_interruptions_reinstate_the_incumbent() {
+        for crash_at in ["before-marker-rebind", "after-marker-rebind"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+            std::fs::remove_dir_all(&data).unwrap();
+            std::fs::create_dir(&data).unwrap();
+            let incumbent = nestweaver_store::GraphStore::create(&data.join("brain.lbug")).unwrap();
+            incumbent
+                .ensure_data_instance_id("rename-incumbent")
+                .unwrap();
+            drop(incumbent);
+            let output = run_restore_in_child_copy_mode(&snapshot, &data, crash_at, &[], false);
+            assert_eq!(
+                output.status.code(),
+                Some(9),
+                "{crash_at}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                read_restore_journal(&data).unwrap().phase,
+                RestorePhase::OldDataPreserved
+            );
+            for _ in 0..2 {
+                recover_interrupted_restore(&data).unwrap();
+            }
+            assert_eq!(
+                nestweaver_store::GraphStore::open_read_only(&data.join("brain.lbug"))
+                    .unwrap()
+                    .data_instance_id()
+                    .unwrap()
+                    .as_deref(),
+                Some("rename-incumbent")
+            );
+            assert!(!restore_journal_path(&data).exists());
+            backup_restore(&RestoreConfig {
+                snapshot_path: snapshot,
+                data_dir: data.clone(),
+                replace: true,
+            })
+            .unwrap();
+            assert!(
+                nestweaver_store::engine_format::has_current_file_marker(&data.join("brain.lbug"))
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_preserves_complete_destination_when_aside_is_exchanged_or_incomplete_without_archive_access()
+     {
+        for force_copy in [false, true] {
+            for exchanged in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+                let output = run_restore_in_child_copy_mode(
+                    &snapshot,
+                    &data,
+                    "after-marker-rebind",
+                    &[],
+                    force_copy,
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(9),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let expected_phase = if force_copy {
+                    RestorePhase::CopyInProgress
+                } else {
+                    RestorePhase::OldDataPreserved
+                };
+                assert_eq!(read_restore_journal(&data).unwrap().phase, expected_phase);
+                let db = data.join("brain.lbug");
+                assert!(nestweaver_store::engine_format::has_current_file_marker(&db).unwrap());
+                assert!(nestweaver_store::GraphStore::open_read_only(&db).is_ok());
+                let destination_hash = sha256_stream_path(&db).unwrap();
+                let marker = nestweaver_store::engine_format::sidecar_path(&db);
+                let destination_marker = std::fs::read(&marker).unwrap();
+                let journal_bytes = std::fs::read(restore_journal_path(&data)).unwrap();
+                let journal = read_restore_journal(&data).unwrap();
+                let aside = restoring_dir_for(&data);
+                let original_aside = tmp.path().join("original-aside");
+                let original_hash = sha256_stream_path(aside.join("brain.lbug")).unwrap();
+                if exchanged {
+                    std::fs::rename(&aside, &original_aside).unwrap();
+                    seed_dataset(&aside, b"FOREIGN ASIDE");
+                } else {
+                    std::fs::remove_file(aside.join("brain.lbug")).unwrap();
+                    assert_eq!(
+                        restore_directory_identity(&aside),
+                        journal.restoring_identity
+                    );
+                    assert!(
+                        journal_proves_owned_tree(
+                            &aside,
+                            journal.restoring_identity,
+                            &journal.restoring_paths
+                        ),
+                        "a subset proof would incorrectly authorize rollback"
+                    );
+                }
+                let remaining_aside_marker = if exchanged {
+                    None
+                } else {
+                    Some(
+                        std::fs::read(nestweaver_store::engine_format::sidecar_path(
+                            &aside.join("brain.lbug"),
+                        ))
+                        .unwrap(),
+                    )
+                };
+                std::fs::remove_file(&snapshot).unwrap();
+                for _ in 0..2 {
+                    let error = recover_interrupted_restore(&data).unwrap_err();
+                    assert!(error.downcast_ref::<BackupRefusal>().is_some(), "{error:#}");
+                    assert!(
+                        format!("{error:#}").contains("preserved aside copy"),
+                        "{error:#}"
+                    );
+                    assert_eq!(sha256_stream_path(&db).unwrap(), destination_hash);
+                    assert_eq!(std::fs::read(&marker).unwrap(), destination_marker);
+                    assert_eq!(
+                        std::fs::read(restore_journal_path(&data)).unwrap(),
+                        journal_bytes
+                    );
+                    if exchanged {
+                        assert_eq!(
+                            std::fs::read(aside.join("brain.lbug")).unwrap(),
+                            b"FOREIGN ASIDE"
+                        );
+                        assert_eq!(
+                            sha256_stream_path(original_aside.join("brain.lbug")).unwrap(),
+                            original_hash
+                        );
+                    } else {
+                        assert!(aside.exists());
+                        assert!(!aside.join("brain.lbug").exists());
+                        assert_eq!(
+                            std::fs::read(nestweaver_store::engine_format::sidecar_path(
+                                &aside.join("brain.lbug")
+                            ))
+                            .unwrap(),
+                            *remaining_aside_marker.as_ref().unwrap()
+                        );
+                    }
+                    assert!(nestweaver_store::GraphStore::open_read_only(&db).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn original_aside_file_witnesses_refuse_same_name_replacements_and_missing_proof() {
+        for phase in [
+            RestorePhase::OldDataPreserved,
+            RestorePhase::CopyInProgress,
+            RestorePhase::CutoverValidated,
+            RestorePhase::Cleanup,
+        ] {
+            for replace_content in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+                let (crash_at, force_copy) = match phase {
+                    RestorePhase::OldDataPreserved => ("after-marker-rebind", false),
+                    RestorePhase::CopyInProgress => ("after-marker-rebind", true),
+                    RestorePhase::CutoverValidated => ("cutover-validated", true),
+                    RestorePhase::Cleanup => ("cleanup", true),
+                    _ => unreachable!(),
+                };
+                let output =
+                    run_restore_in_child_copy_mode(&snapshot, &data, crash_at, &[], force_copy);
+                assert_eq!(
+                    output.status.code(),
+                    Some(9),
+                    "{phase:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let mut journal = read_restore_journal(&data).unwrap();
+                assert_eq!(journal.phase, phase);
+                let aside = restoring_dir_for(&data);
+                let aside_db = aside.join("brain.lbug");
+                if replace_content {
+                    let foreign_dir = tmp.path().join("foreign");
+                    std::fs::create_dir(&foreign_dir).unwrap();
+                    let foreign_db = foreign_dir.join("brain.lbug");
+                    let foreign = nestweaver_store::GraphStore::create(&foreign_db).unwrap();
+                    foreign.ensure_data_instance_id("foreign-aside").unwrap();
+                    drop(foreign);
+                    // In-place replacement keeps the original graph inode;
+                    // a freshly valid marker still cannot establish origin.
+                    std::fs::copy(&foreign_db, &aside_db).unwrap();
+                    nestweaver_store::engine_format::write_sidecar(&aside_db).unwrap();
+                    assert!(
+                        nestweaver_store::engine_format::has_current_file_marker(&aside_db)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        restore_directory_identity(&aside),
+                        journal.restoring_identity
+                    );
+                    assert!(journal_proves_complete_owned_tree(
+                        &aside,
+                        journal.restoring_identity,
+                        &journal.restoring_paths
+                    ));
+                    assert_ne!(
+                        restore_file_witness(&aside_db).unwrap(),
+                        *journal
+                            .restoring_file_witnesses
+                            .as_ref()
+                            .unwrap()
+                            .get("brain.lbug")
+                            .unwrap()
+                    );
+                } else {
+                    journal.restoring_file_witnesses = None;
+                    publish_restore_phase(&journal).unwrap();
+                }
+                let db = data.join("brain.lbug");
+                let destination_hash = sha256_stream_path(&db).unwrap();
+                let destination_marker_path = nestweaver_store::engine_format::sidecar_path(&db);
+                let destination_marker = std::fs::read(&destination_marker_path).unwrap();
+                let aside_hash = sha256_stream_path(&aside_db).unwrap();
+                let aside_marker_path = nestweaver_store::engine_format::sidecar_path(&aside_db);
+                let aside_marker = std::fs::read(&aside_marker_path).unwrap();
+                let journal_bytes = std::fs::read(restore_journal_path(&data)).unwrap();
+                std::fs::remove_file(snapshot).unwrap();
+                for _ in 0..2 {
+                    let error = recover_interrupted_restore(&data).unwrap_err();
+                    assert!(
+                        error.downcast_ref::<BackupRefusal>().is_some(),
+                        "{phase:?}: {error:#}"
+                    );
+                    assert_eq!(sha256_stream_path(&db).unwrap(), destination_hash);
+                    assert_eq!(
+                        std::fs::read(&destination_marker_path).unwrap(),
+                        destination_marker
+                    );
+                    assert_eq!(sha256_stream_path(&aside_db).unwrap(), aside_hash);
+                    assert_eq!(std::fs::read(&aside_marker_path).unwrap(), aside_marker);
+                    assert_eq!(
+                        std::fs::read(restore_journal_path(&data)).unwrap(),
+                        journal_bytes
+                    );
+                    assert!(nestweaver_store::GraphStore::open_read_only(&db).is_ok());
+                    assert!(nestweaver_store::GraphStore::open_read_only(&aside_db).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validated_cleanup_accepts_only_original_surviving_aside_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        let output = run_restore_in_child_copy_mode(&snapshot, &data, "cleanup", &[], true);
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let journal = read_restore_journal(&data).unwrap();
+        let aside = restoring_dir_for(&data);
+        std::fs::remove_file(aside.join("brain.lbug")).unwrap();
+        assert!(!journal_proves_original_aside(&aside, &journal, true));
+        assert!(journal_proves_original_aside(&aside, &journal, false));
+        let destination_hash = sha256_stream_path(data.join("brain.lbug")).unwrap();
+        for _ in 0..2 {
+            recover_interrupted_restore(&data).unwrap();
+        }
+        assert!(!aside.exists());
+        assert!(!restore_journal_path(&data).exists());
+        assert_eq!(
+            sha256_stream_path(data.join("brain.lbug")).unwrap(),
+            destination_hash
+        );
+        assert!(
+            nestweaver_store::engine_format::has_current_file_marker(&data.join("brain.lbug"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn restored_operational_lock_refuses_foreign_bytes_directories_and_links() {
+        for fault in [
+            "foreign_bytes",
+            "unknown_empty",
+            "directory",
+            "symlink",
+            "hardlink",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+            marker_replay_journal(
+                &data,
+                &snapshot,
+                "brain.lbug",
+                RestorePhase::OldDataPreserved,
+            );
+            let mut journal = read_restore_journal(&data).unwrap();
+            let lock = data.join("brain.lbug.write.lock");
+            std::fs::remove_file(&lock).unwrap();
+            journal
+                .destination_paths
+                .retain(|path| path != "brain.lbug.write.lock");
+            journal
+                .destination_file_witnesses
+                .as_mut()
+                .unwrap()
+                .remove("brain.lbug.write.lock");
+            publish_restore_phase(&journal).unwrap();
+            let allowed_before = journal.destination_paths.clone();
+            let outside = tmp.path().join("outside");
+            std::fs::write(&outside, b"").unwrap();
+            match fault {
+                "foreign_bytes" => std::fs::write(&lock, b"irreplaceable").unwrap(),
+                "unknown_empty" => std::fs::write(&lock, b"").unwrap(),
+                "directory" => std::fs::create_dir(&lock).unwrap(),
+                "symlink" => {
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&outside, &lock).unwrap();
+                    #[cfg(not(unix))]
+                    continue;
+                }
+                "hardlink" => {
+                    std::fs::hard_link(&outside, &lock).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let destination_hash = sha256_stream_path(data.join("brain.lbug")).unwrap();
+            let journal_bytes = std::fs::read(restore_journal_path(&data)).unwrap();
+            assert!(
+                prepare_restored_write_lock(&data, &mut journal).is_err(),
+                "{fault}"
+            );
+            assert_eq!(
+                sha256_stream_path(data.join("brain.lbug")).unwrap(),
+                destination_hash
+            );
+            assert_eq!(
+                std::fs::read(restore_journal_path(&data)).unwrap(),
+                journal_bytes
+            );
+            assert_eq!(journal.destination_paths, allowed_before);
+            for _ in 0..2 {
+                assert!(recover_interrupted_restore(&data).is_err(), "{fault}");
+            }
+            assert_eq!(
+                std::fs::read(restore_journal_path(&data)).unwrap(),
+                journal_bytes
+            );
+            assert_eq!(std::fs::read(outside).unwrap().as_slice(), b"");
+            match fault {
+                "foreign_bytes" => assert_eq!(std::fs::read(&lock).unwrap(), b"irreplaceable"),
+                "unknown_empty" => assert_eq!(std::fs::read(&lock).unwrap().as_slice(), b""),
+                "directory" => assert!(lock.is_dir()),
+                "symlink" => assert!(
+                    std::fs::symlink_metadata(&lock)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                ),
+                "hardlink" => assert_eq!(std::fs::read(&lock).unwrap().as_slice(), b""),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn existing_operational_lock_requires_its_exact_previously_finalized_witness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        marker_replay_journal(
+            &data,
+            &snapshot,
+            "brain.lbug",
+            RestorePhase::CutoverValidated,
+        );
+        let mut journal = read_restore_journal(&data).unwrap();
+        let lock = data.join("brain.lbug.write.lock");
+        let original = restore_file_witness(&lock).unwrap();
+        let journal_bytes = std::fs::read(restore_journal_path(&data)).unwrap();
+        prepare_restored_write_lock(&data, &mut journal).unwrap();
+        assert_eq!(restore_file_witness(&lock).unwrap(), original);
+        assert_eq!(
+            std::fs::read(restore_journal_path(&data)).unwrap(),
+            journal_bytes
+        );
+        let replacement = data.join("replacement-lock");
+        std::fs::write(&replacement, b"").unwrap();
+        std::fs::rename(replacement, &lock).unwrap();
+        assert_ne!(restore_file_witness(&lock).unwrap(), original);
+        assert!(prepare_restored_write_lock(&data, &mut journal).is_err());
+        assert_eq!(std::fs::read(&lock).unwrap().as_slice(), b"");
+        assert_eq!(
+            std::fs::read(restore_journal_path(&data)).unwrap(),
+            journal_bytes
+        );
+        assert!(recover_interrupted_restore(&data).is_err());
+        assert_eq!(
+            std::fs::read(restore_journal_path(&data)).unwrap(),
+            journal_bytes
+        );
+    }
+
+    #[test]
+    fn source_inventoried_empty_operational_lock_is_admitted_without_finalized_witness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        marker_replay_journal(&data, &snapshot, "brain.lbug", RestorePhase::CopyInProgress);
+        let mut journal = read_restore_journal(&data).unwrap();
+        journal.destination_file_witnesses = None;
+        journal.source_checksums.as_mut().unwrap().insert(
+            "brain.lbug.write.lock".into(),
+            sha256_stream(std::io::empty()).unwrap(),
+        );
+        publish_restore_phase(&journal).unwrap();
+        let before = std::fs::read(restore_journal_path(&data)).unwrap();
+        let lock = data.join("brain.lbug.write.lock");
+        let witness = restore_file_witness(&lock).unwrap();
+        prepare_restored_write_lock(&data, &mut journal).unwrap();
+        assert_eq!(restore_file_witness(&lock).unwrap(), witness);
+        assert_eq!(std::fs::read(restore_journal_path(&data)).unwrap(), before);
+    }
+
+    #[test]
+    fn competing_operational_lock_creator_never_receives_recovery_deletion_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        let output = run_restore_in_child_copy_mode(
+            &snapshot,
+            &data,
+            "never",
+            &[("NW_RESTORE_TEST_OPERATIONAL_LOCK_RACE", "1")],
+            true,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("foreign operational lock appeared during creation")
+        );
+        let journal = read_restore_journal(&data).unwrap();
+        assert_eq!(journal.phase, RestorePhase::CopyInProgress);
+        assert!(
+            !journal
+                .destination_paths
+                .contains(&"brain.lbug.write.lock".to_string())
+        );
+        let lock = data.join("brain.lbug.write.lock");
+        let foreign_bytes = std::fs::read(&lock).unwrap();
+        assert_eq!(foreign_bytes, b"foreign creator's irreplaceable bytes");
+        let graph_hash = sha256_stream_path(data.join("brain.lbug")).unwrap();
+        let original_hash =
+            sha256_stream_path(restoring_dir_for(&data).join("brain.lbug")).unwrap();
+        let journal_bytes = std::fs::read(restore_journal_path(&data)).unwrap();
+        for _ in 0..2 {
+            assert!(
+                backup_restore(&RestoreConfig {
+                    snapshot_path: snapshot.clone(),
+                    data_dir: data.clone(),
+                    replace: true
+                })
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&lock).unwrap(), foreign_bytes);
+            assert_eq!(
+                sha256_stream_path(data.join("brain.lbug")).unwrap(),
+                graph_hash
+            );
+            assert_eq!(
+                sha256_stream_path(restoring_dir_for(&data).join("brain.lbug")).unwrap(),
+                original_hash
+            );
+            assert_eq!(
+                std::fs::read(restore_journal_path(&data)).unwrap(),
+                journal_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn public_restore_retries_validated_cutovers_without_private_recovery_first() {
+        for force_copy in [false, true] {
+            for with_aside in [false, true] {
+                for crash_at in ["cutover-validated", "cleanup"] {
+                    if !with_aside && crash_at == "cleanup" {
+                        continue;
+                    }
+                    let tmp = tempfile::tempdir().unwrap();
+                    let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+                    if !with_aside {
+                        std::fs::remove_dir_all(&data).unwrap();
+                    }
+                    let output =
+                        run_restore_in_child_copy_mode(&snapshot, &data, crash_at, &[], force_copy);
+                    assert_eq!(
+                        output.status.code(),
+                        Some(9),
+                        "{crash_at}, copy={force_copy}, aside={with_aside}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let receipt = read_restore_journal(&data).unwrap();
+                    assert_eq!(restoring_dir_for(&data).exists(), with_aside);
+                    let lock = data.join("brain.lbug.write.lock");
+                    assert_eq!(std::fs::symlink_metadata(&lock).unwrap().len(), 0);
+                    assert!(
+                        receipt
+                            .destination_paths
+                            .contains(&"brain.lbug.write.lock".to_string())
+                    );
+                    assert!(
+                        receipt
+                            .destination_file_witnesses
+                            .as_ref()
+                            .unwrap()
+                            .contains_key("brain.lbug.write.lock")
+                    );
+                    // Public entry acquires all leases before internal recovery.
+                    // No helper may pre-clear the old journal or prepare its lock.
+                    backup_restore(&RestoreConfig {
+                        snapshot_path: snapshot.clone(),
+                        data_dir: data.clone(),
+                        replace: true,
+                    })
+                    .unwrap();
+                    assert!(!restore_journal_path(&data).exists());
+                    assert!(!restoring_dir_for(&data).exists());
+                    assert!(
+                        nestweaver_store::engine_format::has_current_file_marker(
+                            &data.join("brain.lbug")
+                        )
+                        .unwrap()
+                    );
+                    assert!(
+                        nestweaver_store::GraphStore::open_read_only(&data.join("brain.lbug"))
+                            .is_ok()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unvalidated_recovery_preserves_same_directory_replacement_graph_and_fresh_marker() {
+        for force_copy in [false, true] {
+            for with_aside in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+                std::fs::remove_dir_all(&data).unwrap();
+                if with_aside {
+                    std::fs::create_dir(&data).unwrap();
+                    let incumbent =
+                        nestweaver_store::GraphStore::create(&data.join("brain.lbug")).unwrap();
+                    incumbent
+                        .ensure_data_instance_id("complete-incumbent")
+                        .unwrap();
+                    drop(incumbent);
+                }
+                let output = run_restore_in_child_copy_mode(
+                    &snapshot,
+                    &data,
+                    "after-marker-rebind",
+                    &[],
+                    force_copy,
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(9),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let journal = read_restore_journal(&data).unwrap();
+                let foreign_dir = tmp.path().join("foreign");
+                std::fs::create_dir(&foreign_dir).unwrap();
+                let foreign_db = foreign_dir.join("brain.lbug");
+                let foreign = nestweaver_store::GraphStore::create(&foreign_db).unwrap();
+                foreign
+                    .ensure_data_instance_id("new-same-name-data")
+                    .unwrap();
+                drop(foreign);
+                let db = data.join("brain.lbug");
+                std::fs::copy(&foreign_db, &db).unwrap();
+                nestweaver_store::engine_format::write_sidecar(&db).unwrap();
+                assert_eq!(
+                    restore_directory_identity(&data),
+                    journal.destination_identity
+                );
+                assert!(journal_proves_owned_tree(
+                    &data,
+                    journal.destination_identity,
+                    &journal.destination_paths
+                ));
+                assert!(nestweaver_store::engine_format::has_current_file_marker(&db).unwrap());
+                let replacement_hash = sha256_stream_path(&db).unwrap();
+                let replacement_marker =
+                    std::fs::read(nestweaver_store::engine_format::sidecar_path(&db)).unwrap();
+                std::fs::remove_file(snapshot).unwrap();
+                let recovery = recover_interrupted_restore(&data).unwrap();
+                let preserved = recovery
+                    .preserved
+                    .expect("unvalidated destination must be retained, not deleted");
+                assert_eq!(
+                    sha256_stream_path(preserved.join("brain.lbug")).unwrap(),
+                    replacement_hash
+                );
+                assert_eq!(
+                    std::fs::read(nestweaver_store::engine_format::sidecar_path(
+                        &preserved.join("brain.lbug")
+                    ))
+                    .unwrap(),
+                    replacement_marker
+                );
+                assert_eq!(
+                    nestweaver_store::GraphStore::open_read_only(&preserved.join("brain.lbug"))
+                        .unwrap()
+                        .data_instance_id()
+                        .unwrap()
+                        .as_deref(),
+                    Some("new-same-name-data")
+                );
+                if with_aside {
+                    assert_eq!(
+                        nestweaver_store::GraphStore::open_read_only(&db)
+                            .unwrap()
+                            .data_instance_id()
+                            .unwrap()
+                            .as_deref(),
+                        Some("complete-incumbent")
+                    );
+                } else {
+                    assert!(!data.exists());
+                }
+                recover_interrupted_restore(&data).unwrap();
+                assert!(preserved.exists());
+                assert_eq!(
+                    sha256_stream_path(preserved.join("brain.lbug")).unwrap(),
+                    replacement_hash
+                );
+                assert!(!restore_journal_path(&data).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn public_early_and_midcopy_recovery_retains_every_partial_byte_and_complete_incumbent() {
+        for crash_at in ["copy-in-progress", "copy-midway"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+            std::fs::remove_dir_all(&data).unwrap();
+            std::fs::create_dir(&data).unwrap();
+            let incumbent = nestweaver_store::GraphStore::create(&data.join("brain.lbug")).unwrap();
+            incumbent
+                .ensure_data_instance_id("early-copy-incumbent")
+                .unwrap();
+            drop(incumbent);
+            let output = run_restore_in_child_copy_mode(&snapshot, &data, crash_at, &[], true);
+            assert_eq!(
+                output.status.code(),
+                Some(9),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let partial: Vec<_> = walkdir::WalkDir::new(&data)
+                .into_iter()
+                .map(Result::unwrap)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| {
+                    (
+                        entry.path().strip_prefix(&data).unwrap().to_path_buf(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect();
+            if crash_at == "copy-midway" {
+                assert!(
+                    !partial.is_empty(),
+                    "midcopy seam must land real payload bytes"
+                );
+            }
+            let aside = restoring_dir_for(&data);
+            let incumbent_hash = sha256_stream_path(aside.join("brain.lbug")).unwrap();
+            let error = backup_restore(&RestoreConfig {
+                snapshot_path: tmp.path().join("deliberately-missing.nwsnap.zst"),
+                data_dir: data.clone(),
+                replace: true,
+            })
+            .unwrap_err();
+            let incumbent_home = if aside.exists() {
+                assert!(
+                    format!("{error:#}").contains("stale or ambiguous recovery journal"),
+                    "{error:#}"
+                );
+                aside
+            } else {
+                assert!(format!("{error:#}").contains("No such file"), "{error:#}");
+                assert!(
+                    format!("{error:#}").contains("unproven restore copy preserved at"),
+                    "{error:#}"
+                );
+                data.clone()
+            };
+            assert_eq!(
+                sha256_stream_path(incumbent_home.join("brain.lbug")).unwrap(),
+                incumbent_hash
+            );
+            assert_eq!(
+                nestweaver_store::GraphStore::open_read_only(&incumbent_home.join("brain.lbug"))
+                    .unwrap()
+                    .data_instance_id()
+                    .unwrap()
+                    .as_deref(),
+                Some("early-copy-incumbent")
+            );
+            let candidates: Vec<_> = std::fs::read_dir(tmp.path())
+                .unwrap()
+                .map(Result::unwrap)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path == &data
+                        || path
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("data.preserved-")
+                })
+                .collect();
+            assert!(
+                !candidates.is_empty(),
+                "partial destination must remain at a discoverable path"
+            );
+            assert!(
+                candidates.iter().any(|candidate| partial
+                    .iter()
+                    .all(|(relative, bytes)| std::fs::read(candidate.join(relative))
+                        .is_ok_and(|actual| actual == *bytes))),
+                "all partial bytes must survive together"
+            );
+        }
+    }
+
+    #[test]
+    fn public_force_restore_preserves_foreign_aside_after_success_and_later_archive_failure() {
+        for proof in ["none", "v2_missing_witness", "stale_file_witness"] {
+            for empty_target in [false, true] {
+                for missing_archive in [false, true] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+                    std::fs::remove_dir_all(&data).unwrap();
+                    if empty_target {
+                        std::fs::create_dir(&data).unwrap();
+                    }
+                    let aside = restoring_dir_for(&data);
+                    std::fs::create_dir(&aside).unwrap();
+                    let aside_db = aside.join("brain.lbug");
+                    let foreign = nestweaver_store::GraphStore::create(&aside_db).unwrap();
+                    foreign.ensure_data_instance_id("foreign-aside").unwrap();
+                    drop(foreign);
+                    if proof != "none" {
+                        journal_at(&data, RestorePhase::StagingVerified);
+                        if proof == "v2_missing_witness" {
+                            let mut journal = read_restore_journal(&data).unwrap();
+                            journal.version = 2;
+                            journal.restoring_file_witnesses = None;
+                            publish_restore_phase(&journal).unwrap();
+                        } else {
+                            let replacement_dir = tmp.path().join("replacement");
+                            std::fs::create_dir(&replacement_dir).unwrap();
+                            let replacement_db = replacement_dir.join("brain.lbug");
+                            let replacement =
+                                nestweaver_store::GraphStore::create(&replacement_db).unwrap();
+                            replacement
+                                .ensure_data_instance_id("foreign-aside")
+                                .unwrap();
+                            drop(replacement);
+                            std::fs::copy(replacement_db, &aside_db).unwrap();
+                            nestweaver_store::engine_format::write_sidecar(&aside_db).unwrap();
+                        }
+                    }
+                    assert!(
+                        nestweaver_store::engine_format::has_current_file_marker(&aside_db)
+                            .unwrap()
+                    );
+                    let original_hash = sha256_stream_path(&aside_db).unwrap();
+                    let original_marker =
+                        std::fs::read(nestweaver_store::engine_format::sidecar_path(&aside_db))
+                            .unwrap();
+                    let requested = if missing_archive {
+                        tmp.path().join("missing.nwsnap.zst")
+                    } else {
+                        snapshot
+                    };
+                    let outcome = backup_restore(&RestoreConfig {
+                        snapshot_path: requested,
+                        data_dir: data.clone(),
+                        replace: true,
+                    });
+                    let preserved = if missing_archive {
+                        let error = outcome.unwrap_err();
+                        let candidates: Vec<_> = std::fs::read_dir(tmp.path())
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .map(|entry| entry.path())
+                            .filter(|path| {
+                                path.file_name()
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .starts_with("data.restoring.preserved-")
+                            })
+                            .collect();
+                        assert_eq!(candidates.len(), 1);
+                        assert!(
+                            format!("{error:#}").contains(&format!(
+                                "unproven restore copy preserved at {}",
+                                candidates[0].display()
+                            )),
+                            "{error:#}"
+                        );
+                        candidates[0].clone()
+                    } else {
+                        let result = outcome.unwrap();
+                        assert_eq!(
+                            nestweaver_store::GraphStore::open_read_only(&data.join("brain.lbug"))
+                                .unwrap()
+                                .data_instance_id()
+                                .unwrap()
+                                .as_deref(),
+                            Some("default")
+                        );
+                        result
+                            .preserved_copy
+                            .expect("whole public restore must disclose retained foreign copy")
+                    };
+                    assert_ne!(preserved, data);
+                    assert_ne!(preserved, aside);
+                    assert!(!aside.exists());
+                    assert_eq!(
+                        sha256_stream_path(preserved.join("brain.lbug")).unwrap(),
+                        original_hash
+                    );
+                    assert_eq!(
+                        std::fs::read(nestweaver_store::engine_format::sidecar_path(
+                            &preserved.join("brain.lbug")
+                        ))
+                        .unwrap(),
+                        original_marker
+                    );
+                    assert_eq!(
+                        nestweaver_store::GraphStore::open_read_only(&preserved.join("brain.lbug"))
+                            .unwrap()
+                            .data_instance_id()
+                            .unwrap()
+                            .as_deref(),
+                        Some("foreign-aside")
+                    );
+                    recover_interrupted_restore(&data).unwrap();
+                    assert_eq!(
+                        sha256_stream_path(preserved.join("brain.lbug")).unwrap(),
+                        original_hash
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn captured_staging_verified_original_aside_is_promoted_after_real_rename_interruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        std::fs::remove_dir_all(&data).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        let incumbent = nestweaver_store::GraphStore::create(&data.join("brain.lbug")).unwrap();
+        incumbent
+            .ensure_data_instance_id("captured-original")
+            .unwrap();
+        drop(incumbent);
+        let output = run_restore_in_child_copy_mode(
+            &snapshot,
+            &data,
+            "old-data-renamed-before-journal",
+            &[],
+            true,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(9),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!data.exists());
+        let journal = read_restore_journal(&data).unwrap();
+        assert_eq!(journal.phase, RestorePhase::StagingVerified);
+        assert!(journal_proves_original_aside(
+            &restoring_dir_for(&data),
+            &journal,
+            true
+        ));
+        let error = backup_restore(&RestoreConfig {
+            snapshot_path: tmp.path().join("missing.nwsnap.zst"),
+            data_dir: data.clone(),
+            replace: true,
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("No such file"), "{error:#}");
+        assert!(!restoring_dir_for(&data).exists());
+        assert!(!restore_journal_path(&data).exists());
+        assert_eq!(
+            nestweaver_store::GraphStore::open_read_only(&data.join("brain.lbug"))
+                .unwrap()
+                .data_instance_id()
+                .unwrap()
+                .as_deref(),
+            Some("captured-original")
+        );
+        backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data.clone(),
+            replace: true,
+        })
+        .unwrap();
+        assert_eq!(
+            nestweaver_store::GraphStore::open_read_only(&data.join("brain.lbug"))
+                .unwrap()
+                .data_instance_id()
+                .unwrap()
+                .as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn absent_target_marker_interruptions_retry_without_unbound_destination_debris() {
+        for force_copy in [false, true] {
+            for crash_at in ["before-marker-rebind", "after-marker-rebind"] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+                std::fs::remove_dir_all(&data).unwrap();
+                let output =
+                    run_restore_in_child_copy_mode(&snapshot, &data, crash_at, &[], force_copy);
+                assert_eq!(
+                    output.status.code(),
+                    Some(9),
+                    "{crash_at}, copy={force_copy}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(!restoring_dir_for(&data).exists());
+                for _ in 0..2 {
+                    recover_interrupted_restore(&data).unwrap();
+                }
+                assert!(
+                    !data.exists(),
+                    "unvalidated destination is rebuilt from the archive"
+                );
+                backup_restore(&RestoreConfig {
+                    snapshot_path: snapshot,
+                    data_dir: data.clone(),
+                    replace: true,
+                })
+                .unwrap();
+                assert!(
+                    nestweaver_store::engine_format::has_current_file_marker(
+                        &data.join("brain.lbug")
+                    )
+                    .unwrap()
+                );
+            }
         }
     }
 
@@ -4439,21 +6513,67 @@ mod tests {
 
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        drop(nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap());
-        std::fs::write(data_dir.join("INCUMBENT"), b"the user's own data").unwrap();
+        let incumbent = nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap();
+        incumbent
+            .ensure_data_instance_id("incumbent-restore-fixture")
+            .unwrap();
+        drop(incumbent);
 
         // "crash-at" is deliberately a phase name that never fires: this run
         // must reach validation and refuse there, not die on the way.
-        let status = run_restore_in_child_with(
+        let output = run_restore_in_child_with_output(
             &snapshot,
             &data_dir,
             "never",
             &[("NW_RESTORE_TEST_CORRUPT_AFTER_COPY", "1")],
         );
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
-            status.code(),
+            output.status.code(),
             Some(3),
             "the restore must have REFUSED the corrupt cutover, not crashed or succeeded"
+        );
+
+        let corruption_witness = format!(
+            "test injected graph corruption into {}",
+            data_dir.join("test.lbug").display()
+        );
+        assert!(
+            diagnostics.contains(corruption_witness.as_str()),
+            "corruption injection was not reached: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("restored test.lbug does not match the archive: expected"),
+            "checksum validation did not reject the copied graph: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "failed validation after the cutover; the pre-restore data has been reinstated"
+            ),
+            "post-cutover rollback did not complete: {diagnostics}"
+        );
+        let preserved: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("data.preserved-")
+            })
+            .collect();
+        assert_eq!(preserved.len(), 1, "rollback must retain its unproven copy");
+        assert!(
+            diagnostics.contains(&format!(
+                "unproven restore copy preserved at {}",
+                preserved[0].display()
+            )),
+            "rollback must disclose the exact retained path: {diagnostics}"
+        );
+        assert_eq!(
+            std::fs::read(preserved[0].join("test.lbug")).unwrap(),
+            b"corrupted by the test"
         );
 
         // The rollback already ran inside the child; recovery is idempotent
@@ -4461,8 +6581,13 @@ mod tests {
         for pass in 0..2 {
             recover_interrupted_restore(&data_dir)
                 .unwrap_or_else(|error| panic!("pass {pass}: {error}"));
-            assert!(
-                data_dir.join("INCUMBENT").exists(),
+            assert_eq!(
+                nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug"))
+                    .unwrap()
+                    .data_instance_id()
+                    .unwrap()
+                    .as_deref(),
+                Some("incumbent-restore-fixture"),
                 "pass {pass}: a failed validation must leave the pre-restore data in place"
             );
             assert!(
@@ -4622,6 +6747,122 @@ mod tests {
         let restored_db = restore_dir.join("test.lbug");
         let store = nestweaver_store::GraphStore::open_read_only(&restored_db).unwrap();
         assert!(store.db_path().is_some());
+    }
+
+    #[test]
+    fn multiple_graph_inventory_is_refused_before_restore_cutover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        let before_graph = sha256_stream_path(data.join("brain.lbug")).unwrap();
+        let marker = nestweaver_store::engine_format::sidecar_path(&data.join("brain.lbug"));
+        let before_marker = std::fs::read(&marker).unwrap();
+        let staging = tempfile::tempdir_in(tmp.path()).unwrap();
+        let decoder =
+            nestweaver_store::zstd::Decoder::new(std::fs::File::open(&snapshot).unwrap()).unwrap();
+        tar::Archive::new(decoder).unpack(staging.path()).unwrap();
+        let publication_path = staging
+            .path()
+            .join(crate::publication::PUBLICATION_MANIFEST_FILE);
+        let mut publication: crate::publication::PublicationBundleV3 =
+            serde_json::from_slice(&std::fs::read(&publication_path).unwrap()).unwrap();
+        let mut second = publication
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == crate::publication::ArtifactKind::Graph)
+            .unwrap()
+            .clone();
+        std::fs::copy(
+            staging.path().join(&second.path),
+            staging.path().join("second.lbug"),
+        )
+        .unwrap();
+        second.path = "second.lbug".into();
+        publication.artifacts.push(second);
+        let publication_bytes = serde_json::to_vec_pretty(&publication).unwrap();
+        std::fs::write(&publication_path, &publication_bytes).unwrap();
+        let manifest_path = staging.path().join("manifest.json");
+        let mut manifest: BackupManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.checksums.insert(
+            "second.lbug".into(),
+            sha256_stream_path(staging.path().join("second.lbug")).unwrap(),
+        );
+        manifest.checksums.insert(
+            crate::publication::PUBLICATION_MANIFEST_FILE.into(),
+            sha256_stream_path(&publication_path).unwrap(),
+        );
+        manifest.publication_manifest_blake3 = crate::hash::blake3_hex_bytes(&publication_bytes);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        // All content hashes are consistent: rejection must be about graph
+        // cardinality, before any destructive phase or marker mutation.
+        verify_backup_checksums(staging.path(), &manifest).unwrap();
+        let forged = tmp.path().join("multiple.nwsnap.zst");
+        package_tar_zstd(staging.path(), &forged).unwrap();
+        let inspected = backup_inspect(&forged).unwrap_err();
+        assert!(
+            format!("{inspected:#}").contains("exactly one graph artifact"),
+            "{inspected:#}"
+        );
+        let refused = backup_restore(&RestoreConfig {
+            snapshot_path: forged,
+            data_dir: data.clone(),
+            replace: true,
+        })
+        .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("exactly one graph artifact"),
+            "{refused:#}"
+        );
+        assert_eq!(
+            sha256_stream_path(data.join("brain.lbug")).unwrap(),
+            before_graph
+        );
+        assert_eq!(std::fs::read(marker).unwrap(), before_marker);
+        assert!(!restore_journal_path(&data).exists());
+        assert!(!restoring_dir_for(&data).exists());
+    }
+
+    #[test]
+    fn held_custom_basename_and_kuzu_writers_refuse_restore_without_touching_incumbents() {
+        for graph in ["graph.db", "legacy.kuzu"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), graph);
+            let db = data.join(graph);
+            assert!(
+                restore_lease_targets(&data)
+                    .unwrap()
+                    .contains(&nestweaver_store::canonical_db_path(&db))
+            );
+            let before_graph = sha256_stream_path(&db).unwrap();
+            let marker = nestweaver_store::engine_format::sidecar_path(&db);
+            let before_marker = std::fs::read(&marker).unwrap();
+            let writer = nestweaver_store::acquire_db_write_lease(&db).unwrap();
+            let error = backup_restore(&RestoreConfig {
+                snapshot_path: snapshot.clone(),
+                data_dir: data.clone(),
+                replace: true,
+            })
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("write lease"),
+                "{graph}: {error:#}"
+            );
+            assert_eq!(sha256_stream_path(&db).unwrap(), before_graph);
+            assert_eq!(std::fs::read(&marker).unwrap(), before_marker);
+            assert!(!restore_journal_path(&data).exists());
+            assert!(!restoring_dir_for(&data).exists());
+            drop(writer);
+            backup_restore(&RestoreConfig {
+                snapshot_path: snapshot,
+                data_dir: data,
+                replace: true,
+            })
+            .unwrap();
+        }
     }
 
     /// Rewrite a current archive into the shape a pre-cutover release wrote:
@@ -5193,10 +7434,13 @@ mod tests {
         package_tar_zstd(&extracted, &forged).unwrap();
         let target = dir.path().join("existing");
         std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("sentinel"), "keep existing data").unwrap();
         // A NestWeaver data directory, so the identity check (not the
         // foreign-directory guard) is what refuses.
-        drop(nestweaver_store::GraphStore::create(&target.join("prior.lbug")).unwrap());
+        let incumbent = nestweaver_store::GraphStore::create(&target.join("prior.lbug")).unwrap();
+        incumbent
+            .ensure_data_instance_id("forgery-target-fixture")
+            .unwrap();
+        drop(incumbent);
         let error = backup_restore(&RestoreConfig {
             snapshot_path: forged,
             data_dir: target.clone(),
@@ -5210,8 +7454,12 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(
-            std::fs::read_to_string(target.join("sentinel")).unwrap(),
-            "keep existing data"
+            nestweaver_store::GraphStore::open_read_only(&target.join("prior.lbug"))
+                .unwrap()
+                .data_instance_id()
+                .unwrap()
+                .as_deref(),
+            Some("forgery-target-fixture")
         );
         assert!(!target.join("owned.lbug").exists());
     }
@@ -5600,6 +7848,91 @@ mod hardening_statistics_tests {
 mod destination_guard_tests {
     use super::*;
 
+    #[test]
+    fn output_protects_another_database_and_its_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.lbug");
+        let other = dir.path().join("other.lbug");
+        std::fs::write(&source, b"LBUGsource").unwrap();
+        std::fs::write(&other, b"LBUGother").unwrap();
+        let mut targets = vec![
+            other.clone(),
+            dir.path().join("new.kuzu"),
+            dir.path().join("other.lbug.wal"),
+        ];
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("archive.zst");
+            std::fs::hard_link(&other, &alias).unwrap();
+            targets.push(alias);
+            let link = dir.path().join("linked.zst");
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+            targets.push(link);
+        }
+        for target in targets {
+            let error = refuse_output_in_database_footprint(&source, &target).unwrap_err();
+            assert!(error.downcast_ref::<BackupRefusal>().is_some(), "{error:#}");
+        }
+        assert_eq!(std::fs::read(other).unwrap(), b"LBUGother");
+        refuse_output_in_database_footprint(
+            &source,
+            &dir.path().join("other.lbug.daily.nwsnap.zst"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn marker_filenames_do_not_authorize_recursive_restore_deletion() {
+        for marker in ["publication.json", "fake.lbug", "fake.kuzu"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(marker), b"{}").unwrap();
+            std::fs::write(dir.path().join("thesis.txt"), b"irreplaceable").unwrap();
+            let error = refuse_replacing_foreign_directory(dir.path()).unwrap_err();
+            assert!(error.downcast_ref::<BackupRefusal>().is_some());
+            assert_eq!(
+                std::fs::read(dir.path().join("thesis.txt")).unwrap(),
+                b"irreplaceable"
+            );
+        }
+    }
+
+    #[test]
+    fn copied_physical_marker_does_not_authorize_restore_over_a_fake_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let db = make_db(&source);
+        let target = dir.path().join("foreign");
+        std::fs::create_dir(&target).unwrap();
+        let fake = target.join("brain.lbug");
+        std::fs::write(&fake, b"LBUGnot-a-database").unwrap();
+        std::fs::copy(
+            nestweaver_store::engine_format::sidecar_path(&db),
+            nestweaver_store::engine_format::sidecar_path(&fake),
+        )
+        .unwrap();
+        assert!(!is_recognisable_data_dir(&target).unwrap());
+        std::fs::write(target.join("thesis.txt"), b"mine").unwrap();
+        assert!(refuse_replacing_foreign_directory(&target).is_err());
+        assert_eq!(std::fs::read(target.join("thesis.txt")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn unknown_contents_nested_in_a_sidecar_directory_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db(dir.path());
+        assert!(is_recognisable_data_dir(dir.path()).unwrap());
+        for suffix in [".publications", ".tantivy"] {
+            let sidecar = crate::sidecar_path(&db, suffix);
+            std::fs::create_dir_all(&sidecar).unwrap();
+            let personal = sidecar.join("thesis.txt");
+            std::fs::write(&personal, b"mine").unwrap();
+            assert!(refuse_replacing_foreign_directory(dir.path()).is_err());
+            assert_eq!(std::fs::read(&personal).unwrap(), b"mine");
+            std::fs::remove_dir_all(sidecar).unwrap();
+        }
+    }
+
     fn save_config(db: &Path, output: PathBuf) -> BackupConfig {
         BackupConfig {
             db_path: db.to_path_buf(),
@@ -5716,6 +8049,15 @@ mod destination_guard_tests {
         std::fs::create_dir_all(&data).unwrap();
         make_db(&data);
         std::fs::write(data.join("stale.txt"), "old").unwrap();
+        let refusal = backup_restore(&RestoreConfig {
+            snapshot_path: archive.clone(),
+            data_dir: data.clone(),
+            replace: true,
+        })
+        .unwrap_err();
+        assert!(refusal.downcast_ref::<BackupRefusal>().is_some());
+        assert_eq!(std::fs::read(data.join("stale.txt")).unwrap(), b"old");
+        std::fs::remove_file(data.join("stale.txt")).unwrap();
         backup_restore(&RestoreConfig {
             snapshot_path: archive,
             data_dir: data.clone(),
@@ -5723,7 +8065,6 @@ mod destination_guard_tests {
         })
         .unwrap();
         assert!(data.join("brain.lbug").exists());
-        assert!(!data.join("stale.txt").exists());
     }
 
     /// QA (LOW): a killed save left `<archive>.partial.<pid>.<n>` and a

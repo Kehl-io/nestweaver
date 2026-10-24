@@ -85,3 +85,15 @@ are not an atomic filesystem sandbox against a same-UID actor racing every
 individual LadybugDB path open. Such a guarantee would require descriptor-based
 engine IO or a separately privileged broker. No product path intentionally
 replaces registry entries or a held publication root.
+
+Restore also holds exact database writer leases for the target and aside
+inventories. Its local journal v3 binds directory identity, allowed paths and
+immutable per-file metadata witnesses; it does not change the archive format.
+Archive validation, owned operational-lock preparation and durable physical
+marker binding precede the finalized destination receipt. Recovery checks that
+receipt without reopening or rehashing a leased graph and never refreshes it to
+accept changed files. Original-copy promotion requires complete original proof;
+cleanup requires proof for every surviving original file. Uncertified target
+or aside copies are preserved outside active slots with their paths disclosed,
+or recovery refuses retaining the copies and journal. These checks remain
+within the cooperating-process and same-UID boundary described above.

@@ -68,8 +68,10 @@ impl WorkspaceContext {
 pub fn discover_workspace_context(repo_path: &Path) -> WorkspaceContext {
     let packages = discover_workspace_packages(repo_path);
     let aliases = load_tsconfig_aliases(repo_path);
-    let go_modules =
-        discover_go_modules_with(&|rel: &Path| std::fs::read_to_string(repo_path.join(rel)));
+    let go_modules = discover_go_modules_with(
+        &|rel: &Path| std::fs::read_to_string(repo_path.join(rel)),
+        &[],
+    );
     WorkspaceContext {
         packages,
         aliases,
@@ -93,9 +95,21 @@ pub fn discover_workspace_context_with<F>(read_file: F) -> WorkspaceContext
 where
     F: Fn(&Path) -> Result<String, std::io::Error>,
 {
+    discover_workspace_context_with_files(&[], read_file)
+}
+
+/// Discover manifests from the reader's policy-filtered repository inventory.
+/// This works for working trees and bare Git readers without filesystem access.
+pub fn discover_workspace_context_with_files<F>(
+    files: &[std::path::PathBuf],
+    read_file: F,
+) -> WorkspaceContext
+where
+    F: Fn(&Path) -> Result<String, std::io::Error>,
+{
     let packages = discover_workspace_packages_with(&read_file);
     let aliases = load_tsconfig_aliases_with(&read_file);
-    let go_modules = discover_go_modules_with(&read_file);
+    let go_modules = discover_go_modules_with(&read_file, files);
     WorkspaceContext {
         packages,
         aliases,
@@ -107,18 +121,26 @@ where
 ///
 /// Reads the root `go.mod`, every directory a root `go.work` names in `use`
 /// (each with its own `go.mod`), and every `replace` directive in those files
-/// whose target is a path inside the repository. A nested module that neither
-/// a `go.work` nor a `replace` names is not discovered: finding it would need
-/// a directory listing, which the bare-repository reader cannot provide.
+/// whose target is a path inside the repository, plus nested `go.mod` files
+/// in the reader-provided inventory.
 ///
 /// The result is sorted longest module path first, so a nested module wins
 /// over the module that encloses it.
-fn discover_go_modules_with<F>(read_file: &F) -> Vec<GoModule>
+fn discover_go_modules_with<F>(read_file: &F, files: &[std::path::PathBuf]) -> Vec<GoModule>
 where
     F: Fn(&Path) -> Result<String, std::io::Error>,
 {
     let mut modules: Vec<GoModule> = Vec::new();
     let mut module_dirs = vec![String::new()];
+    for path in files {
+        if path.file_name().is_some_and(|name| name == "go.mod")
+            && let Some(parent) = path.parent()
+            && let Some(dir) = normalize_repo_dir("", &parent.to_string_lossy())
+            && !module_dirs.contains(&dir)
+        {
+            module_dirs.push(dir);
+        }
+    }
     if let Ok(work) = read_file(Path::new("go.work")) {
         for (directive, args) in go_mod_directives(&work) {
             if directive == "use"
@@ -916,6 +938,30 @@ mod tests {
                     directory: "third_party/lib".into(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn inventory_discovers_unlisted_nested_go_module_without_root_manifest() {
+        let files = vec![std::path::PathBuf::from("tools/worker/go.mod")];
+        let ctx = discover_workspace_context_with_files(
+            &files,
+            go_reader(&[("tools/worker/go.mod", "module example.test/worker\n")]),
+        );
+        assert_eq!(
+            ctx.go_modules,
+            vec![GoModule {
+                path: "example.test/worker".into(),
+                directory: "tools/worker".into()
+            }]
+        );
+        let excluded = discover_workspace_context_with_files(
+            &[],
+            go_reader(&[("tools/worker/go.mod", "module example.test/worker\n")]),
+        );
+        assert!(
+            excluded.go_modules.is_empty(),
+            "unlisted manifests must not bypass reader exclusions"
         );
     }
 

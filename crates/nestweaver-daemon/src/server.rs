@@ -166,10 +166,21 @@ const DEFAULT_METADATA_WRITE_WAIT_SECS: u64 = 15;
 /// busy for the whole bounded wait.
 pub const WRITE_BUSY_CODE: &str = "write-busy";
 
+#[cfg(test)]
+tokio::task_local! {
+    // Exercise real RPC handlers with a deterministic short admission budget,
+    // without changing process environment or other concurrently running tests.
+    static TEST_MUTATION_ADMISSION_WAIT: Duration;
+}
+
 /// `NESTWEAVER_METADATA_WRITE_WAIT_SECS` (default 15, at most 3600): how long
 /// `set_extension` / `unset_extension` / `forget_interaction` wait for the
 /// write gate before answering "busy, retry". `0` refuses at once when busy.
 fn metadata_write_wait() -> Duration {
+    #[cfg(test)]
+    if let Ok(wait) = TEST_MUTATION_ADMISSION_WAIT.try_with(|wait| *wait) {
+        return wait;
+    }
     // An unparsable value warns once, naming the variable, then falls back.
     let secs = nestweaver_schema::env::env_parse::<u64>("NESTWEAVER_METADATA_WRITE_WAIT_SECS")
         .unwrap_or(DEFAULT_METADATA_WRITE_WAIT_SECS)
@@ -4379,19 +4390,8 @@ impl DaemonService {
         T: Send + 'static,
         F: FnOnce() -> Result<T, Status> + Send + 'static,
     {
-        // Admission precedes queueing, preserving the immediate UNAVAILABLE
-        // shutdown refusal instead of waiting behind a write that is draining.
-        let guard = ConnectionGuard::write(&self.state)?;
-        let write_gate = self.state.write_gate.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ownership = MutationWorkerOwnership {
-                _write_lease: write_gate.blocking_lock(label),
-                _connection_guard: guard,
-            };
-            task()
-        })
-        .await
-        .map_err(|error| Status::internal(format!("{label} task panicked: {error}")))?
+        self.run_mutation_with_bounded_wait(label, metadata_write_wait(), task)
+            .await
     }
 
     /// [`Self::run_unary_mutation`] for small metadata writes
@@ -4435,6 +4435,10 @@ impl DaemonService {
         let Ok(lease) = tokio::time::timeout(wait, write_gate.lock(label)).await else {
             return Err(write_busy_status(label, &write_gate, wait));
         };
+        self.state
+            .store
+            .verify_backing_file()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         tokio::task::spawn_blocking(move || {
             let _ownership = MutationWorkerOwnership {
                 _write_lease: lease,
@@ -4667,6 +4671,27 @@ impl DaemonService {
         // / disconnect), the same flag the timeout path sets.
         let _disconnect_guard = arm_disconnect_cancel(cancel.clone());
 
+        // Wait on the request future: cancelling a queued consolidation must
+        // not leave a detached blocking worker that applies it later.
+        let mutation = match mutation {
+            Some((guard, label)) => {
+                let wait = metadata_write_wait();
+                let gate = self.state.write_gate.clone();
+                let Ok(lease) = tokio::time::timeout(wait, gate.lock(label)).await else {
+                    return Err(write_busy_status(label, &gate, wait));
+                };
+                self.state
+                    .store
+                    .verify_backing_file()
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                Some(MutationWorkerOwnership {
+                    _write_lease: lease,
+                    _connection_guard: guard,
+                })
+            }
+            None => None,
+        };
+
         let state = self.state.clone();
         let tool_name = tool_name.to_string();
         let args_json = args_json.to_string();
@@ -4682,10 +4707,7 @@ impl DaemonService {
             let _delivery = nestweaver_mcp::tools::scoped_tool_delivery(profile);
             crash_if_test_seam_names(&tool_name);
             let has_authoritative_writer = mutation.is_some();
-            let _mutation_scope = mutation.map(|(guard, label)| MutationWorkerOwnership {
-                _write_lease: state.write_gate.blocking_lock(label),
-                _connection_guard: guard,
-            });
+            let _mutation_scope = mutation;
             let t_parse = std::time::Instant::now();
             let args: serde_json::Value = serde_json::from_str(&args_json)
                 .map_err(|e| Status::invalid_argument(format!("invalid JSON in args_json: {e}")))?;
@@ -7597,6 +7619,17 @@ fn hub_nodes_args(req: &HubNodesRequest) -> serde_json::Value {
     args
 }
 
+fn backup_error_status(error: anyhow::Error) -> Status {
+    if error
+        .downcast_ref::<nestweaver_engine::backup::BackupRefusal>()
+        .is_some()
+    {
+        Status::invalid_argument(format!("backup_refused: {error:#}"))
+    } else {
+        Status::internal(format!("backup failed: {error:#}"))
+    }
+}
+
 #[tonic::async_trait]
 impl NestWeaverDaemon for DaemonService {
     // ── Lifecycle ───────────────────────────────────────────────────
@@ -7614,6 +7647,7 @@ impl NestWeaverDaemon for DaemonService {
         let uptime = self.state.start_time.elapsed().as_secs();
         let active = self.state.active_reads.load(Ordering::Relaxed)
             + self.state.active_writes.load(Ordering::Relaxed);
+        let backing_file_error = self.state.store.verify_backing_file().err();
         Ok(Response::new(HealthCheckResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             instance_id: self.state.instance_id.clone(),
@@ -7626,6 +7660,10 @@ impl NestWeaverDaemon for DaemonService {
             embedding_identity_repair: true,
             watcher: watcher_status(&self.state),
             supervision: lifecycle::process_supervision(std::process::id() as i32).to_string(),
+            backing_file_valid: Some(backing_file_error.is_none()),
+            backing_file_error: backing_file_error
+                .map(|error| error.to_string())
+                .unwrap_or_default(),
         }))
     }
 
@@ -7700,7 +7738,7 @@ impl NestWeaverDaemon for DaemonService {
             .run_unary_mutation("backup", move || {
                 tracing::info!("backup: staging under write lock");
                 nestweaver_engine::stage_backup_from_store(&store, &cfg)
-                    .map_err(|error| Status::internal(format!("backup staging failed: {error}")))
+                    .map_err(backup_error_status)
             })
             .await?;
 
@@ -7709,7 +7747,7 @@ impl NestWeaverDaemon for DaemonService {
             tokio::task::spawn_blocking(move || nestweaver_engine::package_staged(&cfg, staged))
                 .await
                 .map_err(|e| Status::internal(format!("backup packaging panicked: {e}")))?
-                .map_err(|e| Status::internal(format!("backup packaging failed: {e}")))?;
+                .map_err(backup_error_status)?;
 
         let m = &result.manifest;
         tracing::info!(output = %result.output_path.display(), "backup complete");
@@ -15492,6 +15530,17 @@ pub async fn run_server(
     // silently drop it when its own descriptor closes.
     if !read_only {
         lifecycle::note_local_store_write_lock(true);
+        let stored_instance = store.data_instance_id()?;
+        let logical_instance = instance_cfg
+            .as_ref()
+            .map(|config| config.instance_id.as_str())
+            .or(stored_instance.as_deref())
+            .unwrap_or("default");
+        nestweaver_engine::manifest::prepare_recreated_store_sidecars(
+            &store,
+            &db_path,
+            logical_instance,
+        )?;
     }
     let store_open_ms = boot_started.elapsed().as_millis() as u64;
 
@@ -30936,6 +30985,78 @@ external_model = "unavailable-test-model"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_unary_waiter_never_runs_after_gate_release() {
+        let state = test_state_with_writer();
+        let held = state.write_gate.lock("index_repo").await;
+        let service = DaemonService::new(state.clone());
+        let ran = Arc::new(AtomicBool::new(false));
+        let worker_ran = ran.clone();
+        let waiter = tokio::spawn(async move {
+            service
+                .run_unary_mutation("remove_repo", move || {
+                    worker_ran.store(true, Ordering::Release);
+                    Ok::<_, Status>(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.write_gate.waiting() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        drop(held);
+        let _next = state.write_gate.lock("test_barrier").await;
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn health_remains_responsive_but_reports_lost_database() {
+        let state = test_state_with_writer();
+        let service = DaemonService::new(state.clone());
+        assert_eq!(
+            service
+                .health_check(Request::new(HealthCheckRequest {}))
+                .await
+                .unwrap()
+                .into_inner()
+                .backing_file_valid,
+            Some(true)
+        );
+        std::fs::remove_file(&state.db_path).unwrap();
+        let health = service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(health.backing_file_valid, Some(false));
+        assert!(health.backing_file_error.contains("was deleted"));
+        let error = service
+            .run_unary_mutation("remove_repo", || Ok::<_, Status>(()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(state.active_writes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn backup_refusal_status_keeps_expected_errors_distinct_from_faults() {
+        let refused = backup_error_status(
+            nestweaver_engine::backup::BackupRefusal("unsafe destination".into()).into(),
+        );
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert!(refused.message().starts_with("backup_refused:"));
+        assert_eq!(
+            backup_error_status(anyhow::anyhow!("disk failed")).code(),
+            tonic::Code::Internal
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reindex_search_holds_write_gate() {
         let state = test_state_with_writer();
         let service = DaemonService::new(state.clone());
@@ -31111,6 +31232,60 @@ external_model = "unavailable-test-model"
         });
         req.extensions_mut().insert(crate::auth::IsAdmin(true));
         req
+    }
+
+    #[tokio::test]
+    async fn every_short_mcp_mutation_route_times_out_before_admission_and_writes_nothing() {
+        fn admin<T>(body: T) -> Request<T> {
+            let mut request = Request::new(body);
+            request.extensions_mut().insert(crate::auth::IsAdmin(true));
+            request
+        }
+        let state = test_state_with_writer();
+        state
+            .store
+            .insert_repo(&test_repo("repo:busy", "https://example.test/busy", None))
+            .unwrap();
+        let generation = state.store.graph_generation();
+        let held = state.write_gate.lock("deterministic_index_holder").await;
+        let service = DaemonService::new(state.clone());
+        TEST_MUTATION_ADMISSION_WAIT.scope(Duration::from_millis(20), async {
+            // brain_remove_source selects one of three concrete handlers.
+            // Long-running brain_add_source is an admitted streaming index,
+            // whose publication lifetime has separate cancellation coverage.
+            for route in ["remove_repo", "remove_vault", "remove_project", "prune_stale",
+                "compact_embeddings", "brain_memory_consolidate", "set_extension",
+                "unset_extension", "forget_interaction"] {
+                let call = async {
+                    match route {
+                        "remove_repo" => service.remove_repo(admin(RemoveRepoRequest { repo_uid: "repo:busy".into() })).await.map(|_| ()),
+                        "remove_vault" => service.remove_vault(admin(RemoveVaultRequest { vault_uid: "vault:busy".into() })).await.map(|_| ()),
+                        "remove_project" => service.remove_project(admin(RemoveProjectRequest { project_uid: "proj:busy".into() })).await.map(|_| ()),
+                        "prune_stale" => service.prune_stale(admin(PruneStaleRequest {})).await.map(|_| ()),
+                        "compact_embeddings" => service.compact_embeddings(admin(CompactEmbeddingsRequest { dry_run: false })).await.map(|_| ()),
+                        "brain_memory_consolidate" => service.brain_memory_consolidate(admin_json_request(serde_json::json!({"apply": true}))).await.map(|_| ()),
+                        "set_extension" => service.set_extension(admin_json_request(serde_json::json!({"uid":"sym:busy", "key":"owner", "value":"team"}))).await.map(|_| ()),
+                        "unset_extension" => service.unset_extension(admin_json_request(serde_json::json!({"uid":"sym:busy", "key":"owner"}))).await.map(|_| ()),
+                        "forget_interaction" => service.forget_interaction(admin_json_request(serde_json::json!({"uid":"sym:busy"}))).await.map(|_| ()),
+                        _ => unreachable!(),
+                    }
+                };
+                let error = tokio::time::timeout(Duration::from_secs(1), call).await
+                    .unwrap_or_else(|_| panic!("{route} waited beyond its admission deadline"))
+                    .expect_err("a held gate must refuse this route");
+                assert_eq!(error.code(), tonic::Code::ResourceExhausted, "{route}: {error}");
+                assert!(error.message().contains("deterministic_index_holder"), "{route}: {error}");
+                assert!(error.message().contains("nothing was written"), "{route}: {error}");
+                assert_eq!(state.active_writes.load(Ordering::Relaxed), 0, "{route}");
+                assert!(state.store.lookup_repo("repo:busy").unwrap().is_some(), "{route}");
+                assert_eq!(state.store.graph_generation(), generation, "{route}");
+            }
+        }).await;
+        drop(held);
+        let _barrier = state.write_gate.lock("post_refusal_barrier").await;
+        assert!(state.store.lookup_repo("repo:busy").unwrap().is_some());
+        assert_eq!(state.store.graph_generation(), generation);
+        assert!(nestweaver_engine::extensions::load_extensions(&state.db_path).is_empty());
     }
 
     /// A metadata write that cannot get the write gate within its bound

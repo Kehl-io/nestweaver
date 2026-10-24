@@ -1213,6 +1213,9 @@ impl DaemonClient {
         .context("health check timed out — daemon connected but unresponsive")?
         .context("health check failed")?
         .into_inner();
+        // A responsive daemon with an orphaned backing file remains the
+        // incumbent. Preserve access to diagnosis/shutdown; returning a
+        // connection error here would invite autostart of another writer.
         Ok((client, resp))
     }
 
@@ -1507,7 +1510,14 @@ impl DaemonClient {
             match Self::connect_existing(db_path).await {
                 Ok(mut client) => {
                     match tokio::time::timeout(remaining, client.health_check()).await {
-                        Ok(Ok(resp)) => return Ok(resp),
+                        Ok(Ok(resp)) => {
+                            anyhow::ensure!(
+                                resp.backing_file_valid != Some(false),
+                                "daemon is responsive but its database backing file is unhealthy: {}",
+                                resp.backing_file_error
+                            );
+                            return Ok(resp);
+                        }
                         Ok(Err(e)) => {
                             tracing::debug!("wait_healthy: health check not yet passing: {e:#}")
                         }

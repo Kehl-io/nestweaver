@@ -176,8 +176,8 @@ def main():
     args.evidence.mkdir(parents=True, exist_ok=True)
     if args.prewarm_skipped:
         result = dict(planned=None, accounted=None, outstanding=None, caught=0, survived=0,
-                      timed_out=0, unviable=0, complete=False, outer_exhausted=False, exit_status=0,
-                      reason='SKIPPED: prewarm budget exhausted; no mutation coverage measured', verdicts=[])
+                      timed_out=0, unviable=0, complete=False, outer_exhausted=False, exit_status=1,
+                      reason='NO SIGNAL: prewarm budget exhausted; no mutation coverage measured', verdicts=[])
     else:
         try:
             state = read(args.evidence / 'status.json')

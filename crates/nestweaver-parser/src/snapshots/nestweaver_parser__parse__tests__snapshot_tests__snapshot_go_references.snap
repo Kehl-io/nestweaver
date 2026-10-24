@@ -1,139 +1,301 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 6295
+assertion_line: 11838
 expression: "parsed_references(\"simple.go\", &source)"
 ---
-- name: main
+- scope:
+    start: 0
+    end: 603
+    position: 0
+    initialized_at: 0
+    hoisted_var: false
+  name: main
   kind: PackageBinding
   start_line: 1
   context: package main
   receiver: ~
-- name: fmt
+- scope:
+    start: 0
+    end: 603
+    position: 24
+    initialized_at: 24
+    hoisted_var: false
+  name: fmt
   kind: Import
   start_line: 4
   context: "\"fmt\""
   receiver: ~
-- name: strings
+- scope:
+    start: 0
+    end: 603
+    position: 31
+    initialized_at: 31
+    hoisted_var: false
+  name: strings
   kind: Import
   start_line: 5
   context: "\"strings\""
   receiver: ~
-- name: string
+- scope:
+    start: 0
+    end: 603
+    position: 76
+    initialized_at: 76
+    hoisted_var: false
+  name: string
   kind: TypeRef
   start_line: 9
   context: (name string)
   receiver: ~
-- name: string
+- scope:
+    start: 0
+    end: 603
+    position: 106
+    initialized_at: 106
+    hoisted_var: false
+  name: string
   kind: TypeRef
   start_line: 10
   context: (name string)
   receiver: ~
-- name: string
+- scope:
+    start: 0
+    end: 603
+    position: 159
+    initialized_at: 159
+    hoisted_var: false
+  name: string
   kind: TypeRef
   start_line: 14
   context: Prefix string
   receiver: ~
-- name: ConsoleGreeter
+- scope:
+    start: 176
+    end: 283
+    position: 184
+    initialized_at: 184
+    hoisted_var: false
+  name: ConsoleGreeter
   kind: TypeRef
   start_line: 17
   context: g *ConsoleGreeter
   receiver: ~
-- name: string
+- scope:
+    start: 176
+    end: 283
+    position: 207
+    initialized_at: 207
+    hoisted_var: false
+  name: string
   kind: TypeRef
   start_line: 17
   context: (name string)
   receiver: ~
-- name: string
+- scope:
+    start: 0
+    end: 603
+    position: 176
+    initialized_at: 176
+    hoisted_var: false
+  name: string
   kind: TypeRef
   start_line: 17
   context: "func (g *ConsoleGreeter) Greet(name string) string {"
   receiver: ~
-- name: Prefix
+- scope:
+    start: 227
+    end: 283
+    position: 266
+    initialized_at: 266
+    hoisted_var: false
+  name: Prefix
   kind: ReadAccess
   start_line: 18
   context: "(\"%s Hello, %s!\", g.Prefix, name)"
   receiver: g
-- name: Sprintf
+- scope:
+    start: 227
+    end: 283
+    position: 237
+    initialized_at: 237
+    hoisted_var: false
+  name: Sprintf
   kind: Call
   start_line: 18
   context: "fmt.Sprintf(\"%s Hello, %s!\", g.Prefix, name)"
   receiver: fmt
-- name: Sprintf
+- scope:
+    start: 227
+    end: 283
+    position: 237
+    initialized_at: 237
+    hoisted_var: false
+  name: Sprintf
   kind: ReadAccess
   start_line: 18
   context: "fmt.Sprintf(\"%s Hello, %s!\", g.Prefix, name)"
   receiver: fmt
-- name: ConsoleGreeter
+- scope:
+    start: 285
+    end: 397
+    position: 293
+    initialized_at: 293
+    hoisted_var: false
+  name: ConsoleGreeter
   kind: TypeRef
   start_line: 21
   context: g *ConsoleGreeter
   receiver: ~
-- name: string
+- scope:
+    start: 285
+    end: 397
+    position: 319
+    initialized_at: 319
+    hoisted_var: false
+  name: string
   kind: TypeRef
   start_line: 21
   context: (name string)
   receiver: ~
-- name: string
+- scope:
+    start: 0
+    end: 603
+    position: 285
+    initialized_at: 285
+    hoisted_var: false
+  name: string
   kind: TypeRef
   start_line: 21
   context: "func (g *ConsoleGreeter) Farewell(name string) string {"
   receiver: ~
-- name: Prefix
+- scope:
+    start: 339
+    end: 397
+    position: 380
+    initialized_at: 380
+    hoisted_var: false
+  name: Prefix
   kind: ReadAccess
   start_line: 22
   context: "(\"%s Goodbye, %s!\", g.Prefix, name)"
   receiver: g
-- name: Sprintf
+- scope:
+    start: 339
+    end: 397
+    position: 349
+    initialized_at: 349
+    hoisted_var: false
+  name: Sprintf
   kind: Call
   start_line: 22
   context: "fmt.Sprintf(\"%s Goodbye, %s!\", g.Prefix, name)"
   receiver: fmt
-- name: Sprintf
+- scope:
+    start: 339
+    end: 397
+    position: 349
+    initialized_at: 349
+    hoisted_var: false
+  name: Sprintf
   kind: ReadAccess
   start_line: 22
   context: "fmt.Sprintf(\"%s Goodbye, %s!\", g.Prefix, name)"
   receiver: fmt
-- name: Greeter
+- scope:
+    start: 0
+    end: 603
+    position: 399
+    initialized_at: 399
+    hoisted_var: false
+  name: Greeter
   kind: TypeRef
   start_line: 25
   context: "func NewGreeter(prefix string) Greeter {"
   receiver: ~
-- name: string
+- scope:
+    start: 399
+    end: 500
+    position: 415
+    initialized_at: 415
+    hoisted_var: false
+  name: string
   kind: TypeRef
   start_line: 25
   context: (prefix string)
   receiver: ~
-- name: TrimSpace
+- scope:
+    start: 438
+    end: 500
+    position: 472
+    initialized_at: 472
+    hoisted_var: false
+  name: TrimSpace
   kind: Call
   start_line: 26
   context: strings.TrimSpace(prefix)
   receiver: strings
-- name: TrimSpace
+- scope:
+    start: 438
+    end: 500
+    position: 472
+    initialized_at: 472
+    hoisted_var: false
+  name: TrimSpace
   kind: ReadAccess
   start_line: 26
   context: strings.TrimSpace(prefix)
   receiver: strings
-- name: NewGreeter
+- scope:
+    start: 514
+    end: 602
+    position: 528
+    initialized_at: 545
+    hoisted_var: false
+  name: NewGreeter
   kind: Call
   start_line: 30
   context: "NewGreeter(\">>>\")"
   receiver: ~
-- name: Greet
+- scope:
+    start: 514
+    end: 602
+    position: 557
+    initialized_at: 579
+    hoisted_var: false
+  name: Greet
   kind: Call
   start_line: 31
   context: "greeter.Greet(\"world\")"
   receiver: greeter
-- name: Greet
+- scope:
+    start: 514
+    end: 602
+    position: 557
+    initialized_at: 579
+    hoisted_var: false
+  name: Greet
   kind: ReadAccess
   start_line: 31
   context: "greeter.Greet(\"world\")"
   receiver: greeter
-- name: Println
+- scope:
+    start: 514
+    end: 602
+    position: 581
+    initialized_at: 581
+    hoisted_var: false
+  name: Println
   kind: Call
   start_line: 32
   context: fmt.Println(result)
   receiver: fmt
-- name: Println
+- scope:
+    start: 514
+    end: 602
+    position: 581
+    initialized_at: 581
+    hoisted_var: false
+  name: Println
   kind: ReadAccess
   start_line: 32
   context: fmt.Println(result)

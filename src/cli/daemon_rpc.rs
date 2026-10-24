@@ -338,7 +338,62 @@ pub(crate) fn validated_upstream_fallback_config(
     Ok(initial_daemon_transport_unavailable(connect_error).then_some(effective))
 }
 
+#[derive(Debug)]
+pub(crate) struct IncompleteIndexRefusal(pub serde_json::Value);
+
+impl std::fmt::Display for IncompleteIndexRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Repository indexing did not complete; call-graph completeness is unavailable. Re-index the affected repositories before retrying.")
+    }
+}
+impl std::error::Error for IncompleteIndexRefusal {}
+
+fn contains_incomplete_index_refusal(value: &serde_json::Value) -> bool {
+    if value.get("refused").and_then(serde_json::Value::as_bool) == Some(true)
+        && value.get("reason").and_then(serde_json::Value::as_str) == Some("repo_index_incomplete")
+    {
+        return true;
+    }
+    // These are response-envelope fields, never source/property contents.
+    [
+        "local_impact",
+        "org_wide_impact",
+        "results",
+        "result",
+        "structuredContent",
+    ]
+    .iter()
+    .filter_map(|key| value.get(*key))
+    .any(|nested| {
+        nested.as_array().map_or_else(
+            || contains_incomplete_index_refusal(nested),
+            |items| items.iter().any(contains_incomplete_index_refusal),
+        )
+    })
+}
+
+pub(crate) fn reject_incomplete_index_response(
+    value: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    if contains_incomplete_index_refusal(&value) {
+        return Err(IncompleteIndexRefusal(value).into());
+    }
+    Ok(value)
+}
+
 pub(crate) fn try_hybrid_json_rpc_checked(
+    use_daemon: bool,
+    db_path: &std::path::Path,
+    config: Option<&std::path::Path>,
+    rpc_name: &str,
+    args: serde_json::Value,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    try_hybrid_json_rpc_checked_inner(use_daemon, db_path, config, rpc_name, args)?
+        .map(reject_incomplete_index_response)
+        .transpose()
+}
+
+fn try_hybrid_json_rpc_checked_inner(
     use_daemon: bool,
     db_path: &std::path::Path,
     config: Option<&std::path::Path>,
@@ -1289,5 +1344,33 @@ mod hybrid_catalogue_tests {
         assert_eq!(error["jsonrpc"], "2.0");
         assert_eq!(error["id"], "bad-cursor");
         assert_eq!(error["error"]["code"], -32602);
+    }
+}
+
+#[cfg(test)]
+mod incomplete_index_response_tests {
+    use super::*;
+    #[test]
+    fn refused_single_and_federated_tiers_cannot_be_rendered_as_empty_success() {
+        let refusal = serde_json::json!({"refused":true,"reason":"repo_index_incomplete","incomplete_repos":[{"repo_uid":"repo:other"}]});
+        for payload in [
+            refusal.clone(),
+            serde_json::json!({"tier":"two","local_impact":refusal.clone()}),
+            serde_json::json!({"org_wide_impact":{"results":[refusal]}}),
+        ] {
+            let error = reject_incomplete_index_response(payload.clone()).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<IncompleteIndexRefusal>().unwrap().0,
+                payload
+            );
+        }
+        let empty = serde_json::json!({"impact_nodes":[],"total":0});
+        assert_eq!(
+            reject_incomplete_index_response(empty.clone()).unwrap(),
+            empty
+        );
+        let source_property =
+            serde_json::json!({"properties":{"refused":true,"reason":"repo_index_incomplete"}});
+        assert!(reject_incomplete_index_response(source_property).is_ok());
     }
 }

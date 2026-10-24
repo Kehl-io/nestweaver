@@ -196,10 +196,9 @@ use nestweaver_engine::{
     get_last_indexed_at,
     index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits,
     index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits,
-    index_markdown_directory_with_ignore_and_write_lease_and_note_limits, list_repos,
-    list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation, lookup_symbol,
-    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
-    search_symbols, suggest_links,
+    list_repos, list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation,
+    lookup_symbol, record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar,
+    save_summaries, search_symbols, suggest_links,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -1564,7 +1563,7 @@ fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[Str
                 )
             );
         }
-        eprintln!("{message}");
+        let _ = eprint_best_effort(format_args!("{message}"));
         eprint_did_you_mean(&candidates);
         EXIT_NOT_FOUND
     } else if message.contains("Ambiguous") {
@@ -1591,7 +1590,7 @@ fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[Str
                 })
             );
         }
-        eprintln!("{message}");
+        let _ = eprint_best_effort(format_args!("{message}"));
         EXIT_AMBIGUOUS
     } else {
         if json {
@@ -1600,7 +1599,7 @@ fn report_context_lookup_failure(error: &anyhow::Error, json: bool, seeds: &[Str
                 serde_json::json!({ "error": "failed", "seeds": seeds, "message": message })
             );
         }
-        eprintln!("Error: {message}");
+        let _ = eprint_best_effort(format_args!("Error: {message}"));
         EXIT_ERROR
     }
 }
@@ -2802,6 +2801,40 @@ fn json_payload_with_provenance(mut payload: serde_json::Value) -> serde_json::V
     payload
 }
 
+/// Attach current compatibility from the exact store used by a direct query.
+/// Richer wire metadata wins; no ambient store, cached snapshot or second open.
+fn json_payload_with_store_compatibility(
+    store: &GraphStore,
+    payload: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let mut payload = json_payload_with_provenance(payload);
+    if payload.pointer("/_meta/index_compatibility").is_none() {
+        let compatibility = nestweaver_mcp::tools::index_compatibility_json(store, None)?;
+        if let Some(meta) = payload
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            meta.insert("index_compatibility".to_string(), compatibility);
+        }
+    }
+    Ok(payload)
+}
+
+fn local_query_meta(store: &GraphStore) -> anyhow::Result<serde_json::Value> {
+    let payload = json_payload_with_store_compatibility(store, serde_json::json!({}))?;
+    Ok(payload["_meta"].clone())
+}
+
+fn print_json_payload_for_store(
+    store: &GraphStore,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    print_json_payload(&json_payload_with_store_compatibility(
+        store,
+        payload.clone(),
+    )?)
+}
+
 /// Print a `--json` OBJECT payload. The only emitter that should exist.
 ///
 /// Routing every `--json` object print through one function is what makes
@@ -3577,6 +3610,29 @@ fn print_json_not_found_suggesting(target_key: &str, target: &str, candidates: &
 /// the project. A project miss is the tool's not-found envelope keyed
 /// `project`; an unresolved `--repos` selector reports itself (not found 2,
 /// ambiguous 3, malformed 64). `None` for anything else.
+fn report_incomplete_index_refusal(
+    store: &GraphStore,
+    tool: &str,
+    args: &serde_json::Value,
+    json: bool,
+) -> anyhow::Result<bool> {
+    let Some(payload) =
+        nestweaver_mcp::tools::index_incomplete_refusal_for_args(store, tool, args, None)?
+    else {
+        return Ok(false);
+    };
+    if json {
+        print_json_payload(&payload)?;
+    }
+    let _ = eprint_best_effort(format_args!(
+        "{}",
+        payload["message"]
+            .as_str()
+            .unwrap_or("Repository index is incomplete; re-index before retrying.")
+    ));
+    Ok(true)
+}
+
 fn report_project_context_failure(error: &anyhow::Error, name: &str, json: bool) -> Option<i32> {
     if let Some(envelope) = nestweaver_mcp::tools::not_found_envelope(error)
         && envelope.get("project").is_some()
@@ -3587,7 +3643,9 @@ fn report_project_context_failure(error: &anyhow::Error, name: &str, json: bool)
         if json {
             print_json_not_found_suggesting("project", name, &candidates);
         }
-        eprintln!("Project '{name}' not found. Try: nestweaver list-projects");
+        let _ = eprint_best_effort(format_args!(
+            "Project '{name}' not found. Try: nestweaver list-projects"
+        ));
         eprint_did_you_mean(&candidates);
         return Some(EXIT_NOT_FOUND);
     }
@@ -3630,7 +3688,7 @@ fn report_investigate_failure(
         if json {
             println!("{envelope}");
         }
-        eprintln!("{message}");
+        let _ = eprint_best_effort(format_args!("{message}"));
         eprint_did_you_mean(&value_did_you_mean(&envelope));
         return Some(EXIT_NOT_FOUND);
     }
@@ -3643,7 +3701,7 @@ fn report_investigate_failure(
                 serde_json::json!({ "error": "invalid arguments", "scope": scope_value, "message": message })
             );
         }
-        eprintln!("Error: {message}");
+        let _ = eprint_best_effort(format_args!("Error: {message}"));
         return Some(EXIT_USAGE);
     }
     if message.contains("index publication") {
@@ -3653,7 +3711,7 @@ fn report_investigate_failure(
                 serde_json::json!({ "error": "publication_in_progress", "retryable": true, "message": message })
             );
         }
-        eprintln!("{message}");
+        let _ = eprint_best_effort(format_args!("{message}"));
         return Some(EXIT_ERROR);
     }
     None
@@ -4802,15 +4860,15 @@ mod flow_trace_text_tests {
 
 /// The refusal paragraph out of a `dead_code` payload the DAEMON produced.
 ///
-/// nw-372. The daemon route re-renders nothing: the tool that computed the
-/// refusal also wrote the sentence, so this reads `note` and prints it. The
-/// fallback exists only for a payload that says `refused` and carries no
-/// `note`, which this binary cannot produce — and it still names a remedy,
-/// because a refusal with no way forward is the failure mode nw-370 fixed.
+/// Preserve the producer's nonblank `message`, then its legacy `note`.
+/// Older payloads without either paragraph retain the resolver fallback and
+/// its remedy, because a refusal must explain how to proceed (nw-370/372).
 fn dead_code_refusal_note(payload: &serde_json::Value) -> String {
     payload
-        .get("note")
-        .and_then(|v| v.as_str())
+        .get("message")
+        .and_then(|value| value.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| payload.get("note").and_then(|value| value.as_str()))
         .map(str::to_string)
         .unwrap_or_else(|| {
             "dead-code refused: this graph's edges predate the running resolver, and a \
@@ -4850,8 +4908,10 @@ fn affected_tests_refusal_payload(
 
 fn affected_tests_refusal_note(payload: &serde_json::Value) -> String {
     payload
-        .get("note")
-        .and_then(|v| v.as_str())
+        .get("message")
+        .and_then(|value| value.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| payload.get("note").and_then(|value| value.as_str()))
         .map(str::to_string)
         .unwrap_or_else(|| {
             nestweaver_engine::resolver_generation::WHY_AFFECTED_TESTS_REFUSES.to_string()
@@ -12364,8 +12424,43 @@ fn pre_push_backups(hooks_dir: &Path) -> Vec<PathBuf> {
 
 /// Install the advisory (or strict) pre-push blast-radius hook in the current
 /// git repo. Backs up any pre-existing non-nestweaver hook.
+fn validate_hook_directory(cwd: &Path, hooks_dir: &Path) -> anyhow::Result<()> {
+    let common = git_common_dir(cwd)
+        .context("resolving repository common git directory")?
+        .canonicalize()?;
+    let root = git_repo_root(cwd)
+        .context("resolving repository root")?
+        .canonicalize()?;
+    nestweaver_engine::bare_clone::ensure_own_git_metadata(&root)?;
+    let mut ancestor = hooks_dir;
+    let mut suffix = Vec::new();
+    while !ancestor.exists() {
+        // A dangling link is occupied and must never be followed by create_dir_all.
+        anyhow::ensure!(
+            std::fs::symlink_metadata(ancestor).is_err(),
+            "refusing dangling hook directory {}",
+            ancestor.display()
+        );
+        suffix.push(ancestor.file_name().context("invalid hooks path")?);
+        ancestor = ancestor
+            .parent()
+            .context("hooks path has no existing ancestor")?;
+    }
+    let mut resolved = ancestor.canonicalize()?;
+    for component in suffix.into_iter().rev() {
+        resolved.push(component);
+    }
+    anyhow::ensure!(
+        resolved.starts_with(&common) || resolved.starts_with(&root),
+        "refusing hook directory outside this repository and its registered common git directory: {}",
+        resolved.display()
+    );
+    Ok(())
+}
+
 fn install_pre_push_hook(cwd: &Path, strict: bool, db: &Path) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
+    validate_hook_directory(cwd, &hooks_dir)?;
     // A hooks directory OUTSIDE the working tree affects more than this
     // checkout, so say so — and say why, which differs. Only checked when the
     // hooks dir already exists and canonicalizes (a not-yet-created custom
@@ -12626,6 +12721,7 @@ fn hooks_location_warning(
 /// hook — the one that was in place when nestweaver's was last installed.
 fn uninstall_pre_push_hook(cwd: &Path) -> anyhow::Result<i32> {
     let hooks_dir = git_hooks_dir(cwd)?;
+    validate_hook_directory(cwd, &hooks_dir)?;
     let hook_path = hooks_dir.join("pre-push");
 
     match std::fs::symlink_metadata(&hook_path) {
@@ -17577,6 +17673,16 @@ fn main() {
             code
         }
         Err(e) => {
+            if let Some(refusal) = e.downcast_ref::<cli::daemon_rpc::IncompleteIndexRefusal>() {
+                if argv_requests_json() {
+                    let _ = std::io::Write::write_fmt(
+                        &mut std::io::stdout(),
+                        format_args!("{}\n", refusal.0),
+                    );
+                }
+                let _ = eprint_best_effort(refusal);
+                process::exit(EXIT_NEEDS_REINDEX);
+            }
             if let Some(stdout) = e.downcast_ref::<nestweaver_mcp::StdoutWriteError>() {
                 if stdout.kind() == std::io::ErrorKind::BrokenPipe {
                     process::exit(EXIT_SUCCESS);
@@ -17592,7 +17698,10 @@ fn main() {
             }
             // nw-660: a schema violation is the caller's input mistake, so it
             // exits with the usage code clap-rejected values already use.
-            let code = if error_is_invalid_tool_arguments(&e) {
+            let code = if error_is_invalid_tool_arguments(&e)
+                || e.downcast_ref::<nestweaver_engine::backup::BackupRefusal>()
+                    .is_some()
+            {
                 EXIT_USAGE
             } else {
                 EXIT_ERROR
@@ -19335,7 +19444,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 print_repo_map_json(
                     &found.map,
                     &ResolverStaleness::from_store(&store),
-                    None,
+                    Some(local_query_meta(&store)?),
                     Some(found.truncated()),
                     Some(found.files_returned),
                     Some(found.files_total),
@@ -19429,7 +19538,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             })
                         );
                     } else {
-                        eprintln!("{error:#}");
+                        let _ = eprint_best_effort(format_args!("{error:#}"));
                     }
                     return Ok((EXIT_AMBIGUOUS, None));
                 }
@@ -19437,7 +19546,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         print_json_not_found("symbol", &symbol);
                     }
-                    eprintln!("Symbol '{symbol}' not found.");
+                    let _ = eprint_best_effort(format_args!("Symbol '{symbol}' not found."));
                     return Ok((EXIT_NOT_FOUND, None));
                 }
                 Err(error) => return Err(error),
@@ -19535,7 +19644,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         print_json_not_found("target", &target);
                     }
-                    eprintln!("Note '{target}' not found.");
+                    let _ = eprint_best_effort(format_args!("Note '{target}' not found."));
                     return Ok((EXIT_NOT_FOUND, None));
                 }
                 Err(error) => return Err(error),
@@ -19632,7 +19741,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         print_json_not_found("target", &target);
                     }
-                    eprintln!("Note '{target}' not found.");
+                    let _ = eprint_best_effort(format_args!("Note '{target}' not found."));
                     return Ok((EXIT_NOT_FOUND, None));
                 }
                 Err(error) => return Err(error),
@@ -19641,7 +19750,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 if json {
                     print_json_payload(&payload)?;
                 }
-                eprintln!("Note '{target}' not found.");
+                let _ = eprint_best_effort(format_args!("Note '{target}' not found."));
                 return Ok((EXIT_NOT_FOUND, None));
             }
             if payload_is_ambiguous(&payload) {
@@ -19749,7 +19858,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         print_json_not_found("symbol", &name_or_uid);
                     }
-                    eprintln!("Symbol '{name_or_uid}' not found.");
+                    eprint_symbol_not_found(&name_or_uid, &[]);
                     return Ok((EXIT_NOT_FOUND, None));
                 }
                 Err(error) => return Err(error),
@@ -20992,7 +21101,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "hubs",
                     &hubs,
                     &ResolverStaleness::from_store(&store),
-                    None,
+                    Some(local_query_meta(&store)?),
                     &bounds,
                     None,
                     Some(&db_path),
@@ -21202,7 +21311,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "bridges",
                     &bridges,
                     &ResolverStaleness::from_store(&store),
-                    None,
+                    Some(local_query_meta(&store)?),
                     &bounds,
                     None,
                     Some(&db_path),
@@ -22263,6 +22372,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             };
 
+            let payload = cli::daemon_rpc::reject_incomplete_index_response(payload)?;
             if json {
                 print_json_payload(&payload)?;
             } else {
@@ -22449,6 +22559,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 );
             }
 
+            let payload = cli::daemon_rpc::reject_incomplete_index_response(payload)?;
             if json {
                 print_json_payload(&payload)?;
             } else {
@@ -22548,6 +22659,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             } else {
                 let store = open_store(Some(&db_path))?;
+                if report_incomplete_index_refusal(&store, "dead_code", &args, json)? {
+                    return Ok((EXIT_NEEDS_REINDEX, None));
+                }
                 let all_repos = store.list_repos(None)?;
                 if let Some(refusal) =
                     nestweaver_engine::resolver_generation::DeadCodeRefusal::for_repos(
@@ -22558,7 +22672,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     value["review_only"] = serde_json::json!(true);
                     value["high_confidence_available"] = serde_json::json!(false);
                     if json {
-                        print_json_payload(&value)?;
+                        print_json_payload_for_store(&store, &value)?;
                     }
                     eprintln!("Error: {}", refusal.message());
                     return Ok((EXIT_NEEDS_REINDEX, None));
@@ -22588,7 +22702,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     concise: false,
                 };
                 let observed_generation = store.graph_generation();
-                if let Some(refusal) = dead_code_page_guard(&store, observed_generation, &request) {
+                let value = if let Some(refusal) =
+                    dead_code_page_guard(&store, observed_generation, &request)
+                {
                     refusal
                 } else {
                     let manifests =
@@ -22610,7 +22726,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         &identity,
                     )?;
                     dead_code_page_guard(&store, observed_generation, &request).unwrap_or(page)
-                }
+                };
+                json_payload_with_store_compatibility(&store, value)?
             };
             if payload.get("refused").and_then(|v| v.as_bool()) == Some(true) {
                 if json {
@@ -23298,6 +23415,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     // to a changed file refuses; an unrelated one is disclosed
                     // in the selection's notifications instead.
                     let target_uid = target_repo.as_ref().map(|target| target.uid.as_str());
+                    if report_incomplete_index_refusal(
+                        &store,
+                        "affected_tests",
+                        &serde_json::json!({"repo": target_uid, "changed_files": changed_files}),
+                        json,
+                    )? {
+                        return Ok((EXIT_NEEDS_REINDEX, None));
+                    }
                     let mut repos = store.list_repos(None)?;
                     nestweaver_engine::resolver_generation::incompatibility_for_changed_files_in_repo_at(
                         &store,
@@ -23316,7 +23441,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // paragraph goes to stderr on BOTH modes, the same
                         // split `dead-code` and `stale-check` already use.
                         if json {
-                            print_json_payload(&payload)?;
+                            print_json_payload_for_store(&store, &payload)?;
                         }
                         eprintln!("Error: {}", affected_tests_refusal_note(&payload));
                         return Ok((EXIT_NEEDS_REINDEX, None));
@@ -23335,7 +23460,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         )?,
                     };
                     AffectedTestsRpcPayload::Single {
-                        raw: serde_json::to_value(&result)?,
+                        raw: json_payload_with_store_compatibility(
+                            &store,
+                            serde_json::to_value(&result)?,
+                        )?,
                         result: Box::new(result),
                     }
                 }
@@ -25505,6 +25633,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 };
             match resolved {
                 ResolveResult::Found(uid) => {
+                    if report_incomplete_index_refusal(
+                        &store,
+                        "brain_impact",
+                        &serde_json::json!({"symbol": uid}),
+                        json,
+                    )? {
+                        return Ok((EXIT_NEEDS_REINDEX, None));
+                    }
                     let threshold = min_score.unwrap_or(nestweaver_store::DEFAULT_IMPACT_THRESHOLD);
                     let result = store.impact_with_flags_and_threshold(
                         &uid, depth, confidence, threshold, None,
@@ -25570,39 +25706,42 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         });
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&impact_json_ok(
-                                &name_or_uid,
-                                Some(&uid),
-                                serde_json::to_value(&json_nodes)?,
-                                result.truncated_by_threshold,
-                                result.truncated_by_depth,
-                                // `total` is the RESULT-SET size, matching the
-                                // daemon, which computes `nodes.len()` after
-                                // its visibility retain and BEFORE its
-                                // `.take(limit)`. The truncation flags carry
-                                // the "this set is a FLOOR" meaning; `total`
-                                // does not.
-                                //
-                                // An earlier version of this emitted `None`
-                                // when truncated, reasoning that the
-                                // PRE-truncation universe is unknown here. True
-                                // but irrelevant — that is a different
-                                // quantity than the one the daemon reports
-                                // under the same key, so it reintroduced the
-                                // divergence it was meant to close, in the one
-                                // case the happy-path parity fixture cannot
-                                // reach.
-                                //
-                                // nw-357: these two were BOTH `json_nodes.len()`,
-                                // so `returned < total` could never hold and
-                                // the daemon's documented cap signal had no
-                                // counterpart here. They are now the pre-cap
-                                // and post-cap counts, the same two quantities
-                                // `tool_brain_impact` computes.
-                                Some(total as u64),
-                                Some(json_nodes.len() as u64),
-                                note,
-                            ))?
+                            serde_json::to_string_pretty(&json_payload_with_store_compatibility(
+                                &store,
+                                impact_json_ok(
+                                    &name_or_uid,
+                                    Some(&uid),
+                                    serde_json::to_value(&json_nodes)?,
+                                    result.truncated_by_threshold,
+                                    result.truncated_by_depth,
+                                    // `total` is the RESULT-SET size, matching the
+                                    // daemon, which computes `nodes.len()` after
+                                    // its visibility retain and BEFORE its
+                                    // `.take(limit)`. The truncation flags carry
+                                    // the "this set is a FLOOR" meaning; `total`
+                                    // does not.
+                                    //
+                                    // An earlier version of this emitted `None`
+                                    // when truncated, reasoning that the
+                                    // PRE-truncation universe is unknown here. True
+                                    // but irrelevant — that is a different
+                                    // quantity than the one the daemon reports
+                                    // under the same key, so it reintroduced the
+                                    // divergence it was meant to close, in the one
+                                    // case the happy-path parity fixture cannot
+                                    // reach.
+                                    //
+                                    // nw-357: these two were BOTH `json_nodes.len()`,
+                                    // so `returned < total` could never hold and
+                                    // the daemon's documented cap signal had no
+                                    // counterpart here. They are now the pre-cap
+                                    // and post-cap counts, the same two quantities
+                                    // `tool_brain_impact` computes.
+                                    Some(total as u64),
+                                    Some(json_nodes.len() as u64),
+                                    note,
+                                )
+                            )?)?
                         );
                     } else if nodes.is_empty() {
                         if !out.quiet {
@@ -25699,12 +25838,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(
-                                &nestweaver_schema::responses::with_did_you_mean(
+                            serde_json::to_string_pretty(&json_payload_with_store_compatibility(
+                                &store,
+                                nestweaver_schema::responses::with_did_you_mean(
                                     impact_json_not_found(&name_or_uid),
                                     &candidates,
                                 )
-                            )?
+                            )?)?
                         );
                     } else {
                         eprint_symbol_not_found(&name_or_uid, &candidates);
@@ -25718,11 +25858,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // computed result set (nw-111).
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&impact_json_ambiguous(
-                                &name_or_uid,
-                                repo_filter.as_deref(),
-                                serde_json::to_value(&candidates)?
-                            ))?
+                            serde_json::to_string_pretty(&json_payload_with_store_compatibility(
+                                &store,
+                                impact_json_ambiguous(
+                                    &name_or_uid,
+                                    repo_filter.as_deref(),
+                                    serde_json::to_value(&candidates)?
+                                )
+                            )?)?
                         );
                     } else {
                         eprintln!(
@@ -26055,11 +26198,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             let store = open_store(Some(&db_path))?;
             let tantivy_path = tantivy_sidecar_path_for(&db_path);
             let tantivy = TantivyIndex::open_reader_only(&tantivy_path).ok();
-            let root = root.unwrap_or_else(detect_repo_root);
-            // As the daemon's investigate does: a root outside every indexed
-            // source serves no bodies, and the payload says why.
-            let (root, root_not_used) =
-                nestweaver_mcp::tools::investigate_root_or_none(&store, &root);
+            // Explicit roots retain trust validation. An omitted root resolves
+            // each body against its own repository, independent of this cwd.
+            let (root, root_not_used) = match root {
+                Some(root) => nestweaver_mcp::tools::investigate_root_or_none(&store, &root),
+                None => (
+                    PathBuf::from(nestweaver_engine::query::OWNING_REPO_SOURCE_ROOT),
+                    None,
+                ),
+            };
             // nw-189: "all", not "vault". Both are pass-throughs, but the
             // result echoes this string back, and defaulting to "vault" told a
             // caller who supplied NO scope that their results were
@@ -28777,6 +28924,41 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             Ok(pid) => (pid, None),
                             Err(error) => (None, Some(error)),
                         };
+                    let backing_error = if reachable.is_some() {
+                        tokio::runtime::Runtime::new()?.block_on(async {
+                            let mut client =
+                                nestweaver_client::DaemonClient::connect_existing(&db_path).await?;
+                            let health = tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                client.health_check(),
+                            )
+                            .await??;
+                            Ok::<_, anyhow::Error>(
+                                (health.backing_file_valid == Some(false))
+                                    .then_some(health.backing_file_error),
+                            )
+                        })?
+                    } else {
+                        None
+                    };
+                    if let Some(error) = &backing_error {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "state": "unhealthy", "evidence": "backing_file_identity", "pid": reachable,
+                                    "backing_file_valid": false, "backing_file_error": error,
+                                    "db_path": std::path::absolute(&db_path)?, "socket": socket,
+                                    "next_action": "Stop this daemon cleanly and inspect the database path before restarting. Do not start another writer or remove runtime files."
+                                })
+                            );
+                        } else {
+                            println!(
+                                "Daemon is UNHEALTHY: {error}\nStop this daemon cleanly and inspect the database path before restarting. Do not start another writer or remove runtime files."
+                            );
+                        }
+                        return Ok((EXIT_DAEMON_UNHEALTHY, None));
+                    }
                     if json {
                         let owner = if reachable.is_none() {
                             unreachable_daemon_owner(&db_path, &pidfile)
@@ -34527,6 +34709,18 @@ fn run_publication_rebuild(
                         std::process::exit(87);
                     }
                     verify_staged_publication_identity(&target_db, &state.plan)?;
+                    // Persist ancestry before any graph-source mutation. A
+                    // resumed matching input keeps its original base receipt.
+                    {
+                        let authority = acquire_publication_write_authority(
+                            &target_db, "record staged relink ancestry",
+                        )?;
+                        let store = GraphStore::open_with_authority(&target_db, &authority)?;
+                        state = nestweaver_engine::publication_operation::record_code_link_base_generation(
+                            &publication_root, &operation_uuid, state.revision,
+                            store.graph_generation(),
+                        )?;
+                    }
                     let total = u64::try_from(sources.repos.len() + sources.vaults.len())?;
                     let mut completed = 0_u64;
                     for repo in &sources.repos {
@@ -34751,7 +34945,8 @@ fn run_publication_rebuild(
                         total,
                         "linking notes to code".to_string(),
                     )?;
-                    link_staged_notes_to_code(&store, &config, &target_db)?;
+                    link_staged_notes_to_code(&store, &config, &target_db,
+                        &nestweaver_engine::publication_operation::code_link_scope(&state))?;
                     drop(store);
                     let receipt = preserved_state.clone().import_into(&target_db)?;
                     receipt.write_bound(&target_db)?;
@@ -34963,6 +35158,10 @@ fn run_publication_rebuild(
                         &target_db,
                         "seal the staged publication",
                     )?;
+                    // Scoped dependency coverage is disposable staging state.
+                    // Source rescoping has ended; sealed slots contain only the
+                    // typed publication inventory, never this rebuild cache.
+                    nestweaver_engine::code_links::retire_publication_link_cache(&target_db)?;
                     nestweaver_engine::backup::seal_publication_slot_with_authority(&target_db, &slot, &_authority)?;
                     state = nestweaver_engine::publication_operation::mark_ready(
                         &publication_root,
@@ -35211,6 +35410,7 @@ fn link_staged_notes_to_code(
     store: &GraphStore,
     config: &nestweaver_engine::config::InstanceConfig,
     target_db: &Path,
+    relink_scope: &nestweaver_engine::publication_operation::PublicationRelinkScope,
 ) -> anyhow::Result<()> {
     // A fresh graph holds no links built by other rules, so this pass builds
     // every note's links rather than migrating (purging) first.
@@ -35228,10 +35428,11 @@ fn link_staged_notes_to_code(
             None,
         )?;
     }
-    let report = nestweaver_engine::code_links::reconcile_code_links_with_folders(
+    let report = nestweaver_engine::code_links::reconcile_code_links_with_folders_scoped(
         store,
         &config.cross_domain,
         nestweaver_engine::project::project_folders(config, &config.instance_id),
+        relink_scope,
     )?;
     if !report.unreadable.is_empty() {
         anyhow::bail!(
@@ -39729,6 +39930,8 @@ mod pr_impact_hook_tests {
         );
         let hooks_dir = git_hooks_dir(&linked).unwrap();
         std::fs::create_dir_all(&hooks_dir).unwrap();
+        validate_hook_directory(&linked, &hooks_dir)
+            .expect("registered worktree hooks are trusted");
         let message = hooks_location_message(&linked, &hooks_dir)
             .expect("a linked worktree's hooks live outside its working tree");
         assert!(!message.contains("core.hooksPath"), "{message}");
@@ -39746,7 +39949,40 @@ mod pr_impact_hook_tests {
         );
         let hooks_dir = git_hooks_dir(&main).unwrap();
         let message = hooks_location_message(&main, &hooks_dir).expect("outside");
+        assert!(validate_hook_directory(&main, &hooks_dir).is_err());
+        assert!(!shared.join("pre-push").exists());
         assert!(message.contains("core.hooksPath is set"), "{message}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod hook_directory_safety_tests {
+    use super::*;
+    #[test]
+    fn external_directory_links_refuse_before_hook_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let external = temp.path().join("external");
+        std::fs::create_dir(&external).unwrap();
+        let hooks = repo.join(".git/hooks");
+        std::fs::remove_dir_all(&hooks).unwrap();
+        std::os::unix::fs::symlink(&external, &hooks).unwrap();
+        assert!(install_pre_push_hook(&repo, false, &repo.join("graph.lbug")).is_err());
+        assert!(std::fs::read_dir(&external).unwrap().next().is_none());
+        std::fs::remove_file(&hooks).unwrap();
+        let dangling = temp.path().join("absent");
+        std::os::unix::fs::symlink(&dangling, &hooks).unwrap();
+        assert!(install_pre_push_hook(&repo, false, &repo.join("graph.lbug")).is_err());
+        assert!(!dangling.exists());
     }
 }
 
@@ -45190,5 +45426,97 @@ mod cli_fix_round_tests {
         for (argv, is_err) in refused {
             assert!(is_err, "clap must refuse `{argv}` (a usage error, exit 64)");
         }
+    }
+}
+
+#[cfg(test)]
+mod incomplete_refusal_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn dead_code_and_affected_tests_preserve_producer_incomplete_reason_and_remedy() {
+        let message = "Repository indexing did not complete; re-index the affected repositories before retrying.";
+        let payload = serde_json::json!({
+            "refused": true, "reason": "repo_index_incomplete", "message": message,
+            "note": "legacy generic resolver explanation"
+        });
+        assert_eq!(dead_code_refusal_note(&payload), message);
+        assert_eq!(affected_tests_refusal_note(&payload), message);
+        let legacy = serde_json::json!({"note":"existing resolver-generation reason and remedy"});
+        assert_eq!(
+            dead_code_refusal_note(&legacy),
+            legacy["note"].as_str().unwrap()
+        );
+        assert_eq!(
+            affected_tests_refusal_note(&legacy),
+            legacy["note"].as_str().unwrap()
+        );
+        let empty_message = serde_json::json!({"message":" ", "note":"legacy nonempty note"});
+        assert_eq!(
+            dead_code_refusal_note(&empty_message),
+            "legacy nonempty note"
+        );
+        assert_eq!(
+            affected_tests_refusal_note(&empty_message),
+            "legacy nonempty note"
+        );
+        let absent = serde_json::json!({});
+        assert!(dead_code_refusal_note(&absent).contains("edges predate the running resolver"));
+        assert_eq!(
+            affected_tests_refusal_note(&absent),
+            nestweaver_engine::resolver_generation::WHY_AFFECTED_TESTS_REFUSES
+        );
+    }
+}
+
+#[cfg(test)]
+mod direct_store_compatibility_tests {
+    use super::*;
+
+    fn incomplete_store(uid: &str) -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.into(),
+                url: format!("https://example.test/{uid}"),
+                indexed_sha: "fixture".into(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: Some(uid.into()),
+                root_path: None,
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn direct_custom_json_uses_its_exact_store_and_preserves_richer_wire_metadata() {
+        let first = incomplete_store("first");
+        let second = incomplete_store("second");
+        for (store, expected) in [(&first, "first"), (&second, "second"), (&first, "first")] {
+            let value = json_payload_with_store_compatibility(
+                store,
+                serde_json::json!({"refused": true, "reason": "fixture-refusal"}),
+            )
+            .unwrap();
+            assert_eq!(
+                value["_meta"]["index_compatibility"]["incomplete_repos"][0]["repo_uid"],
+                expected
+            );
+            assert_eq!(value["reason"], "fixture-refusal");
+            assert_eq!(value["refused"], true);
+            assert_eq!(value["_meta"]["scope"], "local");
+        }
+        let wire = serde_json::json!({
+            "_meta": {
+                "scope": "hybrid", "sources": ["local", "org"], "stale_repos": ["upstream"],
+                "index_compatibility": {"scope": "authorized-wire", "incomplete_repos": []}
+            },
+            "refused": true, "reason": "repo_index_incomplete"
+        });
+        assert_eq!(
+            json_payload_with_store_compatibility(&first, wire.clone()).unwrap(),
+            wire
+        );
     }
 }

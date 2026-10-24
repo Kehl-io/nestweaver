@@ -26,9 +26,9 @@ pub struct SymbolWindow {
     pub end_line: u32,
     pub body: String,
     /// False when the source span could not be read (file not found from the
-    /// reader's working directory, or an out-of-range span) — the body is then
+    /// selected repository root, or an out-of-range span) — the body is then
     /// an empty string that would otherwise be indistinguishable from a genuinely
-    /// empty symbol. Callers should pass `root` or run from the repo to fix it.
+    /// empty symbol. Re-index a moved checkout or pass its explicit `root`.
     pub body_available: bool,
     /// True when this symbol was pulled in via `neighbors`, not requested directly.
     pub is_neighbor: bool,
@@ -799,7 +799,9 @@ pub fn read_symbols_budgeted(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for sym in primary {
         if neighbors > 0 {
-            let mut in_file = store.symbols_in_file(&sym.file_path).unwrap_or_default();
+            let mut in_file = store
+                .symbols_in_file_in_repo(&sym.file_path, &sym.repo_uid)
+                .unwrap_or_default();
             // nw-113: the whole-file `<module>` owner is never a neighbour.
             in_file.retain(|s| !s.is_module_owner() || s.uid == sym.uid);
             in_file.sort_by_key(|s| s.start_line);
@@ -943,13 +945,14 @@ pub fn read_symbols_budgeted(
 /// Read spans using each symbol's recorded repo `local_root` when the caller
 /// did not pass an explicit root. An explicit `--root` still uses
 /// [`read_symbols`] against that one tree. A repo with no usable
-/// `local_root` falls back to `fallback_root` rather than inventing a path.
+/// `local_root` reports its body unavailable; it never reads the process cwd.
+/// The legacy fallback argument is retained for source compatibility.
 pub fn read_symbols_from_repo_roots(
     store: &GraphStore,
     specs: &[String],
     neighbors: u8,
     token_budget: Option<usize>,
-    fallback_root: &Path,
+    _fallback_root: &Path,
     limits: crate::index_limits::IndexLimits,
 ) -> ReadSymbolsResult {
     use std::collections::HashMap;
@@ -975,7 +978,7 @@ pub fn read_symbols_from_repo_roots(
     }
 
     if repo_groups.is_empty() {
-        let reader = FilesystemReader::with_limits(fallback_root, limits);
+        let reader = FilesystemReader::with_limits(Path::new(""), limits);
         return read_symbols(store, specs, &reader, neighbors, token_budget);
     }
 
@@ -984,7 +987,7 @@ pub fn read_symbols_from_repo_roots(
     let mut remaining_budget = token_budget;
 
     for (repo_uid, group_targets) in &repo_groups {
-        let root = repo_local_root(store, repo_uid).unwrap_or_else(|| fallback_root.to_path_buf());
+        let root = repo_local_root(store, repo_uid).unwrap_or_default();
         let reader = FilesystemReader::with_limits(&root, limits);
         // Only the overall first returned window may exceed the budget.
         // Passing the leftover budget into a fresh `read_symbols` would
@@ -1184,6 +1187,79 @@ mod tests {
             res.symbols[0].body.contains("function greet"),
             "body must come from the indexed tree, not the fallback cwd"
         );
+    }
+
+    #[test]
+    fn neighbors_never_cross_repositories_with_the_same_paths_names_and_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let merged = GraphStore::in_memory().unwrap();
+        let mut seeds = Vec::new();
+        for (name, canary) in [("one", "first-repo-canary"), ("two", "second-repo-canary")] {
+            let root = dir.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            let source = format!(
+                "function before() {{ return '{canary}'; }}\nfunction middle() {{ return '{canary}'; }}\nfunction after() {{ return '{canary}'; }}\n"
+            );
+            fs::write(root.join("main.js"), source).unwrap();
+            let (_, store) = index_directory_in_memory(
+                &root,
+                name,
+                &format!("https://example.com/{name}"),
+                "sha",
+            )
+            .unwrap();
+            for repo in store.list_repos(None).unwrap() {
+                merged.insert_repo(&repo).unwrap();
+            }
+            for symbol in store.list_all_symbols().unwrap() {
+                if symbol.name == "middle" {
+                    seeds.push((symbol.uid.clone(), symbol.repo_uid.clone(), canary));
+                }
+                merged.insert_symbol(&symbol).unwrap();
+            }
+        }
+        assert_eq!(seeds.len(), 2);
+        for (uid, repo_uid, canary) in seeds {
+            let result = read_symbols_from_repo_roots(
+                &merged,
+                &[uid],
+                2,
+                None,
+                dir.path(),
+                crate::index_limits::IndexLimits::default(),
+            );
+            assert_eq!(result.symbols.len(), 3);
+            for window in result.symbols {
+                assert!(window.body.contains(canary));
+                assert_eq!(
+                    merged.lookup_symbol(&window.uid).unwrap().repo_uid,
+                    repo_uid
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_owning_root_never_uses_a_same_path_fallback() {
+        let (_dir, src, store) = test_repo();
+        let wrong = tempfile::tempdir().unwrap();
+        fs::write(
+            wrong.path().join("main.js"),
+            "function greet(name) { return 'wrong-root-canary'; }\n",
+        )
+        .unwrap();
+        fs::rename(&src, src.with_extension("moved")).unwrap();
+        let result = read_symbols_from_repo_roots(
+            &store,
+            &["greet".into()],
+            0,
+            None,
+            wrong.path(),
+            crate::index_limits::IndexLimits::default(),
+        );
+        assert_eq!(result.symbols.len(), 1);
+        assert!(!result.symbols[0].body_available);
+        assert!(!result.symbols[0].body.contains("wrong-root-canary"));
     }
 
     /// nw-542: a token budget spent by the first repo group must drop later

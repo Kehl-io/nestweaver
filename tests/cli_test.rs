@@ -16151,13 +16151,37 @@ fn cli_operator_config_follows_current_on_each_invocation() {
             vec!["dead-code", "--json", "--repo", name],
             vec!["contracts", "drift", "--json", "--repo", name],
         ] {
-            fixture
+            let output = fixture
                 .command()
-                .args(args)
+                .args(&args)
                 .arg("--config")
                 .arg(&fixture.config)
-                .assert()
-                .success();
+                .output()
+                .unwrap();
+            if args[0] == "dead-code" {
+                // This selection fixture intentionally contains a Repo but no
+                // source coverage. Its honest refusal must follow CURRENT too.
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["refused"], true);
+                assert_eq!(value["reason"], "repo_index_incomplete");
+                assert_eq!(value["incomplete_repos"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    value["incomplete_repos"][0]["repo_uid"],
+                    format!("repo:cli:{name}")
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
         // Status administration derives the logical root, rather than appending
         // .publications to the selected graph. This route intentionally has no --config.

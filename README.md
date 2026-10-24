@@ -553,6 +553,23 @@ bash app/build.sh
 open target/release/NestWeaver.app
 ```
 
+For a frozen candidate, retain the CLI and workspace test executables from one
+Cargo compilation, then run those exact executables without rebuilding:
+
+```sh
+bash app/build.sh --validation-artifacts /tmp/nestweaver-validation
+python3 scripts/test-validation-artifacts.py --manifest /tmp/nestweaver-validation/artifacts.json
+```
+
+The validation mode uses the normal release/Metal profile and app packaging.
+It checks that the packaged CLI matches the artifact manifest. The affected Mac
+must validate the source build and app launch; Linux cannot establish those results.
+For Linux, build the frontend first, then use
+`python3 scripts/build-validation-artifacts.py --output /tmp/nestweaver-validation`.
+Both artifact commands require a clean, committed source tree. Test exclusions
+must be explicit and are recorded in the results; legacy direct-mode integration
+fixtures require the separate CI-only artifact/runner and cannot run locally.
+
 The `.app` bundle gives you a menubar status icon, Metal GPU acceleration (~5x faster embeddings via a launchd-managed daemon), a persistent daemon shared with the CLI/MCP, web UI on port 9377, and launchd-managed restart. See [macOS App](#macos-app) below.
 
 ### Supported platforms (CLI)

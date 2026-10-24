@@ -3,6 +3,8 @@
 import copy
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -37,6 +39,16 @@ class Results(unittest.TestCase):
                 if value is not None:
                     (root / name).write_text(json.dumps(value))
             return module.classify(root, data['state'], **kwargs)
+
+    def test_prewarm_skipped_fails_without_inventing_zero_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = subprocess.run([sys.executable, str(SCRIPT), '--evidence', directory,
+                                      '--prewarm-skipped'], capture_output=True, text=True)
+            self.assertEqual(process.returncode, 1)
+            result = json.loads((Path(directory) / 'result.json').read_text())
+            self.assertIsNone(result['planned'])
+            self.assertFalse(result['complete'])
+            self.assertIn('NO SIGNAL', result['reason'])
 
     def test_partial_accounting_fails(self):
         result = self.classify()

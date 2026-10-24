@@ -47,3 +47,11 @@
   right: (expression_list
     (composite_literal
       type: (qualified_type) @ctor.type)))
+
+; Pointer composite literals: x := &Store{} or x := &pkg.Store{}.
+(short_var_declaration
+  left: (expression_list (identifier) @ctor.name)
+  right: (expression_list
+    (unary_expression
+      operator: "&"
+      operand: (composite_literal type: (_) @ctor.type))))
