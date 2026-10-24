@@ -115,6 +115,27 @@ fn typed_backup_refusal_across_daemon_and_direct_routes() {
 }
 
 #[test]
+fn live_daemon_artifacts_allow_repeated_restore_with_complete_retained_copies() {
+    let _fixture_guard = release_fixture_guard();
+    let result = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/backup_refusal.py"
+        ))
+        .arg("--binary")
+        .arg(env!("CARGO_BIN_EXE_nestweaver"))
+        .arg("--live-repeat")
+        .output()
+        .expect("run live repeat-restore fixture");
+    assert!(
+        result.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn global_incomplete_debt_refuses_cli_and_mcp_without_false_empty_success() {
     let _fixture_guard = release_fixture_guard();
     use nestweaver_schema::{File, Repo, Symbol, SymbolKind, Visibility};
