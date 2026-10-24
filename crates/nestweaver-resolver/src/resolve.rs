@@ -12517,6 +12517,29 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
     }
 
     #[test]
+    fn go_signature_parameters_do_not_hide_real_helpers_and_callable_parameters_still_shadow() {
+        let path = "app.go";
+        let source = "package app\ntype API interface { Read(helper *Store) }\ntype Callback func(helper *Store)\ntype Store struct{}\nfunc helper() {}\nfunc (s *Store) Get() {}\nfunc entry() {\n type Local func(helper *Store)\n helper()\n}\nfunc param(helper func()) { helper() }\nfunc literal() { callback := func(helper func()) { helper() }; _ = callback }\nfunc typed(argument *Store) { argument.Get() }\nfunc (receiver *Store) member() { receiver.Get() }\nfunc typedLiteral() { callback := func(argument *Store) { argument.Get() }; _ = callback }\n";
+        let (files, edges) = review_edges(&[(path, source)], Language::Go);
+        assert!(
+            qa_calls(&files, &edges, (path, "entry"), (path, "helper", 5)),
+            "signature parameter names cannot hide the package helper: {edges:#?}"
+        );
+        for caller in ["param", "literal"] {
+            assert!(
+                !qa_calls(&files, &edges, (path, caller), (path, "helper", 5)),
+                "actual callable parameter must still shadow: {caller}: {edges:#?}"
+            );
+        }
+        for caller in ["typed", "member", "typedLiteral"] {
+            assert!(
+                qa_calls(&files, &edges, (path, caller), (path, "Get", 6)),
+                "actual function/method/literal parameter must retain type evidence: {caller}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn go_range_shadow_does_not_borrow_outer_receiver_type_or_hide_it_after_loop() {
         let path = "app.go";
         let source = "package app\ntype Store struct{}\nfunc (s *Store) Get() {}\nfunc run(items []interface{}) {\n x := &Store{}\n for _, x := range items {\n  x.Get()\n }\n x.Get()\n}\n";

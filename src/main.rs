@@ -4827,15 +4827,15 @@ mod flow_trace_text_tests {
 
 /// The refusal paragraph out of a `dead_code` payload the DAEMON produced.
 ///
-/// nw-372. The daemon route re-renders nothing: the tool that computed the
-/// refusal also wrote the sentence, so this reads `note` and prints it. The
-/// fallback exists only for a payload that says `refused` and carries no
-/// `note`, which this binary cannot produce — and it still names a remedy,
-/// because a refusal with no way forward is the failure mode nw-370 fixed.
+/// Preserve the producer's nonblank `message`, then its legacy `note`.
+/// Older payloads without either paragraph retain the resolver fallback and
+/// its remedy, because a refusal must explain how to proceed (nw-370/372).
 fn dead_code_refusal_note(payload: &serde_json::Value) -> String {
     payload
-        .get("note")
-        .and_then(|v| v.as_str())
+        .get("message")
+        .and_then(|value| value.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| payload.get("note").and_then(|value| value.as_str()))
         .map(str::to_string)
         .unwrap_or_else(|| {
             "dead-code refused: this graph's edges predate the running resolver, and a \
@@ -4875,8 +4875,10 @@ fn affected_tests_refusal_payload(
 
 fn affected_tests_refusal_note(payload: &serde_json::Value) -> String {
     payload
-        .get("note")
-        .and_then(|v| v.as_str())
+        .get("message")
+        .and_then(|value| value.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| payload.get("note").and_then(|value| value.as_str()))
         .map(str::to_string)
         .unwrap_or_else(|| {
             nestweaver_engine::resolver_generation::WHY_AFFECTED_TESTS_REFUSES.to_string()
@@ -45378,5 +45380,45 @@ mod cli_fix_round_tests {
         for (argv, is_err) in refused {
             assert!(is_err, "clap must refuse `{argv}` (a usage error, exit 64)");
         }
+    }
+}
+
+#[cfg(test)]
+mod incomplete_refusal_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn dead_code_and_affected_tests_preserve_producer_incomplete_reason_and_remedy() {
+        let message = "Repository indexing did not complete; re-index the affected repositories before retrying.";
+        let payload = serde_json::json!({
+            "refused": true, "reason": "repo_index_incomplete", "message": message,
+            "note": "legacy generic resolver explanation"
+        });
+        assert_eq!(dead_code_refusal_note(&payload), message);
+        assert_eq!(affected_tests_refusal_note(&payload), message);
+        let legacy = serde_json::json!({"note":"existing resolver-generation reason and remedy"});
+        assert_eq!(
+            dead_code_refusal_note(&legacy),
+            legacy["note"].as_str().unwrap()
+        );
+        assert_eq!(
+            affected_tests_refusal_note(&legacy),
+            legacy["note"].as_str().unwrap()
+        );
+        let empty_message = serde_json::json!({"message":" ", "note":"legacy nonempty note"});
+        assert_eq!(
+            dead_code_refusal_note(&empty_message),
+            "legacy nonempty note"
+        );
+        assert_eq!(
+            affected_tests_refusal_note(&empty_message),
+            "legacy nonempty note"
+        );
+        let absent = serde_json::json!({});
+        assert!(dead_code_refusal_note(&absent).contains("edges predate the running resolver"));
+        assert_eq!(
+            affected_tests_refusal_note(&absent),
+            nestweaver_engine::resolver_generation::WHY_AFFECTED_TESTS_REFUSES
+        );
     }
 }

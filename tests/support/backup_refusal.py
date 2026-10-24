@@ -30,8 +30,7 @@ def main():
         os.link(other, hardlink)
         for route in ('daemon', 'direct'):
             if route == 'direct':
-                fixture.run('daemon', '--db', fixture.db, 'stop')
-                fixture.child.wait(timeout=30)
+                fixture.stop_owned_daemon()
             for destination in (other, symlink, hardlink, fixture.db):
                 result = fixture.run('backup', 'save', '--db', fixture.db,
                     destination, '--force', expected=64)

@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 
 
@@ -114,6 +115,56 @@ class IsolatedDaemon:
                     daemon_pid=self.child.pid if self.child else None)
         if result.returncode != expected:
             raise RuntimeError(f"{command}: exit {result.returncode}\n{result.stderr}")
+        return result
+
+    def stop_owned_daemon(self):
+        """Exercise CLI stop while this parent reaps only its own daemon.
+
+        The stop CLI waits for the daemon PID to disappear. An exited direct
+        child keeps that PID as a zombie until this fixture reaps it, so waiting
+        for the CLI before calling Popen.wait would deadlock the acceptance test.
+        The reaper never sends signals and is cancelled before normal cleanup
+        on a failed stop request.
+        """
+        child = self.child
+        if child is None or child.poll() is not None:
+            raise AssertionError("CLI stop requires the live fixture-owned daemon")
+        owned_pid = child.pid
+        if int(self.pidfile.read_text().strip()) != owned_pid:
+            raise AssertionError("refusing CLI stop after fixture PID ownership changed")
+        cancelled = threading.Event()
+        reaper_errors = []
+
+        def reap_owned_child():
+            try:
+                while not cancelled.is_set():
+                    try:
+                        child.wait(timeout=0.1)
+                        return
+                    except subprocess.TimeoutExpired:
+                        pass
+            except BaseException as error:
+                reaper_errors.append(error)
+
+        reaper = threading.Thread(target=reap_owned_child,
+                                  name=f"fixture-reaper-{owned_pid}", daemon=True)
+        reaper.start()
+        try:
+            result = self.run("daemon", "--db", self.db, "stop")
+            reaper.join(timeout=30)
+        finally:
+            cancelled.set()
+            reaper.join(timeout=2)
+            self.record(kind="owned_daemon_stop", daemon_pid=owned_pid,
+                        exit_code=child.returncode, reaper_finished=not reaper.is_alive(),
+                        reaper_errors=[str(error) for error in reaper_errors])
+            if reaper.is_alive():
+                raise RuntimeError("fixture-owned reaper did not stop")
+        if reaper_errors:
+            raise RuntimeError("fixture-owned reaper failed") from reaper_errors[0]
+        if self.child is not child or child.pid != owned_pid or child.returncode != 0:
+            raise AssertionError(
+                f"CLI stop did not drain the same owned daemon {owned_pid}: {child.returncode}")
         return result
 
     def _handle_signal(self, signum, _frame):

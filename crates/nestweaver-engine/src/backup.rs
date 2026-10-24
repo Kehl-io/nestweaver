@@ -1303,11 +1303,15 @@ fn maybe_corrupt_after_copy_for_test(dest: &Path) {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.is_file() && path.file_name().is_some_and(|name| name != "manifest.json")
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "lbug" || extension == "kuzu")
             })
             .min()
     {
-        let _ = std::fs::write(&victim, b"corrupted by the test");
+        std::fs::write(&victim, b"corrupted by the test").expect("inject copied graph corruption");
+        eprintln!("test injected graph corruption into {}", victim.display());
     }
 }
 
@@ -4589,7 +4593,7 @@ mod tests {
             data_dir: PathBuf::from(data_dir),
             replace: true,
         }) {
-            eprintln!("child restore returned an error: {error}");
+            eprintln!("child restore returned an error: {error:#}");
             // A distinct code, so the parent can tell "the restore refused"
             // from "the injected crash fired" (9) and from "it succeeded" (0).
             std::process::exit(3);
@@ -4610,6 +4614,15 @@ mod tests {
         crash_at: &str,
         extra_env: &[(&str, &str)],
     ) -> std::process::ExitStatus {
+        run_restore_in_child_with_output(snapshot, data_dir, crash_at, extra_env).status
+    }
+
+    fn run_restore_in_child_with_output(
+        snapshot: &Path,
+        data_dir: &Path,
+        crash_at: &str,
+        extra_env: &[(&str, &str)],
+    ) -> std::process::Output {
         let mut command =
             std::process::Command::new(std::env::current_exe().expect("this test binary"));
         command
@@ -4628,12 +4641,12 @@ mod tests {
             // purpose, so it is injected here rather than staged on a second
             // real filesystem.
             .env("NW_RESTORE_TEST_FORCE_COPY", "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        command.status().expect("spawn the crash child")
+        command.output().expect("spawn the crash child")
     }
 
     /// Kill a REAL restore process at every phase of a cross-device cutover
@@ -4674,8 +4687,12 @@ mod tests {
             // store, plus a marker that only the incumbent carries.
             let data_dir = tmp.path().join("data");
             std::fs::create_dir_all(&data_dir).unwrap();
-            drop(nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap());
-            std::fs::write(data_dir.join("INCUMBENT"), b"the user's own data").unwrap();
+            let incumbent =
+                nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap();
+            incumbent
+                .ensure_data_instance_id("incumbent-restore-fixture")
+                .unwrap();
+            drop(incumbent);
 
             let status = run_restore_in_child(&snapshot, &data_dir, crash_at);
             assert_eq!(
@@ -4692,8 +4709,13 @@ mod tests {
                 "after a death at {crash_at} the data directory must hold an openable graph"
             );
             if incumbent_must_survive {
-                assert!(
-                    data_dir.join("INCUMBENT").exists(),
+                assert_eq!(
+                    nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug"))
+                        .unwrap()
+                        .data_instance_id()
+                        .unwrap()
+                        .as_deref(),
+                    Some("incumbent-restore-fixture"),
                     "a death at {crash_at} lost the user's own pre-restore data — the one \
                      thing no archive can rebuild"
                 );
@@ -4744,21 +4766,44 @@ mod tests {
 
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        drop(nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap());
-        std::fs::write(data_dir.join("INCUMBENT"), b"the user's own data").unwrap();
+        let incumbent = nestweaver_store::GraphStore::create(&data_dir.join("test.lbug")).unwrap();
+        incumbent
+            .ensure_data_instance_id("incumbent-restore-fixture")
+            .unwrap();
+        drop(incumbent);
 
         // "crash-at" is deliberately a phase name that never fires: this run
         // must reach validation and refuse there, not die on the way.
-        let status = run_restore_in_child_with(
+        let output = run_restore_in_child_with_output(
             &snapshot,
             &data_dir,
             "never",
             &[("NW_RESTORE_TEST_CORRUPT_AFTER_COPY", "1")],
         );
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
-            status.code(),
+            output.status.code(),
             Some(3),
             "the restore must have REFUSED the corrupt cutover, not crashed or succeeded"
+        );
+
+        let corruption_witness = format!(
+            "test injected graph corruption into {}",
+            data_dir.join("test.lbug").display()
+        );
+        assert!(
+            diagnostics.contains(corruption_witness.as_str()),
+            "corruption injection was not reached: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("restored test.lbug does not match the archive: expected"),
+            "checksum validation did not reject the copied graph: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "failed validation after the cutover; the pre-restore data has been reinstated"
+            ),
+            "post-cutover rollback did not complete: {diagnostics}"
         );
 
         // The rollback already ran inside the child; recovery is idempotent
@@ -4766,8 +4811,13 @@ mod tests {
         for pass in 0..2 {
             recover_interrupted_restore(&data_dir)
                 .unwrap_or_else(|error| panic!("pass {pass}: {error}"));
-            assert!(
-                data_dir.join("INCUMBENT").exists(),
+            assert_eq!(
+                nestweaver_store::GraphStore::open_read_only(&data_dir.join("test.lbug"))
+                    .unwrap()
+                    .data_instance_id()
+                    .unwrap()
+                    .as_deref(),
+                Some("incumbent-restore-fixture"),
                 "pass {pass}: a failed validation must leave the pre-restore data in place"
             );
             assert!(
@@ -5498,10 +5548,13 @@ mod tests {
         package_tar_zstd(&extracted, &forged).unwrap();
         let target = dir.path().join("existing");
         std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("sentinel"), "keep existing data").unwrap();
         // A NestWeaver data directory, so the identity check (not the
         // foreign-directory guard) is what refuses.
-        drop(nestweaver_store::GraphStore::create(&target.join("prior.lbug")).unwrap());
+        let incumbent = nestweaver_store::GraphStore::create(&target.join("prior.lbug")).unwrap();
+        incumbent
+            .ensure_data_instance_id("forgery-target-fixture")
+            .unwrap();
+        drop(incumbent);
         let error = backup_restore(&RestoreConfig {
             snapshot_path: forged,
             data_dir: target.clone(),
@@ -5515,8 +5568,12 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(
-            std::fs::read_to_string(target.join("sentinel")).unwrap(),
-            "keep existing data"
+            nestweaver_store::GraphStore::open_read_only(&target.join("prior.lbug"))
+                .unwrap()
+                .data_instance_id()
+                .unwrap()
+                .as_deref(),
+            Some("forgery-target-fixture")
         );
         assert!(!target.join("owned.lbug").exists());
     }

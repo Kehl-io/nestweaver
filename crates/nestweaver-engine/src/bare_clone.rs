@@ -424,7 +424,7 @@ pub fn ensure_repo_root_matches_identity(
         std::fs::canonicalize(String::from_utf8(output.stdout).ok()?.trim()).ok()
     };
     if let (Some(left), Some(right)) = (common(incumbent), common(candidate_root)) {
-        if left == right {
+        if left == right && has_verified_checkout_topology(candidate_root, &right) {
             return Ok(());
         }
     }
@@ -434,6 +434,49 @@ pub fn ensure_repo_root_matches_identity(
         incumbent.display(),
         candidate_root.display()
     )
+}
+
+/// Proof needed when a DIFFERENT root wants to share an indexed identity.
+/// A standalone separate-git-dir/submodule gitfile can be legitimate at its
+/// registered root without proving that every other borrower owns its metadata.
+/// Same-root admission is handled by the caller before this cross-root check.
+pub fn has_verified_checkout_topology(path: &Path, common: &Path) -> bool {
+    if ensure_own_git_metadata(path).is_err() {
+        return false;
+    }
+    let (Ok(checkout), Ok(common)) = (std::fs::canonicalize(path), std::fs::canonicalize(common))
+    else {
+        return false;
+    };
+    let dot_git = checkout.join(".git");
+    // A main checkout's own .git directory proves its root. This also keeps
+    // registered linked-worktree -> ordinary main-checkout switching valid.
+    if dot_git.is_dir() && common == checkout.join(".git") {
+        return true;
+    }
+    let Ok(contents) = std::fs::read_to_string(&dot_git) else {
+        return false;
+    };
+    let Some(target) = contents
+        .strip_prefix("gitdir: ")
+        .map(|value| value.trim_end_matches(['\n', '\r']))
+    else {
+        return false;
+    };
+    let target = Path::new(target);
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        checkout.join(target)
+    };
+    let Ok(git_dir) = std::fs::canonicalize(target) else {
+        return false;
+    };
+    // ensure_own_git_metadata above verifies commondir and the gitdir
+    // backpointer. Require the actual linked-worktree layout as well: an
+    // arbitrary gitfile without commondir must not pass through its Ok arm.
+    git_dir.parent() == Some(common.join("worktrees").as_path())
+        && git_dir.join("commondir").is_file()
 }
 
 /// Refuse a checkout whose `.git` makes Git use another repository's
@@ -738,6 +781,63 @@ mod tests {
         assert!(ensure_own_git_metadata(&linked).is_err());
     }
 
+    #[test]
+    fn borrowed_separate_and_submodule_metadata_cannot_replace_an_indexed_root() {
+        for submodule in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let owner = tmp.path().join("owner");
+            let url = "https://example.test/shared-metadata.git";
+            repo_with_origin(&owner, url);
+            let metadata = if submodule {
+                tmp.path().join("parent/.git/modules/sub")
+            } else {
+                tmp.path().join("metadata")
+            };
+            std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+            std::fs::rename(owner.join(".git"), &metadata).unwrap();
+            std::fs::write(
+                owner.join(".git"),
+                format!("gitdir: {}\n", metadata.display()),
+            )
+            .unwrap();
+            let borrower = tmp.path().join("borrower");
+            std::fs::create_dir_all(&borrower).unwrap();
+            std::fs::copy(owner.join(".git"), borrower.join(".git")).unwrap();
+            // Ownership admission for each standalone layout remains valid;
+            // that does not authorize replacing the already registered root.
+            ensure_own_git_metadata(&owner).unwrap();
+            ensure_own_git_metadata(&borrower).unwrap();
+            let store = nestweaver_store::GraphStore::in_memory().unwrap();
+            let uid = nestweaver_schema::repo_uid("test", url);
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.clone(),
+                    url: url.into(),
+                    indexed_sha: "initial".into(),
+                    staleness_commits_behind: 0,
+                    instance_id: "test".into(),
+                    name: None,
+                    root_path: Some(owner.display().to_string()),
+                })
+                .unwrap();
+            ensure_repo_root_matches_identity(&store, &uid, &owner).unwrap();
+            assert!(ensure_repo_root_matches_identity(&store, &uid, &borrower).is_err());
+            let linked = tmp.path().join("linked");
+            fixture_git(
+                &owner,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "registered",
+                    linked.to_str().unwrap(),
+                ],
+            );
+            ensure_repo_root_matches_identity(&store, &uid, &linked).unwrap();
+        }
+    }
+
     /// Ordinary repositories, registered linked worktrees and submodules keep
     /// their identity.
     #[test]
@@ -833,6 +933,18 @@ mod tests {
             ],
         );
         ensure_repo_root_matches_identity(&store, &uid, &linked).unwrap();
+        // The reverse direction must use the candidate main checkout's own
+        // .git-directory proof, not the canonical same-root fastpath.
+        let reverse_store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let mut linked_registration = store.lookup_repo(&uid).unwrap().unwrap();
+        linked_registration.root_path = Some(linked.display().to_string());
+        reverse_store.insert_repo(&linked_registration).unwrap();
+        assert_ne!(
+            std::fs::canonicalize(&root).unwrap(),
+            std::fs::canonicalize(&linked).unwrap()
+        );
+        ensure_repo_root_matches_identity(&reverse_store, &uid, &root).unwrap();
+
         let unrelated = tmp.path().join("unrelated");
         repo_with_origin(&unrelated, url);
         assert!(ensure_repo_root_matches_identity(&store, &uid, &unrelated).is_err());

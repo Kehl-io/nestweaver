@@ -1,5 +1,17 @@
 //! Standard-artifact acceptance tests. Fixture setup itself uses the daemon.
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
+
+// Each fixture verifies that every daemon present at its start remains intact.
+// Another fixture's legitimate shutdown must not race with that inventory.
+// Keep the entire fixture lifecycle (including Python cleanup) under this lock.
+static RELEASE_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+fn release_fixture_guard() -> MutexGuard<'static, ()> {
+    RELEASE_FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn run_fixture(extra: &[&str]) {
     let result = Command::new("python3")
@@ -22,6 +34,7 @@ fn run_fixture(extra: &[&str]) {
 
 #[test]
 fn release_daemon_fixture_bootstrap() {
+    let _fixture_guard = release_fixture_guard();
     run_fixture(&[]);
 }
 
@@ -30,6 +43,7 @@ fn release_daemon_fixture_bootstrap() {
 #[test]
 #[ignore = "CI-only forbidden-request probe"]
 fn release_standard_artifact_cannot_bypass() {
+    let _fixture_guard = release_fixture_guard();
     let runner = matches!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"))
         && std::env::var("RUNNER_TEMP").is_ok_and(|v| !v.is_empty())
         && std::env::var("RUNNER_OS").is_ok_and(|v| !v.is_empty())
@@ -42,6 +56,7 @@ fn release_standard_artifact_cannot_bypass() {
 
 #[test]
 fn closed_stderr_preserves_semantic_cli_exits() {
+    let _fixture_guard = release_fixture_guard();
     let result = Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -61,6 +76,7 @@ fn closed_stderr_preserves_semantic_cli_exits() {
 
 #[test]
 fn backing_file_admission_release_fixture() {
+    let _fixture_guard = release_fixture_guard();
     let result = Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -80,6 +96,7 @@ fn backing_file_admission_release_fixture() {
 
 #[test]
 fn typed_backup_refusal_across_daemon_and_direct_routes() {
+    let _fixture_guard = release_fixture_guard();
     let result = Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -99,6 +116,7 @@ fn typed_backup_refusal_across_daemon_and_direct_routes() {
 
 #[test]
 fn global_incomplete_debt_refuses_cli_and_mcp_without_false_empty_success() {
+    let _fixture_guard = release_fixture_guard();
     use nestweaver_schema::{File, Repo, Symbol, SymbolKind, Visibility};
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let seed = directory.path().join("seed.lbug");

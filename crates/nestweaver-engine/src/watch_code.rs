@@ -6536,44 +6536,62 @@ mod tests {
             let url = format!("file://{}", root.display());
             let uid = nestweaver_schema::repo_uid("test", &url);
             let watcher = CodeWatcher::new(&db, &root, "test");
-            watcher
-                .process_batch_with_io(
-                    &store,
-                    &uid,
-                    &url,
-                    &[leaf.clone(), barrel, main],
-                    &crate::index::FileSystemIndexEpilogueIo,
-                )
-                .unwrap();
+            let publish = |paths: &[PathBuf], phase: &str| {
+                let outcome = watcher
+                    .process_batch_with_io(
+                        &store,
+                        &uid,
+                        &url,
+                        paths,
+                        &crate::index::FileSystemIndexEpilogueIo,
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(outcome, WatchBatchOutcome::Published { .. }),
+                    "{phase}, cold cache={cold_cache}: {outcome:?}"
+                );
+            };
+            let calls_greet = || {
+                let hello = store.lookup_symbols_by_name("hello").unwrap();
+                let greet = store.lookup_symbols_by_name("greet").unwrap();
+                let (Some(hello), Some(greet)) = (hello.first(), greet.first()) else {
+                    return false;
+                };
+                store
+                    .load_typed_edges()
+                    .unwrap()
+                    .iter()
+                    .any(|(source, target, kind, _, _)| {
+                        source == &hello.uid && target == &greet.uid && kind == "CALLS"
+                    })
+            };
+            publish(&[leaf.clone(), barrel, main], "initial snapshot");
+            assert!(
+                calls_greet(),
+                "initial snapshot must establish hello -> greet"
+            );
             std::fs::remove_file(&leaf).unwrap();
-            watcher
-                .process_batch_with_io(
-                    &store,
-                    &uid,
-                    &url,
-                    std::slice::from_ref(&leaf),
-                    &crate::index::FileSystemIndexEpilogueIo,
-                )
-                .unwrap();
+            publish(std::slice::from_ref(&leaf), "delete target");
+            assert!(!calls_greet(), "delete must retract the former call target");
             if cold_cache {
                 let cache = crate::sidecar_path(&db, ".parsed_cache.bin");
                 let _ = std::fs::remove_file(&cache);
                 let _ = std::fs::remove_file(crate::parsed_cache::log_path(&cache));
+                // Model a cold cache after restart, including the writer's
+                // process-local append-length evidence. Retaining that evidence
+                // would correctly reject our deliberate manual log deletion.
+                crate::parsed_cache::forget_log_length(&cache);
+                let shared = shared_parsed_cache(&cache);
+                let mut parsed = shared.lock().unwrap();
+                parsed.refresh(&cache);
+                assert_eq!(parsed.len(), 0, "cold-cache control must have no parses");
             }
             std::fs::write(
                 &leaf,
                 "export function greet(): string { return 'back'; }\n",
             )
             .unwrap();
-            watcher
-                .process_batch_with_io(
-                    &store,
-                    &uid,
-                    &url,
-                    &[leaf],
-                    &crate::index::FileSystemIndexEpilogueIo,
-                )
-                .unwrap();
+            publish(&[leaf], "recreate target");
             let hello = store.lookup_symbols_by_name("hello").unwrap()[0]
                 .uid
                 .clone();

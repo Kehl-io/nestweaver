@@ -3467,12 +3467,40 @@ fn is_js_clause_binding_site(node: tree_sitter::Node<'_>, lang: Language) -> boo
         }
 }
 
+/// A Go parameter binds a value only in a callable declaration or literal.
+/// Inspect its nearest parameter-list owner: walking to any outer function
+/// would leak names from a local function type into that function's body.
+fn go_parameter_is_callable_binding(node: tree_sitter::Node<'_>) -> bool {
+    let parameter = if node.kind() == "parameter_declaration" {
+        Some(node)
+    } else {
+        node.parent()
+            .filter(|parent| parent.kind() == "parameter_declaration")
+    };
+    parameter
+        .and_then(|parameter| parameter.parent())
+        .filter(|list| list.kind() == "parameter_list")
+        .and_then(|list| list.parent())
+        .is_some_and(|owner| {
+            matches!(
+                owner.kind(),
+                "function_declaration" | "method_declaration" | "func_literal"
+            )
+        })
+}
+
 fn emit_binding_names(
     node: tree_sitter::Node<'_>,
     source_bytes: &[u8],
     references: &mut Vec<RawReference>,
     lang: Language,
 ) {
+    if lang == Language::Go
+        && node.kind() == "parameter_declaration"
+        && !go_parameter_is_callable_binding(node)
+    {
+        return;
+    }
     let root = match node.kind() {
         "let_declaration" | "for_expression" => node.child_by_field_name("pattern"),
         "variable_declarator" => node.child_by_field_name("name"),
@@ -4607,7 +4635,7 @@ fn extract_types_from_tree(
         (lang == Language::Rust).then(|| RustLexicalItems::new(tree.root_node(), source));
 
     let mut matches = cursor.matches(&query, tree.root_node(), source);
-    while let Some(m) = matches.next() {
+    'type_matches: while let Some(m) = matches.next() {
         let mut var_name: Option<String> = None;
         let mut var_type: Option<String> = None;
         let mut var_line: u32 = 0;
@@ -4685,6 +4713,9 @@ fn extract_types_from_tree(
                     });
                 }
                 "param.name" => {
+                    if lang == Language::Go && !go_parameter_is_callable_binding(capture.node) {
+                        continue 'type_matches;
+                    }
                     binding_scope = if matches!(
                         lang,
                         Language::JavaScript | Language::TypeScript | Language::Rust | Language::Go
@@ -12722,6 +12753,59 @@ fn main() {
             parsed.type_bindings
         );
         assert_eq!(binding.unwrap().type_name, "GraphStore");
+    }
+
+    #[test]
+    fn go_signature_only_parameters_do_not_supply_value_or_type_bindings() {
+        let source = "package app\ntype Store struct{}\ntype API interface { Read(signatureOnly *Store) }\ntype Callback func(signatureOnly *Store)\nfunc declared(argument *Store) { argument.Get() }\nfunc (receiver *Store) Method(argument *Store) { receiver.Get(); argument.Get() }\nfunc outer() {\n type Local func(localSignatureOnly *Store)\n callback := func(literalArgument *Store) { literalArgument.Get() }\n _ = callback\n}\n";
+        let parsed = parse_source(Path::new("app.go"), source).unwrap();
+        for name in ["signatureOnly", "localSignatureOnly"] {
+            assert!(
+                !parsed
+                    .references
+                    .iter()
+                    .any(|reference| reference.kind == ReferenceKind::LocalBinding
+                        && reference.name == name),
+                "signature-only value binding leaked: {name}: {:?}",
+                parsed.references
+            );
+            assert!(
+                !parsed
+                    .type_bindings
+                    .iter()
+                    .any(|binding| binding.var_name == name),
+                "signature-only type binding leaked: {name}: {:?}",
+                parsed.type_bindings
+            );
+        }
+        for (name, expected) in [("argument", 2), ("receiver", 1), ("literalArgument", 1)] {
+            let locals: Vec<_> = parsed
+                .references
+                .iter()
+                .filter(|reference| {
+                    reference.kind == ReferenceKind::LocalBinding && reference.name == name
+                })
+                .collect();
+            assert_eq!(locals.len(), expected, "{name}: {locals:?}");
+            let types: Vec<_> = parsed
+                .type_bindings
+                .iter()
+                .filter(|binding| binding.var_name == name)
+                .collect();
+            assert_eq!(types.len(), expected, "{name}: {types:?}");
+            for binding in types {
+                assert_eq!(binding.type_name, "Store");
+                let scope = binding.scope.unwrap();
+                assert!(
+                    (scope.start, scope.end) != (0, source.len()),
+                    "callable parameter cannot be file scoped: {binding:?}"
+                );
+                assert!(
+                    locals.iter().any(|local| local.scope == Some(scope)),
+                    "value/type declaration scopes must agree: {binding:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -712,7 +712,14 @@ impl CodeLinkReconciler {
                 );
                 let invalidated = self.invalidated.contains(&vault_checkpoint)
                     || index.depends_on_checkpoints(&note.uid, &mentions, &self.invalidated);
-                if !migrating && !invalidated && self.coverage.get(&note.uid) == Some(&signature) {
+                // Only the staged API proves complete graph ancestry and
+                // consumes source receipts. Live debt can follow edge deletion
+                // with unchanged source signatures, so it must check the edges.
+                if self.symbol_snapshot.is_some()
+                    && !migrating
+                    && !invalidated
+                    && self.coverage.get(&note.uid) == Some(&signature)
+                {
                     continue;
                 }
                 self.coverage.insert(note.uid.clone(), signature);
@@ -1702,6 +1709,34 @@ repos = ["file:///fixture/repo"]
             "the pass restores discovery's edges"
         );
         assert_eq!(report.rewritten.len(), 2, "{report:?}");
+    }
+
+    #[test]
+    fn a_live_reconciler_rechecks_unchanged_mentions_after_edge_deletion_and_debt() {
+        let fx = two_widgets();
+        let before = edges(&fx.store);
+        let mut reconciler = CodeLinkReconciler::new(CrossDomainConfig::default());
+        reconciler.reconcile(&fx.store, None, &|| false).unwrap();
+        let notes = fx.store.list_notes(None).unwrap();
+        let uids: Vec<&str> = notes.iter().map(|note| note.uid.as_str()).collect();
+        let conn = fx.store.begin_transaction().unwrap();
+        GraphStore::delete_cross_domain_edges_for_notes_on(&conn, &uids).unwrap();
+        fx.store.commit_transaction(&conn).unwrap();
+        mark_code_links_pending(&fx.db, "publication deleted unchanged notes' links");
+        assert!(edges(&fx.store).is_empty());
+
+        let repaired = reconciler.reconcile(&fx.store, None, &|| false).unwrap();
+        assert_eq!(repaired.notes_checked, notes.len());
+        assert_eq!(repaired.rewritten.len(), notes.len());
+        assert_eq!(edges(&fx.store), before);
+        assert!(!code_links_pending(&fx.db));
+        let unchanged = reconciler.reconcile(&fx.store, None, &|| false).unwrap();
+        assert_eq!(
+            unchanged.notes_checked,
+            notes.len(),
+            "live passes verify actual edges even with warm mentions"
+        );
+        assert!(unchanged.rewritten.is_empty());
     }
 
     /// nw-675, route 2: re-indexing a repo deletes the changed file's

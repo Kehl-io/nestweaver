@@ -23672,7 +23672,12 @@ pub fn contained_source_root(
     };
     let admitted = indexed.iter().any(|indexed| {
         git_checkout_position(indexed).is_some_and(|own| {
-            own.common_dir == candidate.common_dir && candidate.relative.starts_with(&own.relative)
+            own.common_dir == candidate.common_dir
+                && candidate.relative.starts_with(&own.relative)
+                && nestweaver_engine::bare_clone::has_verified_checkout_topology(
+                    &candidate.toplevel,
+                    &candidate.common_dir,
+                )
         })
     });
     if admitted {
@@ -23685,6 +23690,7 @@ pub fn contained_source_root(
 /// Where a path sits in its Git checkout: the checkout's canonical common
 /// directory, and the path relative to the checkout's top level.
 struct GitCheckoutPosition {
+    toplevel: std::path::PathBuf,
     common_dir: std::path::PathBuf,
     relative: std::path::PathBuf,
 }
@@ -23725,6 +23731,7 @@ fn git_checkout_position(path: &Path) -> Option<GitCheckoutPosition> {
         .ok()?
         .to_path_buf();
     Some(GitCheckoutPosition {
+        toplevel,
         common_dir,
         relative,
     })
@@ -37753,7 +37760,7 @@ mod ambiguous_name_contract_tests {
     use super::*;
 
     fn ambiguous_ping_store() -> GraphStore {
-        use nestweaver_schema::{Repo, Symbol, SymbolKind, Visibility};
+        use nestweaver_schema::{File, Repo, Symbol, SymbolKind, Visibility};
 
         let store = GraphStore::in_memory().unwrap();
         for (repo_uid, url, path, uid) in [
@@ -37793,6 +37800,19 @@ mod ambiguous_name_contract_tests {
                     root_path: None,
                 })
                 .unwrap();
+            // This fixture models complete indexed repositories. A committed
+            // SHA plus symbols without their File content is an interrupted
+            // publication to the shared completeness preflight.
+            let file_uid = nestweaver_schema::file_uid(repo_uid, path);
+            store
+                .insert_file(&File {
+                    uid: file_uid.clone(),
+                    path: path.to_string(),
+                    repo_uid: repo_uid.to_string(),
+                    content_hash: format!("file-hash-{uid}"),
+                })
+                .unwrap();
+            store.insert_repo_file_edge(repo_uid, &file_uid).unwrap();
             store
                 .insert_symbol(&Symbol {
                     uid: uid.to_string(),
@@ -37815,6 +37835,12 @@ mod ambiguous_name_contract_tests {
                     canonical_id: None,
                 })
                 .unwrap();
+            store.insert_file_symbol_edge(&file_uid, uid).unwrap();
+            let repo = store.lookup_repo(repo_uid).unwrap().unwrap();
+            assert!(
+                !store.repo_index_incomplete(&repo).unwrap(),
+                "ambiguity fixture must represent a completed repository"
+            );
         }
         store
     }
@@ -38029,6 +38055,75 @@ mod ambiguous_name_contract_tests {
     /// must lie inside an indexed repository (or be a linked worktree of
     /// one); any other directory is refused before anything is read.
     #[test]
+    fn source_roots_refuse_borrowed_separate_and_submodule_git_metadata() {
+        for submodule in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = dir.path().join("owner");
+            let borrower = dir.path().join("borrower");
+            std::fs::create_dir_all(&owner).unwrap();
+            std::fs::create_dir_all(&borrower).unwrap();
+            let git = |cwd: &Path, args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{args:?}: {output:?}");
+                String::from_utf8(output.stdout).unwrap()
+            };
+            git(&owner, &["init", "-q"]);
+            std::fs::write(
+                owner.join("main.js"),
+                "function helper() { return 'owner-canary'; }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                borrower.join("main.js"),
+                "function helper() { return 'borrowed-canary'; }\n",
+            )
+            .unwrap();
+            let metadata = if submodule {
+                dir.path().join("parent/.git/modules/sub")
+            } else {
+                dir.path().join("metadata")
+            };
+            std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+            std::fs::rename(owner.join(".git"), &metadata).unwrap();
+            std::fs::write(
+                owner.join(".git"),
+                format!("gitdir: {}\n", metadata.display()),
+            )
+            .unwrap();
+            std::fs::copy(owner.join(".git"), borrower.join(".git")).unwrap();
+            // Prove this fixture reaches the vulnerable MCP path: Git treats
+            // the borrowing directory itself as its checkout, not the owner.
+            let top = git(&borrower, &["rev-parse", "--show-toplevel"]);
+            assert_eq!(
+                std::fs::canonicalize(top.trim()).unwrap(),
+                std::fs::canonicalize(&borrower).unwrap()
+            );
+            let (_, store) = nestweaver_engine::index_directory_in_memory(
+                &owner,
+                "test",
+                "https://example.test/owner",
+                "sha",
+            )
+            .unwrap();
+            let own =
+                tool_read_symbols(&store, json!({"targets":["helper"], "root":owner})).unwrap();
+            assert!(own.to_string().contains("owner-canary"));
+            for _ in 0..2 {
+                assert!(
+                    tool_read_symbols(&store, json!({"targets":["helper"], "root":borrower}))
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn read_symbols_refuses_a_root_outside_indexed_repositories() {
         use nestweaver_engine::index_directory_in_memory;
         let git = |dir: &std::path::Path, args: &[&str]| {
@@ -38111,6 +38206,21 @@ mod ambiguous_name_contract_tests {
         );
         let linked = read(&worktree).unwrap();
         assert!(linked.to_string().contains("return n"), "{linked}");
+
+        // Index the linked root, then explicitly read the ordinary main root.
+        // This exercises cross-root admission through the candidate's own .git
+        // directory rather than the indexed-root containment shortcut.
+        let (_, linked_store) =
+            index_directory_in_memory(&worktree, "test", "https://example.com/linked", "sha")
+                .unwrap();
+        let reverse = tool_read_symbols(
+            &linked_store,
+            json!({
+                "targets": ["helper"], "root": repo.to_string_lossy()
+            }),
+        )
+        .unwrap();
+        assert!(reverse.to_string().contains("return n"), "{reverse}");
 
         // A monorepo subdirectory indexed on its own: the same subdirectory
         // of a linked worktree is admitted, the rest of the checkout is not.
@@ -39056,17 +39166,38 @@ mod compatibility_regressions {
         store
             .set_repo_publication_incomplete("repo:hidden", "interrupted source publication")
             .unwrap();
-        let value = dispatch(&store, None, "flow_trace", json!({}), None).unwrap();
+        let value = dispatch(
+            &store,
+            None,
+            "flow_trace",
+            json!({"symbol":"complete-seed"}),
+            None,
+        )
+        .unwrap();
         assert_eq!(value["refused"], true);
         assert_eq!(value["reason"], "repo_index_incomplete");
-        for tool in [
-            "brain_impact",
-            "flow_trace",
-            "dead_code",
-            "blast_radius",
-            "affected_tests",
+        for (tool, args) in [
+            (
+                "brain_impact",
+                json!({"repo":"repo:visible", "symbol":"complete-seed"}),
+            ),
+            (
+                "flow_trace",
+                json!({"repo":"repo:visible", "symbol":"complete-seed"}),
+            ),
+            ("dead_code", json!({"repos":["repo:visible"]})),
+            (
+                "blast_radius",
+                json!({"repo":"repo:visible", "changed_files":["main.js"]}),
+            ),
+            (
+                "affected_tests",
+                json!({"repo":"repo:visible", "changed_files":["main.js"]}),
+            ),
         ] {
-            let args = json!({"repo":"repo:visible", "repos":["repo:visible"], "symbol":"complete-seed", "changed_files":["main.js"]});
+            // Dispatch validates schema before completeness admission. Keep
+            // these requests valid so a refusal proves publication debt.
+            validate_tool_arguments(tool, &args).unwrap();
             assert!(
                 index_incomplete_refusal_for_args(&store, tool, &args, None)
                     .unwrap()

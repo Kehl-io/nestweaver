@@ -132,8 +132,7 @@ def exercise(binary, mutation):
             elif fixture.db.exists():
                 raise AssertionError("a refused write recreated the missing graph path")
             # The control endpoint must remain usable while health is false.
-            fixture.run("daemon", "--db", fixture.db, "stop")
-            fixture.child.wait(timeout=30)
+            fixture.stop_owned_daemon()
             if fixture.child.returncode != 0:
                 raise AssertionError(f"unhealthy daemon did not drain cleanly: {fixture.child.returncode}")
             fixture.record(kind="backing_file_clean_drain", mutation=mutation,

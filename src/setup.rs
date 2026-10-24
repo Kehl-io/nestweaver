@@ -3581,14 +3581,14 @@ mod integration_fix_tests {
         std::os::unix::fs::symlink(&external, project.join(".mcp.json")).unwrap();
         let db = tmp.path().join("t.lbug");
         let error =
-            configure_tool("claude", &test_ctx(&db, &project), &mut Items::new()).unwrap_err();
+            configure_tool("claude-code", &test_ctx(&db, &project), &mut Items::new()).unwrap_err();
         assert!(error.to_string().contains("outside the project"));
         assert_eq!(std::fs::read_to_string(&external).unwrap(), "{}");
         assert!(!project.join(".claude").exists());
         std::fs::remove_file(project.join(".mcp.json")).unwrap();
         std::fs::write(project.join("real.json"), "{}").unwrap();
         std::os::unix::fs::symlink("real.json", project.join(".mcp.json")).unwrap();
-        configure_tool("claude", &test_ctx(&db, &project), &mut Items::new()).unwrap();
+        configure_tool("claude-code", &test_ctx(&db, &project), &mut Items::new()).unwrap();
         assert!(
             std::fs::read_to_string(project.join("real.json"))
                 .unwrap()
