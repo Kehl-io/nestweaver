@@ -4257,16 +4257,28 @@ mod direct_vault_derivation_tests {
             db.as_os_str().to_owned(),
         ];
         args.extend(extra.iter().map(|value| std::ffi::OsString::from(*value)));
-        let cli = Cli::try_parse_from(args)?;
-        let Commands::Brain { command } = cli.command else {
-            unreachable!()
-        };
-        let out = OutputConfig {
-            quiet: true,
-            verbose: false,
-            color: false,
-        };
-        run_brain(*command, &out, std::time::Instant::now(), false).map(|outcome| outcome.0)
+        // Building the full derived CLI exceeds the default test-thread stack.
+        // Keep parsing and the direct command on the same bounded fixture worker,
+        // as the existing CLI-tree tests do, without changing process-wide limits.
+        let worker = std::thread::Builder::new()
+            .name("direct-vault-cli-fixture".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || -> anyhow::Result<i32> {
+                let cli = Cli::try_parse_from(args)?;
+                let Commands::Brain { command } = cli.command else {
+                    unreachable!()
+                };
+                let out = OutputConfig {
+                    quiet: true,
+                    verbose: false,
+                    color: false,
+                };
+                run_brain(*command, &out, std::time::Instant::now(), false).map(|outcome| outcome.0)
+            })?;
+        match worker.join() {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn refresh_debt(db: &Path) -> usize {
