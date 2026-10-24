@@ -4416,11 +4416,10 @@ pub fn dispatch_cancellable(
     if matches!(
         name,
         "brain_impact" | "flow_trace" | "blast_radius" | "dead_code" | "affected_tests"
-    ) {
-        if let Some(mut refusal) = index_incomplete_refusal_for_args(store, name, &args, visible)? {
-            refusal["_meta"] = json!({"index_compatibility": compatibility});
-            return Ok(refusal);
-        }
+    ) && let Some(mut refusal) = index_incomplete_refusal_for_args(store, name, &args, visible)?
+    {
+        refusal["_meta"] = json!({"index_compatibility": compatibility});
+        return Ok(refusal);
     }
 
     // F16: serve cacheable read tools from (or populate) the response cache.
@@ -4575,38 +4574,37 @@ pub fn index_compatibility_json(
     if !matches!(
         visible,
         Some(nestweaver_engine::authz::VisibleRepos::Only(_))
-    ) {
-        if let Some(db_path) = store.db_path() {
-            let identity = store.publication_identity()?.context(
-                "vault compatibility disclosure requires a database-bound publication identity",
-            )?;
-            let instance = store
-                .data_instance_id()?
-                .unwrap_or_else(|| "default".to_string());
-            let records = nestweaver_engine::markdown_derivation::load_records(
-                db_path,
-                &nestweaver_engine::markdown_derivation::RecordExpectation {
-                    identity: &identity,
-                    data_instance_id: &instance,
-                },
-            );
-            for vault in store.list_vaults(None)? {
-                let current = records
-                    .as_ref()
-                    .ok()
-                    .and_then(|records| records.as_ref())
-                    .and_then(|records| records.vaults.get(&vault.uid))
-                    .is_some_and(|record| {
-                        record.derivation_version
-                            == nestweaver_engine::markdown_derivation::DERIVATION_VERSION
-                            && record.phase
-                                == nestweaver_engine::markdown_derivation::DerivationPhase::Current
-                            && record.witness.is_some()
-                    });
-                if !current {
-                    vault_refresh_required.push(json!({"vault_uid": vault.uid,
-                    "remedy": "Run a full brain refresh for this vault under its matching configuration"}));
-                }
+    ) && let Some(db_path) = store.db_path()
+    {
+        let identity = store.publication_identity()?.context(
+            "vault compatibility disclosure requires a database-bound publication identity",
+        )?;
+        let instance = store
+            .data_instance_id()?
+            .unwrap_or_else(|| "default".to_string());
+        let records = nestweaver_engine::markdown_derivation::load_records(
+            db_path,
+            &nestweaver_engine::markdown_derivation::RecordExpectation {
+                identity: &identity,
+                data_instance_id: &instance,
+            },
+        );
+        for vault in store.list_vaults(None)? {
+            let current = records
+                .as_ref()
+                .ok()
+                .and_then(|records| records.as_ref())
+                .and_then(|records| records.vaults.get(&vault.uid))
+                .is_some_and(|record| {
+                    record.derivation_version
+                        == nestweaver_engine::markdown_derivation::DERIVATION_VERSION
+                        && record.phase
+                            == nestweaver_engine::markdown_derivation::DerivationPhase::Current
+                        && record.witness.is_some()
+                });
+            if !current {
+                vault_refresh_required.push(json!({"vault_uid": vault.uid,
+                "remedy": "Run a full brain refresh for this vault under its matching configuration"}));
             }
         }
     }
