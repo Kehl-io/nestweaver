@@ -423,10 +423,11 @@ pub fn ensure_repo_root_matches_identity(
         }
         std::fs::canonicalize(String::from_utf8(output.stdout).ok()?.trim()).ok()
     };
-    if let (Some(left), Some(right)) = (common(incumbent), common(candidate_root)) {
-        if left == right && has_verified_checkout_topology(candidate_root, &right) {
-            return Ok(());
-        }
+    if let (Some(left), Some(right)) = (common(incumbent), common(candidate_root))
+        && left == right
+        && has_verified_checkout_topology(candidate_root, &right)
+    {
+        return Ok(());
     }
     anyhow::bail!(
         "refusing repository identity collision: {} is already indexed at {}; {} is an independent checkout with the same origin. Index the registered checkout, use a registered linked worktree, or explicitly remove the existing repository before replacing its root",

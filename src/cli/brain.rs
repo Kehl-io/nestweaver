@@ -30,6 +30,113 @@ pub(crate) fn require_complete_graph_publication(
     )
 }
 
+/// Retire prior certification before any direct write. Only a record admitted
+/// Current under the exact existing vault/source/policy may later be restored
+/// after a clean incremental refresh; missing or stale records cannot be minted.
+fn invalidate_direct_vault_derivation(
+    store: &GraphStore,
+    root: &Path,
+    instance_id: &str,
+    extra: &[String],
+    max_note_bytes: u64,
+) -> anyhow::Result<Option<nestweaver_engine::markdown_derivation::VaultDerivationRecord>> {
+    use nestweaver_engine::markdown_derivation as derivation;
+    let db_path = store
+        .db_path()
+        .context("vault derivation requires a persistent graph")?;
+    let identity = store
+        .publication_identity()?
+        .context("vault derivation requires a publication identity")?;
+    let expected = derivation::expectation(&identity, instance_id);
+    let mut records = derivation::load_records(db_path, &expected)?.unwrap_or_default();
+    let source = derivation::filesystem_source(root)?;
+    let uid = nestweaver_schema::vault_uid(instance_id, &source.canonical_root);
+    let admitted = if let Some(record) = records.vaults.get(&uid) {
+        let coverage = derivation::coverage_identity(
+            Path::new(&source.canonical_root),
+            extra,
+            max_note_bytes,
+            record.coverage.scope.clone(),
+        )?;
+        if record.derivation_version > derivation::DERIVATION_VERSION {
+            anyhow::bail!("vault derivation uses a future version; refusing to replace its proof");
+        }
+        match store.lookup_vault(&uid) {
+            Ok(vault) => derivation::admit_vault(
+                Some(&records),
+                &expected,
+                &vault,
+                &source,
+                &coverage,
+                false,
+            )
+            .ok()
+            .map(|()| record.clone()),
+            Err(nestweaver_store::StoreError::NotFound) => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    if records.vaults.remove(&uid).is_some() {
+        derivation::save_records(db_path, &records, &expected)?;
+    }
+    Ok(admitted)
+}
+
+/// Restore only the caller's admitted pre-write Current record, after a clean
+/// incremental publication and search pass. Recheck binding and current policy;
+/// never replace a record installed since it was retired.
+fn restore_direct_incremental_derivation(
+    store: &GraphStore,
+    prior: &nestweaver_engine::markdown_derivation::VaultDerivationRecord,
+    extra: &[String],
+    max_note_bytes: u64,
+) -> anyhow::Result<()> {
+    use nestweaver_engine::markdown_derivation as derivation;
+    let db_path = store
+        .db_path()
+        .context("vault derivation requires a persistent graph")?;
+    let identity = store
+        .publication_identity()?
+        .context("vault derivation requires a publication identity")?;
+    let expected = derivation::expectation(&identity, &prior.data_instance_id);
+    let mut records = derivation::load_records(db_path, &expected)?.unwrap_or_default();
+    if records.vaults.contains_key(&prior.vault_uid) {
+        anyhow::bail!(
+            "vault derivation changed during incremental refresh; refusing to replace its proof"
+        );
+    }
+    let vault = store.lookup_vault(&prior.vault_uid)?;
+    let source = derivation::filesystem_source(Path::new(&vault.root_path))?;
+    let coverage = derivation::coverage_identity(
+        Path::new(&source.canonical_root),
+        extra,
+        max_note_bytes,
+        prior.coverage.scope.clone(),
+    )?;
+    let mut candidate = derivation::DerivationRecords::default();
+    candidate
+        .vaults
+        .insert(prior.vault_uid.clone(), prior.clone());
+    if derivation::admit_vault(
+        Some(&candidate),
+        &expected,
+        &vault,
+        &source,
+        &coverage,
+        false,
+    )
+    .is_ok()
+    {
+        records
+            .vaults
+            .insert(prior.vault_uid.clone(), prior.clone());
+        derivation::save_records(db_path, &records, &expected)?;
+    }
+    Ok(())
+}
+
 /// `--name` is echoed by every later vault listing, so refuse one the graph
 /// cannot hold (control characters, blank, over-long) before anything runs.
 /// A usage error, hence EXIT_USAGE.
@@ -184,8 +291,15 @@ pub(crate) fn run_brain(
                     &db_path,
                     instance_id,
                 )?;
+                let _ = invalidate_direct_vault_derivation(
+                    &store,
+                    &path,
+                    instance_id,
+                    &extra_patterns,
+                    note_limits.max_note_bytes(),
+                )?;
             }
-            let result = index_markdown_directory_with_ignore_and_write_lease_and_note_limits(
+            let full_refresh = index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits(
                 &path,
                 &db_path,
                 instance_id,
@@ -195,6 +309,8 @@ pub(crate) fn run_brain(
                 &write_lease,
             )
             .context("index_markdown_directory")?;
+            require_complete_graph_publication("add a vault", &full_refresh.publication)?;
+            let result = &full_refresh.index;
 
             // Record the indexer run timestamp for this vault.
             if let Err(e) = record_last_indexed_at(&db_path, &result.vault_uid) {
@@ -246,7 +362,16 @@ pub(crate) fn run_brain(
                     let store_for_tantivy =
                         GraphStore::open_read_only_with_authority(&db_path, &write_lease)?;
                     match tantivy.reindex_from_store(&store_for_tantivy) {
-                        Ok(count) => out.status(&format!("Tantivy: indexed {count} document(s)")),
+                        Ok(count) => {
+                            nestweaver_engine::markdown_derivation::stamp_full_refresh_with_store(
+                                &store_for_tantivy,
+                                &full_refresh,
+                                instance_id,
+                                &extra_patterns,
+                                note_limits.max_note_bytes(),
+                            )?;
+                            out.status(&format!("Tantivy: indexed {count} document(s)"));
+                        }
                         Err(e) => tracing::warn!("Tantivy reindex failed: {e}"),
                     }
                 }
@@ -1809,18 +1934,27 @@ pub(crate) fn run_brain(
             // Both refresh arms below write the graph and rebuild Tantivy on
             // the direct path.
             let write_lease = require_exclusive_store_access(&db_path, "refresh a vault")?;
-            {
+            let prior_derivation = {
                 let store = GraphStore::open_or_create_with_authority(&db_path, &write_lease)?;
                 nestweaver_engine::manifest::prepare_recreated_store_sidecars(
                     &store,
                     &db_path,
                     &instance_id,
                 )?;
-            }
+                invalidate_direct_vault_derivation(
+                    &store,
+                    &path,
+                    &instance_id,
+                    &extra_patterns,
+                    note_limits.max_note_bytes(),
+                )?
+            };
             // (summary text, skip rows, frontmatter-unparsed rows), rendered by
             // `finish_vault_refresh` once the link and search rebuilds ran.
             let refresh_outcome: (String, Vec<RefreshSkipRow>, Vec<RefreshSkipRow>);
             let incremental = since.is_some();
+            let mut full_refresh = None;
+            let mut clean_incremental = false;
 
             if let Some(since_str) = since {
                 // Incremental refresh: only re-index files modified since the
@@ -1842,6 +1976,10 @@ pub(crate) fn run_brain(
                     "incremental vault refresh",
                     &result.publication,
                 )?;
+                clean_incremental = result.publication.disposition
+                    == nestweaver_engine::manifest::GraphMutationPublicationDisposition::CommittedComplete
+                    && result.publication.warnings.is_empty()
+                    && !result.skipped.iter().any(nestweaver_engine::markdown_derivation::is_coverage_gap);
 
                 // Record the indexer run timestamp.
                 if let Err(e) = record_last_indexed_at(&db_path, &v_uid) {
@@ -1934,6 +2072,7 @@ pub(crate) fn run_brain(
                         .map(RefreshSkipRow::from_engine)
                         .collect(),
                 );
+                full_refresh = Some(result);
             }
 
             // nw-675: both arms recreate notes, and the cascade took their
@@ -1953,9 +2092,32 @@ pub(crate) fn run_brain(
                     let store_for_tantivy =
                         GraphStore::open_read_only_with_authority(&db_path, &write_lease)?;
                     match tantivy.reindex_from_store(&store_for_tantivy) {
-                        // Stdout carries only the JSON payload under --json.
-                        Ok(count) if json => eprintln!("Tantivy: indexed {count} document(s)"),
-                        Ok(count) => println!("Tantivy: indexed {count} document(s)"),
+                        Ok(count) => {
+                            // Full coverage may create Current. A clean --since
+                            // can only retain its previously admitted Current proof.
+                            if let Some(result) = &full_refresh {
+                                nestweaver_engine::markdown_derivation::stamp_full_refresh_with_store(
+                                    &store_for_tantivy,
+                                    result,
+                                    &instance_id,
+                                    &extra_patterns,
+                                    note_limits.max_note_bytes(),
+                                )?;
+                            } else if clean_incremental && let Some(prior) = &prior_derivation {
+                                restore_direct_incremental_derivation(
+                                    &store_for_tantivy,
+                                    prior,
+                                    &extra_patterns,
+                                    note_limits.max_note_bytes(),
+                                )?;
+                            }
+                            // Stdout carries only the JSON payload under --json.
+                            if json {
+                                eprintln!("Tantivy: indexed {count} document(s)");
+                            } else {
+                                println!("Tantivy: indexed {count} document(s)");
+                            }
+                        }
                         Err(e) => tracing::warn!("Tantivy reindex failed: {e}"),
                     }
                 }
@@ -4077,5 +4239,184 @@ fn print_index_compatibility(value: &serde_json::Value) {
                 println!("    {}", row);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod direct_vault_derivation_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn invoke(vault: &Path, db: &Path, subcommand: &str, extra: &[&str]) -> anyhow::Result<i32> {
+        let mut args = vec![
+            std::ffi::OsString::from("nestweaver"),
+            "brain".into(),
+            subcommand.into(),
+            vault.as_os_str().to_owned(),
+            "--db".into(),
+            db.as_os_str().to_owned(),
+        ];
+        args.extend(extra.iter().map(|value| std::ffi::OsString::from(*value)));
+        let cli = Cli::try_parse_from(args)?;
+        let Commands::Brain { command } = cli.command else {
+            unreachable!()
+        };
+        let out = OutputConfig {
+            quiet: true,
+            verbose: false,
+            color: false,
+        };
+        run_brain(*command, &out, std::time::Instant::now(), false).map(|outcome| outcome.0)
+    }
+
+    fn refresh_debt(db: &Path) -> usize {
+        let store = GraphStore::open_read_only(db).unwrap();
+        nestweaver_mcp::tools::index_compatibility_json(&store, None).unwrap()
+            ["vault_refresh_required"].as_array().unwrap().len()
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(vault.join("note.md"), "# Note\n\nFirst body.\n").unwrap();
+        let db = dir.path().join("brain.lbug");
+        (dir, vault, db)
+    }
+
+    #[test]
+    fn direct_full_refresh_certifies_and_clean_since_retains_only_prior_current() {
+        let (_dir, vault, db) = fixture();
+        assert_eq!(invoke(&vault, &db, "add", &[]).unwrap(), EXIT_SUCCESS);
+        assert_eq!(refresh_debt(&db), 0);
+        std::fs::write(vault.join("note.md"), "# Note\n\nUpdated body.\n").unwrap();
+        assert_eq!(
+            invoke(&vault, &db, "refresh", &["--since", "1970-01-01T00:00:00Z"]).unwrap(),
+            EXIT_SUCCESS
+        );
+        assert_eq!(
+            refresh_debt(&db),
+            0,
+            "clean incremental retains admitted Current"
+        );
+        std::fs::remove_file(nestweaver_engine::markdown_derivation::record_path(&db)).unwrap();
+        assert_eq!(
+            invoke(&vault, &db, "refresh", &["--since", "1970-01-01T00:00:00Z"]).unwrap(),
+            EXIT_SUCCESS
+        );
+        assert_eq!(
+            refresh_debt(&db),
+            1,
+            "incremental coverage cannot mint missing Current"
+        );
+        assert_eq!(invoke(&vault, &db, "refresh", &[]).unwrap(), EXIT_SUCCESS);
+        assert_eq!(refresh_debt(&db), 0);
+        {
+            use nestweaver_engine::markdown_derivation as derivation;
+            let store = GraphStore::open_read_only(&db).unwrap();
+            let identity = store.publication_identity().unwrap().unwrap();
+            let expected = derivation::expectation(&identity, "default");
+            let mut records = derivation::load_records(&db, &expected).unwrap().unwrap();
+            for record in records.vaults.values_mut() {
+                record.derivation_version = derivation::DERIVATION_VERSION - 1;
+                record.witness.as_mut().unwrap().derivation_version = record.derivation_version;
+            }
+            derivation::save_records(&db, &records, &expected).unwrap();
+        }
+        assert_eq!(
+            invoke(&vault, &db, "refresh", &["--since", "1970-01-01T00:00:00Z"]).unwrap(),
+            EXIT_SUCCESS
+        );
+        assert_eq!(
+            refresh_debt(&db),
+            1,
+            "incremental coverage cannot mint stale Current"
+        );
+        assert_eq!(invoke(&vault, &db, "refresh", &[]).unwrap(), EXIT_SUCCESS);
+        assert_eq!(refresh_debt(&db), 0);
+    }
+
+    #[test]
+    fn direct_refresh_search_failure_retires_prior_current_witness() {
+        let (_dir, vault, db) = fixture();
+        assert_eq!(invoke(&vault, &db, "add", &[]).unwrap(), EXIT_SUCCESS);
+        assert_eq!(refresh_debt(&db), 0);
+        let search = tantivy_sidecar_path_for(&db);
+        let saved = search.with_extension("saved-search");
+        std::fs::rename(&search, &saved).unwrap();
+        std::fs::write(&search, b"not a search directory").unwrap();
+        std::fs::write(
+            vault.join("note.md"),
+            "# Note\n\nNew content before search failure.\n",
+        )
+        .unwrap();
+        let outcome = invoke(&vault, &db, "refresh", &[]);
+        if let Err(error) = outcome {
+            let reason = format!("{error:#}").to_lowercase();
+            assert!(
+                reason.contains("search") || reason.contains("tantivy"),
+                "{reason}"
+            );
+        }
+        assert!(
+            search.is_file(),
+            "the search-directory fault must remain present"
+        );
+        assert_eq!(
+            refresh_debt(&db),
+            1,
+            "failed search must not retain old Current proof"
+        );
+        std::fs::remove_file(&search).unwrap();
+        std::fs::rename(&saved, &search).unwrap();
+        assert_eq!(invoke(&vault, &db, "refresh", &[]).unwrap(), EXIT_SUCCESS);
+        assert_eq!(refresh_debt(&db), 0);
+    }
+
+    #[test]
+    fn direct_refresh_refuses_corrupt_derivation_before_changing_graph() {
+        let (_dir, vault, db) = fixture();
+        assert_eq!(invoke(&vault, &db, "add", &[]).unwrap(), EXIT_SUCCESS);
+        let note_hash = {
+            let store = GraphStore::open_read_only(&db).unwrap();
+            store.list_notes(None).unwrap()[0].content_hash.clone()
+        };
+        let sidecar = nestweaver_engine::markdown_derivation::record_path(&db);
+        std::fs::write(&sidecar, b"corrupt proof").unwrap();
+        std::fs::write(vault.join("note.md"), "# Note\n\nMust not commit.\n").unwrap();
+        assert!(invoke(&vault, &db, "refresh", &[]).is_err());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"corrupt proof");
+        let store = GraphStore::open_read_only(&db).unwrap();
+        assert_eq!(store.list_notes(None).unwrap()[0].content_hash, note_hash);
+    }
+
+    #[test]
+    fn direct_refresh_preserves_a_valid_foreign_physical_derivation_record() {
+        let (_dir, vault, db) = fixture();
+        let (_foreign_dir, foreign_vault, foreign_db) = fixture();
+        assert_eq!(invoke(&vault, &db, "add", &[]).unwrap(), EXIT_SUCCESS);
+        assert_eq!(
+            invoke(&foreign_vault, &foreign_db, "add", &[]).unwrap(),
+            EXIT_SUCCESS
+        );
+        let note_hash = {
+            let store = GraphStore::open_read_only(&db).unwrap();
+            store.list_notes(None).unwrap()[0].content_hash.clone()
+        };
+        let foreign = std::fs::read(nestweaver_engine::markdown_derivation::record_path(
+            &foreign_db,
+        ))
+        .unwrap();
+        let sidecar = nestweaver_engine::markdown_derivation::record_path(&db);
+        std::fs::write(&sidecar, &foreign).unwrap();
+        std::fs::write(
+            vault.join("note.md"),
+            "# Note\n\nMust not replace foreign proof.\n",
+        )
+        .unwrap();
+        assert!(invoke(&vault, &db, "refresh", &[]).is_err());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), foreign);
+        let store = GraphStore::open_read_only(&db).unwrap();
+        assert_eq!(store.list_notes(None).unwrap()[0].content_hash, note_hash);
     }
 }

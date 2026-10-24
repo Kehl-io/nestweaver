@@ -1027,6 +1027,29 @@ pub fn stamp_rebuilt_vault(
 ) -> anyhow::Result<bool> {
     let store = nestweaver_store::GraphStore::open_read_only_without_migration(db_path)
         .map_err(|error| anyhow::anyhow!("open staged graph for derivation records: {error}"))?;
+    stamp_full_refresh_with_store(
+        &store,
+        result,
+        data_instance_id,
+        extra_ignore_patterns,
+        max_note_bytes,
+    )
+}
+
+/// Certify an explicitly full refresh after its caller reconciled search.
+/// Reuse the caller's store: opening/closing another database descriptor while
+/// a writer lease is held can release process-wide POSIX record locks.
+/// An incomplete publication removes any prior record and remains owed.
+pub fn stamp_full_refresh_with_store(
+    store: &nestweaver_store::GraphStore,
+    result: &crate::index_md::MarkdownRefreshResult,
+    data_instance_id: &str,
+    extra_ignore_patterns: &[String],
+    max_note_bytes: u64,
+) -> anyhow::Result<bool> {
+    let db_path = store
+        .db_path()
+        .ok_or_else(|| anyhow::anyhow!("derivation records require a persistent graph"))?;
     let identity = store
         .publication_identity()
         .map_err(|error| anyhow::anyhow!("read staged publication identity: {error}"))?
@@ -1045,7 +1068,6 @@ pub fn stamp_rebuilt_vault(
     let notes = store
         .list_notes(Some(&vault.uid))
         .map_err(|error| anyhow::anyhow!("list staged notes: {error}"))?;
-    drop(store);
     let expected = expectation(&identity, data_instance_id);
     let mut records = load_records(db_path, &expected)?.unwrap_or_default();
     let source = filesystem_source(Path::new(&vault.root_path))?;
@@ -1129,6 +1151,33 @@ pub fn admit_all_vaults(
         )?;
     }
     Ok(())
+}
+
+/// Validate an incumbent before an empty recreated store discards its physical
+/// coverage. Logical-instance mismatches and malformed bytes are never healed.
+pub(crate) fn is_previous_physical_store(
+    db_path: &Path,
+    identity: &PublicationIdentity,
+    data_instance_id: &str,
+) -> Result<bool, RecordError> {
+    let bytes = match std::fs::read(record_path(db_path)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(RecordError::Io(error.kind())),
+    };
+    let envelope = decode_envelope(&bytes)?;
+    let records = records_from_envelope(&envelope)?;
+    if let Some(future) = records
+        .vaults
+        .values()
+        .find(|record| record.derivation_version > DERIVATION_VERSION)
+    {
+        return Err(RecordError::FutureVersion(future.derivation_version));
+    }
+    if envelope.data_instance_id != data_instance_id {
+        return Err(RecordError::ForeignIdentity);
+    }
+    Ok(envelope.identity != *identity)
 }
 
 #[cfg(test)]
@@ -1216,6 +1265,18 @@ mod tests {
         assert!(!stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
         assert_eq!(record_of(), None);
         result.index.notes_count -= 1;
+
+        result
+            .index
+            .skipped
+            .push(nestweaver_parser::SkippedFile::new(
+                "unreadable.md",
+                nestweaver_parser::SkipReasonCode::ReadError,
+                "injected coverage gap",
+            ));
+        assert!(!stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
+        assert_eq!(record_of(), None);
+        result.index.skipped.clear();
 
         assert!(stamp_rebuilt_vault(&db, &result, "test", &[], max).unwrap());
         assert_eq!(record_of().unwrap().phase, DerivationPhase::Current);
@@ -1619,31 +1680,4 @@ mod tests {
             "a blocked record with no schedule must not be stranded"
         );
     }
-}
-
-/// Validate an incumbent before an empty recreated store discards its physical
-/// coverage. Logical-instance mismatches and malformed bytes are never healed.
-pub(crate) fn is_previous_physical_store(
-    db_path: &Path,
-    identity: &PublicationIdentity,
-    data_instance_id: &str,
-) -> Result<bool, RecordError> {
-    let bytes = match std::fs::read(record_path(db_path)) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(RecordError::Io(error.kind())),
-    };
-    let envelope = decode_envelope(&bytes)?;
-    let records = records_from_envelope(&envelope)?;
-    if let Some(future) = records
-        .vaults
-        .values()
-        .find(|record| record.derivation_version > DERIVATION_VERSION)
-    {
-        return Err(RecordError::FutureVersion(future.derivation_version));
-    }
-    if envelope.data_instance_id != data_instance_id {
-        return Err(RecordError::ForeignIdentity);
-    }
-    Ok(envelope.identity != *identity)
 }

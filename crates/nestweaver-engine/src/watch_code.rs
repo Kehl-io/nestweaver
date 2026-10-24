@@ -6523,7 +6523,7 @@ mod tests {
     fn watcher_recreated_barrel_target_recovers_untouched_transitive_callers() {
         for cold_cache in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().join("repo");
+            let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
             std::fs::create_dir_all(root.join("util")).unwrap();
             let leaf = root.join("util/strings.ts");
             let barrel = root.join("util/index.ts");
@@ -6614,7 +6614,7 @@ mod tests {
     fn watch_first_records_generation_only_for_complete_initial_source_coverage() {
         for partial in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().join("repo");
+            let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
             std::fs::create_dir_all(&root).unwrap();
             let first = root.join("first.js");
             let second = root.join("second.js");

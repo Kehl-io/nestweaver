@@ -4881,7 +4881,7 @@ mod tests {
             );
             assert!(is_recognisable_data_dir(&data).unwrap());
         }
-        let original_hash = sha256_stream_path(&data.join("graph.db")).unwrap();
+        let original_hash = sha256_stream_path(data.join("graph.db")).unwrap();
         let personal = data.join("graph.db.publications").join("thesis.txt");
         std::fs::create_dir_all(personal.parent().unwrap()).unwrap();
         std::fs::write(&personal, b"irreplaceable").unwrap();
@@ -4894,7 +4894,7 @@ mod tests {
         assert!(error.downcast_ref::<BackupRefusal>().is_some(), "{error:#}");
         assert_eq!(std::fs::read(personal).unwrap(), b"irreplaceable");
         assert_eq!(
-            sha256_stream_path(&data.join("graph.db")).unwrap(),
+            sha256_stream_path(data.join("graph.db")).unwrap(),
             original_hash
         );
     }
@@ -4904,7 +4904,7 @@ mod tests {
         for with_aside in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
-            let original_hash = sha256_stream_path(&data.join("brain.lbug")).unwrap();
+            let original_hash = sha256_stream_path(data.join("brain.lbug")).unwrap();
             if with_aside {
                 seed_dataset(&restoring_dir_for(&data), b"SUPERSEDED");
             }
@@ -4921,7 +4921,7 @@ mod tests {
                     .unwrap()
             );
             assert_eq!(
-                sha256_stream_path(&data.join("brain.lbug")).unwrap(),
+                sha256_stream_path(data.join("brain.lbug")).unwrap(),
                 original_hash
             );
             assert_eq!(
@@ -5179,7 +5179,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let restoring = tmp.path().join("data.restoring");
         let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
-        let original_hash = sha256_stream_path(&data.join("brain.lbug")).unwrap();
+        let original_hash = sha256_stream_path(data.join("brain.lbug")).unwrap();
         seed_dataset(&restoring, b"SUPERSEDED");
         marker_replay_journal(
             &data,
@@ -5194,7 +5194,7 @@ mod tests {
                 "pass {pass}: proven-redundant copy removed"
             );
             assert_eq!(
-                sha256_stream_path(&data.join("brain.lbug")).unwrap(),
+                sha256_stream_path(data.join("brain.lbug")).unwrap(),
                 original_hash
             );
             assert!(!restore_journal_path(&data).exists(), "pass {pass}");
@@ -6753,7 +6753,7 @@ mod tests {
     fn multiple_graph_inventory_is_refused_before_restore_cutover() {
         let tmp = tempfile::tempdir().unwrap();
         let (data, snapshot, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
-        let before_graph = sha256_stream_path(&data.join("brain.lbug")).unwrap();
+        let before_graph = sha256_stream_path(data.join("brain.lbug")).unwrap();
         let marker = nestweaver_store::engine_format::sidecar_path(&data.join("brain.lbug"));
         let before_marker = std::fs::read(&marker).unwrap();
         let staging = tempfile::tempdir_in(tmp.path()).unwrap();
@@ -6818,7 +6818,7 @@ mod tests {
             "{refused:#}"
         );
         assert_eq!(
-            sha256_stream_path(&data.join("brain.lbug")).unwrap(),
+            sha256_stream_path(data.join("brain.lbug")).unwrap(),
             before_graph
         );
         assert_eq!(std::fs::read(marker).unwrap(), before_marker);

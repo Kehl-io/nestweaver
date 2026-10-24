@@ -24078,8 +24078,7 @@ impl Counter {
                 .expect("watcher must refuse incomplete Go inventory")
             } else {
                 index_with_reader(&reader, &store, "test", url, "s0", None)
-                    .err()
-                    .expect("index must refuse incomplete Go inventory")
+                    .expect_err("index must refuse incomplete Go inventory")
             };
             assert!(
                 format!("{error:#}").contains("injected required manifest inventory failure"),

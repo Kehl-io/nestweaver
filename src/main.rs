@@ -196,10 +196,9 @@ use nestweaver_engine::{
     get_last_indexed_at,
     index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits,
     index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits,
-    index_markdown_directory_with_ignore_and_write_lease_and_note_limits, list_repos,
-    list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation, lookup_symbol,
-    record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar, save_summaries,
-    search_symbols, suggest_links,
+    list_repos, list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation,
+    lookup_symbol, record_last_indexed_at, render_text, save_clusters, save_cochange_sidecar,
+    save_summaries, search_symbols, suggest_links,
 };
 use nestweaver_schema::{DEFAULT_DRAIN_CEILING_SECS, Symbol};
 use nestweaver_store::{GraphStore, QueryIntent, TantivyIndex};
@@ -2800,6 +2799,40 @@ fn json_payload_with_provenance(mut payload: serde_json::Value) -> serde_json::V
         &[],
     );
     payload
+}
+
+/// Attach current compatibility from the exact store used by a direct query.
+/// Richer wire metadata wins; no ambient store, cached snapshot or second open.
+fn json_payload_with_store_compatibility(
+    store: &GraphStore,
+    payload: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let mut payload = json_payload_with_provenance(payload);
+    if payload.pointer("/_meta/index_compatibility").is_none() {
+        let compatibility = nestweaver_mcp::tools::index_compatibility_json(store, None)?;
+        if let Some(meta) = payload
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            meta.insert("index_compatibility".to_string(), compatibility);
+        }
+    }
+    Ok(payload)
+}
+
+fn local_query_meta(store: &GraphStore) -> anyhow::Result<serde_json::Value> {
+    let payload = json_payload_with_store_compatibility(store, serde_json::json!({}))?;
+    Ok(payload["_meta"].clone())
+}
+
+fn print_json_payload_for_store(
+    store: &GraphStore,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    print_json_payload(&json_payload_with_store_compatibility(
+        store,
+        payload.clone(),
+    )?)
 }
 
 /// Print a `--json` OBJECT payload. The only emitter that should exist.
@@ -19411,7 +19444,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 print_repo_map_json(
                     &found.map,
                     &ResolverStaleness::from_store(&store),
-                    None,
+                    Some(local_query_meta(&store)?),
                     Some(found.truncated()),
                     Some(found.files_returned),
                     Some(found.files_total),
@@ -21068,7 +21101,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "hubs",
                     &hubs,
                     &ResolverStaleness::from_store(&store),
-                    None,
+                    Some(local_query_meta(&store)?),
                     &bounds,
                     None,
                     Some(&db_path),
@@ -21278,7 +21311,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     "bridges",
                     &bridges,
                     &ResolverStaleness::from_store(&store),
-                    None,
+                    Some(local_query_meta(&store)?),
                     &bounds,
                     None,
                     Some(&db_path),
@@ -22639,7 +22672,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     value["review_only"] = serde_json::json!(true);
                     value["high_confidence_available"] = serde_json::json!(false);
                     if json {
-                        print_json_payload(&value)?;
+                        print_json_payload_for_store(&store, &value)?;
                     }
                     eprintln!("Error: {}", refusal.message());
                     return Ok((EXIT_NEEDS_REINDEX, None));
@@ -22669,7 +22702,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     concise: false,
                 };
                 let observed_generation = store.graph_generation();
-                if let Some(refusal) = dead_code_page_guard(&store, observed_generation, &request) {
+                let value = if let Some(refusal) =
+                    dead_code_page_guard(&store, observed_generation, &request)
+                {
                     refusal
                 } else {
                     let manifests =
@@ -22691,7 +22726,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         &identity,
                     )?;
                     dead_code_page_guard(&store, observed_generation, &request).unwrap_or(page)
-                }
+                };
+                json_payload_with_store_compatibility(&store, value)?
             };
             if payload.get("refused").and_then(|v| v.as_bool()) == Some(true) {
                 if json {
@@ -23405,7 +23441,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // paragraph goes to stderr on BOTH modes, the same
                         // split `dead-code` and `stale-check` already use.
                         if json {
-                            print_json_payload(&payload)?;
+                            print_json_payload_for_store(&store, &payload)?;
                         }
                         eprintln!("Error: {}", affected_tests_refusal_note(&payload));
                         return Ok((EXIT_NEEDS_REINDEX, None));
@@ -23424,7 +23460,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         )?,
                     };
                     AffectedTestsRpcPayload::Single {
-                        raw: serde_json::to_value(&result)?,
+                        raw: json_payload_with_store_compatibility(
+                            &store,
+                            serde_json::to_value(&result)?,
+                        )?,
                         result: Box::new(result),
                     }
                 }
@@ -25667,39 +25706,42 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         });
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&impact_json_ok(
-                                &name_or_uid,
-                                Some(&uid),
-                                serde_json::to_value(&json_nodes)?,
-                                result.truncated_by_threshold,
-                                result.truncated_by_depth,
-                                // `total` is the RESULT-SET size, matching the
-                                // daemon, which computes `nodes.len()` after
-                                // its visibility retain and BEFORE its
-                                // `.take(limit)`. The truncation flags carry
-                                // the "this set is a FLOOR" meaning; `total`
-                                // does not.
-                                //
-                                // An earlier version of this emitted `None`
-                                // when truncated, reasoning that the
-                                // PRE-truncation universe is unknown here. True
-                                // but irrelevant — that is a different
-                                // quantity than the one the daemon reports
-                                // under the same key, so it reintroduced the
-                                // divergence it was meant to close, in the one
-                                // case the happy-path parity fixture cannot
-                                // reach.
-                                //
-                                // nw-357: these two were BOTH `json_nodes.len()`,
-                                // so `returned < total` could never hold and
-                                // the daemon's documented cap signal had no
-                                // counterpart here. They are now the pre-cap
-                                // and post-cap counts, the same two quantities
-                                // `tool_brain_impact` computes.
-                                Some(total as u64),
-                                Some(json_nodes.len() as u64),
-                                note,
-                            ))?
+                            serde_json::to_string_pretty(&json_payload_with_store_compatibility(
+                                &store,
+                                impact_json_ok(
+                                    &name_or_uid,
+                                    Some(&uid),
+                                    serde_json::to_value(&json_nodes)?,
+                                    result.truncated_by_threshold,
+                                    result.truncated_by_depth,
+                                    // `total` is the RESULT-SET size, matching the
+                                    // daemon, which computes `nodes.len()` after
+                                    // its visibility retain and BEFORE its
+                                    // `.take(limit)`. The truncation flags carry
+                                    // the "this set is a FLOOR" meaning; `total`
+                                    // does not.
+                                    //
+                                    // An earlier version of this emitted `None`
+                                    // when truncated, reasoning that the
+                                    // PRE-truncation universe is unknown here. True
+                                    // but irrelevant — that is a different
+                                    // quantity than the one the daemon reports
+                                    // under the same key, so it reintroduced the
+                                    // divergence it was meant to close, in the one
+                                    // case the happy-path parity fixture cannot
+                                    // reach.
+                                    //
+                                    // nw-357: these two were BOTH `json_nodes.len()`,
+                                    // so `returned < total` could never hold and
+                                    // the daemon's documented cap signal had no
+                                    // counterpart here. They are now the pre-cap
+                                    // and post-cap counts, the same two quantities
+                                    // `tool_brain_impact` computes.
+                                    Some(total as u64),
+                                    Some(json_nodes.len() as u64),
+                                    note,
+                                )
+                            )?)?
                         );
                     } else if nodes.is_empty() {
                         if !out.quiet {
@@ -25796,12 +25838,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     if json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(
-                                &nestweaver_schema::responses::with_did_you_mean(
+                            serde_json::to_string_pretty(&json_payload_with_store_compatibility(
+                                &store,
+                                nestweaver_schema::responses::with_did_you_mean(
                                     impact_json_not_found(&name_or_uid),
                                     &candidates,
                                 )
-                            )?
+                            )?)?
                         );
                     } else {
                         eprint_symbol_not_found(&name_or_uid, &candidates);
@@ -25815,11 +25858,14 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // computed result set (nw-111).
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&impact_json_ambiguous(
-                                &name_or_uid,
-                                repo_filter.as_deref(),
-                                serde_json::to_value(&candidates)?
-                            ))?
+                            serde_json::to_string_pretty(&json_payload_with_store_compatibility(
+                                &store,
+                                impact_json_ambiguous(
+                                    &name_or_uid,
+                                    repo_filter.as_deref(),
+                                    serde_json::to_value(&candidates)?
+                                )
+                            )?)?
                         );
                     } else {
                         eprintln!(
@@ -45419,6 +45465,58 @@ mod incomplete_refusal_diagnostic_tests {
         assert_eq!(
             affected_tests_refusal_note(&absent),
             nestweaver_engine::resolver_generation::WHY_AFFECTED_TESTS_REFUSES
+        );
+    }
+}
+
+#[cfg(test)]
+mod direct_store_compatibility_tests {
+    use super::*;
+
+    fn incomplete_store(uid: &str) -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: uid.into(),
+                url: format!("https://example.test/{uid}"),
+                indexed_sha: "fixture".into(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: Some(uid.into()),
+                root_path: None,
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn direct_custom_json_uses_its_exact_store_and_preserves_richer_wire_metadata() {
+        let first = incomplete_store("first");
+        let second = incomplete_store("second");
+        for (store, expected) in [(&first, "first"), (&second, "second"), (&first, "first")] {
+            let value = json_payload_with_store_compatibility(
+                store,
+                serde_json::json!({"refused": true, "reason": "fixture-refusal"}),
+            )
+            .unwrap();
+            assert_eq!(
+                value["_meta"]["index_compatibility"]["incomplete_repos"][0]["repo_uid"],
+                expected
+            );
+            assert_eq!(value["reason"], "fixture-refusal");
+            assert_eq!(value["refused"], true);
+            assert_eq!(value["_meta"]["scope"], "local");
+        }
+        let wire = serde_json::json!({
+            "_meta": {
+                "scope": "hybrid", "sources": ["local", "org"], "stale_repos": ["upstream"],
+                "index_compatibility": {"scope": "authorized-wire", "incomplete_repos": []}
+            },
+            "refused": true, "reason": "repo_index_incomplete"
+        });
+        assert_eq!(
+            json_payload_with_store_compatibility(&first, wire.clone()).unwrap(),
+            wire
         );
     }
 }
