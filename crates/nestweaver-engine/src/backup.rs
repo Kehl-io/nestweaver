@@ -4323,6 +4323,9 @@ mod tests {
         // The pre-restore copy is a NestWeaver data directory: a later
         // `--force` only replaces one of those.
         drop(nestweaver_store::GraphStore::create(&restoring.join("prior.lbug")).unwrap());
+        // A real restore takes its write lease before capturing the journal.
+        // Simulate that crashed owner's stable operational lock before proof.
+        drop(nestweaver_store::acquire_db_write_lease(&restoring.join("prior.lbug")).unwrap());
         publish_restore_phase(&RestoreJournal {
             version: RESTORE_JOURNAL_VERSION,
             phase: RestorePhase::CopyInProgress,

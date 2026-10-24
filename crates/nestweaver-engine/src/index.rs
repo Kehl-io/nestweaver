@@ -14746,7 +14746,14 @@ mod tests {
             true,
         )
         .unwrap();
-        let generation_after_a = store.graph_generation();
+        // A has released its lease, so B may already have reserved its dirty
+        // generation in memory. B cannot persist its clean generation until
+        // continue_tx is sent below; the durable sidecar still identifies A.
+        let generation_after_a = fs::read_to_string(&generation_path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
 
         let b_established = established_rx
             .recv_timeout(PUBLICATION_HANDOFF_DEADLINE)

@@ -3059,13 +3059,13 @@ mod integration_fix_tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(event.as_bytes())
-            .unwrap();
+        // With no jq the hook exits before reading stdin. Either the small
+        // event is queued first or the successful early exit closes the pipe.
+        let input_result = child.stdin.take().unwrap().write_all(event.as_bytes());
         let out = child.wait_with_output().unwrap();
+        if let Err(error) = input_result {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+        }
         assert!(out.status.success(), "{out:?}");
         assert!(
             out.stdout.is_empty(),
