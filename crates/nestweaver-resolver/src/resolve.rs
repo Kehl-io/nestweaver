@@ -3082,6 +3082,54 @@ fn agreed_fallback_return(
     agreed
 }
 
+/// Go methods and their receiver declarations may occupy sibling files. When
+/// an incremental pass omits a package clause, a unique named type declaration
+/// must still anchor ownership; a same-spelled standalone type is not evidence.
+fn go_method_origin_matches(
+    file: &str,
+    origin: &TypedReceiverOrigin,
+    graph: &ImportGraph,
+    symbol_map: &std::collections::HashMap<String, Vec<(&str, &RawSymbol)>>,
+) -> bool {
+    if nestweaver_parser::detect_language(std::path::Path::new(file)) != Some(Language::Go)
+        || nestweaver_parser::detect_language(std::path::Path::new(&origin.file))
+            != Some(Language::Go)
+        || parent_dir(file) != parent_dir(&origin.file)
+        || !go_same_package(graph, file, &origin.file)
+    {
+        return false;
+    }
+    if graph.go_package_of(file).is_some() && graph.go_package_of(&origin.file).is_some() {
+        return true;
+    }
+    // Both internal and external test packages use *_test.go. Unknown package
+    // metadata cannot prove a cross-file route involving either test side.
+    if file.ends_with("_test.go") || origin.file.ends_with("_test.go") {
+        return false;
+    }
+    let mut owners =
+        symbol_map
+            .get(&origin.name)
+            .into_iter()
+            .flatten()
+            .filter(|(owner_file, owner)| {
+                parent_dir(owner_file) == parent_dir(&origin.file)
+                    && nestweaver_parser::detect_language(std::path::Path::new(owner_file))
+                        == Some(Language::Go)
+                    && matches!(
+                        owner.kind,
+                        SymbolKind::Class
+                            | SymbolKind::Enum
+                            | SymbolKind::TypeAlias
+                            | SymbolKind::Interface
+                    )
+            });
+    owners
+        .next()
+        .is_some_and(|(owner_file, _)| *owner_file == origin.file)
+        && owners.next().is_none()
+}
+
 fn method_belongs_to_origin(
     file: &str,
     symbol: &RawSymbol,
@@ -3091,9 +3139,7 @@ fn method_belongs_to_origin(
     type_envs: Option<&std::collections::HashMap<String, TypeEnvironment>>,
 ) -> bool {
     symbol.parent_name.as_deref() == Some(origin.name.as_str())
-        && (graph.go_package_of(file).is_some()
-            && parent_dir(file) == parent_dir(&origin.file)
-            && go_same_package(graph, file, &origin.file)
+        && (go_method_origin_matches(file, origin, graph, symbol_map)
             || file == origin.file
                 && origin.rust_class_position.is_none_or(|position| {
                     let owners = type_envs.and_then(|envs| envs.get(file)).and_then(|env| {
@@ -12674,7 +12720,7 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
             Some(&envs),
             None,
         );
-        for caller in ["factory", "assigned"] {
+        for caller in ["parameter", "literal", "factory", "assigned"] {
             assert!(
                 qa_calls(
                     &incremental,
@@ -12692,6 +12738,379 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
                     ("other/types.go", "Get", 3)
                 ),
                 "incremental foreign {caller}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_incremental_method_owners_keep_package_build_and_language_boundaries() {
+        // Wrong-package/ignored receiver declarations are parser negatives:
+        // they must not gain an edge merely by spelling the same parent name.
+        let mut files = parsed_files(&[
+            ("store/types.go", "package store\ntype Store struct{}\n"),
+            (
+                "store/methods.go",
+                "package store\nfunc (recv Store) Get() {}\n",
+            ),
+            (
+                "store/foreign.go",
+                "package other\nfunc (recv Store) Get() {}\n",
+            ),
+            (
+                "store/ignored.go",
+                "//go:build ignore\n\npackage store\nfunc (recv Store) Get() {}\n",
+            ),
+            (
+                "store/methods_test.go",
+                "package store_test\nfunc (recv Store) Get() {}\n",
+            ),
+            (
+                "store/Foreign.java",
+                "package store; class Store { public void Get() {} }\n",
+            ),
+        ]);
+        for (file, _, references) in &mut files {
+            if file == "store/methods.go" || file == "store/methods_test.go" {
+                references.clear();
+            }
+        }
+        let languages = files
+            .iter()
+            .map(|(file, _, _)| {
+                (
+                    file.clone(),
+                    nestweaver_parser::detect_language(Path::new(file)).unwrap(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let graph = build_import_graph_with_languages(
+            &files,
+            Language::Go,
+            Some(&languages),
+            &WorkspaceContext::default(),
+        );
+        assert!(graph.go_package_of("store/methods.go").is_none());
+        assert!(graph.go_package_of("store/methods_test.go").is_none());
+        assert_eq!(graph.go_package_of("store/foreign.go"), Some("other"));
+        assert!(graph.go_build_ignored("store/ignored.go"));
+        let mut symbol_map = std::collections::HashMap::<String, Vec<(&str, &RawSymbol)>>::new();
+        for (file, symbols, _) in &files {
+            for symbol in symbols {
+                symbol_map
+                    .entry(symbol.name.clone())
+                    .or_default()
+                    .push((file, symbol));
+            }
+        }
+        let origin = TypedReceiverOrigin {
+            file: "store/types.go".into(),
+            name: "Store".into(),
+            rust_class_position: None,
+        };
+        let mut checked = 0;
+        for (file, symbols, _) in &files {
+            let Some(method) = symbols.iter().find(|symbol| symbol.name == "Get") else {
+                continue;
+            };
+            checked += 1;
+            assert_eq!(
+                method_belongs_to_origin(file, method, &origin, &graph, &symbol_map, None),
+                file == "store/methods.go",
+                "owner boundary: {file}"
+            );
+            // A non-Go exact origin cannot use the Go same-directory fallback.
+            let non_go_origin = TypedReceiverOrigin {
+                file: "store/Foreign.java".into(),
+                name: "Store".into(),
+                rust_class_position: None,
+            };
+            if file == "store/methods.go" {
+                assert!(!method_belongs_to_origin(
+                    file,
+                    method,
+                    &non_go_origin,
+                    &graph,
+                    &symbol_map,
+                    None
+                ));
+            }
+        }
+        assert_eq!(
+            checked, 5,
+            "all positive and negative method fixtures must be exercised"
+        );
+    }
+
+    #[test]
+    fn go_unknown_package_method_owner_requires_a_unique_named_go_type() {
+        for (declaration, kind) in [
+            ("type Store int", SymbolKind::TypeAlias),
+            ("type Store interface{}", SymbolKind::Interface),
+            ("type Store struct{}", SymbolKind::Class),
+        ] {
+            // The named scalar and struct standalone programs are valid Go.
+            // A method on an interface is an intentional parser-only negative.
+            let standalone = format!(
+                "//go:build ignore\n\npackage main\n{declaration}\nfunc (recv Store) Get() {{}}\nfunc main() {{}}\n"
+            );
+            let mut files = parsed_files(&[
+                ("store/types.go", "package store\ntype Store struct{}\n"),
+                (
+                    "store/methods.go",
+                    "package store\nfunc (recv Store) Live() {}\n",
+                ),
+                ("store/ignored.go", &standalone),
+            ]);
+            let ignored_kind = files
+                .iter()
+                .find(|(file, _, _)| file == "store/ignored.go")
+                .unwrap()
+                .1
+                .iter()
+                .find(|symbol| symbol.name == "Store")
+                .unwrap()
+                .kind;
+            assert_eq!(
+                ignored_kind, kind,
+                "counterfixture must include the conflicting type: {declaration}"
+            );
+            let known_graph = build_import_graph_with_languages(
+                &files,
+                Language::Go,
+                None,
+                &WorkspaceContext::default(),
+            );
+            for (file, _, references) in &mut files {
+                if file == "store/ignored.go" {
+                    references.clear();
+                }
+            }
+            let unknown_graph = build_import_graph_with_languages(
+                &files,
+                Language::Go,
+                None,
+                &WorkspaceContext::default(),
+            );
+            assert!(!unknown_graph.go_build_ignored("store/ignored.go"));
+            assert!(unknown_graph.go_package_of("store/ignored.go").is_none());
+            let mut symbol_map =
+                std::collections::HashMap::<String, Vec<(&str, &RawSymbol)>>::new();
+            for (file, symbols, _) in &files {
+                for symbol in symbols {
+                    symbol_map
+                        .entry(symbol.name.clone())
+                        .or_default()
+                        .push((file, symbol));
+                }
+            }
+            let origin = TypedReceiverOrigin {
+                file: "store/types.go".into(),
+                name: "Store".into(),
+                rust_class_position: None,
+            };
+            let ignored_method = files
+                .iter()
+                .find(|(file, _, _)| file == "store/ignored.go")
+                .unwrap()
+                .1
+                .iter()
+                .find(|symbol| symbol.name == "Get")
+                .unwrap();
+            assert!(
+                !method_belongs_to_origin(
+                    "store/ignored.go",
+                    ignored_method,
+                    &origin,
+                    &known_graph,
+                    &symbol_map,
+                    None
+                ),
+                "known ignored program"
+            );
+            assert!(
+                !method_belongs_to_origin(
+                    "store/ignored.go",
+                    ignored_method,
+                    &origin,
+                    &unknown_graph,
+                    &symbol_map,
+                    None
+                ),
+                "missing ignored marker must not borrow the production type: {declaration}"
+            );
+            let live_method = files
+                .iter()
+                .find(|(file, _, _)| file == "store/methods.go")
+                .unwrap()
+                .1
+                .iter()
+                .find(|symbol| symbol.name == "Live")
+                .unwrap();
+            assert!(
+                method_belongs_to_origin(
+                    "store/methods.go",
+                    live_method,
+                    &origin,
+                    &unknown_graph,
+                    &symbol_map,
+                    None
+                ),
+                "known matching packages retain ownership despite foreign homonym"
+            );
+        }
+        // With no competing Go type declaration, missing ordinary package
+        // clauses still permit the exact sibling method (the incremental fix).
+        let mut files = parsed_files(&[
+            ("store/types.go", "package store\ntype Store struct{}\n"),
+            (
+                "store/methods.go",
+                "package store\nfunc (recv Store) Get() {}\n",
+            ),
+            ("store/Other.java", "class Store {}\n"),
+        ]);
+        for (_, _, references) in &mut files {
+            references.clear();
+        }
+        let graph = build_import_graph_with_languages(
+            &files,
+            Language::Go,
+            None,
+            &WorkspaceContext::default(),
+        );
+        let mut symbol_map = std::collections::HashMap::<String, Vec<(&str, &RawSymbol)>>::new();
+        for (file, symbols, _) in &files {
+            for symbol in symbols {
+                symbol_map
+                    .entry(symbol.name.clone())
+                    .or_default()
+                    .push((file, symbol));
+            }
+        }
+        let origin = TypedReceiverOrigin {
+            file: "store/types.go".into(),
+            name: "Store".into(),
+            rust_class_position: None,
+        };
+        let method = files
+            .iter()
+            .find(|(file, _, _)| file == "store/methods.go")
+            .unwrap()
+            .1
+            .iter()
+            .find(|symbol| symbol.name == "Get")
+            .unwrap();
+        assert!(method_belongs_to_origin(
+            "store/methods.go",
+            method,
+            &origin,
+            &graph,
+            &symbol_map,
+            None
+        ));
+        symbol_map.remove("Store");
+        assert!(
+            !method_belongs_to_origin(
+                "store/methods.go",
+                method,
+                &origin,
+                &graph,
+                &symbol_map,
+                None
+            ),
+            "unknown package route must retain an actual type declaration"
+        );
+    }
+
+    #[test]
+    fn go_cross_file_test_method_ownership_requires_known_matching_packages() {
+        let files = parsed_files(&[
+            (
+                "store/origin_test.go",
+                "package store\ntype TestOnly struct{}\nfunc (recv TestOnly) Own() {}\n",
+            ),
+            (
+                "store/internal_test.go",
+                "package store\nfunc (recv TestOnly) Get() {}\n",
+            ),
+            (
+                "store/external_test.go",
+                "package store_test\ntype TestOnly struct{}\nfunc (recv TestOnly) Get() {}\n",
+            ),
+        ]);
+        let graph = build_import_graph_with_languages(
+            &files,
+            Language::Go,
+            None,
+            &WorkspaceContext::default(),
+        );
+        let mut symbol_map = std::collections::HashMap::<String, Vec<(&str, &RawSymbol)>>::new();
+        for (file, symbols, _) in &files {
+            for symbol in symbols {
+                symbol_map
+                    .entry(symbol.name.clone())
+                    .or_default()
+                    .push((file, symbol));
+            }
+        }
+        let origin = TypedReceiverOrigin {
+            file: "store/origin_test.go".into(),
+            name: "TestOnly".into(),
+            rust_class_position: None,
+        };
+        for (file, symbols, _) in &files {
+            let method = symbols
+                .iter()
+                .find(|symbol| symbol.kind == SymbolKind::Method)
+                .unwrap();
+            assert_eq!(
+                method_belongs_to_origin(file, method, &origin, &graph, &symbol_map, None),
+                file != "store/external_test.go",
+                "known package: {file}"
+            );
+        }
+        let mut unknown = files.clone();
+        for (_, _, references) in &mut unknown {
+            references.clear();
+        }
+        let unknown_graph = build_import_graph_with_languages(
+            &unknown,
+            Language::Go,
+            None,
+            &WorkspaceContext::default(),
+        );
+        for (file, symbols, _) in &files {
+            let method = symbols
+                .iter()
+                .find(|symbol| symbol.kind == SymbolKind::Method)
+                .unwrap();
+            assert_eq!(
+                method_belongs_to_origin(file, method, &origin, &unknown_graph, &symbol_map, None),
+                file == "store/origin_test.go",
+                "unknown test package must not invent cross-file ownership: {file}"
+            );
+        }
+        // One retained package clause still cannot classify another test file.
+        let mut partial = files.clone();
+        for (file, _, references) in &mut partial {
+            if file != "store/origin_test.go" {
+                references.clear();
+            }
+        }
+        let partial_graph = build_import_graph_with_languages(
+            &partial,
+            Language::Go,
+            None,
+            &WorkspaceContext::default(),
+        );
+        for (file, symbols, _) in &files {
+            let method = symbols
+                .iter()
+                .find(|symbol| symbol.kind == SymbolKind::Method)
+                .unwrap();
+            assert_eq!(
+                method_belongs_to_origin(file, method, &origin, &partial_graph, &symbol_map, None),
+                file == "store/origin_test.go",
+                "one known test package is insufficient: {file}"
             );
         }
     }
