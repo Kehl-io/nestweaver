@@ -317,7 +317,14 @@ pub fn resolve_references_with_file_languages(
             let Some(env) = original_envs.get(file_path) else {
                 continue;
             };
-            if env.call_assignments.is_empty() {
+            if env.call_assignments.is_empty()
+                && env.go_ranges.iter().all(|range| {
+                    !matches!(
+                        range.source,
+                        nestweaver_parser::parse::GoRangeSource::Call(_)
+                    )
+                })
+            {
                 continue;
             }
             let local_bindings: Vec<_> = references
@@ -326,7 +333,21 @@ pub fn resolve_references_with_file_languages(
                 .collect();
             let scope_index = FileScopeIndex::build(&local_bindings, sorted_syms);
             let calls_by_identity = scoped_call_reference_index(references);
-            for assignment in &env.call_assignments {
+            for (assignment, range_value) in env
+                .call_assignments
+                .iter()
+                .map(|assignment| (assignment, false))
+                .chain(
+                    env.go_ranges
+                        .iter()
+                        .filter_map(|range| match &range.source {
+                            nestweaver_parser::parse::GoRangeSource::Call(call) => {
+                                Some((call.as_ref(), true))
+                            }
+                            _ => None,
+                        }),
+                )
+            {
                 let Some(calls) = calls_by_identity.get(&(
                     assignment.callee.as_str(),
                     assignment.receiver.as_deref(),
@@ -401,21 +422,34 @@ pub fn resolve_references_with_file_languages(
                 else {
                     continue;
                 };
+                let mut binding = binding.clone();
+                if range_value {
+                    let Some(element) = crate::types::go_slice_element(&binding.type_name) else {
+                        continue;
+                    };
+                    binding.type_name = element;
+                }
                 seeds.push((
                     file_path.clone(),
                     assignment.clone(),
                     target_file.clone(),
-                    binding.clone(),
+                    binding,
                 ));
             }
         }
         for (file, assignment, target_file, binding) in seeds {
             if let Some(env) = derived.get_mut(&file) {
-                env.seed_scoped_return(&assignment, &target_file, &binding);
+                env.seed_scoped_return(
+                    &assignment,
+                    &target_file,
+                    &binding,
+                    language_for(&file) == Language::Go,
+                );
             }
         }
         for env in derived.values_mut() {
             env.propagate_scoped_aliases();
+            env.propagate_go_ranges();
         }
     }
     let type_envs = scoped_envs.as_ref().or(_type_envs);
@@ -12536,6 +12570,204 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
                 qa_calls(&files, &edges, (path, caller), (path, "Get", 6)),
                 "actual function/method/literal parameter must retain type evidence: {caller}: {edges:#?}"
             );
+        }
+    }
+
+    #[test]
+    fn go_slice_ranges_resolve_without_receiver_or_parameter_type_donors() {
+        for (receiver, argument, element) in [("c", "c", "c"), ("recv", "directArg", "element")] {
+            let source = format!(
+                "package app\ntype Local struct{{}}\nfunc ({receiver} Local) Deliver() {{}}\n\
+                 func direct({argument} Local) {{ {argument}.Deliver() }}\n\
+                 func values(items []Local) {{ for _, {element} := range items {{ {element}.Deliver() }} }}\n\
+                 func pointers(items []*Local) {{ for _, {element} := range items {{ {element}.Deliver() }} }}\n\
+                 func literal() {{ items := []Local{{{{}}}}; for _, {element} := range items {{ {element}.Deliver() }} }}\n\
+                 func pointerLiteral() {{ items := []*Local{{{{}}}}; for _, {element} := range items {{ {element}.Deliver() }} }}\n\
+                 func inlineLiteral() {{ for _, {element} := range []Local{{{{}}}} {{ {element}.Deliver() }} }}\n\
+                 func makeSlice() []Local {{ return []Local{{{{}}}} }}\n\
+                 func factory() {{ for _, {element} := range makeSlice() {{ {element}.Deliver() }} }}\n\
+                 func assignedFactory() {{ items := makeSlice(); for _, {element} := range items {{ {element}.Deliver() }} }}\n"
+            );
+            let (files, edges) = review_edges(&[("app.go", &source)], Language::Go);
+            for caller in [
+                "direct",
+                "values",
+                "pointers",
+                "literal",
+                "pointerLiteral",
+                "inlineLiteral",
+                "factory",
+                "assignedFactory",
+            ] {
+                assert!(
+                    qa_calls(&files, &edges, ("app.go", caller), ("app.go", "Deliver", 3)),
+                    "{caller}, receiver={receiver}, argument={argument}, element={element}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn go_slice_ranges_preserve_qualified_and_exact_factory_return_owners() {
+        let app = "package app\nimport alias \"store\"\nfunc parameter(items []*alias.Store) { for _, item := range items { item.Get() } }\nfunc literal() { items := []alias.Store{{}}; for _, item := range items { item.Get() } }\nfunc factory() { for _, item := range alias.All() { item.Get() } }\nfunc assigned() { items := alias.All(); for _, item := range items { item.Get() } }\n";
+        let input = [
+            (
+                "store/types.go",
+                "package store\ntype Store struct{}\nfunc All() []*Store { return []*Store{{}} }\n",
+            ),
+            (
+                "store/methods.go",
+                "package store\nfunc (recv *Store) Get() {}\n",
+            ),
+            (
+                "other/types.go",
+                "package other\ntype Store struct{}\nfunc (recv *Store) Get() {}\nfunc All() []*Store { return []*Store{{}} }\n",
+            ),
+            ("app.go", app),
+        ];
+        let (files, edges) = review_edges(&input, Language::Go);
+        for caller in ["parameter", "literal", "factory", "assigned"] {
+            assert!(
+                qa_calls(
+                    &files,
+                    &edges,
+                    ("app.go", caller),
+                    ("store/methods.go", "Get", 2)
+                ),
+                "{caller}: {edges:#?}"
+            );
+            assert!(
+                !qa_calls(
+                    &files,
+                    &edges,
+                    ("app.go", caller),
+                    ("other/types.go", "Get", 3)
+                ),
+                "foreign homonym in {caller}: {edges:#?}"
+            );
+        }
+        // Incremental resolution may retain the callee declaration without its
+        // references or a rebuilt type environment. Its exact return still owns
+        // the slice element type; another same-named factory cannot donate it.
+        let mut envs = std::collections::HashMap::new();
+        let parsed = parse_source(Path::new("app.go"), app).unwrap();
+        envs.insert(
+            "app.go".into(),
+            crate::types::TypeEnvironment::build(
+                app,
+                Language::Go,
+                &parsed.symbols,
+                &parsed.type_bindings,
+            ),
+        );
+        let mut incremental = files.clone();
+        for (file, _, references) in &mut incremental {
+            if file != "app.go" {
+                references.clear();
+            }
+        }
+        let edges = resolve_references_with_context(
+            &incremental,
+            Language::Go,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        for caller in ["factory", "assigned"] {
+            assert!(
+                qa_calls(
+                    &incremental,
+                    &edges,
+                    ("app.go", caller),
+                    ("store/methods.go", "Get", 2)
+                ),
+                "incremental {caller}: {edges:#?}"
+            );
+            assert!(
+                !qa_calls(
+                    &incremental,
+                    &edges,
+                    ("app.go", caller),
+                    ("other/types.go", "Get", 3)
+                ),
+                "incremental foreign {caller}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_slice_range_nested_shadows_and_indices_do_not_borrow_element_types() {
+        let path = "app.go";
+        let source = "package app\ntype First struct{}\nfunc (recv First) Deliver() {}\ntype Second struct{}\nfunc (recv Second) Deliver() {}\nfunc nested(outer []First, inner []Second) {\n for _, element := range outer {\n  element.Deliver()\n  for _, element := range inner { element.Deliver() }\n  element.Deliver()\n }\n}\nfunc shadow(items []First) {\n { items := []Second{{}}; for _, element := range items { element.Deliver() } }\n}\n// Parser negatives below deliberately call a method on an integer or interface.\nfunc index(items []First) { for element := range items { element.Deliver() } }\nfunc namedIndex(items []First) { for element, _ := range items { element.Deliver() } }\nfunc unknown(items []interface{}) { for _, element := range items { element.Deliver() } }\n";
+        let parsed = parse_source(Path::new(path), source).unwrap();
+        let env = crate::types::TypeEnvironment::build(
+            source,
+            Language::Go,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        let envs = std::collections::HashMap::from([(path.to_string(), env)]);
+        for (line, caller, first, second) in [
+            (8, "nested", true, false),
+            (9, "nested", false, true),
+            (10, "nested", true, false),
+            (14, "shadow", false, true),
+            (17, "index", false, false),
+            (18, "namedIndex", false, false),
+            (19, "unknown", false, false),
+        ] {
+            let references = parsed
+                .references
+                .iter()
+                .filter(|reference| {
+                    reference.kind != ReferenceKind::Call
+                        || reference.name != "Deliver"
+                        || reference.start_line == line
+                })
+                .cloned()
+                .collect();
+            let files = vec![(path.to_string(), parsed.symbols.clone(), references)];
+            let edges = resolve_references_with_context(
+                &files,
+                Language::Go,
+                "repo:test:abc",
+                &WorkspaceContext::default(),
+                Some(&envs),
+                None,
+            );
+            assert_eq!(
+                qa_calls(&files, &edges, (path, caller), (path, "Deliver", 3)),
+                first,
+                "line {line}, First: {edges:#?}"
+            );
+            assert_eq!(
+                qa_calls(&files, &edges, (path, caller), (path, "Deliver", 5)),
+                second,
+                "line {line}, Second: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_slice_range_re_resolution_retargets_a_changed_factory_element() {
+        for element_type in ["First", "Second"] {
+            let source = format!(
+                "package app\ntype First struct{{}}\nfunc (recv First) Deliver() {{}}\ntype Second struct{{}}\nfunc (recv Second) Deliver() {{}}\nfunc All() []{element_type} {{ return nil }}\nfunc use() {{ for _, element := range All() {{ element.Deliver() }} }}\n"
+            );
+            let (files, edges) = review_edges(&[("app.go", &source)], Language::Go);
+            for (name, line) in [("First", 3), ("Second", 5)] {
+                assert_eq!(
+                    qa_calls(
+                        &files,
+                        &edges,
+                        ("app.go", "use"),
+                        ("app.go", "Deliver", line)
+                    ),
+                    name == element_type,
+                    "changed return to {element_type}: {edges:#?}"
+                );
+            }
         }
     }
 
