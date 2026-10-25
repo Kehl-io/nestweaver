@@ -573,6 +573,7 @@ impl TypeEnvironment {
             bindings,
             scoped_bindings: HashMap::new(),
             call_assignments: Vec::new(),
+            go_ranges: Vec::new(),
             alias_assignments: Vec::new(),
             local_declarations: Vec::new(),
             rust_type_origins: Default::default(),
