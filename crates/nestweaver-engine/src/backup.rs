@@ -5742,11 +5742,54 @@ mod tests {
         std::fs::create_dir(&copied).unwrap();
         std::fs::write(copied.join("thesis.txt"), b"mine too").unwrap();
         std::fs::copy(restore_journal_path(&data), restore_journal_path(&copied)).unwrap();
-        recover_interrupted_restore(&copied).unwrap();
-        assert_eq!(
-            std::fs::read(copied.join("thesis.txt")).unwrap(),
-            b"mine too"
-        );
+        // A copied journal stays bound to its original namespace. Refusal
+        // must retain both foreign trees and the exact journal evidence.
+        let roots = [&data, &original, &copied];
+        let before: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                (
+                    tree_bytes(root),
+                    restore_tree_paths(root)
+                        .unwrap()
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                )
+            })
+            .collect();
+        let source_journal = std::fs::read(restore_journal_path(&data)).unwrap();
+        let copied_journal = std::fs::read(restore_journal_path(&copied)).unwrap();
+        assert!(!restoring_dir_for(&data).exists());
+        assert!(!restoring_dir_for(&copied).exists());
+        for _ in 0..2 {
+            let error = recover_interrupted_restore(&copied).unwrap_err();
+            assert!(error.downcast_ref::<BackupRefusal>().is_some(), "{error:#}");
+            assert!(format!("{error:#}").contains("namespace mismatch"));
+            for (root, (bytes, paths)) in roots.iter().zip(&before) {
+                assert_eq!(&tree_bytes(root), bytes);
+                assert_eq!(
+                    &restore_tree_paths(root)
+                        .unwrap()
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    paths
+                );
+            }
+            assert_eq!(
+                std::fs::read(restore_journal_path(&data)).unwrap(),
+                source_journal
+            );
+            assert_eq!(
+                std::fs::read(restore_journal_path(&copied)).unwrap(),
+                copied_journal
+            );
+            assert!(!restoring_dir_for(&data).exists());
+            assert!(!restoring_dir_for(&copied).exists());
+            assert_eq!(
+                std::fs::read(copied.join("thesis.txt")).unwrap(),
+                b"mine too"
+            );
+        }
     }
 
     #[test]

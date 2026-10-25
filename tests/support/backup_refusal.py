@@ -148,8 +148,12 @@ def live_repeat_restore(binary):
             assert all_bytes(target) == before
             assert journal.read_bytes() == raw
             journal.unlink()  # Only this fixture's successful negative control.
-        source.run('backup', 'restore', source.root/'missing-archive.nwsnap.zst',
-                   '--data-dir', target, '--force', expected=3)
+        # Public CLI generic operational errors use EXIT_ERROR=1. The native
+        # restore_crash_child's exit3 is an internal harness sentinel only.
+        missing = source.run('backup', 'restore', source.root/'missing-archive.nwsnap.zst',
+                             '--data-dir', target, '--force', expected=1)
+        assert 'No such file or directory' in missing.stderr, missing
+        assert 'missing-archive.nwsnap.zst' in missing.stderr, missing
         assert all_bytes(target) == before
         source.record(kind='typed_restore_refusal_vs_operational_io', passed=True)
 
