@@ -1,0 +1,258 @@
+name: Mutation testing (manual advisory)
+
+# Expensive test-strength diagnostics are opt-in. Ordinary PR CI still runs the
+# functional suite; an incomplete manual run remains an honest failure.
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Base branch name or full commit SHA to compare with the selected ref
+        required: true
+        default: main
+        type: string
+      ci_run_id:
+        description: Successful CI workflow run for the exact selected candidate SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  NESTWEAVER_INDEX_CPU_PERCENT: "0"
+  LBUG_BUILD_FROM_SOURCE: "1"
+  CFLAGS: "-DZSTD_DISABLE_ASM"
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  EXPECTED_SHA: ${{ github.sha }}
+  MUTATION_BASE_REF: ${{ inputs.base_ref }}
+  CI_RUN_ID: ${{ inputs.ci_run_id }}
+
+jobs:
+  mutants:
+    name: Mutation testing (advisory)
+    runs-on: ubuntu-latest
+    # Backstop only. Both budgeted steps bound themselves with their own
+    # `timeout` wrapper (see "Warm the -p build shape" and "Mutate only the
+    # selected diff") so that the reporting steps still run and can DISCLOSE
+    # a truncated run. This job-level limit exists for everything those
+    # wrappers can't cover — a wedged apt/cargo install, a hung cache restore.
+    # Cancelling the job here skips the disclosure, so it is set well above
+    # the sum of both budgets and should never be what fires.
+    #
+    # Setup + 30m unified prewarm + 35m mutation budget + signal grace and
+    # report/upload headroom. Neither bounded step may consume this backstop.
+    timeout-minutes: 80
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          # Resolve the selected base against the exact candidate checkout.
+          fetch-depth: 0
+      - name: Verify successful exact-candidate CI prerequisite
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export MUTATION_SCOPE_DIR="$RUNNER_TEMP/mutation-selection"
+          printf 'MUTATION_SCOPE_DIR=%s\n' "$MUTATION_SCOPE_DIR" >> "$GITHUB_ENV"
+          python3 <<'PY'
+          # BEGIN MUTATION PREREQUISITE
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          run_id = os.environ["CI_RUN_ID"]
+          if not re.fullmatch(r"[1-9][0-9]*", run_id):
+              raise SystemExit("ci_run_id must be a run ID")
+          path = Path("scripts/verify-mutation-prerequisite.py")
+          spec = importlib.util.spec_from_file_location("mutation_prerequisite", path)
+          helper = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(helper)
+          result = helper.observe_selected(os.environ["GITHUB_REPOSITORY"],
+                                           os.environ["EXPECTED_SHA"], int(run_id))
+          scope = Path(os.environ["MUTATION_SCOPE_DIR"])
+          scope.mkdir(parents=True, exist_ok=True)
+          (scope / "prerequisite.json").write_text(json.dumps(result, indent=2) + "\n")
+          # END MUTATION PREREQUISITE
+          PY
+      - name: Compute the selected mutation scope
+        id: prdiff
+        run: |
+          python3 <<'PY'
+          # BEGIN MUTATION SCOPE
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          expected = os.environ["EXPECTED_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", expected):
+              raise SystemExit("expected candidate must be a full commit SHA")
+          head = git("rev-parse", "--verify", "HEAD")
+          if head != expected:
+              raise SystemExit("checkout does not match the selected candidate")
+          base = os.environ["MUTATION_BASE_REF"]
+          if re.fullmatch(r"[0-9a-fA-F]{40}", base):
+              base_ref = base
+          else:
+              if not base or base.startswith("-") or base != base.strip():
+                  raise SystemExit("base_ref must be a branch name or full commit SHA")
+              git("check-ref-format", "--branch", base)
+              base_ref = "refs/remotes/origin/" + base
+          base_sha = git("rev-parse", "--verify", "--end-of-options", base_ref + "^{commit}")
+          merge_base = git("merge-base", base_sha, head)
+          selected_range = merge_base + ".." + head
+          scope = Path(os.environ["MUTATION_SCOPE_DIR"])
+          scope.mkdir(parents=True, exist_ok=True)
+          diff = scope / "input.diff"
+          files = scope / "files.txt"
+          packages = scope / "packages.txt"
+          common = ["git", "-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv"]
+          diff.write_bytes(subprocess.check_output([*common, "--unified=3", selected_range]))
+          files.write_bytes(subprocess.check_output([*common, "--name-only", selected_range]))
+          selected = subprocess.run([sys.executable, "scripts/select-mutation-packages.py",
+                                    str(files), str(packages)], check=True,
+                                   capture_output=True, text=True)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(selected.stdout)
+          (scope / "selection.json").write_text(json.dumps({
+              "requested_base": base, "base_sha": base_sha, "merge_base": merge_base,
+              "candidate_sha": head, "range": selected_range,
+              "sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                         for path in (diff, files, packages)}
+          }, indent=2) + "\n")
+          # END MUTATION SCOPE
+          PY
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - name: Check out the pinned LadybugDB source
+        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
+        # in scripts/fetch-lbug-source.sh only.
+        run: scripts/fetch-lbug-source.sh
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          # Share the `build` cache the other Rust jobs populate, instead of a
+          # private key that starts cold on every run. This job is ADVISORY, and
+          # it was spending most of its ~45m rebuilding a workspace three other
+          # jobs had already built. `save-if: false` so an advisory job never
+          # writes over the cache the gating jobs depend on.
+          shared-key: build
+          save-if: false
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          # Pinned to the exact version the exit-code and outcomes.json
+          # field-name comments below were verified against (`src/outcome.rs`
+          # and `src/exit_code.rs` at the `v27.1.0` tag in
+          # sourcefrog/cargo-mutants, byte-identical to that repo's `main` at
+          # verification time). `tool: cargo-mutants` alone would still be a
+          # PARTIAL pin — taiki-e/install-action's own README states an
+          # unversioned tool name resolves to "upstream releases with a delay
+          # of one to a few days" tied to the action's own version, not a
+          # specific tool version — so an unpinned tool name could silently
+          # install a newer cargo-mutants whose exit codes or JSON shape have
+          # moved out from under these comments without this file changing at
+          # all. Bump this deliberately, alongside re-verifying the cited
+          # source files, not by drift.
+          tool: cargo-mutants@27.1.0,cargo-nextest@0.9.140
+      - name: Warm the -p build shape before the mutation budget starts
+        id: prewarm
+        if: steps.prdiff.outputs.package_count != '0'
+        # Build the selected packages together, matching --test-package on
+        # every mutant. A store-only second build changes cc/parallel and
+        # defeats the native products just warmed by the engine build.
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=INT --kill-after=60s "$PREWARM_BUDGET" \
+            python3 scripts/prewarm-mutation-build.py "$MUTATION_SCOPE_DIR/packages.txt"
+          prewarm_status=$?
+          set -e
+          if [ "$prewarm_status" -eq 124 ]; then
+            echo "timed_out=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Mutation testing SKIPPED: unified prewarm did not finish inside $PREWARM_BUDGET; no mutation coverage measured."
+            exit 0
+          fi
+          echo "timed_out=false" >> "$GITHUB_OUTPUT"
+          exit "$prewarm_status"
+        env:
+          PREWARM_BUDGET: 30m
+          NESTWEAVER_NO_DAEMON: "1"
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
+      - name: Mutate only the selected diff
+        id: mutate
+        # Skipped when the pre-warm hit its budget: cargo-mutants would spend
+        # the whole MUTANTS_BUDGET finishing the build the pre-warm could not,
+        # and report zero tested mutants. See that step's 124 branch.
+        if: steps.prewarm.outputs.timed_out != 'true'
+        # Source scope is the selected package list plus --in-diff. All mutants
+        # test that same package union, matching prewarm's dependency features.
+        # Keep the bounded build/test/outer budgets, isolated CI Cargo adapter,
+        # disposable checkout and explicit incomplete-accounting disclosure.
+        # Incremental workspace output is reused only inside this job.
+        run: |
+          set -euo pipefail
+          NW_REAL_CARGO="$(rustup which cargo)"
+          export NW_REAL_CARGO
+          mkdir -p "$RUNNER_TEMP/ci-cargo"
+          ln -s "$PWD/scripts/ci-direct-cargo.sh" "$RUNNER_TEMP/ci-cargo/cargo"
+          export CARGO="$RUNNER_TEMP/ci-cargo/cargo"
+          export PATH="$RUNNER_TEMP/ci-cargo:$PATH"
+          bash scripts/run-mutation-scope.sh --packages "$MUTATION_SCOPE_DIR/packages.txt" --diff "$MUTATION_SCOPE_DIR/input.diff" \
+            --output "$PWD/mutation-evidence" --budget "$MUTANTS_BUDGET"
+        env:
+          # Deliberately shorter than the job's timeout-minutes so this
+          # wrapper, not the runner, is what stops a long run. The gap between
+          # them is no longer just "reporting headroom": timeout-minutes (80)
+          # also has to cover the pre-warm step's own PREWARM_BUDGET (30m,
+          # see "Warm the -p build shape") plus setup — see the job-level
+          # `timeout-minutes` comment above for the actual margin (10m
+          # nominal, ~7m worst-case with both steps' `--kill-after` grace).
+          MUTANTS_BUDGET: 35m
+          NESTWEAVER_NO_DAEMON: "1"
+          NESTWEAVER_ALLOW_NO_DAEMON: "1"
+      - name: Surviving mutants (read these — each one is a test that cannot fail)
+        if: always()
+        # An absent signal and a clean signal MUST NOT look the same. A run that
+        # stopped early, or never ran at all, reports that in place of the
+        # all-clear — it never gets to print "No surviving mutants".
+        env:
+          PREWARM_TIMED_OUT: ${{ steps.prewarm.outputs.timed_out }}
+        run: |
+          args=()
+          if [ "$PREWARM_TIMED_OUT" = true ]; then args+=(--prewarm-skipped); fi
+          python3 scripts/report-mutation-results.py --evidence "$PWD/mutation-evidence" "${args[@]}"
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mutants-report
+          path: |
+            mutation-evidence/
+            ${{ runner.temp }}/mutation-selection/
+          if-no-files-found: error
+          retention-days: 3

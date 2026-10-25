@@ -1,13 +1,9 @@
 name: Coverage
 
 on:
-  push:
-    branches: [main]
-  # Validate extraction on PRs that change this workflow itself.
-  pull_request:
-    branches: [main, staging]
-    paths: [.github/workflows/coverage.yml]
-  # Select the candidate branch/ref for explicit instrumented validation.
+  # Informational instrumentation is expensive; collect it weekly or on demand.
+  schedule:
+    - cron: '17 4 * * 0'
   workflow_dispatch:
 
 permissions:
@@ -31,73 +27,15 @@ env:
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
-  changes:
-    name: Detect changes
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
-        id: filter
-        with:
-          filters: |
-            rust:
-              - '**/*.rs'
-              - 'tests/support/isolated_daemon.py'
-              - 'tests/support/release_*.py'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              - '.cargo/**'
-              - '.github/workflows/ci.yml'
-              - '.github/workflows/coverage.yml'
-              - '.github/workflows/release-please.yml'
-              - '.github/CODEOWNERS'
-              - '.github/main-ruleset.json'
-              - 'CONTRIBUTING.md'
-              - 'release-please-config.json'
-              - 'scripts/observe-release-visibility.sh'
-              - 'scripts/verify-release-canary-pr.sh'
-              - 'scripts/verify-release-bundle.sh'
-              - 'scripts/verify-release-package.sh'
-              - 'scripts/verify-required-ci.sh'
-              - 'scripts/mutation-canary.py'
-              - 'scripts/verify-mutation-prerequisite.py'
-              - 'scripts/verify-main-rules.sh'
-              - 'scripts/verify-linux-archive.py'
-              - 'scripts/verify-release-fault.py'
-              - 'scripts/test-verify-release-fault.py'
-              - 'scripts/run-backlog-benchmarks.sh'
-              # The pinned LadybugDB source every compiling job builds from,
-              # and the other build entry points that fetch it.
-              - 'scripts/fetch-lbug-source.sh'
-              - 'Dockerfile'
-              - '.dockerignore'
-              - '.devcontainer/**'
-              - 'examples/**'
-              - 'instance.toml'
-              - 'INSTALL.md'
-              - 'README.md'
-              - 'CLAUDE.md'
-              - 'docs/**'
-              - 'npm/**'
-              - 'smithery.yaml'
   coverage:
     name: Coverage
     # Higher than the others: coverage instruments every crate and its five
     # observed green runs averaged 105m.
     timeout-minutes: 180
-    needs: changes
     # Coverage is informational (uploads an lcov artifact; nothing gates on it)
-    # and is the single slowest job — a full *instrumented* recompile. Keep it
-    # main-only by default, with an explicit branch validation for backlog work.
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true'
+    # and requires a full instrumented recompile. Required CI validates this
+    # definition; scheduled/manual runs perform the instrumentation.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space

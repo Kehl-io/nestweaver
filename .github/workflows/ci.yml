@@ -133,7 +133,6 @@ jobs:
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
-              - '.github/workflows/coverage.yml'
               - '.github/workflows/release-please.yml'
               - '.github/CODEOWNERS'
               - '.github/main-ruleset.json'
@@ -719,7 +718,7 @@ jobs:
           # Only main saves: branch and PR caches are unreadable elsewhere and
           # evicted main's under the 10 GB repository cap. Branches restore main's.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
+          cache-on-failure: false
           shared-key: build
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
@@ -874,6 +873,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    env:
+      # Match the test/build cache profile instead of creating another namespace.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Free disk space
         run: |
@@ -892,10 +895,8 @@ jobs:
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # Only main saves: branch and PR caches are unreadable elsewhere and
-          # evicted main's under the 10 GB repository cap. Branches restore main's.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
+          # Restore the complete Build & Tests cache; consumers never publish it.
+          save-if: false
           shared-key: build
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
@@ -962,10 +963,8 @@ jobs:
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # Only main saves: branch and PR caches are unreadable elsewhere and
-          # evicted main's under the 10 GB repository cap. Branches restore main's.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
+          # Restore the complete Build & Tests cache; consumers never publish it.
+          save-if: false
           shared-key: build
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
@@ -1038,191 +1037,6 @@ jobs:
           fi
           echo "::error::$cache_dir was created during this job's tests — a test reached the real platform model cache instead of an isolated tempdir (nw-483)."
           exit 1
-
-  mutants:
-    name: Mutation testing (advisory)
-    needs: changes
-    # ADVISORY, NOT ABSENT: this job is not in `required-ci`'s `needs` (nw-282),
-    # so it can never block a merge, and there is deliberately no
-    # mutation-score threshold — a score target invites tests written to kill
-    # mutants rather than to check behaviour (Goodhart). Google's deployment
-    # reports surface individual SURVIVING mutants on the diff under review and
-    # never show developers a score; that is the model here.
-    #
-    # But "advisory" no longer means `continue-on-error: true`. Through
-    # 2026-09 that flag forced this job's own conclusion to `success`
-    # regardless of what any step reported, and cargo-mutants' `--timeout 300`
-    # baseline (see below) truncated on every cross-cutting diff (nw-445:
-    # PR #389 jobs 103681801425/103757379892/103770556730, PR #392 job
-    # 103841693321 — three truncations in a row, each rendered green with
-    # ZERO mutants tested). The contract as of this change:
-    #   - a genuine cargo-mutants error/timeout, or a run with incomplete
-    #     mutant accounting, is now a real job
-    #     `failure` (red X on the PR, `::error::` annotation, step summary
-    #     line) — see the "Surviving mutants" step;
-    #   - "no Rust package in the diff" and "diff generated zero mutants" stay
-    #     `success` with an explicit summary line, because both are legitimate
-    #     nothing-to-do outcomes, not missing signal;
-    #   - surviving mutants (status 2) stay `success` with a report table —
-    #     mutation SCORE is still not a merge gate, only mutation ABSENCE-OF-
-    #     SIGNAL is.
-    #
-    # Why it exists: the post-7.0.0 review found ~20 tests that pass with the
-    # fix they guard reverted — several guarding named tickets, so they read as
-    # coverage while guarding nothing. Coverage cannot see that class; mutant
-    # detection correlates with real fault detection INDEPENDENTLY of coverage
-    # (Just et al., FSE 2014).
-    #
-    # `--in-diff` keeps it to the PR's own changes, which is what makes the
-    # runtime tolerable — a full baseline is a separate, occasional run.
-    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    # Backstop only. Both budgeted steps bound themselves with their own
-    # `timeout` wrapper (see "Warm the -p build shape" and "Mutate only what
-    # this PR changed") so that the reporting steps still run and can DISCLOSE
-    # a truncated run. This job-level limit exists for everything those
-    # wrappers can't cover — a wedged apt/cargo install, a hung cache restore.
-    # Cancelling the job here skips the disclosure, so it is set well above
-    # the sum of both budgets and should never be what fires.
-    #
-    # Setup + 30m unified prewarm + 35m mutation budget + signal grace and
-    # report/upload headroom. Neither bounded step may consume this backstop.
-    timeout-minutes: 80
-    steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
-          sudo apt-get clean
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-          # `--in-diff` needs the base commit to diff against.
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
-      - name: Check out the pinned LadybugDB source
-        # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
-        # in scripts/fetch-lbug-source.sh only.
-        run: scripts/fetch-lbug-source.sh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          cache-on-failure: true
-          # Share the `build` cache the other Rust jobs populate, instead of a
-          # private key that starts cold on every PR. This job is ADVISORY, and
-          # it was spending most of its ~45m rebuilding a workspace three other
-          # jobs had already built. `save-if: false` so an advisory job never
-          # writes over the cache the gating jobs depend on.
-          shared-key: build
-          save-if: false
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
-      - name: Install cargo-mutants
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
-        with:
-          # Pinned to the exact version the exit-code and outcomes.json
-          # field-name comments below were verified against (`src/outcome.rs`
-          # and `src/exit_code.rs` at the `v27.1.0` tag in
-          # sourcefrog/cargo-mutants, byte-identical to that repo's `main` at
-          # verification time). `tool: cargo-mutants` alone would still be a
-          # PARTIAL pin — taiki-e/install-action's own README states an
-          # unversioned tool name resolves to "upstream releases with a delay
-          # of one to a few days" tied to the action's own version, not a
-          # specific tool version — so an unpinned tool name could silently
-          # install a newer cargo-mutants whose exit codes or JSON shape have
-          # moved out from under these comments without this file changing at
-          # all. Bump this deliberately, alongside re-verifying the cited
-          # source files, not by drift.
-          tool: cargo-mutants@27.1.0,cargo-nextest@0.9.140
-      - name: Compute the PR diff
-        id: prdiff
-        # ONE range expression, TWO artifacts (the diff and the file list) and
-        # ONE package computation. nw-272: the package list and the mutant
-        # list must come from the SAME diff — computing the range twice lets
-        # them drift silently, so `--in-diff` could generate a mutant in a
-        # package `-p` never built (skipped, invisible) or `-p` could baseline
-        # packages with no mutants (the exact cost this scoping removes). Both
-        # failure modes look like a normal run.
-        #
-        # This file is shared by prewarm and mutation discovery/test selection.
-        run: |
-          git diff "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.diff
-          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > /tmp/pr.files
-          python3 scripts/select-mutation-packages.py /tmp/pr.files /tmp/pr.pkgs >> "$GITHUB_OUTPUT"
-      - name: Warm the -p build shape before the mutation budget starts
-        id: prewarm
-        if: steps.prdiff.outputs.package_count != '0'
-        # Build the selected packages together, matching --test-package on
-        # every mutant. A store-only second build changes cc/parallel and
-        # defeats the native products just warmed by the engine build.
-        run: |
-          set -euo pipefail
-          set +e
-          timeout --signal=INT --kill-after=60s "$PREWARM_BUDGET" \
-            python3 scripts/prewarm-mutation-build.py /tmp/pr.pkgs
-          prewarm_status=$?
-          set -e
-          if [ "$prewarm_status" -eq 124 ]; then
-            echo "timed_out=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::Mutation testing SKIPPED: unified prewarm did not finish inside $PREWARM_BUDGET; no mutation coverage measured."
-            exit 0
-          fi
-          echo "timed_out=false" >> "$GITHUB_OUTPUT"
-          exit "$prewarm_status"
-        env:
-          PREWARM_BUDGET: 30m
-          NESTWEAVER_NO_DAEMON: "1"
-          NESTWEAVER_ALLOW_NO_DAEMON: "1"
-      - name: Mutate only what this PR changed
-        id: mutate
-        # Skipped when the pre-warm hit its budget: cargo-mutants would spend
-        # the whole MUTANTS_BUDGET finishing the build the pre-warm could not,
-        # and report zero tested mutants. See that step's 124 branch.
-        if: steps.prewarm.outputs.timed_out != 'true'
-        # Source scope is the PR package list plus --in-diff. All mutants
-        # test that same package union, matching prewarm's dependency features.
-        # Keep the bounded build/test/outer budgets, isolated CI Cargo adapter,
-        # disposable checkout and explicit incomplete-accounting disclosure.
-        # Incremental workspace output is reused only inside this job.
-        run: |
-          set -euo pipefail
-          NW_REAL_CARGO="$(rustup which cargo)"
-          export NW_REAL_CARGO
-          mkdir -p "$RUNNER_TEMP/ci-cargo"
-          ln -s "$PWD/scripts/ci-direct-cargo.sh" "$RUNNER_TEMP/ci-cargo/cargo"
-          export CARGO="$RUNNER_TEMP/ci-cargo/cargo"
-          export PATH="$RUNNER_TEMP/ci-cargo:$PATH"
-          bash scripts/run-mutation-scope.sh --packages /tmp/pr.pkgs --diff /tmp/pr.diff \
-            --output "$PWD/mutation-evidence" --budget "$MUTANTS_BUDGET"
-        env:
-          # Deliberately shorter than the job's timeout-minutes so this
-          # wrapper, not the runner, is what stops a long run. The gap between
-          # them is no longer just "reporting headroom": timeout-minutes (80)
-          # also has to cover the pre-warm step's own PREWARM_BUDGET (30m,
-          # see "Warm the -p build shape") plus setup — see the job-level
-          # `timeout-minutes` comment above for the actual margin (10m
-          # nominal, ~7m worst-case with both steps' `--kill-after` grace).
-          MUTANTS_BUDGET: 35m
-          NESTWEAVER_NO_DAEMON: "1"
-          NESTWEAVER_ALLOW_NO_DAEMON: "1"
-      - name: Surviving mutants (read these — each one is a test that cannot fail)
-        if: always()
-        # An absent signal and a clean signal MUST NOT look the same. A run that
-        # stopped early, or never ran at all, reports that in place of the
-        # all-clear — it never gets to print "No surviving mutants".
-        env:
-          PREWARM_TIMED_OUT: ${{ steps.prewarm.outputs.timed_out }}
-        run: |
-          args=()
-          if [ "$PREWARM_TIMED_OUT" = true ]; then args+=(--prewarm-skipped); fi
-          python3 scripts/report-mutation-results.py --evidence "$PWD/mutation-evidence" "${args[@]}"
-      - name: Upload mutants report
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: mutants-report
-          path: mutation-evidence/
-          if-no-files-found: error
-          retention-days: 3
 
   audit:
     name: Security Audit
@@ -1395,6 +1209,10 @@ jobs:
     # side changes.
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
+    env:
+      # Match the test/build cache profile instead of creating another namespace.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Free disk space
         run: |
@@ -1412,10 +1230,8 @@ jobs:
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # Only main saves: branch and PR caches are unreadable elsewhere and
-          # evicted main's under the 10 GB repository cap. Branches restore main's.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
+          # Restore the complete Build & Tests cache; consumers never publish it.
+          save-if: false
           shared-key: build
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:

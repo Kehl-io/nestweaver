@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind a main-only canary to current same-SHA normal CI runtime evidence."""
+"""Bind mutation diagnostics to same-SHA CI; default canaries remain main-only."""
 import argparse
 import importlib.util
 import json
@@ -13,6 +13,50 @@ SPEC = importlib.util.spec_from_file_location('release_required', Path(__file__)
 RELEASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RELEASE)
 JOB_NAMES = ('Required CI', 'Build & Tests', 'Daemon Integration Tests', 'Standard artifact daemon acceptance')
+
+
+def require_runtime_jobs(run, jobs, sha):
+    """Require real successful runtime evidence for the exact run attempt."""
+    attempt = run.get('run_attempt')
+    if (not re.fullmatch('[0-9a-f]{40}', sha) or run.get('head_sha') != sha
+            or type(attempt) is not int or attempt < 1):
+        raise ValueError('invalid runtime prerequisite identity')
+    chosen = []
+    for name in JOB_NAMES:
+        matches = [job for job in jobs if job.get('name') == name and job.get('run_attempt') == attempt]
+        if (len(matches) != 1 or matches[0].get('head_sha') != sha
+                or matches[0].get('status') != 'completed' or matches[0].get('conclusion') != 'success'):
+            raise ValueError(f'actual current runtime job must succeed: {name}')
+        chosen.append(matches[0])
+    return chosen
+
+
+def observe_selected(repo, sha, run_id, fetch=RELEASE.api):
+    """Bind an explicitly selected manual run without relaxing main-only canaries."""
+    if not re.fullmatch('[0-9a-f]{40}', sha) or type(run_id) is not int or run_id <= 0:
+        raise ValueError('invalid prerequisite identity')
+    path = f'actions/runs/{run_id}'
+    def selected_run():
+        pages = fetch(repo, path)
+        if len(pages) != 1 or not isinstance(pages[0], dict):
+            raise ValueError('unreadable selected CI run')
+        run = pages[0]
+        workflow_path = run.get('path')
+        if (run.get('id') != run_id or run.get('head_sha') != sha
+                or not isinstance(workflow_path, str)
+                or workflow_path.split('@', 1)[0] != '.github/workflows/ci.yml'
+                or run.get('status') != 'completed' or run.get('conclusion') != 'success'
+                or type(run.get('run_attempt')) is not int or run['run_attempt'] < 1):
+            raise ValueError('selected exact-candidate CI is not successful')
+        return run
+    run = selected_run()
+    data = fetch(repo, f"actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100")
+    chosen = require_runtime_jobs(run, RELEASE.pages(data, 'jobs'), sha)
+    latest = selected_run()
+    if latest['run_attempt'] != run['run_attempt']:
+        raise ValueError('prerequisite changed during observation')
+    return dict(sha=sha, run_id=run_id, run_attempt=run['run_attempt'], workflow_path=run['path'],
+                run_url=run.get('html_url'), jobs=chosen, observed_at=datetime.now(timezone.utc).isoformat())
 
 
 def observe(repo, sha, run_id, fetch=RELEASE.api):
@@ -32,12 +76,7 @@ def observe(repo, sha, run_id, fetch=RELEASE.api):
     if state != 'pass':
         raise ValueError(f'Required CI prerequisite is not passing: {reason}')
     jobs = RELEASE.pages(data, 'jobs')
-    chosen = []
-    for name in JOB_NAMES:
-        matches = [job for job in jobs if job['name'] == name and job['run_attempt'] == run['run_attempt']]
-        if len(matches) != 1 or matches[0]['status'] != 'completed' or matches[0]['conclusion'] != 'success':
-            raise ValueError(f'actual current runtime job must succeed: {name}')
-        chosen.append(matches[0])
+    chosen = require_runtime_jobs(run, jobs, sha)
     latest = RELEASE.select_run(fetch(repo, path), sha)
     if latest is None or (latest['id'], latest['run_attempt']) != (run_id, run['run_attempt']):
         raise ValueError('prerequisite changed during observation')
