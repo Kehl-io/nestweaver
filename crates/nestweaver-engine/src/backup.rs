@@ -926,6 +926,10 @@ struct RestoreJournal {
 impl OriginalLiveProof {
     fn capture(path: &Path) -> anyhow::Result<Self> {
         let directory = AnchoredDirectory::open(path)?;
+        Self::capture_directory(&directory)
+    }
+
+    fn capture_directory(directory: &AnchoredDirectory) -> anyhow::Result<Self> {
         let (paths, files) = directory.snapshot()?;
         Ok(Self {
             identity: directory.identity()?,
@@ -934,9 +938,8 @@ impl OriginalLiveProof {
         })
     }
 
-    fn verify(&self, path: &Path) -> anyhow::Result<()> {
-        let observed =
-            Self::capture(path).map_err(|error| expected_directory_error(error, path))?;
+    fn verify_directory(&self, directory: &AnchoredDirectory) -> anyhow::Result<()> {
+        let observed = Self::capture_directory(directory)?;
         require_backup!(
             observed.identity == self.identity
                 && observed
@@ -1053,12 +1056,12 @@ impl LivePreservation {
         let source_name = aside
             .file_name()
             .ok_or_else(|| BackupRefusal("missing aside name in recovery proof".into()))?;
-        let source_entry = source.path().join(source_name);
-        let destination_entry = destination.path().join("original");
-        if source_entry.try_exists()? {
-            self.original.verify(&source_entry)?;
+        let retained_name = std::ffi::OsStr::new("original");
+        if source.entry_stat(source_name)?.is_some() {
+            let original = source.verified_child_directory(source_name)?;
+            self.original.verify_directory(&original)?;
             require_backup!(
-                std::fs::read_dir(destination.path())?.next().is_none(),
+                destination.entry_names()?.is_empty(),
                 "preservation reservation is not empty; no path was replaced"
             );
             hook("before-rename")?;
@@ -1069,17 +1072,17 @@ impl LivePreservation {
             hook("after-rename")?;
             maybe_crash_restore_step_for_test("after-live-preserve");
         }
-        let reserved_entries =
-            std::fs::read_dir(destination.path())?.collect::<Result<Vec<_>, _>>()?;
+        let reserved_entries = destination.entry_names()?;
         require_backup!(
-            reserved_entries.len() == 1 && reserved_entries[0].file_name() == "original",
+            reserved_entries.len() == 1 && reserved_entries[0].as_os_str() == retained_name,
             "preservation reservation contains unknown entries; all copies retained"
         );
         require_backup!(
-            !source_entry.try_exists()?,
+            source.entry_stat(source_name)?.is_none(),
             "both original and retained live copies exist; journal preserved"
         );
-        self.original.verify(&destination_entry)?;
+        let retained = destination.verified_child_directory(retained_name)?;
+        self.original.verify_directory(&retained)?;
         self.check_bindings(&source, &destination)?;
         maybe_fail_live_restore_io("reservation-fsync")?;
         destination.file.sync_all().with_context(|| {
@@ -1097,7 +1100,9 @@ impl LivePreservation {
         })?;
         // Recheck after durability and before the caller retires the journal.
         self.check_bindings(&source, &destination)?;
-        self.original.verify(&destination_entry)?;
+        // Reopen through the held reservation to detect a swapped child name.
+        let retained = destination.verified_child_directory(retained_name)?;
+        self.original.verify_directory(&retained)?;
         maybe_crash_restore_step_for_test("live-preserve-durable");
         Ok(self.preserved_path.clone())
     }
@@ -1107,9 +1112,11 @@ impl LivePreservation {
     fn retire_empty_reservation(&self, data_dir: &Path) -> anyhow::Result<()> {
         self.validate_paths(data_dir)?;
         let parent = AnchoredDirectory::open(&self.namespace)?;
-        if std::fs::symlink_metadata(&self.reservation)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        {
+        let reservation_name = self
+            .reservation
+            .file_name()
+            .ok_or_else(|| BackupRefusal("missing reservation name".into()))?;
+        if parent.entry_stat(reservation_name)?.is_none() {
             require_backup!(
                 parent.identity()? == self.namespace_identity
                     && restore_directory_identity(&self.namespace) == Some(self.namespace_identity)
@@ -1118,10 +1125,10 @@ impl LivePreservation {
             );
             return Ok(());
         }
-        let reservation = AnchoredDirectory::open(&self.reservation)?;
+        let reservation = parent.verified_child_directory(reservation_name)?;
         self.check_bindings(&parent, &reservation)?;
         require_backup!(
-            std::fs::read_dir(reservation.path())?.next().is_none(),
+            reservation.entry_names()?.is_empty(),
             "unused live reservation has unknown contents; retained at {}",
             self.reservation.display()
         );
@@ -1179,6 +1186,58 @@ struct AnchoredDirectory {
     file: std::fs::File,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn restore_stat_u64<T: TryInto<u64>>(value: T, field: &str) -> anyhow::Result<u64> {
+    value.try_into().map_err(|_| {
+        BackupRefusal(format!(
+            "preserved {field} cannot be represented as an unsigned witness"
+        ))
+        .into()
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn restore_stat_i64<T: TryInto<i64>>(value: T, field: &str) -> anyhow::Result<i64> {
+    value.try_into().map_err(|_| {
+        BackupRefusal(format!(
+            "preserved {field} cannot be represented as a timestamp witness"
+        ))
+        .into()
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stat_identity(metadata: &libc::stat) -> anyhow::Result<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    let device = restore_stat_u64(metadata.st_dev, "device")?;
+    // Darwin dev_t is an opaque signed i32. Match std MetadataExt::dev's
+    // sign-extension/bit interpretation exactly, including negative values.
+    #[cfg(target_os = "macos")]
+    let device = u64::from_ne_bytes(i64::from(metadata.st_dev).to_ne_bytes());
+    Ok((device, restore_stat_u64(metadata.st_ino, "inode")?))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn restore_file_witness_from_stat(metadata: &libc::stat) -> anyhow::Result<RestoreFileWitness> {
+    let (device, inode) = stat_identity(metadata)?;
+    let modified_nanoseconds = restore_stat_i64(metadata.st_mtime_nsec, "mtime nanoseconds")?;
+    let changed_nanoseconds = restore_stat_i64(metadata.st_ctime_nsec, "ctime nanoseconds")?;
+    require_backup!(
+        (0..1_000_000_000).contains(&modified_nanoseconds)
+            && (0..1_000_000_000).contains(&changed_nanoseconds),
+        "preserved timestamp nanoseconds are outside their valid range"
+    );
+    Ok(RestoreFileWitness {
+        device,
+        inode,
+        length: restore_stat_u64(metadata.st_size, "file length")?,
+        modified_seconds: restore_stat_i64(metadata.st_mtime, "mtime seconds")?,
+        modified_nanoseconds,
+        changed_seconds: restore_stat_i64(metadata.st_ctime, "ctime seconds")?,
+        changed_nanoseconds,
+    })
+}
+
 impl AnchoredDirectory {
     fn open(path: &Path) -> anyhow::Result<Self> {
         #[cfg(unix)]
@@ -1211,25 +1270,6 @@ impl AnchoredDirectory {
         }
     }
 
-    fn path(&self) -> PathBuf {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            #[cfg(target_os = "linux")]
-            {
-                PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()))
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            PathBuf::new()
-        }
-    }
-
     fn observed_path(&self) -> Option<PathBuf> {
         #[cfg(target_os = "macos")]
         {
@@ -1246,9 +1286,145 @@ impl AnchoredDirectory {
             path.truncate(end);
             Some(PathBuf::from(std::ffi::OsString::from_vec(path)))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
-            std::fs::read_link(self.path()).ok()
+            use std::os::fd::AsRawFd;
+            // Diagnostic only. Operational traversal always uses *at APIs.
+            std::fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd())).ok()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            None
+        }
+    }
+
+    fn entry_names(&self) -> anyhow::Result<Vec<std::ffi::OsString>> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::fd::IntoRawFd;
+            use std::os::unix::ffi::OsStringExt;
+
+            // openat(".") creates an independent directory offset. dup would
+            // share it with the anchor and could make later snapshots empty.
+            let scan = self.child_directory(std::ffi::OsStr::new("."))?;
+            let fd = scan.file.into_raw_fd();
+            // SAFETY: fd is an owned directory descriptor. On success the DIR
+            // stream owns it; on failure fdopendir leaves ownership with us.
+            let stream = unsafe { libc::fdopendir(fd) };
+            if stream.is_null() {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: fdopendir failed, so fd still belongs to this call.
+                unsafe { libc::close(fd) };
+                return Err(error.into());
+            }
+            struct DirectoryStream(*mut libc::DIR);
+            impl Drop for DirectoryStream {
+                fn drop(&mut self) {
+                    // SAFETY: exactly one guard owns the successful DIR stream.
+                    unsafe { libc::closedir(self.0) };
+                }
+            }
+            let stream = DirectoryStream(stream);
+            let mut names = Vec::new();
+            loop {
+                // SAFETY: these accessors return this thread's errno slot.
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    *libc::__errno_location() = 0
+                };
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    *libc::__error() = 0
+                };
+                // SAFETY: stream remains exclusively owned until after we copy
+                // this entry's NUL-terminated name, before the next readdir.
+                let entry = unsafe { libc::readdir(stream.0) };
+                if entry.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error().is_some_and(|code| code != 0) {
+                        return Err(error.into());
+                    }
+                    break;
+                }
+                // SAFETY: a successful readdir supplies a terminated d_name.
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+                if matches!(name.to_bytes(), b"." | b"..") {
+                    continue;
+                }
+                require_backup!(
+                    names.len() < 100_000,
+                    "live preservation inventory exceeds its bound"
+                );
+                names.push(std::ffi::OsString::from_vec(name.to_bytes().to_vec()));
+            }
+            Ok(names)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            anyhow::bail!("descriptor anchored directory enumeration is unsupported")
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn entry_stat(&self, name: &std::ffi::OsStr) -> anyhow::Result<Option<libc::stat>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(name.as_bytes())?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: held parent FD, terminated direct child name, valid output
+        // storage. No file is opened, and final symlinks are never followed.
+        if unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        // SAFETY: successful fstatat initialized the complete output struct.
+        Ok(Some(unsafe { metadata.assume_init() }))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn entry_stat(&self, _name: &std::ffi::OsStr) -> anyhow::Result<Option<()>> {
+        anyhow::bail!("descriptor anchored directory metadata is unsupported")
+    }
+
+    fn verified_child_directory(&self, name: &std::ffi::OsStr) -> anyhow::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let before = self.entry_stat(name)?.ok_or_else(|| {
+                BackupRefusal("preservation child is missing; all copies retained".into())
+            })?;
+            require_backup!(
+                before.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                "preservation child is not a directory; all copies retained"
+            );
+            let child = self
+                .child_directory(name)
+                .map_err(|error| expected_directory_error(error, Path::new(name)))?;
+            let after = self.entry_stat(name)?.ok_or_else(|| {
+                BackupRefusal("preservation child disappeared; all copies retained".into())
+            })?;
+            require_backup!(
+                stat_identity(&before)? == child.identity()?
+                    && stat_identity(&after)? == child.identity()?
+                    && after.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                "preservation child changed; all copies retained"
+            );
+            Ok(child)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = name;
+            anyhow::bail!("descriptor anchored directory metadata is unsupported")
         }
     }
 
@@ -1259,9 +1435,8 @@ impl AnchoredDirectory {
             paths: &mut Vec<String>,
             files: &mut HashMap<String, RestoreFileWitness>,
         ) -> anyhow::Result<()> {
-            for entry in std::fs::read_dir(directory.path())? {
-                let entry = entry?;
-                let name = entry.file_name();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            for name in directory.entry_names()? {
                 let name_text = name
                     .to_str()
                     .ok_or_else(|| BackupRefusal("non-UTF8 preserved path".into()))?;
@@ -1272,27 +1447,31 @@ impl AnchoredDirectory {
                         && prefix.bytes().filter(|byte| *byte == b'/').count() < 64,
                     "live preservation inventory exceeds its bound"
                 );
-                let metadata = std::fs::symlink_metadata(directory.path().join(&name))?;
+                let metadata = directory.entry_stat(&name)?.ok_or_else(|| {
+                    BackupRefusal("preserved entry disappeared; all copies retained".into())
+                })?;
                 paths.push(relative.clone());
-                if metadata.is_dir() {
-                    let child = directory.child_directory(&name)?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        require_backup!(
-                            child.identity()? == (metadata.dev(), metadata.ino()),
-                            "preservation child changed"
-                        );
-                    }
+                if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    let child = directory.verified_child_directory(&name)?;
+                    require_backup!(
+                        child.identity()? == stat_identity(&metadata)?,
+                        "preservation child changed"
+                    );
                     walk(&child, &format!("{relative}/"), paths, files)?;
                 } else {
                     require_backup!(
-                        regular_unique_file(&metadata),
+                        metadata.st_mode & libc::S_IFMT == libc::S_IFREG && metadata.st_nlink == 1,
                         "non-regular or linked preserved entry"
                     );
-                    files.insert(relative, restore_file_witness_from_metadata(&metadata)?);
+                    files.insert(relative, restore_file_witness_from_stat(&metadata)?);
                 }
             }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = (directory, prefix, paths, files);
+                anyhow::bail!("descriptor anchored snapshots are unsupported");
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Ok(())
         }
         let mut paths = Vec::new();
@@ -5901,6 +6080,251 @@ mod tests {
             .collect()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn anchored_snapshot_preserves_nested_tree_and_independent_iteration_offsets() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("directory with spaces");
+        std::fs::create_dir(&root).unwrap();
+        let anchor = AnchoredDirectory::open(&root).unwrap();
+        assert!(anchor.entry_names().unwrap().is_empty());
+        assert!(anchor.snapshot().unwrap().0.is_empty());
+        std::fs::create_dir_all(root.join("nested/deep")).unwrap();
+        std::fs::write(root.join("nested/deep/value.bin"), b"preserved").unwrap();
+        // More than one small directory buffer; repeated enumerations must
+        // start independently rather than sharing a dup'd descriptor offset.
+        for number in 0u8..128 {
+            std::fs::write(root.join(format!("item-{number:03}")), [number]).unwrap();
+        }
+        let proof = OriginalLiveProof::capture_directory(&anchor).unwrap();
+        let expected_paths = restore_tree_paths(&root)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            proof
+                .paths
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_paths
+        );
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        assert_eq!(proof.identity, (metadata.dev(), metadata.ino()));
+        assert_eq!(proof.files.len(), 129);
+        for (relative, witness) in &proof.files {
+            assert_eq!(
+                *witness,
+                restore_file_witness(&root.join(relative)).unwrap()
+            );
+        }
+        assert!(restore_stat_u64(-1_i64, "test negative").is_err());
+        assert!(restore_stat_i64(u64::MAX, "test overflow").is_err());
+        let mut invalid = anchor
+            .entry_stat(std::ffi::OsStr::new("item-000"))
+            .unwrap()
+            .unwrap();
+        let valid_length = invalid.st_size;
+        invalid.st_size = -1;
+        assert!(
+            restore_file_witness_from_stat(&invalid)
+                .unwrap_err()
+                .downcast_ref::<BackupRefusal>()
+                .is_some()
+        );
+        invalid.st_size = valid_length;
+        #[cfg(target_os = "macos")]
+        {
+            let device = invalid.st_dev;
+            invalid.st_dev = -1;
+            assert_eq!(
+                restore_file_witness_from_stat(&invalid).unwrap().device,
+                u64::MAX
+            );
+            invalid.st_dev = device;
+        }
+        invalid.st_mtime_nsec = 1_000_000_000;
+        assert!(
+            restore_file_witness_from_stat(&invalid)
+                .unwrap_err()
+                .downcast_ref::<BackupRefusal>()
+                .is_some()
+        );
+        for _ in 0..3 {
+            assert_eq!(anchor.entry_names().unwrap().len(), 129);
+            let (paths, files) = anchor.snapshot().unwrap();
+            assert_eq!(
+                paths.into_iter().collect::<std::collections::BTreeSet<_>>(),
+                expected_paths
+            );
+            assert_eq!(files, proof.files);
+            proof.verify_directory(&anchor).unwrap();
+        }
+        let bytes = tree_bytes(&root);
+        assert_eq!(bytes.len(), 129);
+        assert_eq!(bytes["nested/deep/value.bin"], b"preserved");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn anchored_snapshot_stays_on_held_directory_after_namespace_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let namespace = tmp.path().join("namespace");
+        let data = namespace.join("data");
+        std::fs::create_dir_all(data.join("nested")).unwrap();
+        std::fs::write(data.join("nested/original"), b"original canary").unwrap();
+        let parent = AnchoredDirectory::open(&namespace).unwrap();
+        let anchor = parent
+            .verified_child_directory(std::ffi::OsStr::new("data"))
+            .unwrap();
+        let proof = OriginalLiveProof::capture_directory(&anchor).unwrap();
+        let receipt = LivePreservation::reserve(&data).unwrap();
+        let original_bytes = tree_bytes(&data);
+        let displaced = tmp.path().join("displaced namespace");
+        std::fs::rename(&namespace, &displaced).unwrap();
+        std::fs::create_dir_all(data.join("nested")).unwrap();
+        std::fs::write(data.join("nested/foreign"), b"foreign canary").unwrap();
+        let foreign_bytes = tree_bytes(&data);
+        // The matching visible reservation is foreign too. Both directory
+        // opens must succeed so refusal exercises the recorded namespace
+        // identity check, rather than an earlier missing-directory error.
+        let foreign_reservation = namespace.join(receipt.reservation.file_name().unwrap());
+        std::fs::create_dir(&foreign_reservation).unwrap();
+        std::fs::write(
+            foreign_reservation.join("foreign reservation canary"),
+            b"retain reservation",
+        )
+        .unwrap();
+        assert_ne!(
+            restore_directory_identity(&receipt.reservation),
+            Some(receipt.reservation_identity)
+        );
+        let old_tree_bytes = tree_bytes(&displaced);
+        let old_tree_paths = restore_tree_paths(&displaced)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let foreign_tree_bytes = tree_bytes(&namespace);
+        let foreign_tree_paths = restore_tree_paths(&namespace)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        // Both the original anchor and new child opened through its held
+        // parent stay on the displaced directory, not its replacement name.
+        proof.verify_directory(&anchor).unwrap();
+        let original = parent
+            .verified_child_directory(std::ffi::OsStr::new("data"))
+            .unwrap();
+        proof.verify_directory(&original).unwrap();
+        let nested = original
+            .verified_child_directory(std::ffi::OsStr::new("nested"))
+            .unwrap();
+        assert_eq!(
+            nested.entry_names().unwrap(),
+            [std::ffi::OsString::from("original")]
+        );
+        assert_ne!(
+            OriginalLiveProof::capture(&data).unwrap().identity,
+            proof.identity
+        );
+        for _ in 0..2 {
+            let error = receipt.finish(&data).unwrap_err();
+            assert!(error.downcast_ref::<BackupRefusal>().is_some(), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("namespace changed"),
+                "{error:#}"
+            );
+            proof.verify_directory(&anchor).unwrap();
+            assert_eq!(tree_bytes(&displaced.join("data")), original_bytes);
+            assert_eq!(tree_bytes(&data), foreign_bytes);
+            assert!(
+                displaced
+                    .join(receipt.reservation.file_name().unwrap())
+                    .is_dir()
+            );
+            assert!(receipt.reservation.is_dir());
+            assert_eq!(tree_bytes(&displaced), old_tree_bytes);
+            assert_eq!(
+                restore_tree_paths(&displaced)
+                    .unwrap()
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                old_tree_paths
+            );
+            assert_eq!(tree_bytes(&namespace), foreign_tree_bytes);
+            assert_eq!(
+                restore_tree_paths(&namespace)
+                    .unwrap()
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                foreign_tree_paths
+            );
+            assert_eq!(
+                std::fs::read(foreign_reservation.join("foreign reservation canary")).unwrap(),
+                b"retain reservation"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn anchored_snapshot_refuses_symlinks_and_hardlinks_without_content_reads() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let external = tmp.path().join("external empty file");
+        let external_dir = tmp.path().join("external directory");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("original"), b"kept").unwrap();
+        std::fs::write(&external, b"").unwrap();
+        std::fs::create_dir(&external_dir).unwrap();
+        std::fs::write(external_dir.join("canary"), b"outside").unwrap();
+        let anchor = AnchoredDirectory::open(&root).unwrap();
+        let proof = OriginalLiveProof::capture_directory(&anchor).unwrap();
+        let bad = root.join("entry");
+        for variant in ["file symlink", "directory symlink", "hardlink", "fifo"] {
+            proof.verify_directory(&anchor).unwrap();
+            match variant {
+                "file symlink" => symlink(&external, &bad).unwrap(),
+                "directory symlink" => symlink(&external_dir, &bad).unwrap(),
+                "hardlink" => std::fs::hard_link(&external, &bad).unwrap(),
+                "fifo" => {
+                    let path = std::ffi::CString::new(bad.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: terminated private fixture pathname, no reader or
+                    // writer is opened; an accidental content read would hang.
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                _ => unreachable!(),
+            }
+            for _ in 0..2 {
+                let error = anchor.snapshot().unwrap_err();
+                assert!(
+                    error.downcast_ref::<BackupRefusal>().is_some(),
+                    "{variant}: {error:#}"
+                );
+                assert!(
+                    format!("{error:#}").contains("non-regular or linked"),
+                    "{variant}: {error:#}"
+                );
+                assert!(
+                    anchor
+                        .verified_child_directory(std::ffi::OsStr::new("entry"))
+                        .is_err()
+                );
+                assert_eq!(std::fs::read(&external).unwrap(), b"");
+                assert_eq!(
+                    std::fs::read(external_dir.join("canary")).unwrap(),
+                    b"outside"
+                );
+                assert_eq!(std::fs::read(root.join("original")).unwrap(), b"kept");
+            }
+            std::fs::remove_file(&bad).unwrap();
+            proof.verify_directory(&anchor).unwrap();
+        }
+    }
+
     #[test]
     fn live_repeat_restore_preserves_every_original_byte_and_discloses_all_copies() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7046,8 +7470,8 @@ mod tests {
         );
     }
 
-    /// A journal this build cannot read must not be treated as a completion
-    /// proof. Garbage routes to the no-proof branch, which preserves.
+    /// An invalid present journal is not absent or completion proof. The
+    /// checked decoder refuses without moving either copy or losing evidence.
     #[test]
     fn an_unreadable_journal_is_not_a_completion_proof() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7059,9 +7483,38 @@ mod tests {
         std::fs::write(data.join("brain.lbug"), b"PARTIAL").unwrap();
         std::fs::write(restore_journal_path(&data), b"{not json").unwrap();
 
-        let recovery = recover_interrupted_restore(&data).unwrap();
-        assert!(recovery.preserved.is_some());
-        assert_eq!(copies_of(tmp.path(), b"LAST GOOD COPY").len(), 1);
+        let before_bytes = tree_bytes(tmp.path());
+        let before_paths = restore_tree_paths(tmp.path())
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let journal_bytes = std::fs::read(restore_journal_path(&data)).unwrap();
+        for _ in 0..2 {
+            let error = recover_interrupted_restore(&data).unwrap_err();
+            assert!(error.downcast_ref::<BackupRefusal>().is_some(), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("invalid recovery metadata"),
+                "{error:#}"
+            );
+            assert_eq!(tree_bytes(tmp.path()), before_bytes);
+            assert_eq!(
+                restore_tree_paths(tmp.path())
+                    .unwrap()
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                before_paths
+            );
+            assert_eq!(
+                std::fs::read(restore_journal_path(&data)).unwrap(),
+                journal_bytes
+            );
+            assert_eq!(std::fs::read(data.join("brain.lbug")).unwrap(), b"PARTIAL");
+            assert_eq!(
+                std::fs::read(restoring.join("brain.lbug")).unwrap(),
+                b"LAST GOOD COPY"
+            );
+            assert_eq!(copies_of(tmp.path(), b"LAST GOOD COPY").len(), 1);
+        }
     }
 
     /// Give `dir` an embedded `manifest.json` that its own contents satisfy.
@@ -9817,20 +10270,45 @@ mod destination_guard_tests {
         let foreign = dir.path().join("home");
         std::fs::create_dir_all(foreign.join("Documents")).unwrap();
         std::fs::write(foreign.join("notes.txt"), "mine").unwrap();
-        let error = backup_restore(&RestoreConfig {
-            snapshot_path: archive.clone(),
-            data_dir: foreign.clone(),
-            replace: true,
-        })
-        .expect_err("a foreign directory must be refused even with --force");
-        assert!(
-            error
-                .to_string()
-                .contains("does not look like a NestWeaver data"),
-            "{error:#}"
-        );
-        assert_eq!(std::fs::read(foreign.join("notes.txt")).unwrap(), b"mine");
-        assert!(foreign.join("Documents").is_dir());
+        let snapshot = |root: &Path| {
+            let bytes = walkdir::WalkDir::new(root)
+                .into_iter()
+                .map(Result::unwrap)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| {
+                    (
+                        normalized_relative_path(root, entry.path()).unwrap(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let paths = restore_tree_paths(root)
+                .unwrap()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            (bytes, paths)
+        };
+        let before = snapshot(dir.path());
+        assert!(!restore_journal_path(&foreign).exists());
+        assert!(!restoring_dir_for(&foreign).exists());
+        for _ in 0..2 {
+            let error = backup_restore(&RestoreConfig {
+                snapshot_path: archive.clone(),
+                data_dir: foreign.clone(),
+                replace: true,
+            })
+            .expect_err("a foreign directory must be refused even with --force");
+            assert!(error.downcast_ref::<BackupRefusal>().is_some(), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("unknown or unverified contents"),
+                "{error:#}"
+            );
+            assert_eq!(snapshot(dir.path()), before);
+            assert!(!restore_journal_path(&foreign).exists());
+            assert!(!restoring_dir_for(&foreign).exists());
+            assert_eq!(std::fs::read(foreign.join("notes.txt")).unwrap(), b"mine");
+            assert!(foreign.join("Documents").is_dir());
+        }
 
         // Counterweight: a directory holding a database is still replaced.
         let data = dir.path().join("data");
