@@ -159,7 +159,11 @@ impl TypeEnvironment {
         }
 
         // Tier 2: Self/this (from symbols with parent_name — still needed)
-        extract_self_bindings(language, symbols, &mut bindings);
+        if language != Language::Go {
+            // Go receiver identifiers are ordinary scoped parameters. Their
+            // spelling cannot donate a type to unrelated functions.
+            extract_self_bindings(language, symbols, &mut bindings);
+        }
 
         // Tier 3: Assignment chain fixpoint
         let assignments = extract_assignments(source);
@@ -177,6 +181,8 @@ impl TypeEnvironment {
             inline_type_imports,
         } = if language == Language::Rust {
             nestweaver_parser::parse::scoped_rust_assignment_evidence(source, ast_bindings)
+        } else if language == Language::Go {
+            nestweaver_parser::parse::scoped_go_assignment_evidence(source)
         } else {
             Default::default()
         };
@@ -303,7 +309,7 @@ impl TypeEnvironment {
             .split_once('@')
             .map_or(binding.type_name.as_str(), |(name, _)| name)
             .chars()
-            .all(|ch| ch.is_alphanumeric() || ch == '_')
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.')
         {
             return;
         }

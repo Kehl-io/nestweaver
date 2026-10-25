@@ -1109,18 +1109,43 @@ The backup process:
 nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
   --data-dir ./restored-brain
 
-# A directory that already holds files is left untouched unless --force is set.
-# Restore then renames that directory aside and deletes it only after the new
-# data is in place.
+# A directory that already holds files needs --force and verified ownership.
+# Restore retains the original until the replacement is validated; interrupted
+# recovery can preserve additional copies at a reported sibling path.
 nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
   --data-dir ./restored-brain --force
 ```
 
-`--force` replaces only a NestWeaver data directory: one holding a `*.lbug`
-database or the `publication.json` a restore leaves. Any other non-empty
-directory is refused, even with `--force`, because replacing it deletes its
-contents. A killed restore leaves a `.<dir>.restore-staging.<pid>.*` directory
-beside `--data-dir`; the next restore there removes those whose process is gone.
+`--force` requires a physically bound NestWeaver graph and a recognized layout.
+A database filename, copied marker or `publication.json` alone does not
+authorize deletion. Restore
+takes namespace authority and exact writer leases for inventoried databases in
+both the target and its `.restoring` copy before recovery or replacement.
+
+Recovery writes local journal v4 with a mandatory replacement policy; recognized
+legacy journals keep their conservative recovery rules. This does not change
+the backup archive format. Normal restore validates archive content, prepares
+its owned operational lock and durably binds the physical marker, then records immutable completion
+witnesses before retiring the original. Only complete original-copy proof can
+authorize promoting an aside copy back into the active target.
+
+A quiet live dataset can contain freshly generated Markdown and search files
+that are absent from its original archive. `--force` recognizes their bounded
+typed layout only to preserve the **entire** superseded dataset, never to
+authorize deleting those files. It retains the copy under a reserved sibling
+such as `<data>.preserved-<id>/original` and reports every retained path. Each
+successful live replacement can therefore retain one additional full dataset;
+these copies remain for operator review. Unknown nested files, unrecognized
+catalog entries and nonempty operational locks still refuse replacement.
+
+An unvalidated target or unproven aside copy is retained outside the active
+slots, for example at `<data>.preserved-*` or `<data>.restoring.preserved-*`.
+Success output and later errors disclose the exact retained path. Keep that
+copy for inspection and recovery; a retry does not automatically delete it.
+Missing, older or changed journal proof can instead refuse with the target,
+aside and journal retained. Recovery does not restamp unknown data to make it
+pass ownership checks. Use the reported paths and original backup when
+reviewing a refusal; do not infer deletion authority from a filename.
 
 ### Inspect a backup
 

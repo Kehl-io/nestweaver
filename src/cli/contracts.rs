@@ -220,7 +220,7 @@ pub(crate) fn run_contracts(
                 // nw-117/nw-347: `_meta` is added by the federation layer, which
                 // only runs on the daemon path. This result is genuinely local
                 // scope and the emitter says so, keeping ONE shape in both modes.
-                print_json_payload(&value)?;
+                print_json_payload_for_store(&store, &value)?;
             } else {
                 render_contract_drift_human(&value);
             }

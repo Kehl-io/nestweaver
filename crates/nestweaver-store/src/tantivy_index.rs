@@ -35,6 +35,183 @@ use thiserror::Error;
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
+/// Recognize a quiet, exhaustive built-in Tantivy layout without opening an
+/// Index, mmap or lock. This proves syntax only: callers MUST preserve the
+/// entire incumbent rather than use these names as deletion authority.
+pub fn is_preservable_live_layout(root: &Path) -> anyhow::Result<bool> {
+    const MAX_DESCRIPTOR: u64 = 8 * 1024 * 1024;
+    const MAX_FILES: usize = 100_000;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Catalog {
+        #[serde(default, rename = "index_settings")]
+        _settings: tantivy::IndexSettings,
+        #[serde(default)]
+        persisted_custom_extensions: Vec<String>,
+        segments: Vec<Segment>,
+        #[serde(rename = "schema")]
+        _schema: Schema,
+        #[serde(rename = "opstamp")]
+        _opstamp: u64,
+        #[serde(default, rename = "payload")]
+        _payload: Option<String>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Segment {
+        segment_id: uuid::Uuid,
+        max_doc: u32,
+        deletes: Option<Deletes>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Deletes {
+        num_deleted_docs: u32,
+        opstamp: u64,
+    }
+    let read = |name: &str| -> anyhow::Result<Vec<u8>> {
+        let path = root.join(name);
+        let metadata = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(metadata.is_file() && metadata.len() <= MAX_DESCRIPTOR);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(metadata.nlink() == 1);
+        }
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(MAX_DESCRIPTOR + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() as u64 <= MAX_DESCRIPTOR);
+        Ok(bytes)
+    };
+    let metadata = read("meta.json")?;
+    let raw: serde_json::Value = serde_json::from_slice(&metadata)?;
+    if !current_nested_layout_metadata(&raw) {
+        return Ok(false);
+    }
+    let catalog: Catalog = serde_json::from_slice(&metadata)?;
+    let managed: HashSet<String> = serde_json::from_slice(&read(".managed.json")?)?;
+    if !catalog.persisted_custom_extensions.is_empty()
+        || catalog.segments.len() > MAX_FILES / 6
+        || managed.len() > MAX_FILES
+    {
+        return Ok(false);
+    }
+    let mut candidates = HashSet::from(["meta.json".to_owned()]);
+    let mut ids = HashSet::new();
+    for segment in catalog.segments {
+        if !ids.insert(segment.segment_id) {
+            return Ok(false);
+        }
+        let id = segment.segment_id.simple().to_string();
+        for extension in ["fast", "fieldnorm", "idx", "pos", "store", "term"] {
+            candidates.insert(format!("{id}.{extension}"));
+        }
+        if let Some(deletes) = segment.deletes {
+            if deletes.num_deleted_docs > segment.max_doc {
+                return Ok(false);
+            }
+            candidates.insert(format!("{id}.{}.del", deletes.opstamp));
+        }
+    }
+    if managed != candidates {
+        return Ok(false);
+    }
+    let mut actual = HashSet::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Ok(false);
+        };
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Ok(false);
+            }
+        }
+        if [".tantivy-meta.lock", ".tantivy-writer.lock"].contains(&name.as_str()) {
+            if metadata.len() != 0 {
+                return Ok(false);
+            }
+        } else if name != ".managed.json" {
+            actual.insert(name);
+        }
+        if actual.len() > MAX_FILES {
+            return Ok(false);
+        }
+    }
+    Ok(actual == managed)
+}
+
+/// Dependency deserializers intentionally ignore unknown nested fields. This
+/// conservative live profile supports the text-field schema NestWeaver writes,
+/// and rejects future nested formats before typed value validation.
+fn current_nested_layout_metadata(meta: &serde_json::Value) -> bool {
+    fn keys(value: &serde_json::Value, allowed: &[&str]) -> bool {
+        value
+            .as_object()
+            .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+    }
+    if let Some(settings) = meta.get("index_settings") {
+        if !keys(
+            settings,
+            &[
+                "sort_by_field",
+                "docstore_compression",
+                "docstore_blocksize",
+                "docstore_compress_dedicated_thread",
+            ],
+        ) {
+            return false;
+        }
+        if let Some(sort) = settings.get("sort_by_field")
+            && !sort.is_null()
+            && !keys(sort, &["field", "order"])
+        {
+            return false;
+        }
+    }
+    let Some(fields) = meta.get("schema").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if fields.len() > 1024 {
+        return false;
+    }
+    for field in fields {
+        if !keys(field, &["name", "type", "options"])
+            || field.get("type").and_then(serde_json::Value::as_str) != Some("text")
+        {
+            return false;
+        }
+        let Some(options) = field.get("options") else {
+            return false;
+        };
+        if !keys(options, &["indexing", "stored", "fast", "coerce"]) {
+            return false;
+        }
+        if let Some(indexing) = options.get("indexing")
+            && !indexing.is_null()
+            && !keys(indexing, &["record", "fieldnorms", "tokenizer"])
+        {
+            return false;
+        }
+        if let Some(fast) = options.get("fast")
+            && !fast.is_boolean()
+            && !keys(fast, &["with_tokenizer"])
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Pseudo-relevance-feedback (PRF) tuning constants (Feature F7, PRF half).
 ///
 /// PRF is a two-pass query-expansion technique that improves recall on
@@ -2182,6 +2359,171 @@ mod tests {
     use super::*;
     use nestweaver_schema::{Heading, Note, NoteKind, Section, Tag, Vault};
     use tempfile::tempdir;
+
+    #[test]
+    fn preserve_layout_rejects_only_nested_future_fields_and_accepts_current_defaults() {
+        let temp = tempdir().unwrap();
+        drop(TantivyIndex::open_or_create(temp.path()).unwrap());
+        let path = temp.path().join("meta.json");
+        let original = std::fs::read(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert!(is_preservable_live_layout(temp.path()).unwrap());
+        for change in [
+            "settings",
+            "sort",
+            "schema-field",
+            "options",
+            "indexing",
+            "fast",
+        ] {
+            let mut changed = value.clone();
+            match change {
+                "settings" => changed["index_settings"]["future_layout"] = true.into(),
+                "sort" => {
+                    changed["index_settings"]["sort_by_field"] =
+                        serde_json::json!({"field":"uid","order":"Asc","future_layout":true})
+                }
+                "schema-field" => changed["schema"][0]["future_layout"] = true.into(),
+                "options" => changed["schema"][0]["options"]["future_layout"] = true.into(),
+                "indexing" => {
+                    changed["schema"][0]["options"]["indexing"]["future_layout"] = true.into()
+                }
+                "fast" => {
+                    changed["schema"][0]["options"]["fast"] =
+                        serde_json::json!({"with_tokenizer":"raw","future_layout":true})
+                }
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&changed).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(
+                !is_preservable_live_layout(temp.path()).unwrap(),
+                "{change}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            std::fs::write(&path, &original).unwrap();
+            assert!(is_preservable_live_layout(temp.path()).unwrap());
+        }
+        let mut defaults = value;
+        defaults["index_settings"] = serde_json::json!({});
+        defaults["schema"][0]["options"]["fast"] = serde_json::json!({"with_tokenizer":"raw"});
+        std::fs::write(&path, serde_json::to_vec(&defaults).unwrap()).unwrap();
+        assert!(is_preservable_live_layout(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn preserve_layout_reads_real_quiet_segments_without_opening_an_index() {
+        let temp = tempdir().unwrap();
+        let index = TantivyIndex::open_or_create(temp.path()).unwrap();
+        index
+            .update_note(
+                "note:live",
+                "Live",
+                "vault:live",
+                &["live text".into()],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        drop(index);
+        assert!(is_preservable_live_layout(temp.path()).unwrap());
+        let before = std::fs::read(temp.path().join("meta.json")).unwrap();
+        std::fs::write(temp.path().join("personal.txt"), b"keep").unwrap();
+        assert!(!is_preservable_live_layout(temp.path()).unwrap());
+        std::fs::remove_file(temp.path().join("personal.txt")).unwrap();
+        std::fs::create_dir(temp.path().join("nested")).unwrap();
+        assert!(!is_preservable_live_layout(temp.path()).unwrap());
+        std::fs::remove_dir(temp.path().join("nested")).unwrap();
+        std::fs::write(temp.path().join(".tantivy-meta.lock"), b"foreign lock").unwrap();
+        assert!(!is_preservable_live_layout(temp.path()).unwrap());
+        assert_eq!(
+            std::fs::read(temp.path().join("meta.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn preserve_layout_rejects_catalog_injection_orphan_and_linked_components() {
+        let temp = tempdir().unwrap();
+        drop(TantivyIndex::open_or_create(temp.path()).unwrap());
+        let managed = temp.path().join(".managed.json");
+        let before = std::fs::read(&managed).unwrap();
+        for path in [
+            "../personal",
+            "/personal",
+            "orphan.store",
+            "meta.json/extra",
+        ] {
+            let mut names: HashSet<String> = serde_json::from_slice(&before).unwrap();
+            names.insert(path.into());
+            std::fs::write(&managed, serde_json::to_vec(&names).unwrap()).unwrap();
+            assert!(!is_preservable_live_layout(temp.path()).unwrap());
+        }
+        std::fs::write(&managed, &before).unwrap();
+        assert!(is_preservable_live_layout(temp.path()).unwrap());
+        #[cfg(unix)]
+        {
+            let external = tempdir().unwrap();
+            let foreign = external.path().join("empty-foreign-lock");
+            std::fs::write(&foreign, b"").unwrap();
+            let linked = temp.path().join(".tantivy-meta.lock");
+            let original = std::fs::read(&linked).ok();
+            for hard in [false, true] {
+                if linked.exists() {
+                    std::fs::remove_file(&linked).unwrap();
+                }
+                if hard {
+                    std::fs::hard_link(&foreign, &linked).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&foreign, &linked).unwrap();
+                }
+                assert!(!is_preservable_live_layout(temp.path()).unwrap());
+                assert_eq!(std::fs::read(&foreign).unwrap(), b"");
+                std::fs::remove_file(&linked).unwrap();
+                if let Some(bytes) = &original {
+                    std::fs::write(&linked, bytes).unwrap();
+                }
+                assert!(is_preservable_live_layout(temp.path()).unwrap());
+            }
+            let index = TantivyIndex::open_or_create(temp.path()).unwrap();
+            index
+                .update_note(
+                    "note:linked",
+                    "Linked",
+                    "vault:linked",
+                    &["component witness".into()],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            drop(index);
+            let component = std::fs::read_dir(temp.path())
+                .unwrap()
+                .map(Result::unwrap)
+                .map(|entry| entry.path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "store"))
+                .unwrap();
+            let bytes = std::fs::read(&component).unwrap();
+            let external_component = external.path().join("foreign-component");
+            std::fs::write(&external_component, &bytes).unwrap();
+            for hard in [false, true] {
+                assert!(is_preservable_live_layout(temp.path()).unwrap());
+                std::fs::remove_file(&component).unwrap();
+                if hard {
+                    std::fs::hard_link(&external_component, &component).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&external_component, &component).unwrap();
+                }
+                assert!(!is_preservable_live_layout(temp.path()).unwrap());
+                assert_eq!(std::fs::read(&external_component).unwrap(), bytes);
+                std::fs::remove_file(&component).unwrap();
+                std::fs::write(&component, &bytes).unwrap();
+                assert!(is_preservable_live_layout(temp.path()).unwrap());
+            }
+        }
+    }
 
     #[test]
     fn review_note_scope_counts_and_limits_only_owning_documents() {

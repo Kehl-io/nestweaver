@@ -1165,6 +1165,11 @@ pub fn rescope_operation(
     }
     for checkpoint in invalidated {
         next.completed_artifacts.remove(checkpoint);
+        // Keep the source invalidation across crashes between graph indexing
+        // and relinking. Graph checkpoints alone lose that information once
+        // the changed source has been indexed again.
+        next.completed_artifacts
+            .insert(format!("relink/{checkpoint}"), "invalidated".to_string());
     }
     next.failure = None;
     next.progress = None;
@@ -1475,6 +1480,44 @@ mod tests {
             publication_format_version: crate::snapshot::SNAPSHOT_FORMAT_VERSION,
             created_unix_millis: 42,
         }
+    }
+
+    #[test]
+    fn relink_graph_baseline_is_cas_bound_and_not_rebased_after_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = create_operation(dir.path(), plan()).unwrap();
+        let graph = advance_phase(
+            dir.path(),
+            &state.plan.operation_uuid,
+            state.revision,
+            PublicationPhase::Graph,
+        )
+        .unwrap();
+        let first = record_code_link_base_generation(
+            dir.path(),
+            &graph.plan.operation_uuid,
+            graph.revision,
+            7,
+        )
+        .unwrap();
+        let replay = record_code_link_base_generation(
+            dir.path(),
+            &first.plan.operation_uuid,
+            first.revision,
+            99,
+        )
+        .unwrap();
+        assert_eq!(code_link_scope(&replay).graph_base_generation, Some(7));
+        assert!(
+            record_code_link_base_generation(
+                dir.path(),
+                &first.plan.operation_uuid,
+                first.revision,
+                99
+            )
+            .is_err(),
+            "a stale writer cannot overwrite provenance"
+        );
     }
 
     #[test]
@@ -2475,5 +2518,67 @@ mod tests {
         )
         .unwrap();
         assert!(list_operations(dir.path()).unwrap().is_empty());
+    }
+}
+
+/// Source receipts and a writer-observed graph baseline for one captured
+/// operation input. Source fingerprints include unchanged sources as well.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationRelinkScope {
+    pub input_fingerprint: String,
+    pub source_fingerprints: BTreeMap<String, String>,
+    pub graph_base_generation: Option<u64>,
+}
+
+fn relink_base_key(input_fingerprint: &str) -> String {
+    format!(
+        "relink/base_generation/{}",
+        crate::hash::blake3_hex(input_fingerprint)
+    )
+}
+
+/// Capture once, under the operation's writer authority, BEFORE any source
+/// graph mutations for this input. Crash replay retains the original baseline;
+/// observing a later generation must never re-bless anonymous graph drift.
+pub fn record_code_link_base_generation(
+    publication_root: &Path,
+    operation_uuid: &str,
+    expected_revision: u64,
+    generation: u64,
+) -> anyhow::Result<PublicationOperationState> {
+    checkpoint_operation(
+        publication_root,
+        operation_uuid,
+        expected_revision,
+        |state| {
+            if state.phase != PublicationPhase::Graph
+                || state.cancel_requested
+                || state.failure.is_some()
+            {
+                anyhow::bail!("publication graph baseline requires an active graph phase");
+            }
+            let key = relink_base_key(&state.plan.input_fingerprint);
+            state
+                .completed_artifacts
+                .entry(key)
+                .or_insert_with(|| generation.to_string());
+            Ok(())
+        },
+    )
+}
+
+pub fn code_link_scope(state: &PublicationOperationState) -> PublicationRelinkScope {
+    PublicationRelinkScope {
+        input_fingerprint: state.plan.input_fingerprint.clone(),
+        source_fingerprints: state
+            .completed_artifacts
+            .iter()
+            .filter(|(key, _)| key.starts_with("graph/repo/") || key.starts_with("graph/vault/"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        graph_base_generation: state
+            .completed_artifacts
+            .get(&relink_base_key(&state.plan.input_fingerprint))
+            .and_then(|value| value.parse().ok()),
     }
 }

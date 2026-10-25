@@ -338,6 +338,9 @@ pub struct CodeLinkReconcileReport {
     pub memberships_added: usize,
     /// Notes whose links were compared.
     pub notes_checked: usize,
+    /// Candidate symbol rows loaded from the store by a staged scoped pass.
+    /// Zero proves a no-op/vault-only resume reused the complete candidate witness.
+    pub symbols_checked: usize,
     /// Notes that could not be checked: not readable from the local
     /// filesystem, or whose file no longer matches the text the graph
     /// committed (a pending edit the watcher or a refresh will index). Their
@@ -439,6 +442,11 @@ pub struct CodeLinkReconciler {
     config: CrossDomainConfig,
     project_folders: Vec<crate::project::ProjectFolder>,
     cache: HashMap<String, CachedMentions>,
+    // Populated only by the publication-scoped API after validating complete
+    // coverage. Regular live reconciliations retain their full verification.
+    coverage: HashMap<String, String>,
+    symbol_snapshot: Option<Vec<crate::cross_domain::LinkSymbolRow>>,
+    invalidated: Vec<String>,
     /// nw-677: per vault uid, a reader over the vault's committed text when
     /// it has no working tree (a server-mode bare clone).
     vault_readers: HashMap<String, Box<dyn crate::content_reader::ContentReader>>,
@@ -461,6 +469,9 @@ impl CodeLinkReconciler {
             config,
             project_folders: Vec::new(),
             cache: HashMap::new(),
+            coverage: HashMap::new(),
+            symbol_snapshot: None,
+            invalidated: Vec::new(),
             vault_readers: HashMap::new(),
         }
     }
@@ -610,13 +621,13 @@ impl CodeLinkReconciler {
             report.memberships_added =
                 reconcile_folder_memberships(store, lease, &self.project_folders)?;
         }
-        let index = crate::cross_domain::build_symbol_index_with_config(store, &self.config)?;
+        let index = match &self.symbol_snapshot {
+            Some(symbols) => {
+                crate::cross_domain::build_symbol_index_from_rows(store, &self.config, symbols)?
+            }
+            None => crate::cross_domain::build_symbol_index_with_config(store, &self.config)?,
+        };
         report.unscoped_projects = index.unscoped_projects.clone();
-        if index.is_empty() {
-            // No code indexed: there is nothing to link to, and no link can
-            // exist (every edge ends at a Symbol).
-            return Ok(report);
-        }
         let (notes, integrity) = store
             .list_notes_with_integrity(None)
             .context("list notes for code-link reconciliation")?;
@@ -640,6 +651,7 @@ impl CodeLinkReconciler {
         }
         let live: HashSet<&str> = notes.iter().map(|note| note.uid.as_str()).collect();
         self.cache.retain(|uid, _| live.contains(uid.as_str()));
+        self.coverage.retain(|uid, _| live.contains(uid.as_str()));
 
         let total = notes.len();
         for (done, chunk) in notes.chunks(NOTES_PER_TXN).enumerate() {
@@ -681,8 +693,37 @@ impl CodeLinkReconciler {
                         continue;
                     }
                 };
-                report.notes_checked += 1;
                 let note_spans = spans.get(&note.uid).map(Vec::as_slice).unwrap_or(&[]);
+                let dependency = index.dependency_signature(&note.uid, &mentions);
+                let span_rows: Vec<_> = note_spans
+                    .iter()
+                    .map(|s| (&s.uid, s.start_line, s.end_line))
+                    .collect();
+                let signature = crate::hash::blake3_hex(&serde_json::to_string(&(
+                    &note.content_hash,
+                    &note.vault_uid,
+                    &note.file_path,
+                    dependency,
+                    span_rows,
+                ))?);
+                let vault_checkpoint = format!(
+                    "graph/vault/{}.done",
+                    crate::hash::blake3_hex(&note.vault_uid)
+                );
+                let invalidated = self.invalidated.contains(&vault_checkpoint)
+                    || index.depends_on_checkpoints(&note.uid, &mentions, &self.invalidated);
+                // Only the staged API proves complete graph ancestry and
+                // consumes source receipts. Live debt can follow edge deletion
+                // with unchanged source signatures, so it must check the edges.
+                if self.symbol_snapshot.is_some()
+                    && !migrating
+                    && !invalidated
+                    && self.coverage.get(&note.uid) == Some(&signature)
+                {
+                    continue;
+                }
+                self.coverage.insert(note.uid.clone(), signature);
+                report.notes_checked += 1;
                 desired.push((
                     resolve_note(&note.uid, &mentions, note_spans, &index),
                     note.content_hash.clone(),
@@ -1028,10 +1069,430 @@ pub fn reconcile_code_links_with_folders(
         .reconcile(store, None, &|| false)
 }
 
+/// Persistent, complete dependency coverage for a staged publication. This
+/// cache is deliberately independent of graph generation: the source checkpoint
+/// invalidations and lookup signatures prove exactly what must be reconsidered.
+#[derive(Serialize, Deserialize)]
+struct PublicationLinkCache {
+    version: u32,
+    identity: nestweaver_store::PublicationIdentity,
+    config: String,
+    payload_checksum: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PublicationLinkCoverage {
+    notes: HashMap<String, (String, serde_json::Value, String)>,
+    symbols: Vec<crate::cross_domain::LinkSymbolRow>,
+    repos: Vec<String>,
+    graph_generation: u64,
+    scope: crate::publication_operation::PublicationRelinkScope,
+}
+
+/// Reconcile a staged publication after a scoped resume. The caller supplies
+/// the durable journal's complete invalidation set (not just sources still
+/// waiting for their graph checkpoint). Unrelated notes are neither resolved
+/// nor edge-checked; absent lookup keys are covered so new symbols invalidate
+/// formerly unresolved notes as well. Missing/incompatible coverage widens to
+/// a complete pass, and partial passes never publish a complete witness.
+pub fn reconcile_code_links_with_folders_scoped(
+    store: &GraphStore,
+    config: &CrossDomainConfig,
+    folders: Vec<crate::project::ProjectFolder>,
+    scope: &crate::publication_operation::PublicationRelinkScope,
+) -> Result<CodeLinkReconcileReport, anyhow::Error> {
+    use std::io::Write;
+    let mut reconciler =
+        CodeLinkReconciler::new(config.clone()).with_project_folders(folders.clone());
+    let Some(db_path) = store.db_path() else {
+        return reconciler.reconcile(store, None, &|| false);
+    };
+    let path = PathBuf::from(format!("{}.publication-links.json", db_path.display()));
+    let identity = store.publication_identity()?.context(
+        "staged publication link coverage requires a database-bound publication identity",
+    )?;
+    let config_signature = crate::hash::blake3_hex(&format!(
+        "{}:{}:{folders:?}",
+        CROSS_DOMAIN_RULES_VERSION,
+        serde_json::to_string(config)?
+    ));
+    let repos_now = store.list_repos(None)?;
+    let vaults_now = store.list_vaults(None)?;
+    let expected_sources: HashSet<_> = repos_now
+        .iter()
+        .map(|repo| format!("graph/repo/{}.done", crate::hash::blake3_hex(&repo.uid)))
+        .chain(
+            vaults_now
+                .iter()
+                .map(|vault| format!("graph/vault/{}.done", crate::hash::blake3_hex(&vault.uid))),
+        )
+        .collect();
+    let complete_sources = !scope.input_fingerprint.is_empty()
+        && scope
+            .source_fingerprints
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>()
+            == expected_sources;
+    let mut invalidated_graph_checkpoints = Vec::new();
+    if let Ok(bytes) = std::fs::read(&path)
+        && let Ok(cached) = serde_json::from_slice::<PublicationLinkCache>(&bytes)
+        && cached.version == 3
+        && cached.identity == identity
+        && cached.config == config_signature
+        && serde_json::to_vec(&cached.payload)
+            .is_ok_and(|bytes| crate::hash::blake3_hex_bytes(&bytes) == cached.payload_checksum)
+        && let Ok(coverage) = serde_json::from_value::<PublicationLinkCoverage>(cached.payload)
+    {
+        // One invalid record invalidates the entire complete-coverage claim.
+        let decoded: Option<Vec<_>> = coverage
+            .notes
+            .into_iter()
+            .map(|(uid, (content_hash, mentions, signature))| {
+                Some((
+                    uid,
+                    CachedMentions {
+                        content_hash,
+                        mentions: Arc::new(NoteMentions::from_cache(mentions)?),
+                    },
+                    signature,
+                ))
+            })
+            .collect();
+        let mut current_repos: Vec<_> = store
+            .list_repos(None)?
+            .into_iter()
+            .map(|repo| repo.uid)
+            .collect();
+        current_repos.sort();
+        let same_receipts = coverage.scope.input_fingerprint == scope.input_fingerprint
+            && coverage.scope.source_fingerprints == scope.source_fingerprints;
+        let changed_sources: Vec<_> = scope
+            .source_fingerprints
+            .iter()
+            .filter(|(key, value)| coverage.scope.source_fingerprints.get(*key) != Some(*value))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let provenance_known = complete_sources
+            && ((same_receipts && coverage.graph_generation == store.graph_generation())
+                || (!same_receipts
+                    && !changed_sources.is_empty()
+                    && scope.graph_base_generation == Some(coverage.graph_generation)));
+        if provenance_known {
+            invalidated_graph_checkpoints = changed_sources;
+        }
+        if let Some(decoded) = decoded
+            && coverage.repos == current_repos
+            && provenance_known
+        {
+            reconciler.symbol_snapshot = Some(coverage.symbols);
+            for (uid, mentions, signature) in decoded {
+                reconciler.cache.insert(uid.clone(), mentions);
+                reconciler.coverage.insert(uid, signature);
+            }
+        }
+    }
+    let mut repos = store.list_repos(None)?;
+    repos.sort_by(|a, b| a.uid.cmp(&b.uid));
+    let mut symbols_checked = 0;
+    if let Some(symbols) = &mut reconciler.symbol_snapshot {
+        for repo in &repos {
+            let checkpoint = format!("graph/repo/{}.done", crate::hash::blake3_hex(&repo.uid));
+            if invalidated_graph_checkpoints.contains(&checkpoint) {
+                symbols.retain(|row| row.3 != repo.uid);
+                let refreshed = store.lookup_symbols_by_repo(&repo.uid)?;
+                symbols_checked += refreshed.len();
+                symbols.extend(refreshed.into_iter().map(|symbol| {
+                    (
+                        symbol.uid,
+                        symbol.name,
+                        symbol.kind.as_str().to_string(),
+                        symbol.repo_uid,
+                        symbol.file_path,
+                    )
+                }));
+            }
+        }
+    } else {
+        let symbols = store.list_symbols_for_linking()?;
+        symbols_checked = symbols.len();
+        reconciler.symbol_snapshot = Some(symbols);
+    }
+    reconciler.invalidated = invalidated_graph_checkpoints;
+    let mut report = reconciler.reconcile(store, None, &|| false)?;
+    report.symbols_checked = symbols_checked;
+    if complete_sources
+        && !report.stopped
+        && report.unreadable.is_empty()
+        && report.notes_skipped == 0
+    {
+        let rows: HashMap<_, _> = reconciler
+            .cache
+            .iter()
+            .filter_map(|(uid, cached)| {
+                Some((
+                    uid.clone(),
+                    (
+                        cached.content_hash.clone(),
+                        cached.mentions.to_cache(),
+                        reconciler.coverage.get(uid)?.clone(),
+                    ),
+                ))
+            })
+            .collect();
+        let payload = serde_json::to_value(PublicationLinkCoverage {
+            notes: rows,
+            symbols: reconciler.symbol_snapshot.take().unwrap_or_default(),
+            repos: repos.into_iter().map(|repo| repo.uid).collect(),
+            graph_generation: store.graph_generation(),
+            scope: scope.clone(),
+        })?;
+        let payload_checksum = crate::hash::blake3_hex_bytes(&serde_json::to_vec(&payload)?);
+        let cached = PublicationLinkCache {
+            version: 3,
+            identity,
+            config: config_signature,
+            payload_checksum,
+            payload,
+        };
+        let bytes = serde_json::to_vec(&cached)?;
+        nestweaver_store::durable_sidecar::atomic_replace_file(&path, |file| {
+            file.write_all(&bytes)
+        })?;
+    } else {
+        // A previous complete witness cannot survive a failed/partial pass.
+        nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&path)?;
+    }
+    Ok(report)
+}
+
+/// Retire the disposable staging witness before immutable inventory sealing.
+pub fn retire_publication_link_cache(db_path: &Path) -> anyhow::Result<()> {
+    let path = PathBuf::from(format!("{}.publication-links.json", db_path.display()));
+    nestweaver_store::durable_sidecar::remove_file_durable_if_exists(&path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn scope_for(
+        store: &GraphStore,
+        tag: &str,
+        base: Option<u64>,
+    ) -> crate::publication_operation::PublicationRelinkScope {
+        let source_fingerprints = store
+            .list_repos(None)
+            .unwrap()
+            .into_iter()
+            .map(|repo| {
+                (
+                    format!("graph/repo/{}.done", crate::hash::blake3_hex(&repo.uid)),
+                    "initial-repo".to_string(),
+                )
+            })
+            .chain(store.list_vaults(None).unwrap().into_iter().map(|vault| {
+                (
+                    format!("graph/vault/{}.done", crate::hash::blake3_hex(&vault.uid)),
+                    "initial-vault".to_string(),
+                )
+            }))
+            .collect();
+        crate::publication_operation::PublicationRelinkScope {
+            input_fingerprint: tag.into(),
+            source_fingerprints,
+            graph_base_generation: base,
+        }
+    }
+
+    fn scoped(
+        fx: &Fixture,
+        scope: &crate::publication_operation::PublicationRelinkScope,
+    ) -> CodeLinkReconcileReport {
+        reconcile_code_links_with_folders_scoped(
+            &fx.store,
+            &CrossDomainConfig::default(),
+            vec![],
+            scope,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn scoped_publication_relink_consumes_receipts_and_tracks_absent_lookups() {
+        let fx = fixture(
+            &[
+                ("a.md", "# A\n`FutureWidget`\n"),
+                ("b.md", "# B\n`OtherFutureWidget`\n"),
+            ],
+            &[("src/lib.rs", "pub struct ExistingWidget;\n")],
+        );
+        let initial = scope_for(&fx.store, "input-one", None);
+        assert_eq!(scoped(&fx, &initial).notes_checked, 2);
+        let noop = scoped(&fx, &initial);
+        assert_eq!((noop.notes_checked, noop.symbols_checked), (0, 0));
+        let base = fx.store.graph_generation();
+        std::fs::write(fx.repo.join("src/future.rs"), "pub struct FutureWidget;\n").unwrap();
+        index_repo(&fx.store, &fx.repo, &fx.db);
+        let mut changed = scope_for(&fx.store, "input-two", Some(base));
+        let repo_key = changed
+            .source_fingerprints
+            .keys()
+            .find(|key| key.starts_with("graph/repo/"))
+            .unwrap()
+            .clone();
+        changed
+            .source_fingerprints
+            .insert(repo_key, "source-version-two".into());
+        let report = scoped(&fx, &changed);
+        assert_eq!(report.notes_checked, 1);
+        assert!(report.rewritten.contains(&note_uid_of(&fx.store, "a.md")));
+        let noop = scoped(&fx, &changed);
+        assert_eq!(
+            (noop.notes_checked, noop.symbols_checked),
+            (0, 0),
+            "same historical receipt is consumed"
+        );
+    }
+
+    #[test]
+    fn scoped_publication_relink_same_source_second_edit_and_unknown_drift() {
+        let fx = fixture(
+            &[
+                ("a.md", "# A\n`FutureWidget`\n"),
+                ("b.md", "# B\n`NeverDefined`\n"),
+            ],
+            &[("src/lib.rs", "pub struct ExistingWidget;\n")],
+        );
+        let mut scope = scope_for(&fx.store, "initial", None);
+        scoped(&fx, &scope);
+        let repo_key = scope
+            .source_fingerprints
+            .keys()
+            .find(|key| key.starts_with("graph/repo/"))
+            .unwrap()
+            .clone();
+        for (revision, source) in [
+            ("one", "pub struct FutureWidget;\n"),
+            ("two", "pub fn FutureWidget() {}\n"),
+            ("three", "pub struct FutureWidget;\n"),
+        ] {
+            scope.graph_base_generation = Some(fx.store.graph_generation());
+            std::fs::write(fx.repo.join("src/future.rs"), source).unwrap();
+            index_repo(&fx.store, &fx.repo, &fx.db);
+            scope.input_fingerprint = revision.into();
+            scope
+                .source_fingerprints
+                .insert(repo_key.clone(), revision.into());
+            assert_eq!(scoped(&fx, &scope).notes_checked, 1);
+            let noop = scoped(&fx, &scope);
+            assert_eq!((noop.notes_checked, noop.symbols_checked), (0, 0));
+        }
+        // Same old receipts cannot bless an unexplained graph change.
+        full_vault_refresh(&fx);
+        assert_eq!(
+            scoped(&fx, &scope).notes_checked,
+            2,
+            "unattributed graph generation widens fully"
+        );
+        std::fs::write(
+            format!("{}.publication-links.json", fx.db.display()),
+            b"corrupt",
+        )
+        .unwrap();
+        assert_eq!(scoped(&fx, &scope).notes_checked, 2);
+    }
+
+    #[test]
+    fn scoped_publication_relink_queries_only_the_changed_repository_symbols() {
+        let fx = fixture(
+            &[
+                ("a.md", "# A\n`ExistingWidget`\n"),
+                ("b.md", "# B\n`UnrelatedWidget`\n"),
+            ],
+            &[("src/lib.rs", "pub struct ExistingWidget;\n")],
+        );
+        let other = fx._dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("lib.rs"), "pub struct UnrelatedWidget;\n").unwrap();
+        crate::index::index_directory_with_store(
+            &fx.store,
+            &other,
+            &fx.db,
+            "default",
+            "file:///fixture/other",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+        let initial = scope_for(&fx.store, "initial", None);
+        scoped(&fx, &initial);
+        let repo = fx
+            .store
+            .list_repos(None)
+            .unwrap()
+            .into_iter()
+            .find(|repo| repo.url == REPO_URL)
+            .unwrap();
+        let expected = fx.store.lookup_symbols_by_repo(&repo.uid).unwrap().len();
+        let mut changed = initial.clone();
+        changed.graph_base_generation = Some(fx.store.graph_generation());
+        changed.input_fingerprint = "changed".into();
+        changed.source_fingerprints.insert(
+            format!("graph/repo/{}.done", crate::hash::blake3_hex(&repo.uid)),
+            "changed".into(),
+        );
+        index_repo(&fx.store, &fx.repo, &fx.db);
+        let report = scoped(&fx, &changed);
+        assert_eq!(report.symbols_checked, expected);
+        assert!(report.symbols_checked < fx.store.list_symbols_for_linking().unwrap().len());
+        assert_eq!(report.notes_checked, 1);
+        // An unrelated repo drift predates the next operation baseline; a
+        // historical repo-A receipt must not let repo-B skip verification.
+        std::fs::write(other.join("lib.rs"), "pub struct ChangedOtherWidget;\n").unwrap();
+        crate::index::index_directory_with_store(
+            &fx.store,
+            &other,
+            &fx.db,
+            "default",
+            "file:///fixture/other",
+            "sha",
+            false,
+            None,
+        )
+        .unwrap();
+        changed.graph_base_generation = Some(fx.store.graph_generation());
+        let widened = scoped(&fx, &changed);
+        assert_eq!(widened.notes_checked, 2);
+    }
+
+    #[test]
+    fn scoped_publication_link_cache_is_retired_before_strict_sealing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(crate::publication::PUBLICATION_GRAPH_FILE);
+        let store = GraphStore::create(&db).unwrap();
+        let scope = scope_for(&store, "empty-complete-stage", None);
+        reconcile_code_links_with_folders_scoped(
+            &store,
+            &CrossDomainConfig::default(),
+            vec![],
+            &scope,
+        )
+        .unwrap();
+        assert!(PathBuf::from(format!("{}.publication-links.json", db.display())).exists());
+        drop(store);
+        assert!(
+            crate::backup::seal_publication_slot(&db, dir.path()).is_err(),
+            "strict inventory rejects disposable cache"
+        );
+        retire_publication_link_cache(&db).unwrap();
+        retire_publication_link_cache(&db).unwrap();
+        crate::backup::seal_publication_slot(&db, dir.path()).unwrap();
+    }
 
     /// A vault of notes plus a Rust repo, indexed into one file-backed store
     /// the way `brain add` + `index` build one, with discovery run once.
@@ -1248,6 +1709,34 @@ repos = ["file:///fixture/repo"]
             "the pass restores discovery's edges"
         );
         assert_eq!(report.rewritten.len(), 2, "{report:?}");
+    }
+
+    #[test]
+    fn a_live_reconciler_rechecks_unchanged_mentions_after_edge_deletion_and_debt() {
+        let fx = two_widgets();
+        let before = edges(&fx.store);
+        let mut reconciler = CodeLinkReconciler::new(CrossDomainConfig::default());
+        reconciler.reconcile(&fx.store, None, &|| false).unwrap();
+        let notes = fx.store.list_notes(None).unwrap();
+        let uids: Vec<&str> = notes.iter().map(|note| note.uid.as_str()).collect();
+        let conn = fx.store.begin_transaction().unwrap();
+        GraphStore::delete_cross_domain_edges_for_notes_on(&conn, &uids).unwrap();
+        fx.store.commit_transaction(&conn).unwrap();
+        mark_code_links_pending(&fx.db, "publication deleted unchanged notes' links");
+        assert!(edges(&fx.store).is_empty());
+
+        let repaired = reconciler.reconcile(&fx.store, None, &|| false).unwrap();
+        assert_eq!(repaired.notes_checked, notes.len());
+        assert_eq!(repaired.rewritten.len(), notes.len());
+        assert_eq!(edges(&fx.store), before);
+        assert!(!code_links_pending(&fx.db));
+        let unchanged = reconciler.reconcile(&fx.store, None, &|| false).unwrap();
+        assert_eq!(
+            unchanged.notes_checked,
+            notes.len(),
+            "live passes verify actual edges even with warm mentions"
+        );
+        assert!(unchanged.rewritten.is_empty());
     }
 
     /// nw-675, route 2: re-indexing a repo deletes the changed file's

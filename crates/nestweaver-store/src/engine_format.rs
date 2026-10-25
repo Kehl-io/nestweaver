@@ -34,6 +34,17 @@ pub fn sidecar_path(db_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Evidence that a NestWeaver-created format marker names this exact file.
+/// Does not open the database: closing a second descriptor would release a
+/// restore caller's process-scoped POSIX writer lock.
+pub fn has_current_file_marker(db_path: &Path) -> std::io::Result<bool> {
+    Ok(read_sidecar(db_path)?.is_some_and(|marker| {
+        marker.format == ENGINE_FORMAT_VALUE
+            && marker.file.is_some()
+            && marker.file == file_identity(db_path)
+    }))
+}
+
 /// Write the sidecar durably (temp file, fsync, rename, fsync the directory).
 ///
 /// The first line is the format. When the database file exists, a second line

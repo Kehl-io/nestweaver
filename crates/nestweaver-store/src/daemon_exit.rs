@@ -731,13 +731,28 @@ mod tests {
     fn a_stale_sentinel_without_a_signal_is_an_unexpected_exit_not_a_crash() {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
-        // A daemon that was SIGKILLed: sentinel present, nothing recorded.
-        std::fs::write(dir.path().join(RUNNING_FILE), "4242\n").unwrap();
+        // Own and reap the previous process rather than assuming an arbitrary
+        // pid is dead: CI may have an unrelated live process with that pid.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn the previous sentinel owner");
+        let previous_pid = child.id();
+        assert!(child.wait().expect("reap the previous owner").success());
+        let running = dir.path().join(RUNNING_FILE);
+        std::fs::write(&running, format!("{previous_pid}\n")).unwrap();
+        // If the OS reuses the pid before arm, the sentinel must still name
+        // the earlier incarnation rather than the new live process.
+        #[cfg(target_os = "linux")]
+        {
+            set_mtime(&running, 1);
+            assert_eq!(sentinel_mtime_unix(&running), Some(1));
+        }
 
         let armed = arm(dir.path()).unwrap();
         let exit = armed_report().expect("the killed daemon is reported");
         assert_eq!(exit.signal, None);
-        assert_eq!(exit.pid, 4242);
+        assert_eq!(exit.pid, previous_pid);
         assert!(exit.summary().contains("exited unexpectedly"));
         assert!(
             !exit.summary().contains("engine crashed"),

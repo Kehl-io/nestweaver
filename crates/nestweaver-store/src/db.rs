@@ -3185,6 +3185,9 @@ impl GraphStore {
         if registered_waiter {
             state.waiters -= 1;
         }
+        // The file may have disappeared while this publisher was queued.
+        // Check at admission, before assigning ownership or allowing writes.
+        self.verify_backing_file()?;
         let token = state.next_token;
         state.next_token = token.checked_add(1).ok_or_else(|| {
             StoreError::Query("index publication ownership token exhausted".into())
@@ -3216,6 +3219,7 @@ impl GraphStore {
         if state.owner.is_some() {
             return Ok(None);
         }
+        self.verify_backing_file()?;
         let token = state.next_token;
         state.next_token = token.checked_add(1).ok_or_else(|| {
             StoreError::Query("index publication ownership token exhausted".into())
@@ -10696,6 +10700,49 @@ mod wal_recovery_arm_tests {
 #[cfg(all(test, unix))]
 mod backing_file_tests {
     use super::GraphStore;
+
+    #[test]
+    fn nonblocking_admission_refuses_deleted_and_replaced_files() {
+        for replace in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("g.lbug");
+            let store = GraphStore::open_or_create(&db).unwrap();
+            if replace {
+                let copy = dir.path().join("copy.lbug");
+                std::fs::copy(&db, &copy).unwrap();
+                std::fs::rename(copy, &db).unwrap();
+            } else {
+                std::fs::remove_file(&db).unwrap();
+            }
+            assert!(store.try_acquire_index_publication_lease().is_err());
+        }
+    }
+
+    #[test]
+    fn queued_publication_rechecks_backing_file_after_wait() {
+        for replace in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("g.lbug");
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let owner = store.acquire_index_publication_lease().unwrap();
+            std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| store.acquire_index_publication_lease().map(drop));
+                assert!(
+                    store.wait_for_index_publication_waiters(1, std::time::Duration::from_secs(5))
+                );
+                if replace {
+                    let copy = dir.path().join("copy.lbug");
+                    std::fs::copy(&db, &copy).unwrap();
+                    std::fs::rename(copy, &db).unwrap();
+                } else {
+                    std::fs::remove_file(&db).unwrap();
+                }
+                drop(owner);
+                assert!(waiter.join().unwrap().is_err());
+            });
+            assert_eq!(store.index_publication_waiter_count(), 0);
+        }
+    }
 
     /// QA: a daemon whose database directory was `rm -rf`'d kept writing to
     /// the unlinked inode and reported success. A publication now refuses.

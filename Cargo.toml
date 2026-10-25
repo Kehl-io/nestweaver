@@ -185,3 +185,8 @@ required-features = ["ci-direct-tests"]
 [[test]]
 name = "parity_test"
 required-features = ["ci-direct-tests"]
+
+# Preserve proc-macro dylib alignment on macOS (Rust/LLVM strip regression).
+# Scope the workaround to the affected macro; packaged executable policy is unchanged.
+[profile.release.package.rust-embed-impl]
+strip = "none"
