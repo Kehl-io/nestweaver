@@ -10270,7 +10270,11 @@ mod destination_guard_tests {
         let foreign = dir.path().join("home");
         std::fs::create_dir_all(foreign.join("Documents")).unwrap();
         std::fs::write(foreign.join("notes.txt"), "mine").unwrap();
-        let snapshot = |root: &Path| {
+        type Snapshot = (
+            std::collections::BTreeMap<String, Vec<u8>>,
+            std::collections::BTreeSet<String>,
+        );
+        let snapshot = |root: &Path| -> Snapshot {
             let bytes = walkdir::WalkDir::new(root)
                 .into_iter()
                 .map(Result::unwrap)
@@ -10288,7 +10292,54 @@ mod destination_guard_tests {
                 .collect::<std::collections::BTreeSet<_>>();
             (bytes, paths)
         };
+        // Snapshot protected content BEFORE the first public call. Namespace
+        // authority legitimately creates only these two empty parent siblings.
         let before = snapshot(dir.path());
+        let foreign_before = snapshot(&foreign);
+        let source_before = snapshot(&source);
+        let archive_before = std::fs::read(&archive).unwrap();
+        // Keep exact byte coverage without dumping database/archive byte
+        // arrays when one path differs. Diagnostics identify just that path.
+        let assert_snapshot = |root: &Path, expected: &Snapshot| {
+            let observed = snapshot(root);
+            assert_eq!(
+                observed.1,
+                expected.1,
+                "path set changed at {}",
+                root.display()
+            );
+            assert_eq!(
+                observed.0.keys().collect::<Vec<_>>(),
+                expected.0.keys().collect::<Vec<_>>(),
+                "regular file set changed at {}",
+                root.display()
+            );
+            for (relative, expected_bytes) in &expected.0 {
+                let observed_bytes = &observed.0[relative];
+                assert!(
+                    observed_bytes == expected_bytes,
+                    "bytes changed at {} (observed {} bytes, expected {} bytes)",
+                    root.join(relative).display(),
+                    observed_bytes.len(),
+                    expected_bytes.len()
+                );
+            }
+        };
+        let controls = [
+            ".home.nestweaver-write-namespace.lock",
+            ".home.restoring.nestweaver-write-namespace.lock",
+        ];
+        let mut expected_after = before.clone();
+        for name in controls {
+            assert!(!dir.path().join(name).exists());
+            assert!(
+                expected_after
+                    .0
+                    .insert(name.to_owned(), Vec::new())
+                    .is_none()
+            );
+            assert!(expected_after.1.insert(name.to_owned()));
+        }
         assert!(!restore_journal_path(&foreign).exists());
         assert!(!restoring_dir_for(&foreign).exists());
         for _ in 0..2 {
@@ -10303,7 +10354,20 @@ mod destination_guard_tests {
                 format!("{error:#}").contains("unknown or unverified contents"),
                 "{error:#}"
             );
-            assert_eq!(snapshot(dir.path()), before);
+            // Compare against the original snapshot plus precisely two known
+            // empty control files; no wildcard exclusion or mutated baseline.
+            assert_snapshot(dir.path(), &expected_after);
+            assert_snapshot(&foreign, &foreign_before);
+            assert_snapshot(&source, &source_before);
+            assert!(
+                std::fs::read(&archive).unwrap() == archive_before,
+                "archive bytes changed"
+            );
+            for name in controls {
+                let metadata = std::fs::symlink_metadata(dir.path().join(name)).unwrap();
+                assert!(regular_unique_file(&metadata));
+                assert_eq!(metadata.len(), 0);
+            }
             assert!(!restore_journal_path(&foreign).exists());
             assert!(!restoring_dir_for(&foreign).exists());
             assert_eq!(std::fs::read(foreign.join("notes.txt")).unwrap(), b"mine");
