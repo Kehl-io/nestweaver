@@ -6,6 +6,7 @@ use nestweaver_schema::{
 use rayon::prelude::*;
 
 use crate::imports::{ImportGraph, JvmImportRank, NamedBinding, build_import_graph_with_languages};
+use crate::type_extractors::TypeNameParts;
 use crate::types::TypeEnvironment;
 use crate::util::parent_dir;
 use crate::workspace::WorkspaceContext;
@@ -919,19 +920,14 @@ fn resolve_single_reference(
                 || binding.line >= source_sym.start_line
         }) {
             let method_name = &reference.name;
-            let type_name = &binding.type_name;
             let scoped_origin_required = reference.scope.is_some()
                 && matches!(
                     language,
                     Language::Rust | Language::JavaScript | Language::TypeScript | Language::Go
                 );
-            let (origin_file, tagged_type) =
-                type_name.split_once('#').unwrap_or((file_path, type_name));
-            let (unqualified_type, _origin_line) = tagged_type
-                .split_once('#')
-                .map_or((tagged_type, binding.line), |(name, line)| {
-                    (name, line.parse().unwrap_or(binding.line))
-                });
+            let parts = binding.type_name_parts();
+            let origin_file = parts.origin_file.unwrap_or(file_path);
+            let unqualified_type = parts.raw_type;
             let (unqualified_type, origin_position) = unqualified_type
                 .split_once('@')
                 .map_or((unqualified_type, None), |(name, position)| {
@@ -2501,7 +2497,7 @@ fn is_identifier(text: &str) -> bool {
 /// The type a receiver binding's internal tag names (`file#Type#line`,
 /// `Type@position`), as a bare type name.
 fn untagged_type(type_name: &str) -> &str {
-    let name = type_name.split('#').nth(1).unwrap_or(type_name);
+    let name = TypeNameParts::decode(type_name).raw_type;
     name.split('@').next().unwrap_or(name)
 }
 
@@ -2655,13 +2651,14 @@ impl ReceiverInference<'_, '_, '_> {
         } else {
             env.lookup(name, self.reference.start_line)
         }?;
-        let (file, tagged) = binding
-            .type_name
-            .split_once('#')
-            .unwrap_or((self.file_path, &binding.type_name));
+        let parts = binding.type_name_parts();
         let name = untagged_type(&binding.type_name);
         if self.language == Language::Go {
-            return self.declared_type(file, tagged.split('#').next()?, None);
+            return self.declared_type(
+                parts.origin_file.unwrap_or(self.file_path),
+                parts.raw_type,
+                None,
+            );
         }
         self.type_exists(name)
             .then(|| InferredReceiverType::unscoped(name.to_string()))
@@ -13608,6 +13605,85 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
             ),
             "a method receiver's name must not type unrelated parameters: {edges:#?}"
         );
+    }
+
+    #[test]
+    fn hash_filename_does_not_change_rust_return_positions_or_js_assignments() {
+        for path in ["src/name.rs", "src/has#name.rs"] {
+            let source = "struct Store;\nimpl Store {\n fn leaf(&self) {}\n}\nfn factory() -> Store { Store }\nfn use_store() { let db = factory(); db.leaf(); }\n";
+            let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+            assert!(
+                qa_calls(&files, &edges, (path, "use_store"), (path, "leaf", 3)),
+                "{path}: {edges:#?}"
+            );
+        }
+        for (language, extension) in [(Language::JavaScript, "js"), (Language::TypeScript, "ts")] {
+            for basename in ["name", "has#name"] {
+                let path = format!("src/{basename}.{extension}");
+                let source = "class Store {\n leaf() {}\n}\nfunction use_store() { const db = new Store(); db.leaf(); }\nfunction unknown(db) { db.leaf(); }\n";
+                let (files, edges) = review_edges(&[(path.as_str(), source)], language);
+                assert!(
+                    qa_calls(&files, &edges, (&path, "use_store"), (&path, "leaf", 2)),
+                    "{path}: {edges:#?}"
+                );
+                assert!(
+                    !qa_calls(&files, &edges, (&path, "unknown"), (&path, "leaf", 2)),
+                    "unknown donor: {path}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn go_factory_chain_and_assignment_keep_hash_filename_origins() {
+        for path in ["pkg/name.go", "pkg/has#name.go", "pkg/#12/has##name.go"] {
+            for split in [false, true] {
+                let same = "package pkg\ntype Provider struct{}\nfunc NewProvider() Provider { return Provider{} }\nfunc (p Provider) Named() {}\nfunc PTChain() { NewProvider().Named() }\nfunc PTAssignment() { p := NewProvider(); p.Named() }\n";
+                let declaration = "package pkg\ntype Provider struct{}\nfunc NewProvider() Provider { return Provider{} }\n";
+                // Keep split files in the declaration's exact package directory.
+                let dir = path.rsplit_once('/').unwrap().0;
+                let method_path = format!("{dir}/methods.go");
+                let caller_path = format!("{dir}/caller.go");
+                let inputs = if split {
+                    vec![
+                        (path, declaration),
+                        (
+                            method_path.as_str(),
+                            "package pkg\nfunc (p Provider) Named() {}\n",
+                        ),
+                        (
+                            caller_path.as_str(),
+                            "package pkg\nfunc PTChain() { NewProvider().Named() }\nfunc PTAssignment() { p := NewProvider(); p.Named() }\n",
+                        ),
+                    ]
+                } else {
+                    vec![(path, same)]
+                };
+                let (files, edges) = review_edges(&inputs, Language::Go);
+                let caller_file = if split { caller_path.as_str() } else { path };
+                let target_file = if split { method_path.as_str() } else { path };
+                for caller in ["PTChain", "PTAssignment"] {
+                    assert!(
+                        qa_calls(
+                            &files,
+                            &edges,
+                            (caller_file, caller),
+                            (path, "NewProvider", 3)
+                        ),
+                        "{path}/{split}/{caller}: {edges:#?}"
+                    );
+                    assert!(
+                        qa_calls(
+                            &files,
+                            &edges,
+                            (caller_file, caller),
+                            (target_file, "Named", if split { 2 } else { 4 })
+                        ),
+                        "{path}/{split}/{caller}: {edges:#?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

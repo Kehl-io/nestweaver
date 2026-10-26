@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page, type APIRequestContext, type TestInfo } from "@playwright/test";
 import { renderedFrame } from "./deliveryBarriers";
 
 // Keep native SSE and real symbol/repository metadata. Only source payloads
@@ -146,8 +146,14 @@ test("committed source removal clears old bodies and preserves typed missing-sou
 });
 
 
-test("real body-only reindex refreshes both selected source previews without reselection", async ({ page, request }, testInfo) => {
-  test.setTimeout(180_000);
+interface OwnedSource {
+  sourcePath: string;
+  original: string;
+  reindex: () => Promise<void>;
+  find: () => Promise<{ uid: string; name: string; start_line: number }>;
+}
+
+async function withOwnedSource(request: APIRequestContext, testInfo: TestInfo, exercise: (source: OwnedSource) => Promise<void>) {
   const fixture = JSON.parse(process.env.NESTWEAVER_UI_SOURCE_FIXTURE ?? "null") as {
     binary: string; repo: string; db: string; pidfile: string; pid: number;
   } | null;
@@ -171,23 +177,101 @@ test("real body-only reindex refreshes both selected source previews without res
     return symbol!;
   };
   try {
-    const before = await find();
-    await selectSource(page);
-    for (const preview of previews(page)) await expect(preview).toContainText("return releaseB();");
-    const changed = original.replace("return releaseB();", "return 'preview-after-real-index';");
-    expect(changed).not.toBe(original);
-    await writeFile(sourcePath, changed);
-    await reindex();
-    const after = await find();
-    expect(after.uid).toBe(before.uid);
-    expect(after.start_line).toBe(before.start_line);
-    for (const preview of previews(page)) {
-      await expect(preview).toContainText("preview-after-real-index", { timeout: 15_000 });
-      await expect(preview).not.toContainText("return releaseB();");
-    }
-    expect(new URL(page.url()).searchParams.get("node")).toBe(before.uid);
+    await exercise({ sourcePath, original, reindex, find });
   } finally {
     await writeFile(sourcePath, original);
     await reindex();
   }
+}
+
+async function holdSymbolReply(page: Page, uid: string, status: number) {
+  let holding = true;
+  let count = 0;
+  let releaseReply!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseReply = resolve; });
+  await page.route("**/api/v1/symbol/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (decodeURIComponent(path.slice("/api/v1/symbol/".length)) !== uid) return route.continue();
+    const response = await route.fetch();
+    if (holding && response.status() === status) {
+      count += 1;
+      await gate;
+    }
+    await route.fulfill({ response });
+  });
+  return { count: () => count, release: () => { holding = false; releaseReply(); } };
+}
+
+function countSourceRequests(page: Page) {
+  let count = 0;
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === "/api/v1/source" && url.searchParams.get("file") === "release-journey.js") count += 1;
+  });
+  return () => count;
+}
+
+test("real body-only reindex waits for current metadata then refreshes both previews without reselection", async ({ page, request }, testInfo) => {
+  test.setTimeout(180_000);
+  await withOwnedSource(request, testInfo, async ({ sourcePath, original, reindex, find }) => {
+    const requests = countSourceRequests(page);
+    const before = await find();
+    await selectSource(page);
+    for (const preview of previews(page)) await expect(preview).toContainText("return releaseB();");
+    const baseline = requests();
+    const metadata = await holdSymbolReply(page, before.uid, 200);
+    try {
+      const changed = original.replace("return releaseB();", "return 'preview-after-real-index';");
+      expect(changed).not.toBe(original);
+      await writeFile(sourcePath, changed);
+      await reindex();
+      const after = await find();
+      expect(after.uid).toBe(before.uid);
+      expect(after.start_line).toBe(before.start_line);
+      await expect.poll(metadata.count).toBeGreaterThan(0);
+      for (const preview of previews(page)) await expect(preview).toHaveCount(0);
+      expect(requests(), "new bodies wait for current successful symbol metadata").toBe(baseline);
+      metadata.release();
+      for (const preview of previews(page)) {
+        await expect(preview).toContainText("preview-after-real-index", { timeout: 15_000 });
+        await expect(preview).not.toContainText("return releaseB();");
+      }
+      expect(requests()).toBeGreaterThan(baseline);
+      expect(new URL(page.url()).searchParams.get("node")).toBe(before.uid);
+    } finally {
+      metadata.release();
+    }
+  });
+});
+
+test("real moved-symbol reindex never attributes a new target line to held old metadata", async ({ page, request }, testInfo) => {
+  test.setTimeout(180_000);
+  await withOwnedSource(request, testInfo, async ({ sourcePath, original, reindex, find }) => {
+    const requests = countSourceRequests(page);
+    const before = await find();
+    await selectSource(page);
+    for (const preview of previews(page)) await expect(preview.locator("[aria-current=true]")).toContainText("function releaseA");
+    const baseline = requests();
+    const metadata = await holdSymbolReply(page, before.uid, 404);
+    try {
+      await writeFile(sourcePath, "export function unrelatedReplacement() { return 'UNRELATED_NEW_TARGET'; }\n" + original);
+      await reindex();
+      const after = await find();
+      expect(after.uid).not.toBe(before.uid);
+      expect(after.start_line).toBe(before.start_line + 1);
+      const missing = await request.get(`/api/v1/symbol/${encodeURIComponent(before.uid)}`);
+      expect(missing.status()).toBe(404);
+      await expect.poll(metadata.count).toBeGreaterThan(0);
+      for (const preview of previews(page)) await expect(preview).toHaveCount(0);
+      expect(requests(), "invalidated symbol coordinates cannot request the new file body").toBe(baseline);
+      expect(new URL(page.url()).searchParams.get("node")).toBe(before.uid);
+      metadata.release();
+      for (const panel of [page.getByTestId("detail-panel"), page.getByRole("complementary", { name: "Source and note evidence" })]) {
+        await expect(panel.getByRole("heading", { name: "Node not found" })).toBeVisible();
+        await expect(panel).not.toContainText("UNRELATED_NEW_TARGET");
+      }
+    } finally {
+      metadata.release();
+    }
+  });
 });

@@ -347,6 +347,7 @@ export function SourceEvidencePanel({
               </pre>
             )}
             <CodePreview
+              symbolUid={symbol.uid}
               filePath={filePath}
               line={line}
               repoUid={symbol.repo_uid}

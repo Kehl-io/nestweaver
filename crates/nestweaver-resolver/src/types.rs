@@ -4,7 +4,9 @@ use std::collections::HashSet;
 use nestweaver_parser::RawSymbol;
 use nestweaver_schema::{Language, ResolvedType, SymbolKind};
 
-use crate::type_extractors::{BindingSource, TypeBinding, extract_bindings, extract_self_bindings};
+use crate::type_extractors::{
+    BindingSource, TypeBinding, TypeNameParts, extract_bindings, extract_self_bindings,
+};
 
 /// A variable binding key: (variable_name, line_number).
 type BindingKey = (String, u32);
@@ -415,21 +417,20 @@ impl TypeEnvironment {
             let Some(mut binding) = binding else {
                 continue;
             };
-            let (origin, type_name) = binding
-                .type_name
-                .split_once('#')
-                .map_or((None, binding.type_name.as_str()), |(file, rest)| {
-                    (Some(file), rest)
-                });
-            let (type_name, origin_line) = type_name
-                .split_once('#')
-                .map_or((type_name, None), |(name, line)| (name, Some(line)));
-            let Some(element) = go_slice_element(type_name) else {
+            let parts = binding.type_name_parts();
+            let Some(element) = go_slice_element(parts.raw_type) else {
                 continue;
             };
-            binding.type_name = match (origin, origin_line) {
-                (Some(file), Some(line)) => format!("{file}#{element}#{line}"),
-                _ => element,
+            // Preserve the declaration line, not the range variable's line.
+            // Line-less legacy ranges retain their existing unscoped policy.
+            binding.type_name = if parts.origin_line.is_some() {
+                TypeNameParts {
+                    raw_type: &element,
+                    ..parts
+                }
+                .encode()
+            } else {
+                element
             };
             binding.line = range.line;
             let scope = range.scope;
@@ -742,6 +743,62 @@ fn extract_call_assignment(line: &str) -> Option<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn go_range_element_rewrite_preserves_hash_path_and_declared_return_line() {
+        let source = "package app\nfunc use() { items := All(); for _, item := range items { item.Named() } }\n";
+        let parsed =
+            nestweaver_parser::parse_source(std::path::Path::new("app.go"), source).unwrap();
+        for legacy in [false, true] {
+            let mut env = super::TypeEnvironment::build(
+                source,
+                nestweaver_schema::Language::Go,
+                &parsed.symbols,
+                &parsed.type_bindings,
+            );
+            let assignment = env
+                .call_assignments
+                .iter()
+                .find(|call| call.variable == "items")
+                .unwrap()
+                .clone();
+            let declared = crate::type_extractors::TypeBinding {
+                type_name: "[]*alias.Store".into(),
+                line: 77,
+                confidence: 0.95,
+                source: crate::type_extractors::BindingSource::ReturnType,
+            };
+            env.seed_scoped_return(&assignment, "factory/has#type.go", &declared, true);
+            if legacy {
+                let (_, binding) = env
+                    .scoped_bindings
+                    .iter_mut()
+                    .find(|((name, _, _, _), _)| name == "items")
+                    .unwrap()
+                    .1;
+                binding.type_name = "factory.go#[]*alias.Store".into();
+            }
+            env.propagate_go_ranges();
+            let (_, binding) = env
+                .scoped_bindings
+                .iter()
+                .find(|((name, _, _, _), _)| name == "item")
+                .unwrap()
+                .1;
+            let parts = binding.type_name_parts();
+            assert_eq!(parts.raw_type, "alias.Store");
+            assert_eq!(
+                parts.origin_file,
+                if legacy {
+                    None
+                } else {
+                    Some("factory/has#type.go")
+                }
+            );
+            assert_eq!(parts.origin_line, if legacy { None } else { Some(77) });
+            assert_eq!(binding.line, env.go_ranges[0].line);
+        }
+    }
+
     #[test]
     fn go_slice_elements_require_one_concrete_named_element_type() {
         for (slice, element) in [
