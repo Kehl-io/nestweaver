@@ -1299,7 +1299,97 @@ fn extract_rust_type_info(sig: &str) -> Option<TypeInfo> {
     None
 }
 
-fn extract_go_type_info(sig: &str) -> Option<TypeInfo> {
+/// The declared type of exactly one Go result. A grouped declaration such as
+/// `(left, right []T)` still declares two results and cannot seed one receiver.
+fn go_single_result_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if node.has_error() {
+        return None;
+    }
+    let result = if node.kind() == "parameter_list" {
+        let mut cursor = node.walk();
+        let mut results = node
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra());
+        let declaration = results.next()?;
+        if results.next().is_some() || declaration.kind() != "parameter_declaration" {
+            return None;
+        }
+        let mut cursor = declaration.walk();
+        if declaration
+            .children_by_field_name("name", &mut cursor)
+            .count()
+            > 1
+        {
+            return None;
+        }
+        declaration.child_by_field_name("type")?
+    } else {
+        node
+    };
+    if result.has_error() {
+        return None;
+    }
+    let text = result.utf8_text(source).ok()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn extract_go_type_info(
+    signature: &str,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<TypeInfo> {
+    if !matches!(
+        node.kind(),
+        "function_declaration" | "method_declaration" | "method_elem"
+    ) {
+        // Preserve descriptive metadata on function types, fields and values.
+        // Resolver return seeding admits Function/Method symbols only; opaque
+        // non-callable metadata must not become a new concrete type donor.
+        return extract_go_signature_type_info(signature);
+    }
+    let result = node.child_by_field_name("result")?;
+    let return_type = go_single_result_type(result, source)
+        .or_else(|| go_multiple_result_metadata(result, source))?;
+    Some(TypeInfo {
+        declared_type: None,
+        parameter_types: Vec::new(),
+        return_type: Some(return_type),
+    })
+}
+
+/// Public symbol/contract metadata retains valid multi-result spelling even
+/// though it cannot seed a single receiver. Never use error recovery as a raw
+/// text fallback, or let this metadata-only path populate AST type bindings.
+fn go_multiple_result_metadata(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() != "parameter_list" || node.has_error() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let mut count = 0;
+    for declaration in node
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+    {
+        if declaration.kind() != "parameter_declaration"
+            || declaration.child_by_field_name("type").is_none()
+        {
+            return None;
+        }
+        let mut cursor = declaration.walk();
+        count += declaration
+            .children_by_field_name("name", &mut cursor)
+            .count()
+            .max(1);
+    }
+    if count <= 1 {
+        return None;
+    }
+    node.utf8_text(source).ok().map(str::to_string)
+}
+
+// Non-callable symbols retain their previous descriptive signature metadata.
+// Callable declarations above must use canonical AST results instead.
+fn extract_go_signature_type_info(sig: &str) -> Option<TypeInfo> {
     // "func greet(name string) string {", "func (i *Impl) Add(a, b int) int {".
     // The parameter list is the first one after the optional receiver; the
     // LAST `)` of a one-line declaration can sit inside its body.
@@ -1376,14 +1466,19 @@ fn extract_python_type_info(sig: &str) -> Option<TypeInfo> {
     None
 }
 
-fn extract_type_info(signature: &str, lang: Language) -> Option<TypeInfo> {
+fn extract_type_info(
+    signature: &str,
+    lang: Language,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<TypeInfo> {
     match lang {
         // Java/C#: return type is the word before the method name
         // e.g., "public String greet(String name)" → return_type = "String"
         Language::Java | Language::CSharp => extract_java_style_type_info(signature),
         // Go: return type is after the closing paren
         // e.g., "func greet(name string) string" → return_type = "string"
-        Language::Go => extract_go_type_info(signature),
+        Language::Go => extract_go_type_info(signature, node, source),
         // Rust: return type after ->
         // e.g., "fn greet(name: &str) -> String" → return_type = "String"
         Language::Rust => extract_rust_type_info(signature),
@@ -2050,7 +2145,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         // `export` keyword), so they need their own check.
                         || is_commonjs_export_assignment(lang, node, source_bytes),
                 );
-                let mut type_info = extract_type_info(&signature, lang);
+                let mut type_info = extract_type_info(&signature, lang, node, source_bytes);
                 if matches!(lang, Language::JavaScript | Language::TypeScript)
                     && kind == SymbolKind::Property
                     && matches!(
@@ -3406,7 +3501,7 @@ fn collect_local_bindings(
             || lang == Language::Go
                 && matches!(
                     node.kind(),
-                    "short_var_declaration" | "var_spec" | "parameter_declaration"
+                    "short_var_declaration" | "var_spec" | "const_spec" | "parameter_declaration"
                 )
             || lang == Language::Go && go_range_declares_names(node)
         {
@@ -3505,7 +3600,7 @@ fn emit_binding_names(
         "let_declaration" | "for_expression" => node.child_by_field_name("pattern"),
         "variable_declarator" => node.child_by_field_name("name"),
         "short_var_declaration" | "range_clause" => node.child_by_field_name("left"),
-        "var_spec" | "parameter_declaration" => node.child_by_field_name("name"),
+        "var_spec" | "const_spec" | "parameter_declaration" => node.child_by_field_name("name"),
         "catch_clause" => node.child_by_field_name("parameter"),
         "for_in_statement" => node.child_by_field_name("left"),
         "arrow_function" => node.child_by_field_name("parameter"),
@@ -3514,7 +3609,18 @@ fn emit_binding_names(
     let Some(root) = root else {
         return;
     };
-    let mut stack = vec![root];
+    let mut stack = if lang == Language::Go
+        && matches!(
+            node.kind(),
+            "var_spec" | "const_spec" | "parameter_declaration"
+        ) {
+        // Every local name shadows independently, including names after the
+        // first in a multi-name var, const or parameter declaration. Inference stays narrower.
+        let mut cursor = node.walk();
+        node.children_by_field_name("name", &mut cursor).collect()
+    } else {
+        vec![root]
+    };
     while let Some(current) = stack.pop() {
         if is_type_node(current.kind()) {
             continue;
@@ -3710,6 +3816,7 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
                 | "let_declaration"
                 | "short_var_declaration"
                 | "var_spec"
+                | "const_spec"
                 | "range_clause"
         ) {
             initialized_at = parent.end_byte();
@@ -4197,14 +4304,8 @@ pub fn scoped_go_assignment_evidence(source: &str) -> ScopedRustEvidence {
     );
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if node.kind() == "short_var_declaration"
-            && let (Some(left), Some(right)) = (
-                node.child_by_field_name("left"),
-                node.child_by_field_name("right"),
-            )
-            && left.named_child_count() == 1
-            && right.named_child_count() == 1
-            && let (Some(name), Some(value)) = (left.named_child(0), right.named_child(0))
+        if let Some((name, value)) = go_single_initializer(node)
+            && let Some(value) = go_unwrap_parentheses(value)
             && name.kind() == "identifier"
             && let (Ok(variable), Some(scope)) =
                 (name.utf8_text(source.as_bytes()), lexical_scope(name))
@@ -4223,6 +4324,7 @@ pub fn scoped_go_assignment_evidence(source: &str) -> ScopedRustEvidence {
         }
         if go_range_declares_names(node)
             && let (Some(left), Some(right)) = (node.child_by_field_name("left"), node.child_by_field_name("right"))
+            && let Some(right) = go_unwrap_parentheses(right)
             // One binding is the integer index, never the slice element.
             && left.named_child_count() == 2
             && let Some(value) = left.named_child(1)
@@ -4257,6 +4359,56 @@ pub fn scoped_go_assignment_evidence(source: &str) -> ScopedRustEvidence {
         stack.extend(node.named_children(&mut cursor));
     }
     result
+}
+
+/// Parentheses preserve expression identity. Use the inner node's original
+/// offsets for lexical lookup and matching the exact parsed call reference.
+fn go_unwrap_parentheses(mut node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    if node.has_error() {
+        return None;
+    }
+    while node.kind() == "parenthesized_expression" {
+        let mut cursor = node.walk();
+        let mut children = node
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra());
+        node = children.next()?;
+        if children.next().is_some() {
+            return None;
+        }
+    }
+    (!node.has_error()).then_some(node)
+}
+
+/// Infer only a single untyped initializer. Explicit annotations keep their
+/// authoritative binding; multi-name/multi-value declarations remain unknown.
+fn go_single_initializer(
+    node: tree_sitter::Node<'_>,
+) -> Option<(tree_sitter::Node<'_>, tree_sitter::Node<'_>)> {
+    match node.kind() {
+        "short_var_declaration" => {
+            let left = node.child_by_field_name("left")?;
+            let right = node.child_by_field_name("right")?;
+            if left.named_child_count() != 1 || right.named_child_count() != 1 {
+                return None;
+            }
+            Some((left.named_child(0)?, right.named_child(0)?))
+        }
+        "var_spec" if node.child_by_field_name("type").is_none() => {
+            let mut cursor = node.walk();
+            let mut names = node.children_by_field_name("name", &mut cursor);
+            let name = names.next()?;
+            if names.next().is_some() {
+                return None;
+            }
+            let values = node.child_by_field_name("value")?;
+            if values.named_child_count() != 1 {
+                return None;
+            }
+            Some((name, values.named_child(0)?))
+        }
+        _ => None,
+    }
 }
 
 fn go_slice_literal_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
@@ -4788,12 +4940,17 @@ fn extract_types_from_tree(
                     kind = AstBindingKind::ReturnType;
                 }
                 "return.type" => {
-                    var_type = Some(if lang == Language::Rust {
-                        rust_receiver_type(capture.node, source)
-                            .unwrap_or_else(|| extract_base_type(text))
+                    var_type = if lang == Language::Go {
+                        go_single_result_type(capture.node, source)
+                            .map(|result| extract_base_type(&result))
                     } else {
-                        extract_base_type(text)
-                    });
+                        Some(if lang == Language::Rust {
+                            rust_receiver_type(capture.node, source)
+                                .unwrap_or_else(|| extract_base_type(text))
+                        } else {
+                            extract_base_type(text)
+                        })
+                    };
                 }
                 "param.name" => {
                     if lang == Language::Go && !go_parameter_is_callable_binding(capture.node) {
@@ -12889,6 +13046,262 @@ fn main() {
                 );
             }
         }
+    }
+
+    #[test]
+    fn go_single_results_share_ast_and_persisted_declaration_types() {
+        let source = "package app\nfunc Named() (items []*store.Store) { return nil }\nfunc Plain() []store.Store { return nil }\nfunc Parenthesized() ([]store.Store) { return nil }\nfunc Multiple() (items []store.Store, err error) { return nil, nil }\nfunc Grouped() (left, right []store.Store) { return nil, nil }\nfunc (recv Holder) Method() (items []store.Store) { return nil }\nfunc MultiLine() (\n items []*store.Store,\n) { return nil }\n";
+        let parsed = parse_source(Path::new("app.go"), source).unwrap();
+        for (name, expected_metadata, expected_binding) in [
+            ("Named", Some("[]*store.Store"), Some("[]*store.Store")),
+            ("Plain", Some("[]store.Store"), Some("[]store.Store")),
+            (
+                "Parenthesized",
+                Some("[]store.Store"),
+                Some("[]store.Store"),
+            ),
+            ("Multiple", Some("(items []store.Store, err error)"), None),
+            ("Grouped", Some("(left, right []store.Store)"), None),
+            ("Method", Some("[]store.Store"), Some("[]store.Store")),
+            ("MultiLine", Some("[]*store.Store"), Some("[]*store.Store")),
+        ] {
+            let symbol = parsed
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap();
+            let stored = symbol
+                .type_info
+                .as_ref()
+                .and_then(|info| info.return_type.as_deref());
+            assert_eq!(stored, expected_metadata, "persisted declaration {name}");
+            let ast = parsed.type_bindings.iter().find(|binding| {
+                binding.var_name == name && binding.kind == AstBindingKind::ReturnType
+            });
+            assert_eq!(
+                ast.map(|binding| binding.type_name.as_str()),
+                expected_binding,
+                "AST return {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_interface_methods_preserve_single_result_metadata_without_parameter_donors() {
+        let source = "package app\ntype Client struct{}\ntype Factory interface {\n Plain() []Client\n Named() (items []*Client)\n Multiple() (items []Client, err error)\n Grouped() (left, right []Client)\n}\nfunc PlainFunction() []Client { return nil }\nfunc NamedFunction() (items []*Client) { return nil }\n";
+        let parsed = parse_source(Path::new("app.go"), source).unwrap();
+        for (name, expected) in [
+            ("Plain", Some("[]Client")),
+            ("Named", Some("[]*Client")),
+            ("Multiple", Some("(items []Client, err error)")),
+            ("Grouped", Some("(left, right []Client)")),
+        ] {
+            let method = parsed
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap();
+            assert_eq!(method.kind, SymbolKind::Method);
+            assert_eq!(
+                method
+                    .type_info
+                    .as_ref()
+                    .and_then(|info| info.return_type.as_deref()),
+                expected,
+                "interface method {name}"
+            );
+        }
+        // The existing query emits AST return bindings for declarations, not
+        // interface method elements. Preserve that boundary; no new names from
+        // interface parameter/result lists become file-wide value donors.
+        let interface_end = source.find("func PlainFunction").unwrap();
+        for name in [
+            "Plain", "Named", "Multiple", "Grouped", "items", "left", "right", "err",
+        ] {
+            assert!(
+                !parsed
+                    .type_bindings
+                    .iter()
+                    .any(|binding| binding.var_name == name
+                        && binding
+                            .scope
+                            .is_some_and(|scope| scope.position < interface_end)),
+                "interface name must not acquire an AST value binding: {name}"
+            );
+        }
+        for (name, expected) in [
+            ("PlainFunction", "[]Client"),
+            ("NamedFunction", "[]*Client"),
+        ] {
+            let binding = parsed
+                .type_bindings
+                .iter()
+                .find(|binding| {
+                    binding.var_name == name && binding.kind == AstBindingKind::ReturnType
+                })
+                .unwrap();
+            assert_eq!(binding.type_name, expected);
+        }
+        assert!(!parsed.references.iter().any(|reference| matches!(
+            reference.name.as_str(),
+            "left" | "right" | "err"
+        ) && reference.kind
+            == ReferenceKind::LocalBinding));
+    }
+
+    #[test]
+    fn go_noncallable_symbols_preserve_opaque_function_return_metadata() {
+        let source = "package app\ntype Store struct{}\ntype FactoryFunc func() []Store\ntype Holder struct { Build func() []Store }\nvar BuildVar = func() []Store { return nil }\n";
+        let parsed = parse_source(Path::new("app.go"), source).unwrap();
+        for name in ["FactoryFunc", "Build", "BuildVar"] {
+            let symbol = parsed
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap();
+            assert!(!matches!(
+                symbol.kind,
+                SymbolKind::Function | SymbolKind::Method
+            ));
+            assert_eq!(
+                symbol
+                    .type_info
+                    .as_ref()
+                    .and_then(|info| info.return_type.as_deref()),
+                Some("[]Store"),
+                "opaque metadata on {name}"
+            );
+            assert!(
+                !parsed
+                    .type_bindings
+                    .iter()
+                    .any(|binding| binding.var_name == name
+                        && binding.kind == AstBindingKind::ReturnType),
+                "opaque symbol must not gain a single-return inference binding: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_multi_result_metadata_never_falls_back_through_error_recovery() {
+        let source = "package app\nfunc Broken() (items []Store, err error {}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&build_ts_language(Language::Go, Path::new("app.go")))
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(tree.root_node().has_error());
+        let mut stack = vec![tree.root_node()];
+        let mut malformed_results = 0;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "parameter_list" && node.has_error() {
+                malformed_results += 1;
+                assert!(go_single_result_type(node, source.as_bytes()).is_none());
+                assert!(go_multiple_result_metadata(node, source.as_bytes()).is_none());
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert!(
+            malformed_results > 0,
+            "fixture must exercise a recovered result list"
+        );
+    }
+
+    #[test]
+    fn go_var_initializers_and_parentheses_keep_declaration_and_inner_offsets() {
+        let source = "package app\nfunc run(items []Thing) {\n { var items = []Other{}; for _, element := range (( /* source */ items )) { element.Get() } }\n for _, items := range (( /* outer */ items )) { items.Get() }\n for _, element := range (( /* factory */ All() )) { element.Get() }\n for _, element := range (( []Thing{} )) { element.Get() }\n var first, second = []Thing{}, []Other{}\n var typed []Thing = nil\n _ = func(first, second []Thing) { _ = first; _ = second }\n const typedConst Other = 1\n const firstConst, secondConst = 1, 2\n const (\n inheritedFirst = 1\n inheritedSecond\n )\n}\n";
+        let parsed = parse_source(Path::new("app.go"), source).unwrap();
+        for name in ["first", "second"] {
+            assert!(
+                parsed
+                    .references
+                    .iter()
+                    .any(|reference| reference.name == name
+                        && reference.kind == ReferenceKind::LocalBinding),
+                "every var name shadows: {name}"
+            );
+        }
+        let parameter_at = source.find("second []Thing").unwrap();
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.name == "second"
+                    && reference.kind == ReferenceKind::LocalBinding
+                    && reference
+                        .scope
+                        .is_some_and(|scope| scope.position == parameter_at)),
+            "grouped closure's second parameter shadows independently"
+        );
+        for (name, declaration) in [
+            ("typedConst", "typedConst Other = 1"),
+            ("firstConst", "firstConst, secondConst = 1, 2"),
+            ("secondConst", "firstConst, secondConst = 1, 2"),
+            ("inheritedFirst", "inheritedFirst = 1"),
+            ("inheritedSecond", "inheritedSecond"),
+        ] {
+            let declaration_start = source.find(declaration).unwrap();
+            let declaration_end = declaration_start + declaration.len();
+            let expected_position = declaration_start + declaration.find(name).unwrap();
+            let binding = parsed
+                .references
+                .iter()
+                .find(|reference| {
+                    reference.name == name && reference.kind == ReferenceKind::LocalBinding
+                })
+                .unwrap_or_else(|| panic!("every const name shadows: {name}"));
+            let scope = binding.scope.unwrap();
+            assert_eq!(
+                scope.position, expected_position,
+                "const declaration identity {name}"
+            );
+            assert_eq!(
+                scope.initialized_at, declaration_end,
+                "const becomes visible after its specification: {name}"
+            );
+        }
+        let evidence = scoped_go_assignment_evidence(source);
+        assert_eq!(
+            evidence.go_slice_literals.len(),
+            1,
+            "no guessed multi-var/explicit annotation types"
+        );
+        let literal = &evidence.go_slice_literals[0];
+        assert_eq!(literal.type_name, "[]Other");
+        let scope = literal.scope.unwrap();
+        assert_eq!(scope.initialized_at, source.find("; for").unwrap());
+        assert!(
+            parsed
+                .references
+                .iter()
+                .any(|reference| reference.name == "items"
+                    && reference.kind == ReferenceKind::LocalBinding
+                    && reference.scope == Some(scope))
+        );
+        assert_eq!(evidence.go_ranges.len(), 4);
+        let shadowed = evidence
+            .go_ranges
+            .iter()
+            .find(|range| range.variable == "items")
+            .unwrap();
+        let GoRangeSource::Identifier { position, .. } = shadowed.source else {
+            panic!("{shadowed:?}")
+        };
+        assert_eq!(&source[position..position + 5], "items");
+        assert!(
+            position < shadowed.scope.initialized_at,
+            "range source must see outer declaration"
+        );
+        let call = evidence
+            .go_ranges
+            .iter()
+            .find_map(|range| match &range.source {
+                GoRangeSource::Call(call) => Some(call),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(&source[call.call_position..call.call_position + 5], "All()");
     }
 
     #[test]
