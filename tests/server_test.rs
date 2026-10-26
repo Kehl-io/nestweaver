@@ -316,48 +316,43 @@ async fn server_exposes_read_only_embed_plan_rpc() {
 }
 
 #[test]
-fn cli_embed_reports_a_noop_plan_without_loading_the_embedding_runtime() {
+fn cli_embed_empty_scope_does_not_load_the_embedding_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.lbug");
     let repo_dir = dir.path().join("repo");
     write_test_repo(&repo_dir);
     index_repo(&repo_dir, &db_path);
 
-    // Seed every indexed node in the authoritative sidecar before the daemon
-    // starts. A no-op plan must return without requiring a ready model.
-    let store = nestweaver_store::GraphStore::open(&db_path).unwrap();
-    let mut uids: Vec<_> = store
-        .list_all_symbols()
-        .unwrap()
-        .into_iter()
-        .map(|symbol| symbol.uid)
-        .collect();
-    uids.extend(
-        store
-            .list_notes(None)
-            .unwrap()
-            .into_iter()
-            .map(|note| note.uid),
-    );
-    uids.extend(
-        store
-            .list_all_headings()
-            .unwrap()
-            .into_iter()
-            .map(|heading| heading.uid),
-    );
-    assert!(
-        !uids.is_empty(),
-        "fixture must index at least one embeddable node"
-    );
-    store.set_embedding_metadata("test-model", 3).unwrap();
-    for uid in uids {
-        assert!(store.add_embedding(&uid, vec![0.1, 0.2, 0.3]));
-    }
-    store.flush_embedding_index().unwrap();
-    drop(store);
-
-    let _guard = helpers::server_guard::ServerGuard::start(&db_path);
+    // This repository has symbols but no notes. A truly empty scope has
+    // nothing to recover, even when the embedding runtime is unavailable.
+    let config_path = dir.path().join("instance.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+instance_id = "empty-embed-scope"
+[snapshot_storage]
+backend = "local"
+path = {snapshots:?}
+[workspace]
+backend = "local"
+path = {workspace:?}
+[inference]
+endpoint = "http://127.0.0.1:1"
+embedding_model = "unused"
+summary_model = "unused"
+[git]
+credential_method = "ssh"
+[embedding]
+cache_dir = {cache:?}
+"#,
+            snapshots = dir.path().join("snapshots").display().to_string(),
+            workspace = dir.path().join("workspace").display().to_string(),
+            cache = dir.path().join("model-cache").display().to_string()
+        ),
+    )
+    .unwrap();
+    let _guard = helpers::server_guard::ServerGuard::start_with_config(&db_path, &config_path);
     // The preflight is a daemon RPC, so this must exercise the daemon route.
     // CI exports NESTWEAVER_NO_DAEMON=1 for the whole test job, which
     // `resolve_use_daemon` honors under GitHub Actions runner context — the
@@ -368,7 +363,13 @@ fn cli_embed_reports_a_noop_plan_without_loading_the_embedding_runtime() {
     let output = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
         .env_remove("NESTWEAVER_NO_DAEMON")
         .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
-        .args(["embed", "--db", &db_path.display().to_string()])
+        .args([
+            "embed",
+            "--scope",
+            "notes",
+            "--db",
+            &db_path.display().to_string(),
+        ])
         .output()
         .unwrap();
 

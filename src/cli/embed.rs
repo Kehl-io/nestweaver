@@ -90,6 +90,17 @@ pub(crate) fn render_daemon_embed_outcome(
     (lines, exit)
 }
 
+// Missing/legacy status is not evidence that an existing semantic corpus is usable.
+// Only an actually empty scope may skip the runtime regardless of its state.
+fn embedding_plan_can_skip_runtime(
+    plan: &nestweaver_proto::EmbedResponse,
+    status: Option<&nestweaver_proto::EmbeddingStatus>,
+) -> bool {
+    plan.eligible == 0
+        && (plan.scoped == 0
+            || status.is_some_and(|status| matches!(status.state.as_str(), "ready" | "embedding")))
+}
+
 /// Generate embeddings for symbols, notes, and/or headings.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_embed<Load>(
@@ -229,10 +240,23 @@ where
                                 plan.eligible, plan.skipped, plan.scoped
                             );
                             if plan.eligible == 0 {
-                                eprintln!(
-                                    "No embedding work required; every scoped node already has an authoritative sidecar embedding."
-                                );
-                                return Ok(EXIT_SUCCESS);
+                                // Eligibility describes stored vectors, not whether the daemon
+                                // can serve them semantically. A nonempty, fully embedded scope
+                                // still needs the canonical Embed RPC to recover a failed runtime.
+                                // Empty scopes retain their no-load policy.
+                                let status = if plan.scoped == 0 {
+                                    None
+                                } else {
+                                    rt.block_on(client.brain_status())
+                                        .context("read embedding runtime readiness before skipping embed")?
+                                        .embedding_status
+                                };
+                                if embedding_plan_can_skip_runtime(&plan, status.as_ref()) {
+                                    eprintln!(
+                                        "No embedding work required; every scoped node already has an authoritative sidecar embedding."
+                                    );
+                                    return Ok(EXIT_SUCCESS);
+                                }
                             }
                         }
                         Err(error) => {
@@ -958,4 +982,54 @@ pub(crate) fn daemon_lacks_embedding_preflight(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<tonic::Status>()
         .is_some_and(|status| status.code() == tonic::Code::Unimplemented)
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::embedding_plan_can_skip_runtime;
+    use nestweaver_proto::{EmbedResponse, EmbeddingStatus};
+
+    #[test]
+    fn existing_vectors_do_not_hide_an_unavailable_embedding_runtime() {
+        let mut plan = EmbedResponse {
+            eligible: 0,
+            skipped: 2,
+            scoped: 2,
+            ..Default::default()
+        };
+        assert!(!embedding_plan_can_skip_runtime(&plan, None));
+        for state in [
+            "failed",
+            "loading",
+            "seeding",
+            "disabled",
+            "",
+            "future-state",
+        ] {
+            let status = EmbeddingStatus {
+                state: state.to_string(),
+                ..Default::default()
+            };
+            assert!(
+                !embedding_plan_can_skip_runtime(&plan, Some(&status)),
+                "{state}"
+            );
+        }
+        for state in ["ready", "embedding"] {
+            let status = EmbeddingStatus {
+                state: state.to_string(),
+                ..Default::default()
+            };
+            assert!(
+                embedding_plan_can_skip_runtime(&plan, Some(&status)),
+                "{state}"
+            );
+            plan.eligible = 1;
+            assert!(!embedding_plan_can_skip_runtime(&plan, Some(&status)));
+            plan.eligible = 0;
+        }
+        plan.scoped = 0;
+        plan.skipped = 0;
+        assert!(embedding_plan_can_skip_runtime(&plan, None));
+    }
 }

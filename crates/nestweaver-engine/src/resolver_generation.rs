@@ -364,7 +364,11 @@ use std::path::Path;
 /// 15 — inferred var slices, transparent range parentheses and exact single
 /// named factory returns. Parsed cache10 supplies canonical result types and
 /// all var/const/parameter shadow declarations; existing repositories require index --force.
-pub const RESOLVER_GENERATION: u32 = 15;
+/// 16 — Go factory-call receiver chains retain the declaring type's file
+///     origin, and added/recreated package members invalidate unchanged Go
+///     importers through bounded same-package dependency seeds. Older graphs
+///     can retain missing CALLS edges; force reindex each repository once.
+pub const RESOLVER_GENERATION: u32 = 16;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

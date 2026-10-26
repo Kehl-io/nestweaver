@@ -376,14 +376,7 @@ impl TypeEnvironment {
             ))
             .or_insert((
                 scope.initialized_at,
-                TypeBinding {
-                    // Retain the exact callee's file for alias/import type-origin
-                    // resolution; this tag stays internal to the type environment.
-                    type_name: format!("{target_file}#{}#{}", binding.type_name, binding.line),
-                    line: assignment.line,
-                    confidence: binding.confidence.min(0.85),
-                    source: BindingSource::ReturnType,
-                },
+                binding.scoped_return(target_file, assignment.line),
             ));
     }
 

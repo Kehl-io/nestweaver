@@ -6520,6 +6520,119 @@ mod tests {
     }
 
     #[test]
+    fn watcher_recreated_go_member_recovers_resolved_package_importers() {
+        for cold_cache in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+            for subdir in ["a", "b", "factory", "app"] {
+                std::fs::create_dir_all(root.join(subdir)).unwrap();
+            }
+            for (path, source) in [
+                ("go.mod", "module example.test/watchedmembers\n\ngo 1.22\n"),
+                ("a/types.go", "package alpha\ntype Client struct{}\n"),
+                (
+                    "a/caller.go",
+                    "package alpha\nfunc Local(argument Client) { argument.Ping() }\n",
+                ),
+                (
+                    "b/types.go",
+                    "package beta\ntype Client struct{}\nfunc (receiver Client) Ping() string { return \"foreign\" }\n",
+                ),
+                (
+                    "factory/factory.go",
+                    "package factory\nimport choice \"example.test/watchedmembers/a\"\ntype Provider struct{}\nfunc (receiver Provider) Named() (values []*choice.Client) { return nil }\n",
+                ),
+                (
+                    "app/app.go",
+                    "package app\nimport left \"example.test/watchedmembers/a\"\nimport maker \"example.test/watchedmembers/factory\"\nfunc Direct(argument left.Client) { argument.Ping() }\nfunc Factory(provider maker.Provider) { for _, element := range provider.Named() { element.Ping() } }\n",
+                ),
+            ] {
+                std::fs::write(root.join(path), source).unwrap();
+            }
+            let leaf = root.join("a/methods.go");
+            let method =
+                "package alpha\nfunc (receiver Client) Ping() string { return \"alpha\" }\n";
+            std::fs::write(&leaf, method).unwrap();
+            let db = dir.path().join("watch.lbug");
+            let url = format!("file://{}", root.display());
+            crate::index::index_directory(&root, &db, "test", &url, "initial").unwrap();
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let uid = nestweaver_schema::repo_uid("test", &url);
+            let watcher = CodeWatcher::new(&db, &root, "test");
+            let publish = |paths: &[PathBuf]| {
+                let outcome = watcher
+                    .process_batch_with_io(
+                        &store,
+                        &uid,
+                        &url,
+                        paths,
+                        &crate::index::FileSystemIndexEpilogueIo,
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(outcome, WatchBatchOutcome::Published { .. }),
+                    "cold={cold_cache}: {outcome:?}"
+                );
+            };
+            let assert_calls = |target_path: Option<&str>| {
+                let symbols = store.lookup_symbols_by_repo(&uid).unwrap();
+                let target = target_path.map(|path| {
+                    symbols
+                        .iter()
+                        .find(|s| s.name == "Ping" && s.file_path == path)
+                        .unwrap()
+                        .uid
+                        .clone()
+                });
+                for name in ["Direct", "Factory", "Local"] {
+                    let caller = symbols.iter().find(|s| s.name == name).unwrap();
+                    let actual: HashSet<_> = store
+                        .callees_of(&caller.uid)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|s| s.name == "Ping")
+                        .map(|s| s.uid)
+                        .collect();
+                    assert_eq!(
+                        actual,
+                        target.iter().cloned().collect(),
+                        "{name}, cold cache={cold_cache}"
+                    );
+                }
+                target
+            };
+            let old_uid = assert_calls(Some("a/methods.go")).unwrap();
+            std::fs::remove_file(&leaf).unwrap();
+            publish(std::slice::from_ref(&leaf));
+            assert_calls(None);
+            if cold_cache {
+                let cache = crate::sidecar_path(&db, ".parsed_cache.bin");
+                let _ = std::fs::remove_file(&cache);
+                let _ = std::fs::remove_file(crate::parsed_cache::log_path(&cache));
+                crate::parsed_cache::forget_log_length(&cache);
+                let shared = shared_parsed_cache(&cache);
+                let mut parsed = shared.lock().unwrap();
+                parsed.refresh(&cache);
+                assert_eq!(parsed.len(), 0);
+            }
+            std::fs::write(&leaf, method.replacen("\n", "\n\n", 1)).unwrap();
+            publish(std::slice::from_ref(&leaf));
+            let new_uid = assert_calls(Some("a/methods.go")).unwrap();
+            assert_ne!(old_uid, new_uid);
+            let renamed = root.join("a/renamed.go");
+            std::fs::rename(&leaf, &renamed).unwrap();
+            publish(&[leaf, renamed]);
+            assert_calls(Some("a/renamed.go"));
+            // A provider moved out of the imported package is not a donor.
+            let moved = root.join("b/moved.go");
+            std::fs::rename(root.join("a/renamed.go"), &moved).unwrap();
+            std::fs::write(&moved, method.replace("package alpha", "package beta")).unwrap();
+            publish(&[root.join("a/renamed.go"), moved]);
+            assert_calls(None);
+        }
+    }
+
+    #[test]
     fn watcher_recreated_barrel_target_recovers_untouched_transitive_callers() {
         for cold_cache in [false, true] {
             let dir = tempfile::tempdir().unwrap();

@@ -28355,6 +28355,80 @@ accelerator = "cpu"
         servicer.abort();
     }
 
+    /// Recover the runtime even when authoritative vectors make the plan a
+    /// no-op. The model reload must not regenerate vectors or rewrite identity.
+    #[cfg(feature = "embed")]
+    #[tokio::test]
+    async fn daemon_embed_recovers_unavailable_runtime_with_only_existing_vectors() {
+        let cache = tempfile::tempdir().expect("embedding cache tempdir");
+        let (state, rx) = state_with_isolated_embedding_cache_and_reload(cache.path());
+        let mut failed = state.embedding_runtime.status();
+        failed.state = "failed".to_string();
+        failed.model_id = "test-owner/test-model".to_string();
+        failed.error = "cached model was unavailable at startup".to_string();
+        state.embedding_runtime.publish_unavailable(failed);
+        insert_unembedded_symbol(&state.store, "sym-existing-vector");
+        state
+            .store
+            .set_embedding_metadata("test-owner/test-model", 3)
+            .unwrap();
+        assert!(
+            state
+                .store
+                .add_embedding("sym-existing-vector", vec![0.1, 0.2, 0.3])
+        );
+        state.store.flush_embedding_index().unwrap();
+        let sidecar = state.store.embedding_sidecar_path().unwrap();
+        let before_bytes = std::fs::read(&sidecar).unwrap();
+        let before_pipeline = state.store.get_embedding_pipeline().unwrap();
+        assert!(state.embedding_runtime.snapshot().1.is_none());
+        let loader_calls = Arc::new(AtomicU32::new(0));
+        let servicer =
+            spawn_fake_reload_servicer(Arc::clone(&state), rx, Arc::clone(&loader_calls));
+        let service = DaemonService::new(Arc::clone(&state));
+        let request = || {
+            let mut request = Request::new(EmbedRequest {
+                scope: "symbols".to_string(),
+                force: false,
+                batch_size: 8,
+                repair_identity: false,
+            });
+            request.extensions_mut().insert(crate::auth::IsAdmin(true));
+            request
+        };
+        let plan = service.plan_embed(request()).await.unwrap().into_inner();
+        assert_eq!((plan.eligible, plan.skipped, plan.scoped), (0, 1, 1));
+        assert!(
+            state.embedding_runtime.snapshot().1.is_none(),
+            "planning must not reload"
+        );
+        let response = service.embed(request()).await.unwrap().into_inner();
+        assert_eq!(
+            (
+                response.succeeded,
+                response.failed,
+                response.rejected,
+                response.skipped
+            ),
+            (0, 0, 0, 1)
+        );
+        assert_eq!(loader_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(state.embedding_runtime.status().state, "ready");
+        assert!(
+            state.embedding_runtime.snapshot().1.is_some(),
+            "queries must share the recovered model"
+        );
+        assert_eq!(
+            state.store.get_embedding_pipeline().unwrap(),
+            before_pipeline
+        );
+        assert_eq!(std::fs::read(sidecar).unwrap(), before_bytes);
+        let model = state.embedding_runtime.snapshot().1.unwrap();
+        assert_eq!(model.embed_query("same seed").unwrap(), vec![0.1, 0.2, 0.3]);
+        assert_eq!(model.embed_query("new seed").unwrap(), vec![0.1, 0.2, 0.3]);
+        servicer.abort();
+    }
+
     /// Server-review IMPORTANT item 3: the `embed` RPC's missing-model
     /// branch must refuse immediately for an EXTERNAL backend rather than
     /// attempting to seed a local HF artifact cache that will never exist

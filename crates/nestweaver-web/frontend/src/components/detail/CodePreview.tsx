@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../../api/client";
 import { ambiguousCandidates, sourceErrorText } from "../../api/source";
 import type { SourceResponse } from "../../api/types";
+import { useStore } from "../../stores";
 import { RepoPicker } from "./RepoPicker";
 
 interface CodePreviewProps {
@@ -20,6 +21,7 @@ interface CodePreviewProps {
 }
 
 interface LocalPick {
+  workspaceId: string;
   filePath: string;
   repo: string;
   candidates: string[];
@@ -33,36 +35,44 @@ export function CodePreview({
   repoUid,
   onPickRepo,
 }: CodePreviewProps) {
+  const graphEpoch = useStore((s) => s.graphEpoch);
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
   const [source, setSource] = useState<SourceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [candidates, setCandidates] = useState<string[] | null>(null);
   // A pick made here applies only to the path it was made for.
   const [localPick, setLocalPick] = useState<LocalPick | null>(null);
-  const pick = localPick?.filePath === filePath ? localPick : null;
+  const pick = localPick?.filePath === filePath && localPick.workspaceId === workspaceId
+    ? localPick : null;
   const effectiveRepo = pick?.repo ?? repoUid;
 
   useEffect(() => {
     const controller = new AbortController();
+    const current = () => !controller.signal.aborted &&
+      useStore.getState().graphEpoch === graphEpoch &&
+      useStore.getState().activeWorkspaceId === workspaceId;
     setSource(null);
     setError(null);
     setCandidates(null);
     api
       .source(filePath, line, context, { signal: controller.signal }, effectiveRepo)
       .then((data) => {
-        if (!controller.signal.aborted) setSource(data);
+        if (current()) setSource(data);
       })
       .catch((e: unknown) => {
-        if (!controller.signal.aborted) {
+        if (current()) {
           setError(sourceErrorText(e, filePath, `Source not available: ${filePath}:${line}`));
           setCandidates(ambiguousCandidates(e));
         }
       });
     return () => controller.abort();
-  }, [context, filePath, line, effectiveRepo]);
+    // A committed index can change the body while all source coordinates stay
+    // identical. Layout-only graphVersion changes must not invalidate source.
+  }, [context, filePath, line, effectiveRepo, graphEpoch, workspaceId]);
 
   const handlePick = (uid: string, options: string[]) => {
     if (onPickRepo) onPickRepo(uid, options);
-    else setLocalPick({ filePath, repo: uid, candidates: options });
+    else setLocalPick({ workspaceId, filePath, repo: uid, candidates: options });
   };
 
   if (error && candidates) {

@@ -122,7 +122,12 @@ class UiDaemon(IsolatedDaemon):
         env = self.env.copy()
         env.update(NESTWEAVER_UI_FIXTURE_URL=url,
                    NESTWEAVER_UI_RESULTS_DIR=str(self.root / "browser-results"),
-                   NESTWEAVER_UI_BROWSER_EXECUTABLE=str(browser))
+                   NESTWEAVER_UI_BROWSER_EXECUTABLE=str(browser),
+                   NESTWEAVER_UI_SOURCE_FIXTURE=json.dumps({
+                       "binary": str(self.binary), "repo": str(self.repo),
+                       "db": str(self.db), "pidfile": str(self.pidfile),
+                       "pid": self.child.pid,
+                   }))
         if self.wikilink_fixture:
             env["NESTWEAVER_UI_WIKILINK_FIXTURE"] = "1"
         command = [str(node), str(frontend / "node_modules/@playwright/test/cli.js"),

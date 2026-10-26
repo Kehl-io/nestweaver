@@ -18,6 +18,19 @@ pub struct TypeBinding {
     pub source: BindingSource,
 }
 
+impl TypeBinding {
+    /// Preserve the exact declaration context for a returned type. Both
+    /// assignment and expression inference use this internal origin encoding.
+    pub(crate) fn scoped_return(&self, target_file: &str, use_line: u32) -> Self {
+        Self {
+            type_name: format!("{target_file}#{}#{}", self.type_name, self.line),
+            line: use_line,
+            confidence: self.confidence.min(0.85),
+            source: BindingSource::ReturnType,
+        }
+    }
+}
+
 /// The mechanism that produced a [`TypeBinding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingSource {
