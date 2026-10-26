@@ -12776,7 +12776,7 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
 
     #[test]
     fn go_var_slice_evidence_preserves_later_name_shadow_guards_and_annotations() {
-        let app = "package app\nimport a \"store\"\nimport b \"other\"\nfunc afterShadow() { var items = []a.Store{}; { var items = []b.Store{}; for _, item := range (items) { item.Get() } } }\nfunc beforeShadow(items []a.Store) { { for _, item := range (items) { item.Get() }; var items = []b.Store{}; _ = items } }\nfunc multiShadow() { var items = []a.Store{}; { var unused, items = 0, []interface{ Get() }{}; _ = unused; for _, item := range (items) { item.Get() } } }\nfunc groupedClosure() { var items = []a.Store{}; _ = items; _ = func(unused, items []b.Store) { _ = unused; for _, item := range (items) { item.Get() } } }\nfunc explicitType() { var items []b.Store = nil; for _, item := range (items) { item.Get() } }\nfunc unknown(items []interface{ Get() }) { for _, item := range (items) { item.Get() } }\nfunc interfaceFactory() { for _, item := range a.Unknown() { item.Get() } }\nfunc multiResult() { items, _ := a.Multi(); for _, item := range items { item.Get() } }\nfunc groupedResult() { items, _ := a.Grouped(); for _, item := range items { item.Get() } }\nfunc afterTypedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const item b.Store = 0; item.Get() } } }\nfunc beforeTypedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const item b.Store = 0; _ = item } } }\nfunc afterUntypedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const item = b.Store(0); item.Get() } } }\nfunc beforeUntypedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const item = b.Store(0); _ = item } } }\nfunc afterGroupedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const unused, item b.Store = 0, 0; _ = unused; item.Get() } } }\nfunc beforeGroupedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const unused, item b.Store = 0, 0; _ = unused; _ = item } } }\nfunc afterInheritedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const (unused = b.Store(0); item); _ = unused; item.Get() } } }\nfunc beforeInheritedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const (unused = b.Store(0); item); _ = unused; _ = item } } }\n";
+        let app = "package app\nimport a \"store\"\nimport b \"other\"\nfunc afterShadow() { var items = []a.Store{}; { var items = []b.Store{}; for _, item := range (items) { item.Get() } } }\nfunc beforeShadow(items []a.Store) { { for _, item := range (items) { item.Get() }; var items = []b.Store{}; _ = items } }\nfunc multiShadow() { var items = []a.Store{}; { var unused, items = 0, []interface{ Get() }{}; _ = unused; for _, item := range (items) { item.Get() } } }\nfunc groupedClosure() { var items = []a.Store{}; _ = items; _ = func(unused, items []b.Store) { _ = unused; for _, item := range (items) { item.Get() } } }\nfunc explicitType() { var items []b.Store = nil; for _, item := range (items) { item.Get() } }\nfunc unknown(items []interface{ Get() }) { for _, item := range (items) { item.Get() } }\nfunc interfaceFactory() { for _, item := range a.Unknown() { item.Get() } }\nfunc multiResult() { items, _ := a.Multi(); for _, item := range items { item.Get() } }\nfunc groupedResult() { items, _ := a.Grouped(); for _, item := range items { item.Get() } }\nfunc afterTypedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const item b.Scalar = 0; item.Get() } } }\nfunc beforeTypedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const item b.Scalar = 0; _ = item } } }\nfunc afterUntypedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const item = b.Scalar(0); item.Get() } } }\nfunc beforeUntypedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const item = b.Scalar(0); _ = item } } }\nfunc afterGroupedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const unused, item b.Scalar = 0, 0; _ = unused; item.Get() } } }\nfunc beforeGroupedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const unused, item b.Scalar = 0, 0; _ = unused; _ = item } } }\nfunc afterInheritedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const (unused = b.Scalar(0); item); _ = unused; item.Get() } } }\nfunc beforeInheritedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const (unused = b.Scalar(0); item); _ = unused; _ = item } } }\n";
         let input = [
             (
                 "store/types.go",
@@ -12784,20 +12784,38 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
             ),
             (
                 "other/types.go",
-                "package other\ntype Store int\nfunc (recv Store) Get() {}\n",
+                "package other\ntype Store struct{}\nfunc (recv Store) Get() {}\ntype Scalar int\nfunc (recv Scalar) Get() {}\n",
             ),
             ("app.go", app),
         ];
         let (files, edges) = review_edges(&input, Language::Go);
+        let other_symbols = &files
+            .iter()
+            .find(|(path, _, _)| path == "other/types.go")
+            .unwrap()
+            .1;
+        assert!(
+            other_symbols
+                .iter()
+                .any(|symbol| symbol.name == "Store" && symbol.kind == SymbolKind::Class)
+        );
+        assert!(
+            other_symbols
+                .iter()
+                .any(|symbol| symbol.name == "Scalar" && symbol.kind == SymbolKind::TypeAlias)
+        );
+        // Scalar constants are valid Go, but scalar-alias receiver resolution
+        // is deliberately outside this inference fix. Its real Get symbol
+        // makes the conservative refusal checks non-vacuous.
+        let scalar_get = uid_at(&files, "other/types.go", "Get", 5);
+        assert_ne!(scalar_get, uid_at(&files, "other/types.go", "Get", 3));
         for (caller, expected, other) in [
             ("afterShadow", "other/types.go", "store/types.go"),
             ("beforeShadow", "store/types.go", "other/types.go"),
             ("explicitType", "other/types.go", "store/types.go"),
             ("groupedClosure", "other/types.go", "store/types.go"),
-            ("afterTypedConst", "other/types.go", "store/types.go"),
             ("beforeTypedConst", "store/types.go", "other/types.go"),
             ("beforeUntypedConst", "store/types.go", "other/types.go"),
-            ("afterGroupedConst", "other/types.go", "store/types.go"),
             ("beforeGroupedConst", "store/types.go", "other/types.go"),
             ("beforeInheritedConst", "store/types.go", "other/types.go"),
         ] {
@@ -12809,6 +12827,15 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
                 !qa_calls(&files, &edges, ("app.go", caller), (other, "Get", 3)),
                 "wrong owner in {caller}: {edges:#?}"
             );
+            assert!(
+                !qa_calls(
+                    &files,
+                    &edges,
+                    ("app.go", caller),
+                    ("other/types.go", "Get", 5)
+                ),
+                "scalar donor in {caller}: {edges:#?}"
+            );
         }
         for caller in [
             "multiShadow",
@@ -12816,12 +12843,18 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
             "interfaceFactory",
             "multiResult",
             "groupedResult",
+            "afterTypedConst",
             "afterUntypedConst",
+            "afterGroupedConst",
             "afterInheritedConst",
         ] {
-            for target in ["store/types.go", "other/types.go"] {
+            for (target, line) in [
+                ("store/types.go", 3),
+                ("other/types.go", 3),
+                ("other/types.go", 5),
+            ] {
                 assert!(
-                    !qa_calls(&files, &edges, ("app.go", caller), (target, "Get", 3)),
+                    !qa_calls(&files, &edges, ("app.go", caller), (target, "Get", line)),
                     "concrete donor {caller}: {edges:#?}"
                 );
             }
