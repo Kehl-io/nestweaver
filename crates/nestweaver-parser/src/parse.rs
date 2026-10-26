@@ -6579,6 +6579,17 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
 
 // ── tests ──────────────────────────────────────────────────────────────────
 
+/// The scoped `LocalBinding`s named `name`.
+#[cfg(test)]
+fn local_scopes(parsed: &ParsedFile, name: &str) -> Vec<LexicalScope> {
+    parsed
+        .references
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::LocalBinding && r.name == name)
+        .filter_map(|r| r.scope)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15690,16 +15701,6 @@ mod generator_and_bare_arrow_tests {
                 parsed.symbols
             );
         }
-    }
-
-    /// The scoped `LocalBinding`s named `name`.
-    fn local_scopes(parsed: &ParsedFile, name: &str) -> Vec<LexicalScope> {
-        parsed
-            .references
-            .iter()
-            .filter(|r| r.kind == ReferenceKind::LocalBinding && r.name == name)
-            .filter_map(|r| r.scope)
-            .collect()
     }
 
     /// nw-113 final review M1: a generator's parameter and `var` are scoped to
