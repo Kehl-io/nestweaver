@@ -390,8 +390,6 @@ cache_dir = {cache:?}
             "notes",
             "--db",
             &db_path.display().to_string(),
-            "--config",
-            &config_path.display().to_string(),
         ])
         .output()
         .unwrap();

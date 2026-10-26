@@ -4549,6 +4549,9 @@ struct PrepareIndexResolution<'a> {
     /// edges for every resolve-filter member; that parse has to land first.
     parsed_files_for_resolver: &'a mut Vec<ParsedFileEntry>,
     file_languages: &'a HashMap<String, Language>,
+    /// Accepted publication paths, including unchanged files whose parsed
+    /// cache misses. Scanned-but-skipped paths are not declaration targets.
+    eligible_files: &'a HashSet<String>,
     actually_changed_files: &'a std::collections::HashSet<String>,
     /// Changed files that were not in the store before this pass deleted
     /// stale file nodes. A recreated import target is in here; a modification
@@ -4763,6 +4766,7 @@ fn prepare_index_resolution(
         r_uid,
         parsed_files_for_resolver,
         file_languages,
+        eligible_files,
         actually_changed_files,
         added_files,
         removed_files,
@@ -4817,7 +4821,7 @@ fn prepare_index_resolution(
         // filter member, and naming the importer earlier drops edges this
         // pass cannot rebuild.
         let mut seeded =
-            resolution_seeds_for_added_files(reader, deps, r_uid, added_files, file_languages)?;
+            resolution_seeds_for_added_files(reader, deps, r_uid, added_files, eligible_files)?;
         // A restored barrel or package member changes every importer above
         // it. Expand before selecting parses and deleting outgoing edges.
         affected.extend(deps.affected_files_for_repo(r_uid, &seeded));
@@ -4853,6 +4857,33 @@ fn prepare_index_resolution(
     } else {
         None
     };
+
+    // A cold parsed cache can omit unchanged declaration targets even after
+    // every affected source has been hydrated. In particular, a Git index can
+    // replace a Go method without updating the full-index filemeta entry. The
+    // following full scan then reparses that method while its surviving type
+    // file remains Unchanged. Resolve against the permitted package peers too;
+    // target-only peers must not join the outgoing-edge replacement filter.
+    if !skip_resolution {
+        let source_files: HashSet<String> = resolve_filter.clone().unwrap_or_else(|| {
+            parsed_files_for_resolver
+                .iter()
+                .map(|(path, ..)| path.clone())
+                .collect()
+        });
+        let targets = go_package_peers_for_paths(&source_files, eligible_files);
+        let included = include_missing_seeded_importer_parses(
+            reader,
+            parsed_files_for_resolver,
+            &mut type_envs,
+            file_languages,
+            &targets,
+        );
+        anyhow::ensure!(
+            included == targets,
+            "could not hydrate Go package declaration targets before resolution"
+        );
+    }
 
     {
         let all_symbols_with_returns: std::collections::HashMap<
@@ -6084,6 +6115,7 @@ where
                 r_uid: &r_uid,
                 parsed_files_for_resolver: &mut parsed_files_for_resolver,
                 file_languages: &file_languages,
+                eligible_files: &present_files,
                 actually_changed_files: &actually_changed_files,
                 added_files: &added_files,
                 removed_files: &removed_files,
@@ -9816,13 +9848,33 @@ fn resolution_seeds_for_added_files(
     deps: &crate::resolution_cache::ResolutionDeps,
     r_uid: &str,
     added: &HashSet<String>,
-    file_languages: &HashMap<String, Language>,
+    eligible_files: &HashSet<String>,
 ) -> anyhow::Result<HashSet<String>> {
     if added.is_empty() {
         return Ok(HashSet::new());
     }
-    let known: HashSet<String> = file_languages.keys().cloned().collect();
-    resolution_seeds_for_added_paths(reader, deps, r_uid, added, &known)
+    resolution_seeds_for_added_paths(reader, deps, r_uid, added, eligible_files)
+}
+
+/// Permitted production Go peers of source paths, used for scheduling and
+/// declaration-target hydration. The resolver owns package/build checks.
+fn go_package_peers_for_paths(paths: &HashSet<String>, known: &HashSet<String>) -> HashSet<String> {
+    let is_go_member = |path: &str| path.ends_with(".go") && !path.ends_with("_test.go");
+    let go_dirs: HashSet<&Path> = paths
+        .iter()
+        .filter(|path| known.contains(*path) && is_go_member(path))
+        .filter_map(|path| Path::new(path).parent())
+        .collect();
+    known
+        .iter()
+        .filter(|path| {
+            is_go_member(path)
+                && Path::new(path)
+                    .parent()
+                    .is_some_and(|dir| go_dirs.contains(dir))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Recover unresolved importers, and seed surviving Go package members before
@@ -9843,26 +9895,7 @@ fn resolution_seeds_for_added_paths(
     if added.is_empty() {
         return Ok(HashSet::new());
     }
-    let is_go_member = |path: &str| path.ends_with(".go") && !path.ends_with("_test.go");
-    let go_dirs: HashSet<&Path> = added
-        .iter()
-        .filter(|path| known.contains(*path) && is_go_member(path))
-        .filter_map(|path| Path::new(path).parent())
-        .collect();
-    let mut seeded: HashSet<String> = if go_dirs.is_empty() {
-        HashSet::new()
-    } else {
-        known
-            .iter()
-            .filter(|path| {
-                is_go_member(path)
-                    && Path::new(path)
-                        .parent()
-                        .is_some_and(|dir| go_dirs.contains(dir))
-            })
-            .cloned()
-            .collect()
-    };
+    let mut seeded = go_package_peers_for_paths(added, known);
     if let Some(unresolved) = deps
         .unresolved_for_repo(r_uid)
         .filter(|rows| !rows.is_empty())
@@ -10671,7 +10704,7 @@ pub(crate) fn prepare_watcher_batch_resolution(
             &resolution_deps,
             r_uid,
             &added_files,
-            &file_languages,
+            &verified,
         )?;
         scope.extend(resolution_deps.affected_files_for_repo(r_uid, &recovered));
         Some(scope)
@@ -10726,6 +10759,7 @@ pub(crate) fn prepare_watcher_batch_resolution(
             r_uid,
             parsed_files_for_resolver: &mut resolver_files,
             file_languages: &file_languages,
+            eligible_files: &verified,
             actually_changed_files: changed,
             added_files: &added_files,
             removed_files: &removed_files,
@@ -24308,6 +24342,139 @@ impl Counter {
         }
     }
 
+    #[test]
+    fn full_index_go_target_hydration_preserves_policy_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("graph.lbug");
+        fs::create_dir_all(repo.join("a")).unwrap();
+        fs::write(
+            repo.join("go.mod"),
+            "module example.test/policy\n\ngo 1.22\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("a/types.go"),
+            "package alpha\ntype Client struct{}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("a/caller.go"),
+            "package alpha\nfunc Local(argument Client) { argument.Ping() }\n",
+        )
+        .unwrap();
+        let method = "package alpha\nfunc (receiver Client) Ping() {}\n";
+        fs::write(repo.join("a/methods.go"), method).unwrap();
+        let binary = b"package alpha\nfunc Poisoned() {}\n\x00\x00\n";
+        let oversized = format!("package alpha\n//{}\n", "x".repeat(1024));
+        fs::write(repo.join("a/binary.go"), binary).unwrap();
+        fs::write(repo.join("a/large.go"), &oversized).unwrap();
+        for (path, name) in [
+            ("a/later_binary.go", "BeforeBinary"),
+            ("a/later_large.go", "BeforeLarge"),
+        ] {
+            fs::write(
+                repo.join(path),
+                format!("package alpha\nfunc {name}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let url = "https://example.test/go-policy-targets";
+        let r_uid = repo_uid("test", url);
+        let index = |db_path: &Path| {
+            index_directory_with_options_and_limits(
+                &repo,
+                db_path,
+                "test",
+                url,
+                "fixture",
+                false,
+                None,
+                crate::index_limits::IndexLimits::new(1024).unwrap(),
+            )
+            .unwrap()
+        };
+        let assert_state = |result: &IndexResult, newly_skipped: bool| {
+            let expected: std::collections::BTreeSet<_> = [
+                ("a/binary.go", SkipReasonCode::Binary),
+                ("a/large.go", SkipReasonCode::Oversized),
+            ]
+            .into_iter()
+            .chain(
+                newly_skipped
+                    .then_some([
+                        ("a/later_binary.go", SkipReasonCode::Binary),
+                        ("a/later_large.go", SkipReasonCode::Oversized),
+                    ])
+                    .into_iter()
+                    .flatten(),
+            )
+            .map(|(path, reason)| (path.to_string(), reason))
+            .collect();
+            let actual: std::collections::BTreeSet<_> = result
+                .skipped_files
+                .iter()
+                .map(|row| (row.path.clone(), row.reason_code))
+                .collect();
+            assert_eq!(actual, expected, "policy disclosures must remain exact");
+            assert_eq!(result.skipped_files.len(), expected.len());
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let files: HashSet<_> = store
+                .list_files_by_repo(&r_uid)
+                .unwrap()
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect();
+            for (path, _) in &expected {
+                assert!(
+                    !files.contains(path),
+                    "skipped peer must not be published: {path}"
+                );
+            }
+            let symbols = store.lookup_symbols_by_repo(&r_uid).unwrap();
+            let caller = symbols
+                .iter()
+                .find(|symbol| symbol.name == "Local")
+                .unwrap();
+            let target = symbols.iter().find(|symbol| symbol.name == "Ping").unwrap();
+            let callees: HashSet<_> = store
+                .callees_of(&caller.uid)
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.uid)
+                .collect();
+            assert_eq!(callees, HashSet::from([target.uid.clone()]));
+        };
+        assert_state(&index(&db), false);
+        let cache = crate::sidecar_path(&db, ".parsed_cache.bin");
+        let _ = fs::remove_file(&cache);
+        let _ = fs::remove_file(crate::parsed_cache::log_path(&cache));
+        crate::parsed_cache::forget_log_length(&cache);
+        fs::write(repo.join("a/methods.go"), format!("\n{method}")).unwrap();
+        fs::write(repo.join("a/later_binary.go"), binary).unwrap();
+        fs::write(repo.join("a/later_large.go"), &oversized).unwrap();
+        let updated = index(&db);
+        assert!(
+            updated.files_unchanged > 0,
+            "accepted peers must use cold-cache hydration"
+        );
+        assert_state(&updated, true);
+        let edges = resolved_edge_set(&db);
+        assert_state(&index(&db), true);
+        assert_eq!(
+            edges,
+            resolved_edge_set(&db),
+            "no-op must preserve eligible calls and skips"
+        );
+        let fresh = dir.path().join("fresh.lbug");
+        index(&fresh);
+        assert_eq!(
+            edges,
+            resolved_edge_set(&fresh),
+            "policy-skip refresh must agree with fresh indexing"
+        );
+    }
+
     fn exercise_go_package_member_recreation(
         git_incremental: bool,
         cold_cache: bool,
@@ -24426,10 +24593,11 @@ impl Counter {
         );
         let edges = resolved_edge_set(&db);
         index_directory(&repo, &db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+        assert_calls(Some("a/methods.go"));
         assert_eq!(
             edges,
             resolved_edge_set(&db),
-            "no-op must not duplicate restored edges"
+            "no-op must preserve restored edges: git={git_incremental}, cold={cold_cache}, pointer={pointer}"
         );
         fs::rename(repo.join("a/methods.go"), repo.join("a/renamed.go")).unwrap();
         update("rename method within package");
@@ -24439,7 +24607,7 @@ impl Counter {
         assert_eq!(
             resolved_edge_set(&db),
             resolved_edge_set(&fresh),
-            "restoration/rename must agree with fresh indexing"
+            "restoration/rename must agree with fresh indexing: git={git_incremental}, cold={cold_cache}, pointer={pointer}"
         );
     }
 
