@@ -12893,13 +12893,51 @@ fn is_unsafe_index_root(path: &std::path::Path) -> bool {
 }
 
 /// Canonicalize a config repo entry URL into an allow-list path.
+/// File URI paths are decoded exactly once; plain paths retain literal bytes.
 ///
 /// Config `[[repos]]` entries store `file://`-prefixed identity URLs;
 /// `PathBuf::from("file:///x")` is a *relative* path that never canonicalizes,
 /// which silently emptied the watcher allow-list.
 fn config_repo_canonical_path(url: &str) -> Option<PathBuf> {
-    let stripped = url.strip_prefix("file://").unwrap_or(url);
-    std::fs::canonicalize(stripped).ok()
+    let path = if url
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
+        // URL parsing is permissive about malformed escapes, surrounding
+        // whitespace, and backslashes. Refuse those ambiguous spellings here:
+        // the configured URL defines an authorization boundary.
+        let bytes = url.as_bytes();
+        if !url
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
+            || url.trim() != url
+            || bytes
+                .iter()
+                .any(|byte| byte.is_ascii_control() || *byte == b'\\')
+            || bytes.iter().enumerate().any(|(index, byte)| {
+                *byte == b'%'
+                    && !bytes
+                        .get(index + 1..index + 3)
+                        .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            })
+        {
+            return None;
+        }
+        let parsed = url::Url::parse(url).ok()?;
+        if parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.host_str().is_some_and(|host| host != "localhost")
+        {
+            return None;
+        }
+        // to_file_path decodes percent escapes once. Canonicalize afterwards
+        // so symlink aliases and containment use real filesystem ownership.
+        parsed.to_file_path().ok()?
+    } else {
+        // Plain paths are not URI data: a literal %20 names a literal %20.
+        PathBuf::from(url)
+    };
+    std::fs::canonicalize(path).ok()
 }
 
 /// Validate a watcher target path against the instance config's registered
@@ -34568,6 +34606,146 @@ mod watch_path_allowed_tests {
         assert_eq!(via_plain.as_deref(), Some(canonical.as_path()));
 
         assert!(config_repo_canonical_path("file:///definitely/missing/path").is_none());
+    }
+
+    #[test]
+    fn config_file_uris_decode_once_but_plain_paths_remain_literal() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            "vault space",
+            "vault研究",
+            "literal%20",
+            "literal%",
+            "hash#question?",
+        ] {
+            let root = temp.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            let expected = root.canonicalize().unwrap();
+            let uri = url::Url::from_directory_path(&root).unwrap();
+            assert_eq!(
+                config_repo_canonical_path(uri.as_str()),
+                Some(expected.clone())
+            );
+            assert_eq!(
+                config_repo_canonical_path(root.to_str().unwrap()),
+                Some(expected)
+            );
+        }
+
+        // Both spellings exist. %2520 must resolve to the literal %20 name,
+        // never the other directory that a second decode would select.
+        let space = temp.path().join("literal ");
+        std::fs::create_dir(&space).unwrap();
+        let literal_percent = temp.path().join("literal%20");
+        let uri = url::Url::from_directory_path(&literal_percent).unwrap();
+        assert_eq!(
+            config_repo_canonical_path(uri.as_str()),
+            Some(literal_percent.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn config_file_uris_accept_localhost_and_refuse_ambiguous_or_remote_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let uri = url::Url::from_directory_path(temp.path()).unwrap();
+        let local = format!("file://localhost{}", uri.path());
+        assert_eq!(
+            config_repo_canonical_path(&local),
+            Some(temp.path().canonicalize().unwrap())
+        );
+        assert_eq!(
+            config_repo_canonical_path(&uri.as_str().replacen("file:", "FILE:", 1)),
+            Some(temp.path().canonicalize().unwrap())
+        );
+
+        for invalid in [
+            format!("file://example.test{}", uri.path()),
+            format!("file://user:password@localhost{}", uri.path()),
+            format!("file://localhost:8080{}", uri.path()),
+            format!("{uri}?query"),
+            format!("{uri}#fragment"),
+            format!("{uri}%"),
+            format!("{uri}%2"),
+            format!("{uri}%GG"),
+            format!("{uri}%00"),
+            format!("{uri}\\child"),
+            format!("{uri}\tchild"),
+            format!("{uri} "),
+            "file:relative".to_string(),
+            "file:///definitely/missing/encoded%20root".to_string(),
+        ] {
+            assert!(
+                config_repo_canonical_path(&invalid).is_none(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_config_root_preserves_containment_and_source_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault 研究");
+        let child = vault.join("child");
+        let sibling = temp.path().join("vault 研究 sibling");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let uri = url::Url::from_directory_path(&vault).unwrap();
+        let repos = vec![repo_cfg(uri.as_str(), Some(RepoType::Vault))];
+        assert!(
+            watch_path_allowed(Some(&repos), &vault.canonicalize().unwrap(), "vault", true).is_ok()
+        );
+        assert!(
+            watch_path_allowed(Some(&repos), &child.canonicalize().unwrap(), "vault", true).is_ok()
+        );
+        assert!(
+            watch_path_allowed(Some(&repos), &vault.canonicalize().unwrap(), "repo", false).is_ok()
+        );
+        assert!(
+            watch_path_allowed(
+                Some(&repos),
+                &sibling.canonicalize().unwrap(),
+                "vault",
+                true
+            )
+            .is_err()
+        );
+        let code_only = vec![repo_cfg(uri.as_str(), Some(RepoType::Code))];
+        assert!(
+            watch_path_allowed(
+                Some(&code_only),
+                &vault.canonicalize().unwrap(),
+                "vault",
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encoded_config_root_uses_canonical_symlink_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let vault = temp.path().join("vault 研究");
+        let outside = temp.path().join("outside");
+        let alias = temp.path().join("alias 研究");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&vault, &alias).unwrap();
+        std::os::unix::fs::symlink(&outside, vault.join("escape")).unwrap();
+        let uri = url::Url::from_directory_path(&alias).unwrap();
+        let repos = vec![repo_cfg(uri.as_str(), Some(RepoType::Vault))];
+        assert!(
+            watch_path_allowed(Some(&repos), &vault.canonicalize().unwrap(), "vault", true).is_ok()
+        );
+        assert!(
+            watch_path_allowed(
+                Some(&repos),
+                &vault.join("escape").canonicalize().unwrap(),
+                "vault",
+                true
+            )
+            .is_err()
+        );
     }
 
     /// Without an instance config, an explicit `--repo` path must be

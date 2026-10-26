@@ -4,13 +4,21 @@
 No Cargo commands, binaries, database processes, or forged CI environment.
 """
 from pathlib import Path
+import hashlib
+import json
+import os
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
+import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CI = (ROOT / '.github/workflows/ci.yml').read_text()
 COVERAGE = (ROOT / '.github/workflows/coverage.yml').read_text()
+MUTATION = (ROOT / '.github/workflows/mutation.yml').read_text()
 RELEASE = (ROOT / '.github/workflows/release-please.yml').read_text()
 
 
@@ -41,6 +49,93 @@ def first_cargo_command(section):
     return min(offsets)
 
 
+class MutationScope(unittest.TestCase):
+    """Execute only scope selection in disposable Git repos, never Cargo."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        self.env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        empty = self.root / 'empty'; empty.mkdir()
+        self.git('init', '--initial-branch=main', '--template', str(empty))
+        scripts = self.root / 'scripts'; scripts.mkdir()
+        shutil.copyfile(ROOT / 'scripts/select-mutation-packages.py', scripts / 'select-mutation-packages.py')
+        self.write('src/lib.rs', 'pub fn root() -> bool { false }\n')
+        self.write('crates/nestweaver-parser/src/lib.rs', 'pub fn parse() -> bool { false }\n')
+        self.base = self.commit('base')
+        self.write('src/lib.rs', 'pub fn root() -> bool { true }\n')
+        self.write('crates/nestweaver-parser/src/lib.rs', 'pub fn parse() -> bool { true }\n')
+        self.head = self.commit('candidate')
+        # Main advances independently: a two-dot diff would wrongly include its
+        # unrelated package. Both selection artifacts must use the merge base.
+        self.git('checkout', '-b', 'advanced-base', self.base)
+        self.write('crates/foreign/src/lib.rs', 'pub fn unrelated() {}\n')
+        self.advanced = self.commit('main advanced')
+        self.git('update-ref', 'refs/remotes/origin/main', self.advanced)
+        self.git('checkout', '--detach', self.head)
+
+    def git(self, *args):
+        return subprocess.check_output(['git', '-c', 'commit.gpgSign=false',
+                                        '-c', 'core.hooksPath=' + str(self.root / 'empty'), *args],
+                                       cwd=self.root, env=self.env, text=True,
+                                       stderr=subprocess.DEVNULL).strip()
+
+    def write(self, relative, value):
+        path = self.root / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(value)
+
+    def commit(self, message):
+        self.git('add', '.')
+        self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                 'commit', '-m', message)
+        return self.git('rev-parse', 'HEAD')
+
+    def select(self, base='main', expected=None):
+        source = MUTATION.split('# BEGIN MUTATION SCOPE\n', 1)[1].split('# END MUTATION SCOPE', 1)[0]
+        self.scope = self.root / 'selected'
+        environment = dict(self.env, MUTATION_BASE_REF=base, EXPECTED_SHA=expected or self.head,
+                           MUTATION_SCOPE_DIR=str(self.scope), GITHUB_OUTPUT=str(self.root / 'output'))
+        return subprocess.run([sys.executable, '-c', textwrap.dedent(source)], cwd=self.root,
+                              env=environment, capture_output=True, text=True, timeout=10)
+
+    def test_branch_diff_and_packages_share_one_resolved_range(self):
+        result = self.select()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads((self.scope / 'selection.json').read_text())
+        self.assertEqual(record['base_sha'], self.advanced)
+        self.assertEqual(record['merge_base'], self.base)
+        self.assertEqual(record['candidate_sha'], self.head)
+        self.assertEqual(record['range'], self.base + '..' + self.head)
+        self.assertEqual((self.scope / 'files.txt').read_text().splitlines(),
+                         ['crates/nestweaver-parser/src/lib.rs', 'src/lib.rs'])
+        self.assertEqual((self.scope / 'packages.txt').read_text().splitlines(),
+                         ['nestweaver', 'nestweaver-parser'])
+        self.assertNotIn('foreign', (self.scope / 'input.diff').read_text())
+        for name, digest in record['sha256'].items():
+            self.assertEqual(hashlib.sha256((self.scope / name).read_bytes()).hexdigest(), digest)
+
+    def test_explicit_commit_and_empty_selection_are_legitimate(self):
+        result = self.select(self.base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads((self.scope / 'selection.json').read_text())
+        self.assertEqual(record['base_sha'], self.base)
+        result = self.select(self.head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.scope / 'files.txt').read_bytes(), b'')
+        self.assertEqual((self.scope / 'packages.txt').read_bytes(), b'')
+
+    def test_invalid_or_missing_base_and_wrong_candidate_refuse(self):
+        for base in ('missing-branch', '--help', 'bad branch', '$(touch SHOULD_NOT_EXIST)', 'f' * 40):
+            with self.subTest(base=base):
+                result = self.select(base)
+                self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'SHOULD_NOT_EXIST').exists())
+        result = self.select(expected=self.base)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('checkout does not match', result.stderr)
+
+
 class RuntimeContracts(unittest.TestCase):
     def test_canary_helper_changes_supply_runtime_prerequisites(self):
         rust = CI.split('            rust:\n', 1)[1].split('            metal:', 1)[0]
@@ -52,23 +147,67 @@ class RuntimeContracts(unittest.TestCase):
         self.assertNotRegex(CI, r'(?m)^  coverage:')
         self.assertNotIn('coverage_validation:', CI)
         self.assertIn('name: Coverage\n', COVERAGE)
-        self.assertIn('branches: [main]', COVERAGE)
+        trigger = COVERAGE.split('on:\n', 1)[1].split('\npermissions:', 1)[0]
+        self.assertNotRegex(trigger, r'(?m)^  (push|pull_request):')
+        self.assertIn('schedule:\n', trigger)
+        self.assertIn("cron: '17 4 * * 0'", trigger)
         self.assertIn('workflow_dispatch:', COVERAGE)
         self.assertIn('group: coverage-${{ github.ref }}', COVERAGE)
-        self.assertIn('paths: [.github/workflows/coverage.yml]', COVERAGE)
         self.assertNotIn('cancel-in-progress: true', COVERAGE)
         self.assertNotIn('- coverage\n', job(CI, 'required-ci'))
         lane = job(COVERAGE, 'coverage')
-        self.assertIn("if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true'", lane)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'", lane)
+        self.assertNotRegex(COVERAGE, r'(?m)^  validate:')
+        rust = CI.split('            rust:\n', 1)[1].split('            metal:', 1)[0]
+        self.assertNotIn("'.github/workflows/coverage.yml'", rust)
+        required = job(CI, 'required-ci')
+        self.assertIn('if: always()', required)
+        self.assertIn('python3 scripts/verify-ci-runtime-contracts.py', required)
+        self.assertIn('"$tool_dir/actionlint" .github/workflows/*.yml', required)
         self.assertIn('cache-targets: false', lane)
         self.assertIn('NESTWEAVER_NO_DAEMON: "1"', lane)
         self.assertIn('NESTWEAVER_ALLOW_NO_DAEMON: "1"', lane)
         self.assertIn('--no-fail-fast --lcov --output-path lcov.info -- --skip daemon_', lane)
-        def rust_paths(source):
-            section = source.split('            rust:\n', 1)[1]
-            section = re.split(r'^            \w+:|^  \w[\w-]*:', section, flags=re.M)[0]
-            return set(re.findall(r"- '([^']+)'", section))
-        self.assertEqual(rust_paths(CI), rust_paths(COVERAGE))
+
+    def test_mutation_is_opt_in_without_weakening_its_verdict(self):
+        self.assertNotRegex(CI, r'(?m)^  mutants:')
+        trigger = MUTATION.split('on:\n', 1)[1].split('\npermissions:', 1)[0]
+        self.assertIn('workflow_dispatch:', trigger)
+        self.assertNotRegex(trigger, r'(?m)^  (push|pull_request|schedule):')
+        self.assertIn('base_ref:', trigger)
+        self.assertIn('ci_run_id:', trigger)
+        mutations = job(MUTATION, 'mutants')
+        self.assertNotIn('continue-on-error:', mutations)
+        self.assertNotIn('github.base_ref', mutations)
+        self.assertIn('fetch-depth: 0', mutations)
+        self.assertIn('ref: ${{ github.sha }}', mutations)
+        self.assertIn('save-if: false', mutations)
+        self.assertIn('if: always()', step(mutations, 'Surviving mutants (read these — each one is a test that cannot fail)'))
+        self.assertIn('helper.observe_selected(', mutations)
+        self.assertLess(mutations.index('Verify successful exact-candidate CI prerequisite'),
+                        first_cargo_command(mutations))
+
+    def test_linux_jobs_share_the_same_cache_profile(self):
+        for name in ('build-and-check', 'daemon-tests', 'clippy', 'e2e'):
+            lane = job(CI, name)
+            self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', lane, name)
+            self.assertIn('CARGO_PROFILE_TEST_DEBUG: "0"', lane, name)
+
+    def test_linux_shared_cache_has_one_successful_main_writer(self):
+        for name in ('build-and-check', 'daemon-tests', 'clippy', 'e2e'):
+            lane = job(CI, name)
+            caches = re.findall(r'      - uses: Swatinem/rust-cache@[0-9a-f]{40}[^\n]*\n(.*?)(?=^      - |\Z)',
+                                lane, re.M | re.S)
+            self.assertEqual(len(caches), 1, name)
+            cache = caches[0]
+            self.assertIn('shared-key: build', cache, name)
+            if name == 'build-and-check':
+                self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
+                self.assertIn('cache-on-failure: false', cache)
+                self.assertNotIn('cache-on-failure: true', cache)
+            else:
+                self.assertIn('save-if: false', cache, name)
+                self.assertNotIn("github.ref == 'refs/heads/main'", cache, name)
 
     def test_metal_observation_preserves_commands_and_failure_evidence(self):
         metal = job(CI, 'metal-smoke')
@@ -107,9 +246,9 @@ class RuntimeContracts(unittest.TestCase):
         self.assertNotRegex(cache[1], r'shared-key: metal-smoke\s*$')
 
     def test_mutation_prewarm_and_tests_use_the_same_package_union(self):
-        mutations = job(CI, 'mutants')
+        mutations = job(MUTATION, 'mutants')
         self.assertIn('cargo-nextest@0.9.140', mutations)
-        self.assertIn('scripts/prewarm-mutation-build.py /tmp/pr.pkgs', mutations)
+        self.assertIn('scripts/prewarm-mutation-build.py "$MUTATION_SCOPE_DIR/packages.txt"', mutations)
         self.assertNotIn('for pkg in', step(mutations, 'Warm the -p build shape before the mutation budget starts'))
         helper = (ROOT / 'scripts/run-mutation-scope.sh').read_text()
         self.assertIn('test_pkg_args+=(--test-package "$pkg")', helper)
@@ -184,8 +323,8 @@ class RuntimeContracts(unittest.TestCase):
 
     def test_advisory_legacy_builds_enable_feature(self):
         self.assertIn('cargo llvm-cov --workspace --features ci-direct-tests', job(COVERAGE, 'coverage'))
-        self.assertIn('scripts/ci-direct-cargo.sh', job(CI, 'mutants'))
-        self.assertIn('scripts/run-mutation-scope.sh', job(CI, 'mutants'))
+        self.assertIn('scripts/ci-direct-cargo.sh', job(MUTATION, 'mutants'))
+        self.assertIn('scripts/run-mutation-scope.sh', job(MUTATION, 'mutants'))
 
     def test_browser_uses_owned_daemon_and_standard_artifact(self):
         browser = job(CI, 'e2e')
@@ -280,12 +419,14 @@ class RuntimeContracts(unittest.TestCase):
             self.assertIn(path, rust)
         self.assertIn("'scripts/fetch-lbug-source.sh'", metal)
         for name in ('backlog-performance', 'metal-smoke', 'build-and-check', 'clippy',
-                     'daemon-tests', 'mutants', 'e2e'):
+                     'daemon-tests', 'e2e'):
             section = job(CI, name)
             self.assertLess(section.index('scripts/fetch-lbug-source.sh'),
                             first_cargo_command(section), name)
         coverage = job(COVERAGE, 'coverage')
         self.assertLess(coverage.index('scripts/fetch-lbug-source.sh'), first_cargo_command(coverage))
+        mutations = job(MUTATION, 'mutants')
+        self.assertLess(mutations.index('scripts/fetch-lbug-source.sh'), first_cargo_command(mutations))
         build = job(RELEASE, 'build')
         self.assertLess(build.index('scripts/fetch-lbug-source.sh'), first_cargo_command(build))
 
@@ -304,7 +445,7 @@ class RuntimeContracts(unittest.TestCase):
         self.assertNotIn("'tests/support/test_isolated_daemon.py'", filters)
 
     def test_no_ci_marker_is_forged(self):
-        for source in (CI, RELEASE):
+        for source in (CI, RELEASE, MUTATION):
             self.assertNotRegex(source, r'(?m)^\s+(CI|GITHUB_ACTIONS):\s*["\']?(true|1)')
 
     def test_direct_bypass_requires_github_runner_context(self):

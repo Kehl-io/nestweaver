@@ -319,30 +319,57 @@ existing `DaemonState` fixtures rather than in `embedding_repair.rs`, even
 though the functions moved — they exercise the full RPC/`DaemonState` wiring,
 not those functions in isolation.
 
-### Mutation testing (advisory, not in Required CI)
+### CI runtime policy
 
-The `mutants` job runs `cargo-mutants` over the packages **this PR's diff**
-touches. It is **not** in `Required CI` and mutation score is not a merge gate:
-a score that gates merges is optimized against rather than acted on, and what
-is actually useful is the list of individual surviving mutants on the diff
-under review.
+Required CI retains workspace tests, daemon integration, standard-artifact
+acceptance, browser tests, macOS/Metal portability, formatting and security
+checks. Linux compilation jobs use matching debug profiles so they can restore
+the same Rust cache. Only a successful Build & Tests run on main writes that
+shared cache; Clippy, daemon and browser jobs restore it. This prevents a faster
+partial build from occupying an immutable cache key before the complete build.
+
+Informational coverage runs weekly or through `coverage.yml`'s manual dispatch.
+Coverage-only workflow edits use the always-on Required CI policy and syntax
+checks without compiling Rust. A full instrumented rebuild is not part of
+ordinary PR validation or every main push.
+
+### Optional mutation testing
+
+`mutation.yml` runs `cargo-mutants` on demand over the packages touched between
+an explicit base and the selected candidate. It does not run automatically on
+PRs. Use it when investigating whether regression tests detect a particular
+mistake; the useful output is the list of individual surviving mutants.
+
+Run ordinary CI successfully for the exact candidate first, then supply that
+run's ID and the comparison base:
+
+```sh
+gh workflow run mutation.yml --ref <candidate-branch> \
+  -f base_ref=main -f ci_run_id=<successful-CI-run-id>
+```
+
+The workflow verifies the prerequisite's exact SHA, workflow path and current
+attempt before compiling. Required CI, Build & Tests, Daemon Integration Tests
+and Standard artifact daemon acceptance must each have actually passed; a green
+docs-only run with skipped runtime jobs is insufficient. It resolves the base
+and candidate once and uses the same merge-base range for the diff and package
+selection. When selecting
+main itself, provide an earlier base commit to measure a nonempty change.
 
 The pinned contract, so a change here is a deliberate one:
 
 | Setting | Value | Why |
 | --- | --- | --- |
 | tool version | `cargo-mutants@27.1.0` | Exit codes and `outcomes.json` shape are parsed by the reporting step; an unpinned install can change both. |
-| `--baseline skip` | — | cargo-mutants' own unmutated baseline build+test was what actually blew the budget (measured: 1715s build + a 300s test timeout, exit 4, zero mutants tested). Safe only because `build-and-check` already proves this commit green — but note that job runs `--workspace` while this one runs `-p`, so the two resolve different feature sets. |
+| `--baseline skip` | — | The verified successful exact-head CI run supplies ordinary baseline evidence. The workspace and selected-package feature sets can still differ; the mutation pre-warm builds its actual selected package union. |
 | `--in-place` | — | The runner's checkout is disposable, `persist-credentials: false`, nothing pushes from it, and no later step reads mutated source. Conflicts with `-j` in cargo-mutants' own arg parsing, which is a reason not to add `-j` here. |
 | `--build-timeout 300` | per build | Bounds the build phase, which `--timeout` does not reach. |
-| `--timeout 600` | per test run | Bounds ONE mutant's test run, not the job. Deliberately >1.5x the worst measured combined suite (~327s), because `--no-fail-fast` means every mutant runs the full, non-short-circuited suite. |
-| pre-warm | `PREWARM_BUDGET: 30m` | Builds each touched package's own `-p` shape BEFORE the mutation budget starts, so cargo-mutants does not spend the mutation budget on a cold build. |
+| `--timeout 600` | per test run | Bounds one mutant's test run. The selected-package union uses nextest with fail-fast; this timeout is separate from the total budget. |
+| pre-warm | `PREWARM_BUDGET: 30m` | Builds the selected package union before the mutation budget starts, matching the mutation test graph. |
 | job timeout | 80 minutes | Covers the 30m pre-warm plus the 35m `MUTANTS_BUDGET` plus setup. |
 
-**The job is no longer `continue-on-error`.** "Advisory" now means "surviving
-mutants do not fail the build", not "nothing here can fail the build". Through
-the old configuration the job reported success regardless of what any step
-found, including runs that tested ZERO mutants. The contract now:
+The optional workflow retains honest failure reporting. It does not turn
+incomplete measurements into successful mutation coverage:
 
 - a genuine cargo-mutants error or timeout, or a run that tested zero mutants
   when it should have tested some, is a **real job failure**;
@@ -351,11 +378,10 @@ found, including runs that tested ZERO mutants. The contract now:
   green, because there was genuinely nothing to measure.
 
 **When the pre-warm cannot finish inside `PREWARM_BUDGET`** — a diff too wide
-to warm in 30 minutes — the mutation run is **SKIPPED, not failed**, with a
-loud summary. No mutation coverage is measured in that case and the summary
-says so in as many words: it is a scope limit, not a clean result. The whole
-point is that an absent signal and a clean signal must not look the same, so
-that path never prints an all-clear.
+to warm in 30 minutes — mutation execution is skipped and the diagnostic
+workflow fails with an incomplete/no-signal report. No mutation coverage is
+measured, and the summary states that explicitly. This path never prints an
+all-clear.
 
 ## Release gate
 

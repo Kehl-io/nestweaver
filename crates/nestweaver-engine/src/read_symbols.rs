@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use nestweaver_schema::Symbol;
+use nestweaver_schema::{Language, Symbol};
 use nestweaver_store::GraphStore;
 use serde::{Deserialize, Serialize};
 
@@ -235,7 +235,9 @@ fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -
     if file_component {
         return true;
     }
-    let decl = declaration_start(&lines);
+    let objective_c =
+        nestweaver_parser::detect_language(Path::new(file_path)) == Some(Language::ObjectiveC);
+    let decl = declaration_start(&lines, objective_c);
     // Inspect the declaration header only. A call or comment inside the body
     // can mention the old name while this span now belongs to another method.
     for line in lines.iter().skip(decl).take(HEADER_LINES) {
@@ -262,15 +264,25 @@ fn file_stem(file_path: &str) -> &str {
 /// depth is tracked so a multi-line annotation argument list is skipped whole.
 /// Skipping only moves where the name is looked for; it never accepts a span
 /// on its own.
-fn declaration_start(lines: &[&str]) -> usize {
+fn declaration_start(lines: &[&str], objective_c: bool) -> usize {
     let mut depth: i32 = 0;
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
         let is_comment = t.starts_with("//") || t.starts_with("/*") || t.starts_with('*');
+        // Objective-C uses @ for declarations as well as directives. These
+        // headers name the symbol itself, unlike Java/Dart annotations. Keep
+        // the distinction language- and token-aware so decorators still skip.
+        let is_objc_declaration = objective_c
+            && ["@protocol", "@interface", "@implementation"]
+                .iter()
+                .any(|&keyword| {
+                    t.strip_prefix(keyword)
+                        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                });
         let is_prefix = depth > 0
             || t.is_empty()
             || is_comment
-            || t.starts_with('@')
+            || (t.starts_with('@') && !is_objc_declaration)
             || t.starts_with("#[")
             || t.starts_with('[');
         if !is_prefix {
@@ -1986,6 +1998,75 @@ app();
         let (dir, store) = fixture_file("src/values.go", src);
         let w = read_one(&dir, &store, "Answer");
         assert!(w.body_available && !w.stale_span, "{w:?}");
+    }
+
+    #[test]
+    fn unchanged_objective_c_declarations_read_their_own_spans() {
+        let src = "@protocol MiniProtocol\n- (void)ping;\n@end\n@interface MiniInterface\n- (void)ping;\n@end\n@implementation MiniInterface\n- (void)ping {}\n@end\n";
+        for path in ["src/mini.m", "src/mini.mm"] {
+            let (dir, store) = fixture_file(path, src);
+            for (name, kind, start, end) in [
+                (
+                    "MiniProtocol",
+                    nestweaver_schema::SymbolKind::Interface,
+                    1,
+                    3,
+                ),
+                (
+                    "MiniInterface",
+                    nestweaver_schema::SymbolKind::Interface,
+                    4,
+                    6,
+                ),
+                ("MiniInterface", nestweaver_schema::SymbolKind::Class, 7, 9),
+            ] {
+                let symbols = store.lookup_symbols_by_name(name).unwrap();
+                let sym = symbols.iter().find(|sym| sym.kind == kind).unwrap();
+                let w = read_one(&dir, &store, &sym.uid);
+                assert!(w.body_available && !w.stale_span, "{path}: {w:?}");
+                assert_eq!((w.start_line, w.end_line), (start, end), "{w:?}");
+                assert_eq!(w.body, read_span(src, start, end).unwrap(), "{w:?}");
+                assert!(w.relocated_from_line.is_none(), "{w:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn renamed_objective_c_declarations_do_not_read_another_body() {
+        let src = "@protocol MiniProtocol\n- (void)ping;\n@end\n@interface MiniInterface\n- (void)ping;\n@end\n@implementation MiniInterface\n- (void)ping {}\n@end\n";
+        let (dir, store) = fixture_file("src/mini.m", src);
+        fs::write(
+            dir.path().join("src/mini.m"),
+            src.replace("MiniProtocol", "OtherProtocol")
+                .replace("MiniInterface", "OtherInterface"),
+        )
+        .unwrap();
+        for name in ["MiniProtocol", "MiniInterface"] {
+            for sym in store.lookup_symbols_by_name(name).unwrap() {
+                let w = read_one(&dir, &store, &sym.uid);
+                assert!(
+                    w.stale_span && !w.body_available && w.body.is_empty(),
+                    "{w:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn objective_c_header_detection_preserves_annotation_and_name_guards() {
+        for keyword in ["@protocol", "@interface", "@implementation"] {
+            let body = format!("// comment\n\n{keyword} Target\n@end");
+            assert!(span_holds_symbol(&body, "Target", "src/mini.m", ""));
+            assert!(!span_holds_symbol(&body, "Other", "src/mini.m", ""));
+            let annotation = format!(
+                "{keyword}Like(\n Target,\n arg,\n arg,\n arg,\n arg\n)\nvoid other() {{}}"
+            );
+            assert!(!span_holds_symbol(&annotation, "Target", "src/mini.m", ""));
+            // Even an exact Objective-C keyword remains a decorator in a
+            // different language; a name in its arguments is not a declaration.
+            let decorator = annotation.replace(&format!("{keyword}Like("), &format!("{keyword} ("));
+            assert!(!span_holds_symbol(&decorator, "Target", "src/mini.py", ""));
+        }
     }
 
     #[test]

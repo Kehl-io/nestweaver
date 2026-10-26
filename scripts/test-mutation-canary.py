@@ -91,6 +91,70 @@ class Canary(unittest.TestCase):
             ['nestweaver', 'nestweaver-canary-sibling'])
         self.assertEqual(helper.select(['README.md', 'srcgen/code.rs', 'build.rs.old']), [])
 
+    def test_selected_branch_prerequisite_requires_actual_runtime_jobs(self):
+        helper = load('verify-mutation-prerequisite')
+        sha = 'b' * 40
+        run = dict(id=20, run_attempt=1, event='pull_request', head_branch='candidate',
+                   head_sha=sha, path='.github/workflows/ci.yml', status='completed', conclusion='success')
+        jobs = [dict(id=n + 1, name=name, run_attempt=1, head_sha=sha,
+                     status='completed', conclusion='success') for n, name in enumerate(helper.JOB_NAMES)]
+        calls = []
+        def fetch(repo, path):
+            calls.append(path)
+            if path == 'actions/runs/20':
+                return [copy.deepcopy(run)]
+            self.assertEqual(path, 'actions/runs/20/attempts/1/jobs?per_page=100')
+            return [dict(jobs=copy.deepcopy(jobs[:2]), total_count=len(jobs)),
+                    dict(jobs=copy.deepcopy(jobs[2:]), total_count=len(jobs))]
+        result = helper.observe_selected('owner/repo', sha, 20, fetch)
+        self.assertEqual([job['id'] for job in result['jobs']], [1, 2, 3, 4])
+        self.assertEqual(calls.count('actions/runs/20'), 2)
+        run['path'] = '.github/workflows/ci.yml@refs/heads/candidate'
+        self.assertEqual(helper.observe_selected('owner/repo', sha, 20, fetch)['run_id'], 20)
+        run['path'] = '.github/workflows/ci.yml'
+        for mutate in (lambda: jobs.pop(),
+                       lambda: jobs[-1].update(conclusion='skipped'),
+                       lambda: jobs[-1].update(head_sha='c' * 40),
+                       lambda: jobs[-1].update(run_attempt=2),
+                       lambda: jobs.append(dict(jobs[-1], id=99))):
+            original = copy.deepcopy(jobs)
+            mutate()
+            with self.assertRaises(ValueError):
+                helper.observe_selected('owner/repo', sha, 20, fetch)
+            jobs[:] = original
+        for mutate in (lambda: run.update(path='.github/workflows/coverage.yml'),
+                       lambda: run.update(head_sha='c' * 40),
+                       lambda: run.update(status='in_progress', conclusion=None),
+                       lambda: run.update(conclusion='failure')):
+            original = copy.deepcopy(run)
+            mutate()
+            with self.assertRaises(ValueError):
+                helper.observe_selected('owner/repo', sha, 20, fetch)
+            run.clear(); run.update(original)
+
+    def test_selected_prerequisite_rejects_attempt_drift_and_truncated_jobs(self):
+        helper = load('verify-mutation-prerequisite')
+        sha = 'b' * 40
+        for drift in ('rerun', 'pending', 'truncated'):
+            observations = 0
+            def fetch(repo, path):
+                nonlocal observations
+                if path == 'actions/runs/20':
+                    observations += 1
+                    run = dict(id=20, run_attempt=1, head_sha=sha, path='.github/workflows/ci.yml',
+                               status='completed', conclusion='success')
+                    if observations == 2 and drift == 'rerun':
+                        run['run_attempt'] = 2
+                    if observations == 2 and drift == 'pending':
+                        run.update(status='in_progress', conclusion=None)
+                    return [run]
+                jobs = [dict(id=n + 1, name=name, run_attempt=1, head_sha=sha,
+                             status='completed', conclusion='success')
+                        for n, name in enumerate(helper.JOB_NAMES)]
+                return [dict(jobs=jobs, total_count=len(jobs) + (drift == 'truncated'))]
+            with self.subTest(drift=drift), self.assertRaises(ValueError):
+                helper.observe_selected('owner/repo', sha, 20, fetch)
+
     def test_github_runner_guard_predicates_without_setting_environment(self):
         helper = load('mutation-canary')
         self.assertTrue(hasattr(helper, 'github_runner_context'), 'missing factored GitHub runner predicate')

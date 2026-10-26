@@ -81,12 +81,42 @@ pub fn propagate_types(
     iterations
 }
 
+/// Only a concrete slice of a named (optionally pointer) type is inferred.
+/// Arrays, nested slices, maps, generic and interface elements remain unknown.
+pub(crate) fn go_slice_element(type_name: &str) -> Option<String> {
+    let rest = type_name
+        .trim()
+        .strip_prefix('[')?
+        .trim_start()
+        .strip_prefix(']')?
+        .trim();
+    let element = rest.strip_prefix('*').unwrap_or(rest).trim();
+    let mut parts = element.split('.');
+    let valid_name = |name: &str| {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_alphabetic() || ch == '_')
+            && chars.all(|ch| ch.is_alphanumeric() || ch == '_')
+    };
+    if !parts.next().is_some_and(valid_name) {
+        return None;
+    }
+    if let Some(name) = parts.next()
+        && !valid_name(name)
+    {
+        return None;
+    }
+    parts.next().is_none().then(|| element.to_string())
+}
+
 /// Per-file type environment: maps (variable_name, scope_line) → type_name.
 /// Built by running all four inference tiers, then the fixpoint loop.
 #[derive(Clone)]
 pub struct TypeEnvironment {
     bindings: HashMap<(String, u32), TypeBinding>,
     pub(crate) call_assignments: Vec<nestweaver_parser::parse::ScopedCallAssignment>,
+    pub(crate) go_ranges: Vec<nestweaver_parser::parse::ScopedGoRangeBinding>,
     alias_assignments: Vec<nestweaver_parser::parse::ScopedAliasAssignment>,
     local_declarations: Vec<nestweaver_parser::RawReference>,
     scoped_bindings: HashMap<ScopedBindingKey, (usize, TypeBinding)>,
@@ -170,6 +200,8 @@ impl TypeEnvironment {
         propagate_assignments(&mut bindings, &assignments, 10);
 
         let nestweaver_parser::parse::ScopedRustEvidence {
+            go_ranges,
+            go_slice_literals,
             call_assignments,
             alias_assignments,
             local_declarations,
@@ -186,6 +218,21 @@ impl TypeEnvironment {
         } else {
             Default::default()
         };
+        for literal in go_slice_literals {
+            if let Some(scope) = literal.scope {
+                scoped_bindings
+                    .entry((literal.var_name, scope.position, scope.start, scope.end))
+                    .or_insert((
+                        scope.initialized_at,
+                        TypeBinding {
+                            type_name: literal.type_name,
+                            line: literal.line,
+                            confidence: 0.95,
+                            source: BindingSource::Constructor,
+                        },
+                    ));
+            }
+        }
         let rust_type_origins = rust_type_origins
             .into_iter()
             .map(|origin| (origin.position, origin))
@@ -208,6 +255,7 @@ impl TypeEnvironment {
             bindings,
             scoped_bindings,
             call_assignments,
+            go_ranges,
             alias_assignments,
             local_declarations,
             rust_type_origins,
@@ -221,6 +269,7 @@ impl TypeEnvironment {
                 .collect(),
         };
         env.propagate_scoped_aliases();
+        env.propagate_go_ranges();
         env
     }
 
@@ -281,8 +330,10 @@ impl TypeEnvironment {
             .map(|(_, (_, binding))| binding)
     }
 
+    /// Keep environments with ephemeral range evidence even when ordinary
+    /// annotation bindings are empty (for example an inline slice factory).
     pub fn has_scoped_call_assignments(&self) -> bool {
-        !self.call_assignments.is_empty()
+        !self.call_assignments.is_empty() || !self.go_ranges.is_empty()
     }
 
     pub(crate) fn ast_return_type(&self, name: &str, line: u32) -> Option<&TypeBinding> {
@@ -303,13 +354,15 @@ impl TypeEnvironment {
         assignment: &nestweaver_parser::parse::ScopedCallAssignment,
         target_file: &str,
         binding: &TypeBinding,
+        allow_go_slice: bool,
     ) {
-        if !binding
-            .type_name
-            .split_once('@')
-            .map_or(binding.type_name.as_str(), |(name, _)| name)
-            .chars()
-            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.')
+        if !(allow_go_slice && go_slice_element(&binding.type_name).is_some())
+            && !binding
+                .type_name
+                .split_once('@')
+                .map_or(binding.type_name.as_str(), |(name, _)| name)
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.')
         {
             return;
         }
@@ -332,6 +385,74 @@ impl TypeEnvironment {
                     source: BindingSource::ReturnType,
                 },
             ));
+    }
+
+    /// Infer only the value side of a declared slice range. Unknown inner
+    /// declarations block outer evidence exactly as ordinary receiver lookup does.
+    pub(crate) fn propagate_go_ranges(&mut self) {
+        let mut seeds = Vec::new();
+        for range in &self.go_ranges {
+            use nestweaver_parser::parse::GoRangeSource;
+            let binding = match &range.source {
+                GoRangeSource::Identifier { name, position } => self
+                    .local_declarations
+                    .iter()
+                    .filter_map(|declaration| {
+                        let scope = declaration.scope?;
+                        (declaration.name == *name
+                            && scope.start <= *position
+                            && *position < scope.end
+                            && scope.initialized_at <= *position)
+                            .then_some(scope)
+                    })
+                    .min_by_key(|scope| {
+                        (scope.end - scope.start, std::cmp::Reverse(scope.position))
+                    })
+                    .and_then(|scope| self.lookup_declaration(name, scope, *position))
+                    .cloned(),
+                GoRangeSource::SliceLiteral { type_name } => Some(TypeBinding {
+                    type_name: type_name.clone(),
+                    line: range.line,
+                    confidence: 0.95,
+                    source: BindingSource::Constructor,
+                }),
+                // Exact factory return origins are seeded by the resolver.
+                GoRangeSource::Call(_) => None,
+            };
+            let Some(mut binding) = binding else {
+                continue;
+            };
+            let (origin, type_name) = binding
+                .type_name
+                .split_once('#')
+                .map_or((None, binding.type_name.as_str()), |(file, rest)| {
+                    (Some(file), rest)
+                });
+            let (type_name, origin_line) = type_name
+                .split_once('#')
+                .map_or((type_name, None), |(name, line)| (name, Some(line)));
+            let Some(element) = go_slice_element(type_name) else {
+                continue;
+            };
+            binding.type_name = match (origin, origin_line) {
+                (Some(file), Some(line)) => format!("{file}#{element}#{line}"),
+                _ => element,
+            };
+            binding.line = range.line;
+            let scope = range.scope;
+            seeds.push((
+                (
+                    range.variable.clone(),
+                    scope.position,
+                    scope.start,
+                    scope.end,
+                ),
+                (scope.initialized_at, binding),
+            ));
+        }
+        for (key, binding) in seeds {
+            self.scoped_bindings.entry(key).or_insert(binding);
+        }
     }
 
     pub(crate) fn propagate_scoped_aliases(&mut self) {
@@ -452,6 +573,7 @@ impl TypeEnvironment {
             bindings,
             scoped_bindings: HashMap::new(),
             call_assignments: Vec::new(),
+            go_ranges: Vec::new(),
             alias_assignments: Vec::new(),
             local_declarations: Vec::new(),
             rust_type_origins: Default::default(),
@@ -627,6 +749,49 @@ fn extract_call_assignment(line: &str) -> Option<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn go_slice_elements_require_one_concrete_named_element_type() {
+        for (slice, element) in [
+            ("[]Local", "Local"),
+            ("[]*pkg.Local", "pkg.Local"),
+            (" [ ] * Local ", "Local"),
+        ] {
+            assert_eq!(super::go_slice_element(slice).as_deref(), Some(element));
+        }
+        for other in [
+            "Local",
+            "[2]Local",
+            "[][]Local",
+            "[]**Local",
+            "map[string]Local",
+            "[]interface{}",
+            "[]Local[int]",
+            "[]pkg.sub.Local",
+            "[]",
+            "[]123",
+        ] {
+            assert_eq!(super::go_slice_element(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn go_inline_literal_ranges_retain_environments_without_persisted_bindings() {
+        let source =
+            "package app\nfunc use() { for _, element := range []pkg.Store{} { element.Get() } }\n";
+        let parsed =
+            nestweaver_parser::parse_source(std::path::Path::new("app.go"), source).unwrap();
+        let env = super::TypeEnvironment::build(
+            source,
+            nestweaver_schema::Language::Go,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        );
+        assert_eq!(env.binding_count(), 0);
+        assert!(
+            env.has_scoped_call_assignments(),
+            "engine must retain ephemeral range evidence"
+        );
+    }
     use super::*;
     use nestweaver_schema::Visibility;
 

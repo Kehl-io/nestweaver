@@ -357,7 +357,11 @@ use std::path::Path;
 ///     Re-index: `nestweaver index --repo <path> --force`.
 /// 13 — nested Go modules, scoped Go receiver/return origins and recovered
 /// barrel reverse-dependency closure. Parsed cache 9 supplies the new facts.
-pub const RESOLVER_GENERATION: u32 = 13;
+/// 14 — typed Go slice range elements retain lexical/package ownership and
+/// exact factory return origins. Existing graphs lack these CALLS edges; force
+/// re-index repositories to regenerate them. All new range evidence is ephemeral,
+/// so the persisted parsed-cache format remains version 9.
+pub const RESOLVER_GENERATION: u32 = 14;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

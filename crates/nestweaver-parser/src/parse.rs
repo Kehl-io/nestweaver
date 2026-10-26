@@ -4121,9 +4121,27 @@ pub struct ScopedRustInlineTypeImport {
     pub line: u32,
 }
 
+/// Collection evidence is ephemeral: parsed-file caches retain their existing shape.
+#[derive(Debug, Clone)]
+pub enum GoRangeSource {
+    Identifier { name: String, position: usize },
+    SliceLiteral { type_name: String },
+    Call(Box<ScopedCallAssignment>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedGoRangeBinding {
+    pub variable: String,
+    pub scope: LexicalScope,
+    pub line: u32,
+    pub source: GoRangeSource,
+}
+
 /// Per-file lexical evidence retained only while resolving references.
 #[derive(Debug, Clone, Default)]
 pub struct ScopedRustEvidence {
+    pub go_ranges: Vec<ScopedGoRangeBinding>,
+    pub go_slice_literals: Vec<AstTypeBinding>,
     pub call_assignments: Vec<ScopedCallAssignment>,
     pub alias_assignments: Vec<ScopedAliasAssignment>,
     pub local_declarations: Vec<RawReference>,
@@ -4159,8 +4177,8 @@ fn rust_type_module_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<V
     None
 }
 
-/// Exact scalar Go call assignments; return types are attached only after
-/// the resolver selects the callee declaration, never by a file-global name.
+/// Exact Go call assignments and slice range sources. Return types are attached
+/// only after the resolver selects the callee declaration, never by name alone.
 pub fn scoped_go_assignment_evidence(source: &str) -> ScopedRustEvidence {
     let mut parser = tree_sitter::Parser::new();
     let language = build_ts_language(Language::Go, Path::new("source.go"));
@@ -4171,6 +4189,12 @@ pub fn scoped_go_assignment_evidence(source: &str) -> ScopedRustEvidence {
         return Default::default();
     };
     let mut result = ScopedRustEvidence::default();
+    collect_local_bindings(
+        tree.root_node(),
+        source.as_bytes(),
+        &mut result.local_declarations,
+        Language::Go,
+    );
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if node.kind() == "short_var_declaration"
@@ -4180,44 +4204,102 @@ pub fn scoped_go_assignment_evidence(source: &str) -> ScopedRustEvidence {
             )
             && left.named_child_count() == 1
             && right.named_child_count() == 1
-            && let (Some(name), Some(call)) = (left.named_child(0), right.named_child(0))
+            && let (Some(name), Some(value)) = (left.named_child(0), right.named_child(0))
             && name.kind() == "identifier"
-            && call.kind() == "call_expression"
-            && let Some(function) = call.child_by_field_name("function")
-            && let Some(callee) = if function.kind() == "identifier" {
-                Some(function)
-            } else if function.kind() == "selector_expression" {
-                function.child_by_field_name("field")
-            } else {
-                None
-            }
-            && let (Ok(variable), Ok(callee), Some(scope)) = (
-                name.utf8_text(source.as_bytes()),
-                callee.utf8_text(source.as_bytes()),
-                lexical_scope(name),
-            )
+            && let (Ok(variable), Some(scope)) =
+                (name.utf8_text(source.as_bytes()), lexical_scope(name))
         {
-            result.call_assignments.push(ScopedCallAssignment {
-                variable: variable.into(),
-                scope,
-                line: name.start_position().row as u32 + 1,
-                callee: callee.into(),
-                receiver: function
-                    .child_by_field_name("operand")
-                    .and_then(|receiver| receiver.utf8_text(source.as_bytes()).ok())
-                    .map(str::to_string),
-                local_callee_line: None,
-                local_callee_exists: false,
-                import_positions: Vec::new(),
-                import_paths: Vec::new(),
-                call_position: call.start_byte(),
-                awaited: false,
-            });
+            if let Some(call) = go_call_assignment(name, value, source.as_bytes()) {
+                result.call_assignments.push(call);
+            } else if let Some(type_name) = go_slice_literal_type(value, source.as_bytes()) {
+                result.go_slice_literals.push(AstTypeBinding {
+                    var_name: variable.into(),
+                    scope: Some(scope),
+                    type_name,
+                    line: name.start_position().row as u32 + 1,
+                    kind: AstBindingKind::Constructor,
+                });
+            }
+        }
+        if go_range_declares_names(node)
+            && let (Some(left), Some(right)) = (node.child_by_field_name("left"), node.child_by_field_name("right"))
+            // One binding is the integer index, never the slice element.
+            && left.named_child_count() == 2
+            && let Some(value) = left.named_child(1)
+            && value.kind() == "identifier"
+            && let (Ok(variable), Some(scope)) = (value.utf8_text(source.as_bytes()), lexical_scope(value))
+            && variable != "_"
+        {
+            let origin = if right.kind() == "identifier" {
+                right
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(|name| GoRangeSource::Identifier {
+                        name: name.into(),
+                        position: right.start_byte(),
+                    })
+            } else if let Some(type_name) = go_slice_literal_type(right, source.as_bytes()) {
+                Some(GoRangeSource::SliceLiteral { type_name })
+            } else {
+                go_call_assignment(value, right, source.as_bytes())
+                    .map(|call| GoRangeSource::Call(Box::new(call)))
+            };
+            if let Some(source) = origin {
+                result.go_ranges.push(ScopedGoRangeBinding {
+                    variable: variable.into(),
+                    scope,
+                    line: value.start_position().row as u32 + 1,
+                    source,
+                });
+            }
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
     result
+}
+
+fn go_slice_literal_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() != "composite_literal" {
+        return None;
+    }
+    let kind = node.child_by_field_name("type")?;
+    if kind.kind() != "slice_type" {
+        return None;
+    }
+    kind.utf8_text(source).ok().map(str::to_string)
+}
+
+fn go_call_assignment(
+    name: tree_sitter::Node<'_>,
+    call: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<ScopedCallAssignment> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    let callee = match function.kind() {
+        "identifier" => function,
+        "selector_expression" => function.child_by_field_name("field")?,
+        _ => return None,
+    };
+    Some(ScopedCallAssignment {
+        variable: name.utf8_text(source).ok()?.into(),
+        scope: lexical_scope(name)?,
+        line: name.start_position().row as u32 + 1,
+        callee: callee.utf8_text(source).ok()?.into(),
+        receiver: function
+            .child_by_field_name("operand")
+            .and_then(|receiver| receiver.utf8_text(source).ok())
+            .map(str::to_string),
+        local_callee_line: None,
+        local_callee_exists: false,
+        import_positions: Vec::new(),
+        import_paths: Vec::new(),
+        call_position: call.start_byte(),
+        awaited: false,
+    })
 }
 
 pub fn scoped_rust_assignment_evidence(
@@ -4448,6 +4530,7 @@ pub fn scoped_rust_assignment_evidence(
         public_root_uses,
         module_types,
         inline_type_imports: lexical_items.inline_type_imports(tree.root_node(), source.as_bytes()),
+        ..Default::default()
     }
 }
 
@@ -12806,6 +12889,47 @@ fn main() {
                 );
             }
         }
+    }
+
+    #[test]
+    fn go_range_evidence_selects_only_declared_value_bindings_and_exact_sources() {
+        let source = "package app\nfunc f(items []Thing) {\n for _, value := range items { value.Get() }\n for index := range items { _ = index }\n for index, _ := range items { _ = index }\n for _, value = range items { value.Get() }\n for _, value := range All() { value.Get() }\n for _, value := range []*Thing{} { value.Get() }\n}\n";
+        let evidence = scoped_go_assignment_evidence(source);
+        assert_eq!(evidence.go_ranges.len(), 3, "{evidence:#?}");
+        let named = evidence
+            .go_ranges
+            .iter()
+            .find(|range| range.line == 3)
+            .unwrap();
+        assert_eq!(named.variable, "value");
+        let GoRangeSource::Identifier { name, position } = &named.source else {
+            panic!("{named:#?}");
+        };
+        assert_eq!(name, "items");
+        assert!(named.scope.position < named.scope.initialized_at);
+        assert!(*position < named.scope.initialized_at);
+        assert!(named.scope.initialized_at < source.find("value.Get()").unwrap());
+        let GoRangeSource::Call(call) = &evidence
+            .go_ranges
+            .iter()
+            .find(|range| range.line == 7)
+            .unwrap()
+            .source
+        else {
+            panic!("missing factory");
+        };
+        assert_eq!(call.callee, "All");
+        assert_eq!(&source[call.call_position..call.call_position + 5], "All()");
+        let GoRangeSource::SliceLiteral { type_name } = &evidence
+            .go_ranges
+            .iter()
+            .find(|range| range.line == 8)
+            .unwrap()
+            .source
+        else {
+            panic!("missing literal");
+        };
+        assert_eq!(type_name, "[]*Thing");
     }
 
     #[test]

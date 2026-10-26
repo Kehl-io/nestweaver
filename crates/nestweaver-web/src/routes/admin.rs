@@ -2921,6 +2921,38 @@ credential_method = "ssh"
     }
 
     #[tokio::test]
+    async fn device_approve_expired_grant_is_not_found_with_valid_admin_auth() {
+        let state = test_admin_state();
+        state.device_flow.write().await.insert(
+            "expired-device".to_string(),
+            PendingDevice {
+                user_code: "EXPIRED1".to_string(),
+                expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                approved_token: None,
+            },
+        );
+        let app = device_router(state.clone());
+        let (status, _) = post_json(
+            &app,
+            "/auth/device/approve",
+            Some("test-admin-token"),
+            r#"{"user_code":"EXPIRED1"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(state.device_flow.read().await.is_empty());
+        let (status, body) = post_json(
+            &app,
+            "/auth/token",
+            None,
+            r#"{"device_code":"expired-device"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "expired_token");
+    }
+
+    #[tokio::test]
     async fn device_authorize_rejects_past_capacity() {
         let state = test_admin_state();
         // Fill the pending map to capacity with non-expired grants.
