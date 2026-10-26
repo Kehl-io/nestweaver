@@ -190,13 +190,15 @@ notes below before using an older database with a new binary.
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
 - For a compatible database, run `nestweaver stale-check --db <db>`. The
-  current resolver generation is **14**; any other generation requires
+  current resolver generation is **15**; any other generation requires
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - The current source also infers method receivers from typed Go slice range
   elements, including qualified types and exact factory returns. Generation 14
   requires the same forced repository re-index to add the missing call edges;
-  the parsed cache stays at version 9 because range evidence is ephemeral.
+  generation15 additionally handles inferred `var` slices, parenthesized range
+  sources and single named factory results. Parsed cache10 reparses unchanged
+  declarations for normalized return types and complete var/const/parameter shadow guards.
 - **Upgrading to 12.2.2 needs a forced re-index of every repository and a
   refresh of every vault.** It moves the
   resolver generation from 11 to 12 and the parsed cache from 7 to 8, because

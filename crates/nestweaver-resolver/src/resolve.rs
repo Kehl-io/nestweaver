@@ -12620,6 +12620,248 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
     }
 
     #[test]
+    fn go_range_residual_forms_keep_exact_owners_in_fresh_and_incremental_resolution() {
+        let app = "package app\nimport alias \"store\"\nfunc initialized() { var items = []alias.Store{{}}; for _, item := range items { item.Get() } }\nfunc identifier(items []alias.Store) { for _, item := range (( /* source */ items )) { item.Get() } }\nfunc literal() { for _, item := range ([]alias.Store{{}}) { item.Get() } }\nfunc factory() { for _, item := range (alias.All()) { item.Get() } }\nfunc named() { for _, item := range alias.Named() { item.Get() } }\nfunc pointer() { for _, item := range alias.NamedPointer() { item.Get() } }\nfunc assignedVarFactory() { var items = alias.Named(); for _, item := range items { item.Get() } }\nfunc shadowSource(items []alias.Store) { for _, items := range (items) { items.Get() } }\n";
+        let input = [
+            (
+                "store/types.go",
+                "package store\ntype Store struct{}\nfunc All() []Store { return nil }\nfunc Named() (items []Store) { return nil }\nfunc NamedPointer() (items []*Store) { return nil }\n",
+            ),
+            (
+                "store/methods.go",
+                "package store\nfunc (recv Store) Get() {}\n",
+            ),
+            (
+                "other/types.go",
+                "package other\ntype Store struct{}\nfunc (recv Store) Get() {}\nfunc Named() (items []Store) { return nil }\n",
+            ),
+            ("app.go", app),
+        ];
+        let (files, fresh) = review_edges(&input, Language::Go);
+        let parsed = parse_source(Path::new("app.go"), app).unwrap();
+        let envs = std::collections::HashMap::from([(
+            "app.go".into(),
+            crate::types::TypeEnvironment::build(
+                app,
+                Language::Go,
+                &parsed.symbols,
+                &parsed.type_bindings,
+            ),
+        )]);
+        let mut incremental = files.clone();
+        for (path, _, references) in &mut incremental {
+            if path != "app.go" {
+                references.clear();
+            }
+        }
+        let partial = resolve_references_with_context(
+            &incremental,
+            Language::Go,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        for (label, edges) in [
+            ("fresh", &fresh),
+            ("incremental exact-callee fallback", &partial),
+        ] {
+            for caller in [
+                "initialized",
+                "identifier",
+                "literal",
+                "factory",
+                "named",
+                "pointer",
+                "assignedVarFactory",
+                "shadowSource",
+            ] {
+                assert!(
+                    qa_calls(
+                        &files,
+                        edges,
+                        ("app.go", caller),
+                        ("store/methods.go", "Get", 2)
+                    ),
+                    "{label} {caller}: {edges:#?}"
+                );
+                assert!(
+                    !qa_calls(
+                        &files,
+                        edges,
+                        ("app.go", caller),
+                        ("other/types.go", "Get", 3)
+                    ),
+                    "foreign owner {label} {caller}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn go_qualified_named_factory_keeps_unchanged_callee_import_origin_without_type_environment() {
+        let app = "package app\nimport maker \"factory\"\nfunc consume() { for _, item := range maker.Named() { item.Get() } }\n";
+        let input = [
+            ("store/types.go", "package store\ntype Store struct{}\n"),
+            (
+                "store/methods.go",
+                "package store\nfunc (recv Store) Get() {}\n",
+            ),
+            (
+                "other/types.go",
+                "package other\ntype Store struct{}\nfunc (recv Store) Get() {}\n",
+            ),
+            (
+                "factory/all.go",
+                "package factory\nimport choice \"store\"\nfunc Named() (items []choice.Store) { return nil }\n",
+            ),
+            ("app.go", app),
+        ];
+        let (files, fresh) = review_edges(&input, Language::Go);
+        let parsed = parse_source(Path::new("app.go"), app).unwrap();
+        let envs = std::collections::HashMap::from([(
+            "app.go".into(),
+            crate::types::TypeEnvironment::build(
+                app,
+                Language::Go,
+                &parsed.symbols,
+                &parsed.type_bindings,
+            ),
+        )]);
+        let mut incremental = files.clone();
+        for (path, _, references) in &mut incremental {
+            if path != "app.go" {
+                // The unchanged callee has no rebuilt type environment or body
+                // references. Its existing import/package facts are still the
+                // authority needed to interpret its declared alias `choice`.
+                references.retain(|reference| {
+                    matches!(
+                        reference.kind,
+                        ReferenceKind::Import
+                            | ReferenceKind::ImportAlias
+                            | ReferenceKind::PackageBinding
+                    )
+                });
+            }
+        }
+        let partial = resolve_references_with_context(
+            &incremental,
+            Language::Go,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            Some(&envs),
+            None,
+        );
+        for (label, edges) in [("fresh", &fresh), ("unchanged qualified callee", &partial)] {
+            assert!(
+                qa_calls(
+                    &files,
+                    edges,
+                    ("app.go", "consume"),
+                    ("store/methods.go", "Get", 2)
+                ),
+                "{label}: {edges:#?}"
+            );
+            assert!(
+                !qa_calls(
+                    &files,
+                    edges,
+                    ("app.go", "consume"),
+                    ("other/types.go", "Get", 3)
+                ),
+                "foreign owner {label}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_var_slice_evidence_preserves_later_name_shadow_guards_and_annotations() {
+        let app = "package app\nimport a \"store\"\nimport b \"other\"\nfunc afterShadow() { var items = []a.Store{}; { var items = []b.Store{}; for _, item := range (items) { item.Get() } } }\nfunc beforeShadow(items []a.Store) { { for _, item := range (items) { item.Get() }; var items = []b.Store{}; _ = items } }\nfunc multiShadow() { var items = []a.Store{}; { var unused, items = 0, []interface{ Get() }{}; _ = unused; for _, item := range (items) { item.Get() } } }\nfunc groupedClosure() { var items = []a.Store{}; _ = items; _ = func(unused, items []b.Store) { _ = unused; for _, item := range (items) { item.Get() } } }\nfunc explicitType() { var items []b.Store = nil; for _, item := range (items) { item.Get() } }\nfunc unknown(items []interface{ Get() }) { for _, item := range (items) { item.Get() } }\nfunc interfaceFactory() { for _, item := range a.Unknown() { item.Get() } }\nfunc multiResult() { items, _ := a.Multi(); for _, item := range items { item.Get() } }\nfunc groupedResult() { items, _ := a.Grouped(); for _, item := range items { item.Get() } }\nfunc afterTypedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const item b.Scalar = 0; item.Get() } } }\nfunc beforeTypedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const item b.Scalar = 0; _ = item } } }\nfunc afterUntypedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const item = b.Scalar(0); item.Get() } } }\nfunc beforeUntypedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const item = b.Scalar(0); _ = item } } }\nfunc afterGroupedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const unused, item b.Scalar = 0, 0; _ = unused; item.Get() } } }\nfunc beforeGroupedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const unused, item b.Scalar = 0, 0; _ = unused; _ = item } } }\nfunc afterInheritedConst() { var items = []a.Store{}; for _, item := range items { _ = item; { const (unused = b.Scalar(0); item); _ = unused; item.Get() } } }\nfunc beforeInheritedConst() { var items = []a.Store{}; for _, item := range items { { item.Get(); const (unused = b.Scalar(0); item); _ = unused; _ = item } } }\n";
+        let input = [
+            (
+                "store/types.go",
+                "package store\ntype Store struct{}\nfunc (recv Store) Get() {}\nfunc Unknown() (items []interface{ Get() }) { return nil }\nfunc Multi() (items []Store, err error) { return nil, nil }\nfunc Grouped() (left, right []Store) { return nil, nil }\n",
+            ),
+            (
+                "other/types.go",
+                "package other\ntype Store struct{}\nfunc (recv Store) Get() {}\ntype Scalar int\nfunc (recv Scalar) Get() {}\n",
+            ),
+            ("app.go", app),
+        ];
+        let (files, edges) = review_edges(&input, Language::Go);
+        let other_symbols = &files
+            .iter()
+            .find(|(path, _, _)| path == "other/types.go")
+            .unwrap()
+            .1;
+        assert!(
+            other_symbols
+                .iter()
+                .any(|symbol| symbol.name == "Store" && symbol.kind == SymbolKind::Class)
+        );
+        assert!(
+            other_symbols
+                .iter()
+                .any(|symbol| symbol.name == "Scalar" && symbol.kind == SymbolKind::TypeAlias)
+        );
+        // Scalar constants are valid Go, but scalar-alias receiver resolution
+        // is deliberately outside this inference fix. Its real Get symbol
+        // makes the conservative refusal checks non-vacuous.
+        let scalar_get = uid_at(&files, "other/types.go", "Get", 5);
+        assert_ne!(scalar_get, uid_at(&files, "other/types.go", "Get", 3));
+        for (caller, expected, other) in [
+            ("afterShadow", "other/types.go", "store/types.go"),
+            ("beforeShadow", "store/types.go", "other/types.go"),
+            ("explicitType", "other/types.go", "store/types.go"),
+            ("groupedClosure", "other/types.go", "store/types.go"),
+            ("beforeTypedConst", "store/types.go", "other/types.go"),
+            ("beforeUntypedConst", "store/types.go", "other/types.go"),
+            ("beforeGroupedConst", "store/types.go", "other/types.go"),
+            ("beforeInheritedConst", "store/types.go", "other/types.go"),
+        ] {
+            assert!(
+                qa_calls(&files, &edges, ("app.go", caller), (expected, "Get", 3)),
+                "{caller}: {edges:#?}"
+            );
+            assert!(
+                !qa_calls(&files, &edges, ("app.go", caller), (other, "Get", 3)),
+                "wrong owner in {caller}: {edges:#?}"
+            );
+            assert!(
+                !qa_calls(
+                    &files,
+                    &edges,
+                    ("app.go", caller),
+                    ("other/types.go", "Get", 5)
+                ),
+                "scalar donor in {caller}: {edges:#?}"
+            );
+        }
+        for caller in [
+            "multiShadow",
+            "unknown",
+            "interfaceFactory",
+            "multiResult",
+            "groupedResult",
+            "afterTypedConst",
+            "afterUntypedConst",
+            "afterGroupedConst",
+            "afterInheritedConst",
+        ] {
+            for (target, line) in [
+                ("store/types.go", 3),
+                ("other/types.go", 3),
+                ("other/types.go", 5),
+            ] {
+                assert!(
+                    !qa_calls(&files, &edges, ("app.go", caller), (target, "Get", line)),
+                    "concrete donor {caller}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn go_slice_ranges_resolve_without_receiver_or_parameter_type_donors() {
         for (receiver, argument, element) in [("c", "c", "c"), ("recv", "directArg", "element")] {
             let source = format!(

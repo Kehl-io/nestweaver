@@ -61,7 +61,8 @@ use serde::{Deserialize, Serialize};
 ///     that end before a one-line body, and one JS/TS `this.x =` property
 ///     per class.
 /// 9 — scoped Go bindings and pointer/qualified composite literal evidence.
-const CACHE_VERSION: u32 = 9;
+/// 10 — canonical single Go result types and complete Go declaration shadow names.
+const CACHE_VERSION: u32 = 10;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -517,6 +518,58 @@ mod tests {
         assert_eq!(result.references[0].name, "world");
         assert_eq!(result.type_bindings.len(), 1);
         assert_eq!(result.type_bindings[0].var_name, "x");
+    }
+
+    #[test]
+    fn generation14_go_named_return_cache_is_not_reused_for_unchanged_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("parse.bin");
+        let source = "package app\nfunc Named() (items []Store) { return nil }\n";
+        let parsed = nestweaver_parser::parse_source(Path::new("app.go"), source).unwrap();
+        let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        let mut old = CachedParseResult {
+            symbols: parsed.symbols,
+            references: parsed.references,
+            type_bindings: parsed.type_bindings,
+        };
+        for symbol in &mut old.symbols {
+            if symbol.name == "Named" {
+                symbol.type_info.as_mut().unwrap().return_type = Some("(items []Store)".into());
+            }
+        }
+        for binding in &mut old.type_bindings {
+            if binding.var_name == "Named" {
+                binding.type_name = "(items []Store)".into();
+            }
+        }
+        let file = ParsedCacheFile {
+            version: 9,
+            entries: HashMap::from([(hash.clone(), old.clone())]),
+        };
+        std::fs::write(&path, rmp_serde::to_vec_named(&file).unwrap()).unwrap();
+        let record = LogRecord {
+            version: 9,
+            hash: std::borrow::Cow::Borrowed(&hash),
+            entry: std::borrow::Cow::Borrowed(&old),
+        };
+        let encoded = rmp_serde::to_vec_named(&record).unwrap();
+        let mut log = (encoded.len() as u32).to_le_bytes().to_vec();
+        log.extend(encoded);
+        std::fs::write(log_path(&path), log).unwrap();
+        assert!(
+            ParsedCache::load(&path).get(&hash).is_none(),
+            "unchanged source must not reuse generation14 named-return facts"
+        );
+        let fresh = nestweaver_parser::parse_source(Path::new("app.go"), source).unwrap();
+        let result = fresh
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "Named")
+            .unwrap();
+        assert_eq!(
+            result.type_info.as_ref().unwrap().return_type.as_deref(),
+            Some("[]Store")
+        );
     }
 
     #[test]
