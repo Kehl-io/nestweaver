@@ -1,10 +1,14 @@
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
 import { ambiguousCandidates, sourceErrorText } from "../../api/source";
+import { fetchSymbol } from "../../api/symbolQuery";
 import type { SourceResponse } from "../../api/types";
+import { useStore } from "../../stores";
 import { RepoPicker } from "./RepoPicker";
 
 interface CodePreviewProps {
+  /** Symbol identity whose current metadata must validate these coordinates. Omit for literal file previews. */
+  symbolUid?: string;
   filePath: string;
   line: number;
   context?: number;
@@ -20,12 +24,15 @@ interface CodePreviewProps {
 }
 
 interface LocalPick {
+  symbolUid?: string;
+  workspaceId: string;
   filePath: string;
   repo: string;
   candidates: string[];
 }
 
 export function CodePreview({
+  symbolUid,
   filePath,
   line,
   context = 10,
@@ -33,36 +40,59 @@ export function CodePreview({
   repoUid,
   onPickRepo,
 }: CodePreviewProps) {
+  const graphEpoch = useStore((s) => s.graphEpoch);
+  const workspaceId = useStore((s) => s.activeWorkspaceId);
   const [source, setSource] = useState<SourceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [candidates, setCandidates] = useState<string[] | null>(null);
-  // A pick made here applies only to the path it was made for.
+  // A pick applies only to its path, workspace and source identity.
   const [localPick, setLocalPick] = useState<LocalPick | null>(null);
-  const pick = localPick?.filePath === filePath ? localPick : null;
+  const pick = localPick?.filePath === filePath && localPick.workspaceId === workspaceId &&
+    localPick.symbolUid === symbolUid
+    ? localPick : null;
   const effectiveRepo = pick?.repo ?? repoUid;
 
   useEffect(() => {
     const controller = new AbortController();
+    const current = () => !controller.signal.aborted &&
+      useStore.getState().graphEpoch === graphEpoch &&
+      useStore.getState().activeWorkspaceId === workspaceId;
     setSource(null);
     setError(null);
     setCandidates(null);
-    api
-      .source(filePath, line, context, { signal: controller.signal }, effectiveRepo)
+    const load = async () => {
+      if (symbolUid !== undefined) {
+        // Parents may retain old metadata while its shared query refreshes.
+        // Never read a new file body using coordinates from that older query.
+        const { symbol } = await fetchSymbol(symbolUid);
+        if (!current()) return;
+        if (symbol.uid !== symbolUid || symbol.file_path !== filePath ||
+          symbol.start_line !== line || !symbol.repo_uid || symbol.repo_uid !== effectiveRepo) {
+          setError("Source evidence is unavailable for the selected symbol.");
+          return;
+        }
+      }
+      if (!current()) return;
+      return api.source(filePath, line, context, { signal: controller.signal }, effectiveRepo);
+    };
+    load()
       .then((data) => {
-        if (!controller.signal.aborted) setSource(data);
+        if (data && current()) setSource(data);
       })
       .catch((e: unknown) => {
-        if (!controller.signal.aborted) {
+        if (current()) {
           setError(sourceErrorText(e, filePath, `Source not available: ${filePath}:${line}`));
           setCandidates(ambiguousCandidates(e));
         }
       });
     return () => controller.abort();
-  }, [context, filePath, line, effectiveRepo]);
+    // A committed index can change the body while all source coordinates stay
+    // identical. Layout-only graphVersion changes must not invalidate source.
+  }, [symbolUid, context, filePath, line, effectiveRepo, graphEpoch, workspaceId]);
 
   const handlePick = (uid: string, options: string[]) => {
     if (onPickRepo) onPickRepo(uid, options);
-    else setLocalPick({ filePath, repo: uid, candidates: options });
+    else setLocalPick({ symbolUid, workspaceId, filePath, repo: uid, candidates: options });
   };
 
   if (error && candidates) {

@@ -18,6 +18,122 @@ pub struct TypeBinding {
     pub source: BindingSource,
 }
 
+/// Borrowed view of the resolver's ephemeral return-origin encoding. Paths
+/// may contain `#`; type payloads emitted by scoped inference cannot. Keep
+/// declaration lines separate from the binding's later use-site line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TypeNameParts<'a> {
+    pub(crate) origin_file: Option<&'a str>,
+    pub(crate) raw_type: &'a str,
+    pub(crate) origin_line: Option<u32>,
+}
+
+/// Validate only the internal tag payload envelope, without normalizing the
+/// recorded type. Ownership and language meaning remain the resolver's job.
+fn origin_type_payload(raw: &str) -> bool {
+    let name = if let Some((name, position)) = raw.split_once('@') {
+        if position.is_empty()
+            || !position.bytes().all(|byte| byte.is_ascii_digit())
+            || position.parse::<usize>().is_err()
+        {
+            return false;
+        }
+        name
+    } else {
+        raw
+    };
+    if crate::types::go_slice_element(name).is_some() {
+        return true;
+    }
+    let name = name.trim().strip_prefix('*').unwrap_or(name.trim()).trim();
+    name.split('.').all(|part| {
+        let mut chars = part.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_alphabetic() || ch == '_' || ch == '$')
+            && chars.all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')
+    })
+}
+
+impl<'a> TypeNameParts<'a> {
+    pub(crate) fn decode(encoded: &'a str) -> Self {
+        let unscoped = Self {
+            origin_file: None,
+            raw_type: encoded,
+            origin_line: None,
+        };
+        let Some((head, suffix)) = encoded.rsplit_once('#') else {
+            return unscoped;
+        };
+        if let Some((file, raw_type)) = head.rsplit_once('#') {
+            // Multi-hash strings are canonical tags only with a strict
+            // decimal u32 suffix. Never reinterpret a malformed line as a
+            // line-less legacy type and thereby manufacture owner evidence.
+            if !suffix.is_empty()
+                && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                && let Ok(line) = suffix.parse::<u32>()
+                && !file.is_empty()
+                && origin_type_payload(raw_type)
+            {
+                return Self {
+                    origin_file: Some(file),
+                    raw_type,
+                    origin_line: Some(line),
+                };
+            }
+            return unscoped;
+        }
+        // The unambiguous old file#Type form has exactly one separator.
+        // Rust's raw identifier syntax is a type spelling, never a file tag.
+        if !head.is_empty() && origin_type_payload(suffix) && head != "r" && !head.ends_with("::r")
+        {
+            Self {
+                origin_file: Some(head),
+                raw_type: suffix,
+                origin_line: None,
+            }
+        } else {
+            unscoped
+        }
+    }
+
+    pub(crate) fn encode(self) -> String {
+        // Raw Rust identifiers are not admitted scoped-return payloads. If
+        // handed one, retain its exact spelling without inventing a tag.
+        if !origin_type_payload(self.raw_type) {
+            return self.raw_type.to_string();
+        }
+        match (self.origin_file, self.origin_line) {
+            (Some(file), Some(line)) => format!("{file}#{}#{line}", self.raw_type),
+            (Some(file), None) if !file.contains('#') => format!("{file}#{}", self.raw_type),
+            _ => self.raw_type.to_string(),
+        }
+    }
+}
+
+impl TypeBinding {
+    /// Decode origin metadata without splitting delimiters inside file paths.
+    pub(crate) fn type_name_parts(&self) -> TypeNameParts<'_> {
+        TypeNameParts::decode(&self.type_name)
+    }
+
+    /// Preserve the exact declaration context for a returned type. Both
+    /// assignment and expression inference use this internal origin encoding.
+    pub(crate) fn scoped_return(&self, target_file: &str, use_line: u32) -> Self {
+        Self {
+            type_name: TypeNameParts {
+                origin_file: Some(target_file),
+                raw_type: &self.type_name,
+                origin_line: Some(self.line),
+            }
+            .encode(),
+            line: use_line,
+            confidence: self.confidence.min(0.85),
+            source: BindingSource::ReturnType,
+        }
+    }
+}
+
 /// The mechanism that produced a [`TypeBinding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingSource {
@@ -634,6 +750,113 @@ fn extract_assignment_target(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use nestweaver_schema::Visibility;
+
+    #[test]
+    fn scoped_type_codec_roundtrips_path_delimiters_and_declaration_metadata() {
+        for file in [
+            "pkg/name.go",
+            "pkg/has#name.go",
+            "pkg/#12/has##name.go",
+            "pkg/ends#",
+            "pkg/has@name.rs",
+            "pkg/日本語 space#type.ts",
+        ] {
+            for raw_type in [
+                "Provider",
+                "pkg.Provider",
+                "*pkg.Provider",
+                "[]*pkg.Provider",
+                "Provider@42",
+            ] {
+                for line in [0, 17, u32::MAX] {
+                    let parts = TypeNameParts {
+                        origin_file: Some(file),
+                        raw_type,
+                        origin_line: Some(line),
+                    };
+                    let encoded = parts.encode();
+                    assert_eq!(TypeNameParts::decode(&encoded), parts, "{encoded}");
+                }
+            }
+        }
+        let encoded = TypeNameParts {
+            origin_file: Some("pkg/has#name.rs"),
+            raw_type: "Provider@42",
+            origin_line: Some(7),
+        }
+        .encode();
+        assert_eq!(TypeNameParts::decode(&encoded).raw_type, "Provider@42");
+    }
+
+    #[test]
+    fn scoped_type_codec_does_not_trust_malformed_or_raw_identifier_tags() {
+        for raw in [
+            "Provider",
+            "pkg.Provider",
+            "Provider@42",
+            "r#Provider",
+            "mod::r#Provider@42",
+            "file.go#Provider#",
+            "file.go#Provider#-1",
+            "file.go#Provider#+1",
+            "file.go#Provider#4294967296",
+            "file.go#Provider#bad",
+            "file.go#Provider#1#2",
+            "file.go#Provider@-1#7",
+            "file.go#Provider@#7",
+            "#Provider#7",
+            "file.go##7",
+            "file.go#-1",
+            "file.go#+1",
+        ] {
+            let parts = TypeNameParts::decode(raw);
+            assert_eq!(parts.origin_file, None, "{raw}");
+            assert_eq!(parts.origin_line, None, "{raw}");
+            assert_eq!(parts.raw_type, raw, "untrusted/raw spelling changed: {raw}");
+        }
+        // Retain only the unambiguous one-separator legacy envelope. A
+        // nonnumeric multi-hash suffix must never be retried as this form.
+        assert_eq!(
+            TypeNameParts::decode("file.go#Provider@42"),
+            TypeNameParts {
+                origin_file: Some("file.go"),
+                raw_type: "Provider@42",
+                origin_line: None,
+            }
+        );
+        for raw_type in ["r#Provider", "mod::r#Provider@42"] {
+            assert_eq!(
+                TypeNameParts {
+                    origin_file: Some("file.rs"),
+                    raw_type,
+                    origin_line: Some(7)
+                }
+                .encode(),
+                raw_type
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_return_keeps_declaration_line_distinct_from_receiver_use_line() {
+        let declared = TypeBinding {
+            type_name: "Provider@42".into(),
+            line: 7,
+            confidence: 0.95,
+            source: BindingSource::ReturnType,
+        };
+        let used = declared.scoped_return("pkg/has#name.rs", 99);
+        assert_eq!(used.line, 99);
+        assert_eq!(
+            used.type_name_parts(),
+            TypeNameParts {
+                origin_file: Some("pkg/has#name.rs"),
+                raw_type: "Provider@42",
+                origin_line: Some(7),
+            }
+        );
+        assert_eq!(used.confidence, 0.85);
+    }
 
     fn make_symbol(name: &str, kind: SymbolKind, parent: Option<&str>) -> RawSymbol {
         RawSymbol {

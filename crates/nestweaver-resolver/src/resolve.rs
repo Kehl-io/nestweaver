@@ -6,6 +6,7 @@ use nestweaver_schema::{
 use rayon::prelude::*;
 
 use crate::imports::{ImportGraph, JvmImportRank, NamedBinding, build_import_graph_with_languages};
+use crate::type_extractors::TypeNameParts;
 use crate::types::TypeEnvironment;
 use crate::util::parent_dir;
 use crate::workspace::WorkspaceContext;
@@ -822,12 +823,7 @@ fn resolve_single_reference(
     {
         receiver_inference
             .infer(receiver, 0)
-            .map(|type_name| crate::type_extractors::TypeBinding {
-                type_name,
-                line: reference.start_line,
-                confidence: 0.85,
-                source: crate::type_extractors::BindingSource::ReturnType,
-            })
+            .map(|inferred| inferred.binding(reference.start_line))
     } else {
         None
     };
@@ -924,19 +920,14 @@ fn resolve_single_reference(
                 || binding.line >= source_sym.start_line
         }) {
             let method_name = &reference.name;
-            let type_name = &binding.type_name;
             let scoped_origin_required = reference.scope.is_some()
                 && matches!(
                     language,
                     Language::Rust | Language::JavaScript | Language::TypeScript | Language::Go
                 );
-            let (origin_file, tagged_type) =
-                type_name.split_once('#').unwrap_or((file_path, type_name));
-            let (unqualified_type, _origin_line) = tagged_type
-                .split_once('#')
-                .map_or((tagged_type, binding.line), |(name, line)| {
-                    (name, line.parse().unwrap_or(binding.line))
-                });
+            let parts = binding.type_name_parts();
+            let origin_file = parts.origin_file.unwrap_or(file_path);
+            let unqualified_type = parts.raw_type;
             let (unqualified_type, origin_position) = unqualified_type
                 .split_once('@')
                 .map_or((unqualified_type, None), |(name, position)| {
@@ -1946,6 +1937,7 @@ fn resolve_single_reference(
 /// `Err(...)` to `type Err = String`. A method call (`items.len()`) does not
 /// name a free function in a file the caller happens to import. A field
 /// access may still name a field in the same file; it may not name a function.
+#[derive(Clone, PartialEq, Eq)]
 struct TypedReceiverOrigin {
     file: String,
     name: String,
@@ -2372,6 +2364,34 @@ fn jvm_type_origin(
 /// (`a.b().c().d()` is three levels).
 const RECEIVER_INFERENCE_DEPTH: u8 = 4;
 
+/// Exact Go owner evidence travels with each chain step. Other languages
+/// retain their existing name-based inference until they have equivalent
+/// declaration evidence; no global name match can manufacture a Go origin.
+#[derive(Clone, PartialEq, Eq)]
+struct InferredReceiverType {
+    name: String,
+    origin: Option<TypedReceiverOrigin>,
+}
+
+impl InferredReceiverType {
+    fn unscoped(name: String) -> Self {
+        Self { name, origin: None }
+    }
+
+    fn binding(self, line: u32) -> crate::type_extractors::TypeBinding {
+        let binding = crate::type_extractors::TypeBinding {
+            type_name: self.name,
+            line,
+            confidence: 0.85,
+            source: crate::type_extractors::BindingSource::ReturnType,
+        };
+        match self.origin {
+            Some(origin) => binding.scoped_return(&origin.file, line),
+            None => binding,
+        }
+    }
+}
+
 /// Everything [`ReceiverInference::infer`] reads. Bundled so the recursion does
 /// not thread ten parameters.
 struct ReceiverInference<'a, 'b, 'c> {
@@ -2477,7 +2497,7 @@ fn is_identifier(text: &str) -> bool {
 /// The type a receiver binding's internal tag names (`file#Type#line`,
 /// `Type@position`), as a bare type name.
 fn untagged_type(type_name: &str) -> &str {
-    let name = type_name.split('#').nth(1).unwrap_or(type_name);
+    let name = TypeNameParts::decode(type_name).raw_type;
     name.split('@').next().unwrap_or(name)
 }
 
@@ -2543,7 +2563,7 @@ impl ReceiverInference<'_, '_, '_> {
     /// The static type of a receiver expression, or `None` when nothing in
     /// the graph establishes one. Every step needs exact evidence: a `new`
     /// of a repository type, a declared return type, or a typed binding.
-    fn infer(&self, expr: &str, depth: u8) -> Option<String> {
+    fn infer(&self, expr: &str, depth: u8) -> Option<InferredReceiverType> {
         if depth > RECEIVER_INFERENCE_DEPTH {
             return None;
         }
@@ -2557,7 +2577,9 @@ impl ReceiverInference<'_, '_, '_> {
                 })
                 .collect();
             let name = path.rsplit(['.', ':', '\\']).next()?;
-            return self.type_exists(name).then(|| name.to_string());
+            return self
+                .type_exists(name)
+                .then(|| InferredReceiverType::unscoped(name.to_string()));
         }
         if let Some(callee) = split_trailing_call(expr) {
             if callee.is_empty() {
@@ -2618,7 +2640,7 @@ impl ReceiverInference<'_, '_, '_> {
                 && self.graph.go_requires_qualifier(self.file_path, file))
     }
 
-    fn identifier_type(&self, name: &str) -> Option<String> {
+    fn identifier_type(&self, name: &str) -> Option<InferredReceiverType> {
         let env = self.env?;
         let binding = if is_self_receiver(name) {
             env.lookup_self(self.reference.start_line)
@@ -2629,14 +2651,23 @@ impl ReceiverInference<'_, '_, '_> {
         } else {
             env.lookup(name, self.reference.start_line)
         }?;
+        let parts = binding.type_name_parts();
         let name = untagged_type(&binding.type_name);
-        self.type_exists(name).then(|| name.to_string())
+        if self.language == Language::Go {
+            return self.declared_type(
+                parts.origin_file.unwrap_or(self.file_path),
+                parts.raw_type,
+                None,
+            );
+        }
+        self.type_exists(name)
+            .then(|| InferredReceiverType::unscoped(name.to_string()))
     }
 
     /// A free call `f(...)`: a constructor-style call of a repository type
     /// (`Child()`, `Point(1, 2)`), or a function with one declared return
     /// type among the visible declarations.
-    fn free_call_type(&self, callee: &str) -> Option<String> {
+    fn free_call_type(&self, callee: &str) -> Option<InferredReceiverType> {
         if active_lexical_binding(self.scope_index, self.reference, callee, self.language).is_some()
         {
             return None;
@@ -2649,6 +2680,7 @@ impl ReceiverInference<'_, '_, '_> {
                     && symbol.parent_name.is_none()
                     && self.bare_name_visible(file)
             })
+            .copied()
             .collect();
         if functions.is_empty() {
             let types: Vec<_> = symbols
@@ -2658,24 +2690,30 @@ impl ReceiverInference<'_, '_, '_> {
                         && self.bare_name_visible(file)
                 })
                 .collect();
-            return (!types.is_empty()).then(|| callee.to_string());
+            return if self.language == Language::Go {
+                self.declared_type(self.file_path, callee, None)
+            } else {
+                (!types.is_empty()).then(|| InferredReceiverType::unscoped(callee.to_string()))
+            };
         }
         let local: Vec<_> = functions
             .iter()
             .filter(|(file, _)| *file == self.file_path)
+            .copied()
             .collect();
-        let candidates: Vec<_> = if local.is_empty() {
-            functions.iter().collect()
-        } else {
-            local
-        };
-        self.agreed_return_type(candidates.iter().map(|(_, symbol)| *symbol), None)
+        let candidates: Vec<_> = if local.is_empty() { functions } else { local };
+        self.agreed_return_type(candidates.into_iter(), None)
     }
 
     /// `base.method(...)`: a static call when `base` names a repository type
     /// that is not shadowed by a local, otherwise a call on `base`'s own
     /// inferred type. Inherited methods are found through `extends`.
-    fn member_call_type(&self, base: &str, method: &str, depth: u8) -> Option<String> {
+    fn member_call_type(
+        &self,
+        base: &str,
+        method: &str,
+        depth: u8,
+    ) -> Option<InferredReceiverType> {
         let base = base.trim();
         let owner = if is_identifier(base)
             && !is_self_receiver(base)
@@ -2684,7 +2722,11 @@ impl ReceiverInference<'_, '_, '_> {
                 .is_none()
             && self.identifier_type(base).is_none()
         {
-            Some(base.to_string())
+            if self.language == Language::Go {
+                self.declared_type(self.file_path, base, None)
+            } else {
+                Some(InferredReceiverType::unscoped(base.to_string()))
+            }
         } else if is_identifier(base) && !is_self_receiver(base) && !self.type_exists(base) {
             // A namespace or package qualifier (`calc.New(3)`): a free
             // function of the module or package that qualifier imports.
@@ -2705,7 +2747,17 @@ impl ReceiverInference<'_, '_, '_> {
     /// `candidate_matches` (`import c "…/calc"` binds `c` to every file of
     /// `calc`); elsewhere a whole-module binding (`import pkg.helpers as h`,
     /// `import * as m from`) names its one source file.
-    fn qualified_free_call_type(&self, qualifier: &str, function: &str) -> Option<String> {
+    fn qualified_free_call_type(
+        &self,
+        qualifier: &str,
+        function: &str,
+    ) -> Option<InferredReceiverType> {
+        if self.language == Language::Go
+            && active_lexical_binding(self.scope_index, self.reference, qualifier, self.language)
+                .is_some()
+        {
+            return None;
+        }
         let files: Vec<&str> = if self.language == Language::Go {
             self.graph
                 .go_qualified_package(self.file_path, qualifier)?
@@ -2719,7 +2771,7 @@ impl ReceiverInference<'_, '_, '_> {
                 .filter_map(|binding| binding.source_file.as_deref())
                 .collect()
         };
-        let functions: Vec<&RawSymbol> = self
+        let functions: Vec<_> = self
             .symbol_map
             .get(function)?
             .iter()
@@ -2727,8 +2779,12 @@ impl ReceiverInference<'_, '_, '_> {
                 symbol.kind == SymbolKind::Function
                     && symbol.parent_name.is_none()
                     && files.contains(file)
+                    && (self.language != Language::Go
+                        || symbol.visibility != Visibility::Private
+                        || parent_dir(self.file_path) == parent_dir(file)
+                            && go_same_package(self.graph, self.file_path, file))
             })
-            .map(|(_, symbol)| *symbol)
+            .copied()
             .collect();
         if functions.is_empty() {
             return None;
@@ -2736,8 +2792,12 @@ impl ReceiverInference<'_, '_, '_> {
         self.agreed_return_type(functions.into_iter(), None)
     }
 
-    fn method_return_type(&self, owner: &str, method: &str) -> Option<String> {
-        let mut current = vec![owner.to_string()];
+    fn method_return_type(
+        &self,
+        receiver: &InferredReceiverType,
+        method: &str,
+    ) -> Option<InferredReceiverType> {
+        let mut current = vec![receiver.name.clone()];
         let mut visited = std::collections::HashSet::new();
         for _ in 0..=RECEIVER_INFERENCE_DEPTH {
             let mut next = Vec::new();
@@ -2750,11 +2810,22 @@ impl ReceiverInference<'_, '_, '_> {
                     .get(method)
                     .into_iter()
                     .flatten()
-                    .filter(|(_, symbol)| {
+                    .filter(|(file, symbol)| {
                         symbol.kind == SymbolKind::Method
                             && symbol.parent_name.as_deref() == Some(owner.as_str())
+                            && (self.language != Language::Go
+                                || receiver.origin.as_ref().is_some_and(|origin| {
+                                    go_method_origin_matches(
+                                        file,
+                                        origin,
+                                        self.graph,
+                                        self.symbol_map,
+                                    ) && (symbol.visibility != Visibility::Private
+                                        || parent_dir(self.file_path) == parent_dir(file)
+                                            && go_same_package(self.graph, self.file_path, file))
+                                }))
                     })
-                    .map(|(_, symbol)| *symbol)
+                    .copied()
                     .collect();
                 if !methods.is_empty() {
                     return self.agreed_return_type(methods.into_iter(), Some(owner.as_str()));
@@ -2771,18 +2842,48 @@ impl ReceiverInference<'_, '_, '_> {
         None
     }
 
+    /// Interpret a return relative to its declaration before dropping qualifiers.
+    fn declared_type(
+        &self,
+        file: &str,
+        raw: &str,
+        owner: Option<&str>,
+    ) -> Option<InferredReceiverType> {
+        if self.language != Language::Go {
+            return normalize_return_type(raw, owner, self.symbol_map)
+                .map(InferredReceiverType::unscoped);
+        }
+        // Parser return metadata already unwraps named scalar results. Refuse
+        // tuples, containers and expressions rather than borrowing their names.
+        let name = raw.trim().trim_start_matches('*').trim();
+        let origin = typed_receiver_origin(
+            file,
+            name,
+            self.reference,
+            self.symbol_map,
+            self.graph,
+            self.language,
+            None,
+            false,
+        )?;
+        Some(InferredReceiverType {
+            name: origin.name.clone(),
+            origin: Some(origin),
+        })
+    }
+
     /// The one normalized return type every candidate declares, or `None`
     /// when any lacks one or they disagree.
     fn agreed_return_type<'s>(
         &self,
-        candidates: impl Iterator<Item = &'s RawSymbol>,
+        candidates: impl Iterator<Item = (&'s str, &'s RawSymbol)>,
         owner: Option<&str>,
-    ) -> Option<String> {
-        let mut agreed: Option<String> = None;
-        for symbol in candidates {
+    ) -> Option<InferredReceiverType> {
+        let mut agreed: Option<InferredReceiverType> = None;
+        for (file, symbol) in candidates {
             let raw = symbol.type_info.as_ref()?.return_type.as_deref()?;
             let owner = owner.or(symbol.parent_name.as_deref());
-            let normalized = normalize_return_type(raw, owner, self.symbol_map)?;
+            let normalized = self.declared_type(file, raw, owner)?;
             match &agreed {
                 Some(existing) if *existing != normalized => return None,
                 _ => agreed = Some(normalized),
@@ -2938,7 +3039,7 @@ fn fallback_receiver_type(
         return None;
     }
     if let Some(inferred) = inference.infer(expr, depth) {
-        return Some(inferred);
+        return Some(inferred.name);
     }
     let expr = expr.trim();
     let callee = split_trailing_call(expr)?;
@@ -13504,6 +13605,388 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
             ),
             "a method receiver's name must not type unrelated parameters: {edges:#?}"
         );
+    }
+
+    #[test]
+    fn hash_filename_does_not_change_rust_return_positions_or_js_assignments() {
+        for path in ["src/name.rs", "src/has#name.rs"] {
+            let source = "struct Store;\nimpl Store {\n fn leaf(&self) {}\n}\nfn factory() -> Store { Store }\nfn use_store() { let db = factory(); db.leaf(); }\n";
+            let (files, edges) = review_edges(&[(path, source)], Language::Rust);
+            assert!(
+                qa_calls(&files, &edges, (path, "use_store"), (path, "leaf", 3)),
+                "{path}: {edges:#?}"
+            );
+        }
+        for (language, extension) in [(Language::JavaScript, "js"), (Language::TypeScript, "ts")] {
+            for basename in ["name", "has#name"] {
+                let path = format!("src/{basename}.{extension}");
+                let source = "class Store {\n leaf() {}\n}\nfunction use_store() { const db = new Store(); db.leaf(); }\nfunction unknown(db) { db.leaf(); }\n";
+                let (files, edges) = review_edges(&[(path.as_str(), source)], language);
+                assert!(
+                    qa_calls(&files, &edges, (&path, "use_store"), (&path, "leaf", 2)),
+                    "{path}: {edges:#?}"
+                );
+                assert!(
+                    !qa_calls(&files, &edges, (&path, "unknown"), (&path, "leaf", 2)),
+                    "unknown donor: {path}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn go_factory_chain_and_assignment_keep_hash_filename_origins() {
+        for path in ["pkg/name.go", "pkg/has#name.go", "pkg/#12/has##name.go"] {
+            for split in [false, true] {
+                let same = "package pkg\ntype Provider struct{}\nfunc NewProvider() Provider { return Provider{} }\nfunc (p Provider) Named() {}\nfunc PTChain() { NewProvider().Named() }\nfunc PTAssignment() { p := NewProvider(); p.Named() }\n";
+                let declaration = "package pkg\ntype Provider struct{}\nfunc NewProvider() Provider { return Provider{} }\n";
+                // Keep split files in the declaration's exact package directory.
+                let dir = path.rsplit_once('/').unwrap().0;
+                let method_path = format!("{dir}/methods.go");
+                let caller_path = format!("{dir}/caller.go");
+                let inputs = if split {
+                    vec![
+                        (path, declaration),
+                        (
+                            method_path.as_str(),
+                            "package pkg\nfunc (p Provider) Named() {}\n",
+                        ),
+                        (
+                            caller_path.as_str(),
+                            "package pkg\nfunc PTChain() { NewProvider().Named() }\nfunc PTAssignment() { p := NewProvider(); p.Named() }\n",
+                        ),
+                    ]
+                } else {
+                    vec![(path, same)]
+                };
+                let (files, edges) = review_edges(&inputs, Language::Go);
+                let caller_file = if split { caller_path.as_str() } else { path };
+                let target_file = if split { method_path.as_str() } else { path };
+                for caller in ["PTChain", "PTAssignment"] {
+                    assert!(
+                        qa_calls(
+                            &files,
+                            &edges,
+                            (caller_file, caller),
+                            (path, "NewProvider", 3)
+                        ),
+                        "{path}/{split}/{caller}: {edges:#?}"
+                    );
+                    assert!(
+                        qa_calls(
+                            &files,
+                            &edges,
+                            (caller_file, caller),
+                            (target_file, "Named", if split { 2 } else { 4 })
+                        ),
+                        "{path}/{split}/{caller}: {edges:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn go_factory_call_chains_keep_declaring_package_for_scalar_returns() {
+        for result in [
+            "Provider",
+            "*Provider",
+            "(value *Provider)",
+            "choice.Provider",
+        ] {
+            for foreign_homonym in [false, true] {
+                let factory = format!(
+                    "package maker\nimport choice \"types\"\nfunc New() {result} {{ panic(\"fixture\") }}\n"
+                );
+                let local_types = if result == "choice.Provider" {
+                    "package maker\n"
+                } else {
+                    "package maker\ntype Provider struct{}\nfunc (p Provider) Named() {}\n"
+                };
+                let foreign = if foreign_homonym {
+                    "package foreign\ntype Provider struct{}\nfunc (p Provider) Named() {}\n"
+                } else {
+                    "package foreign\n"
+                };
+                let imported_types = if result == "choice.Provider" {
+                    "package types\ntype Provider struct{}\nfunc (p Provider) Named() {}\n"
+                } else {
+                    "package types\n"
+                };
+                let app = if foreign_homonym {
+                    "package app\nimport factory \"maker\"\ntype Provider struct{}\nfunc (p Provider) Named() {}\nfunc chain() { factory.New().Named() }\nfunc assigned() { p := factory.New(); p.Named() }\n"
+                } else {
+                    "package app\nimport factory \"maker\"\nfunc chain() { factory.New().Named() }\nfunc assigned() { p := factory.New(); p.Named() }\n"
+                };
+                let (files, edges) = review_edges(
+                    &[
+                        ("maker/factory.go", &factory),
+                        ("maker/types.go", local_types),
+                        ("types/types.go", imported_types),
+                        ("foreign/types.go", foreign),
+                        ("app.go", app),
+                    ],
+                    Language::Go,
+                );
+                let target = if result == "choice.Provider" {
+                    "types/types.go"
+                } else {
+                    "maker/types.go"
+                };
+                for caller in ["chain", "assigned"] {
+                    assert!(
+                        qa_calls(&files, &edges, ("app.go", caller), (target, "Named", 3)),
+                        "{result}/{foreign_homonym}/{caller}: {edges:#?}"
+                    );
+                    assert!(qa_calls(
+                        &files,
+                        &edges,
+                        ("app.go", caller),
+                        ("maker/factory.go", "New", 3)
+                    ));
+                    if foreign_homonym {
+                        assert!(!qa_calls(
+                            &files,
+                            &edges,
+                            ("app.go", caller),
+                            ("app.go", "Named", 4)
+                        ));
+                        assert!(!qa_calls(
+                            &files,
+                            &edges,
+                            ("app.go", caller),
+                            ("foreign/types.go", "Named", 3)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn go_factory_call_chains_scope_each_intermediate_method_and_identifier() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "maker/types.go",
+                    "package maker\nimport chosen \"chosen\"\ntype Provider struct{}\nfunc New() *Provider { return nil }\nfunc (p Provider) Next() chosen.Provider { panic(\"fixture\") }\nfunc samePackage() { New().Next().Named() }\n",
+                ),
+                (
+                    "chosen/types.go",
+                    "package chosen\ntype Provider struct{}\nfunc (p Provider) Named() {}\n",
+                ),
+                (
+                    "other/types.go",
+                    "package other\ntype Provider struct{}\nfunc (p Provider) Next() Provider { panic(\"fixture\") }\nfunc (p Provider) Named() {}\n",
+                ),
+                (
+                    "app.go",
+                    "package app\nimport factory \"maker\"\nfunc chain() { factory.New().Next().Named() }\nfunc assigned() { p := factory.New(); p.Next().Named() }\nfunc parameter(p *factory.Provider) { p.Next().Named() }\n",
+                ),
+            ],
+            Language::Go,
+        );
+        for (path, caller) in [
+            ("app.go", "chain"),
+            ("app.go", "assigned"),
+            ("app.go", "parameter"),
+            ("maker/types.go", "samePackage"),
+        ] {
+            assert!(
+                qa_calls(
+                    &files,
+                    &edges,
+                    (path, caller),
+                    ("chosen/types.go", "Named", 3)
+                ),
+                "{caller}: {edges:#?}"
+            );
+            assert!(!qa_calls(
+                &files,
+                &edges,
+                (path, caller),
+                ("other/types.go", "Named", 4)
+            ));
+        }
+    }
+
+    #[test]
+    fn go_factory_call_chains_refuse_unproven_returns_shadowing_and_private_steps() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "maker/types.go",
+                    "package maker\ntype Provider struct{}\nfunc (p Provider) Named() {}\nfunc (p Provider) hidden() Provider { return p }\nfunc New() Provider { panic(\"fixture\") }\nfunc Many() (Provider, error) { panic(\"fixture\") }\nfunc Slice() []Provider { return nil }\nfunc External() library.Provider { panic(\"fixture\") }\nfunc Unknown() interface{} { return nil }\n",
+                ),
+                (
+                    "app.go",
+                    "package app\nimport factory \"maker\"\nfunc multiple() { factory.Many().Named() }\nfunc slice() { factory.Slice().Named() }\nfunc external() { factory.External().Named() }\nfunc unknown() { factory.Unknown().Named() }\nfunc shadow(factory interface{}) { factory.New().Named() }\nfunc privateStep() { factory.New().hidden().Named() }\n",
+                ),
+            ],
+            Language::Go,
+        );
+        for caller in [
+            "multiple",
+            "slice",
+            "external",
+            "unknown",
+            "shadow",
+            "privateStep",
+        ] {
+            assert!(
+                !qa_calls(
+                    &files,
+                    &edges,
+                    ("app.go", caller),
+                    ("maker/types.go", "Named", 3)
+                ),
+                "{caller}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_factory_call_chains_do_not_take_wrong_package_or_ignored_method_donors() {
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "maker/types.go",
+                    "package maker\ntype Provider struct{}\nfunc New() Provider { return Provider{} }\nfunc (p Provider) Named() {}\n",
+                ),
+                (
+                    "maker/wrong.go",
+                    "package foreign\ntype Provider struct{}\nfunc (p Provider) Named() {}\n",
+                ),
+                (
+                    "maker/ignored.go",
+                    "//go:build ignore\n\npackage maker\ntype Provider struct{}\nfunc (p Provider) Named() {}\n",
+                ),
+                (
+                    "app.go",
+                    "package app\nimport factory \"maker\"\nfunc chain() { factory.New().Named() }\n",
+                ),
+            ],
+            Language::Go,
+        );
+        assert!(
+            qa_calls(
+                &files,
+                &edges,
+                ("app.go", "chain"),
+                ("maker/types.go", "Named", 4)
+            ),
+            "{edges:#?}"
+        );
+        assert!(!qa_calls(
+            &files,
+            &edges,
+            ("app.go", "chain"),
+            ("maker/wrong.go", "Named", 3)
+        ));
+        assert!(!qa_calls(
+            &files,
+            &edges,
+            ("app.go", "chain"),
+            ("maker/ignored.go", "Named", 5)
+        ));
+    }
+
+    #[test]
+    fn go_factory_call_chains_require_origin_agreement_not_just_type_spelling() {
+        // Invalid duplicate declarations deliberately model an ambiguous graph:
+        // their same-spelled Provider returns name different exact packages.
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "maker/first.go",
+                    "package maker\nimport picked \"one\"\nfunc New() picked.Provider { panic(\"fixture\") }\n",
+                ),
+                (
+                    "maker/second.go",
+                    "package maker\nimport picked \"two\"\nfunc New() picked.Provider { panic(\"fixture\") }\n",
+                ),
+                (
+                    "one/types.go",
+                    "package one\ntype Provider struct{}\nfunc (p Provider) Named() {}\n",
+                ),
+                (
+                    "two/types.go",
+                    "package two\ntype Provider struct{}\nfunc (p Provider) Named() {}\n",
+                ),
+                (
+                    "app.go",
+                    "package app\nimport factory \"maker\"\nfunc chain() { factory.New().Named() }\n",
+                ),
+            ],
+            Language::Go,
+        );
+        for target in ["one/types.go", "two/types.go"] {
+            assert!(
+                !qa_calls(&files, &edges, ("app.go", "chain"), (target, "Named", 3)),
+                "{edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_factory_call_chains_use_unchanged_callee_metadata_and_retarget_return_alias() {
+        for picked in ["one", "two"] {
+            let factory = format!(
+                "package maker\nimport picked \"{picked}\"\nfunc New() picked.Provider {{ panic(\"fixture\") }}\n"
+            );
+            let inputs = [
+                ("maker/factory.go", factory.as_str()),
+                (
+                    "one/types.go",
+                    "package one\ntype Provider struct{}\nfunc (p Provider) Named() {}\n",
+                ),
+                (
+                    "two/types.go",
+                    "package two\ntype Provider struct{}\nfunc (p Provider) Named() {}\n",
+                ),
+                (
+                    "app.go",
+                    "package app\nimport factory \"maker\"\nfunc renamedCaller() { factory.New().Named() }\n",
+                ),
+            ];
+            let mut files = Vec::new();
+            let mut envs = std::collections::HashMap::new();
+            for (path, source) in inputs {
+                let parsed = parse_source(Path::new(path), source).unwrap();
+                if path == "app.go" {
+                    envs.insert(
+                        path.to_string(),
+                        crate::types::TypeEnvironment::build(
+                            source,
+                            Language::Go,
+                            &parsed.symbols,
+                            &parsed.type_bindings,
+                        ),
+                    );
+                }
+                files.push((path.to_string(), parsed.symbols, parsed.references));
+            }
+            let edges = resolve_references_with_context(
+                &files,
+                Language::Go,
+                "repo:test:abc",
+                &WorkspaceContext::default(),
+                Some(&envs),
+                None,
+            );
+            for (package, target) in [("one", "one/types.go"), ("two", "two/types.go")] {
+                assert_eq!(
+                    qa_calls(
+                        &files,
+                        &edges,
+                        ("app.go", "renamedCaller"),
+                        (target, "Named", 3)
+                    ),
+                    package == picked,
+                    "retarget {picked}: {edges:#?}"
+                );
+            }
+        }
     }
 
     #[test]

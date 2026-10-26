@@ -153,6 +153,7 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
           Source Evidence
         </h3>
         <CodePreview
+          symbolUid={symbol.uid}
           filePath={symbol.file_path}
           line={symbol.start_line}
           repoUid={symbol.repo_uid}

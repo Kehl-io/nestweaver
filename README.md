@@ -190,9 +190,13 @@ notes below before using an older database with a new binary.
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
 - For a compatible database, run `nestweaver stale-check --db <db>`. The
-  current resolver generation is **15**; any other generation requires
+  current resolver generation is **16**; any other generation requires
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
+- Generation 16 preserves declaring-package origin through Go factory-call
+  receiver chains and revisits unchanged importers when Go package methods are
+  added or recreated. Existing graphs may retain missing CALLS edges until the
+  forced index above. Parsed-cache and resolution-dependency formats are unchanged.
 - The current source also infers method receivers from typed Go slice range
   elements, including qualified types and exact factory returns. Generation 14
   requires the same forced repository re-index to add the missing call edges;

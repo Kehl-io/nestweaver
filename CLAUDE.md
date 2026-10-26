@@ -565,6 +565,14 @@ federation          (leaf: schema + proto only)
   <- mcp (daemon feature) <- daemon
 ```
 
+### Current resolver upgrade
+
+Resolver generation 16 preserves declaring-package origin through Go factory-call
+receiver chains and invalidates unchanged Go importers when package methods are
+added or recreated. Existing graphs can retain missing CALLS edges: run
+`nestweaver index --repo <path> --force` once per repository after upgrading.
+The parsed cache and resolution-dependency sidecar formats are unchanged.
+
 ## Conventions
 
 - Rust edition 2024, resolver 2
