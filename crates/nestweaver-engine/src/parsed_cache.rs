@@ -62,7 +62,8 @@ use serde::{Deserialize, Serialize};
 ///     per class.
 /// 9 — scoped Go bindings and pointer/qualified composite literal evidence.
 /// 10 — canonical single Go result types and complete Go declaration shadow names.
-const CACHE_VERSION: u32 = 10;
+/// 11 — Go initializer and case/default bindings retain their implicit block lifetime.
+const CACHE_VERSION: u32 = 11;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -569,6 +570,332 @@ mod tests {
         assert_eq!(
             result.type_info.as_ref().unwrap().return_type.as_deref(),
             Some("[]Store")
+        );
+    }
+
+    #[test]
+    fn go_initializer_scope_cache_upgrade_repairs_unchanged_graph_and_stays_durable() {
+        use nestweaver_parser::ReferenceKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("app")).unwrap();
+        std::fs::create_dir_all(repo.join("lib")).unwrap();
+        std::fs::write(repo.join("go.mod"), "module example.test/scopes\n").unwrap();
+        std::fs::write(repo.join("lib/lib.go"), "package lib\nfunc Ping() {}\n").unwrap();
+        let source = "package app\nimport helper \"example.test/scopes/lib\"\nfunc Control() {\n helper.Ping()\n}\nfunc AfterIf() {\n if helper := 1; helper > 0 { _ = helper }\n helper.Ping()\n}\nfunc AfterSwitch() {\n switch helper := 1; helper { case 1: }\n helper.Ping()\n}\n";
+        std::fs::write(repo.join("app/app.go"), source).unwrap();
+        let parsed = nestweaver_parser::parse_source(Path::new("app/app.go"), source).unwrap();
+        let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        let mut stale = CachedParseResult {
+            symbols: parsed.symbols,
+            references: parsed.references,
+            type_bindings: parsed.type_bindings,
+        };
+        // Version 10 assigned each initializer its enclosing function block.
+        // Keep the same source hash and all other facts: only its lifetime is old.
+        let mut old_bindings = 0;
+        for reference in &mut stale.references {
+            if reference.kind != ReferenceKind::LocalBinding || reference.name != "helper" {
+                continue;
+            }
+            let scope = reference.scope.as_mut().unwrap();
+            let function_start = source[..scope.position].rfind("func ").unwrap();
+            let body_start = function_start + source[function_start..].find('{').unwrap();
+            let body_end = function_start + source[function_start..].find("\n}").unwrap() + 2;
+            assert!(
+                scope.end < body_end,
+                "fresh initializer must end before the function"
+            );
+            scope.start = body_start;
+            scope.end = body_end;
+            old_bindings += 1;
+        }
+        assert_eq!(old_bindings, 2);
+        let db = tmp.path().join("graph.lbug");
+        let path = crate::sidecar_path(&db, ".parsed_cache.bin");
+        let seed_old_cache = || {
+            let file = ParsedCacheFile {
+                version: 10,
+                entries: HashMap::from([(hash.clone(), stale.clone())]),
+            };
+            std::fs::write(&path, rmp_serde::to_vec_named(&file).unwrap()).unwrap();
+            let record = LogRecord {
+                version: 10,
+                hash: std::borrow::Cow::Borrowed(&hash),
+                entry: std::borrow::Cow::Borrowed(&stale),
+            };
+            let encoded = rmp_serde::to_vec_named(&record).unwrap();
+            let mut log = (encoded.len() as u32).to_le_bytes().to_vec();
+            log.extend(encoded);
+            std::fs::write(log_path(&path), log).unwrap();
+        };
+        seed_old_cache();
+        assert!(
+            ParsedCache::load(&path).get(&hash).is_none(),
+            "neither the base nor append log may restore version-10 Go scope facts"
+        );
+
+        let url = "https://example.test/go-scope-cache";
+        let repo_uid = nestweaver_schema::repo_uid("review", url);
+        let index = |force| {
+            crate::index::index_directory_with_options(
+                &repo,
+                &db,
+                "review",
+                url,
+                "unchanged",
+                force,
+                None,
+            )
+            .unwrap();
+        };
+        let graph = || {
+            let store = nestweaver_store::GraphStore::open(&db).unwrap();
+            let symbols = store.list_all_symbols().unwrap();
+            let ping = symbols
+                .iter()
+                .find(|symbol| symbol.name == "Ping" && symbol.file_path == "lib/lib.go")
+                .unwrap();
+            let edges = store.load_typed_edges().unwrap();
+            for name in ["Control", "AfterIf", "AfterSwitch"] {
+                let caller = symbols.iter().find(|symbol| symbol.name == name).unwrap();
+                assert!(
+                    edges.iter().any(|edge| edge.0 == caller.uid
+                        && edge.1 == ping.uid
+                        && edge.2 == "CALLS"),
+                    "missing exact {name} -> lib.Ping edge"
+                );
+            }
+            let mut normalized: Vec<_> = edges
+                .into_iter()
+                .map(|edge| (edge.0, edge.1, edge.2, edge.3.to_bits(), edge.4))
+                .collect();
+            normalized.sort();
+            normalized
+        };
+        // The actual nonforced index must reparse the unchanged content hash.
+        index(false);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("app/app.go")).unwrap(),
+            source
+        );
+        let rewritten: ParsedCacheFile =
+            rmp_serde::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rewritten.version, CACHE_VERSION);
+        for reference in &rewritten.entries[&hash].references {
+            if reference.kind == ReferenceKind::LocalBinding && reference.name == "helper" {
+                let scope = reference.scope.unwrap();
+                let after_call = source[scope.initialized_at..]
+                    .find("helper.Ping()")
+                    .unwrap()
+                    + scope.initialized_at;
+                assert!(
+                    scope.end <= after_call,
+                    "cached lifetime must end before the later call"
+                );
+            }
+        }
+        let expected = graph();
+        assert_eq!(
+            crate::resolver_generation::load(&db).generation_for(&repo_uid),
+            crate::resolver_generation::RESOLVER_GENERATION
+        );
+        index(false);
+        assert_eq!(
+            graph(),
+            expected,
+            "same-source no-op must preserve repaired edges"
+        );
+        // A warm filemeta hit need not reparse automatically: rejecting a parse
+        // cache is not a substitute for the documented force-reindex upgrade.
+        // It must not resurrect old facts or disturb this already-correct graph.
+        let filemeta = crate::sidecar_path(&db, ".filemeta.json");
+        let before_meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&filemeta).unwrap()).unwrap();
+        seed_old_cache();
+        assert!(ParsedCache::load(&path).get(&hash).is_none());
+        index(false);
+        let after_meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&filemeta).unwrap()).unwrap();
+        assert_eq!(
+            after_meta, before_meta,
+            "warm no-op keeps unchanged file metadata"
+        );
+        assert_eq!(
+            graph(),
+            expected,
+            "rejected old cache must not damage warm graph"
+        );
+        if let Some(cached) = ParsedCache::load(&path).get(&hash) {
+            for reference in &cached.references {
+                if reference.kind == ReferenceKind::LocalBinding && reference.name == "helper" {
+                    let scope = reference.scope.unwrap();
+                    let after_call = source[scope.initialized_at..]
+                        .find("helper.Ping()")
+                        .unwrap()
+                        + scope.initialized_at;
+                    assert!(
+                        scope.end <= after_call,
+                        "warm index must not restore old lifetimes"
+                    );
+                }
+            }
+        }
+
+        // Model an already stored generation-16 graph with missing caller edges.
+        {
+            let store = nestweaver_store::GraphStore::open(&db).unwrap();
+            store
+                .delete_resolved_edges_for_file(&repo_uid, "app/app.go")
+                .unwrap();
+        }
+        let mut generations = crate::resolver_generation::load(&db);
+        generations.repos.insert(repo_uid.clone(), 16);
+        std::fs::write(
+            crate::sidecar_path(&db, crate::resolver_generation::RESOLVER_GENERATION_SIDECAR),
+            serde_json::to_vec(&generations).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            generations.stale_repos([repo_uid.as_str()]),
+            vec![repo_uid.clone()]
+        );
+        index(false);
+        assert_eq!(
+            crate::resolver_generation::load(&db).generation_for(&repo_uid),
+            16,
+            "a nonforced unchanged run cannot claim an old graph was repaired"
+        );
+        index(true);
+        assert_eq!(
+            graph(),
+            expected,
+            "force index must repair old stored graph edges"
+        );
+        assert_eq!(
+            crate::resolver_generation::load(&db).generation_for(&repo_uid),
+            crate::resolver_generation::RESOLVER_GENERATION
+        );
+        index(false);
+        assert_eq!(graph(), expected, "post-repair no-op must remain durable");
+    }
+
+    #[test]
+    fn go_initializer_scope_real_git_incremental_rebuilds_calls_and_noop_preserves_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("app")).unwrap();
+        std::fs::create_dir_all(repo.join("lib")).unwrap();
+        let empty_git = tmp.path().join("empty-git");
+        std::fs::create_dir(&empty_git).unwrap();
+        let empty_config = tmp.path().join("empty-gitconfig");
+        std::fs::write(&empty_config, "").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &empty_config)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_CONFIG_COUNT")
+                .args(["-c", "commit.gpgSign=false", "-c", "user.name=Fixture"])
+                .args(["-c", "user.email=fixture@example.invalid", "-c"])
+                .arg(format!("core.hooksPath={}", empty_git.display()))
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        std::fs::write(repo.join("go.mod"), "module example.test/scopes\n").unwrap();
+        std::fs::write(repo.join("lib/lib.go"), "package lib\nfunc Ping() {}\n").unwrap();
+        let app = repo.join("app/app.go");
+        std::fs::write(&app, "package app\nimport helper \"example.test/scopes/lib\"\nfunc IfRun() { helper.Ping() }\nfunc SwitchRun() { helper.Ping() }\n").unwrap();
+        git(&["init", "-q", "--template", empty_git.to_str().unwrap()]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "ordinary Go callers"]);
+        let initial_sha = git(&["rev-parse", "HEAD"]);
+        let db = tmp.path().join("graph.lbug");
+        let url = "https://example.test/go-scope-git";
+        crate::index::index_directory_with_options(
+            &repo,
+            &db,
+            "review",
+            url,
+            &initial_sha,
+            true,
+            None,
+        )
+        .unwrap();
+        let graph = || {
+            let store = nestweaver_store::GraphStore::open(&db).unwrap();
+            let symbols = store.list_all_symbols().unwrap();
+            let ping = symbols
+                .iter()
+                .find(|s| s.name == "Ping" && s.file_path == "lib/lib.go")
+                .unwrap();
+            let edges = store.load_typed_edges().unwrap();
+            let callers: Vec<_> = ["IfRun", "SwitchRun"]
+                .into_iter()
+                .map(|name| {
+                    let caller = symbols
+                        .iter()
+                        .find(|s| s.name == name && s.file_path == "app/app.go")
+                        .unwrap();
+                    assert!(
+                        edges
+                            .iter()
+                            .any(|e| e.0 == caller.uid && e.1 == ping.uid && e.2 == "CALLS"),
+                        "missing exact {name} -> Ping edge"
+                    );
+                    caller.uid.clone()
+                })
+                .collect();
+            let mut edges: Vec<_> = edges
+                .into_iter()
+                .map(|e| (e.0, e.1, e.2, e.3.to_bits(), e.4))
+                .collect();
+            edges.sort();
+            (callers, edges)
+        };
+        let before = graph();
+        let unchanged_lib = std::fs::read(repo.join("lib/lib.go")).unwrap();
+        std::fs::write(&app, "\npackage app\nimport helper \"example.test/scopes/lib\"\nfunc IfRun() { if helper := 1; helper > 0 { _ = helper }; helper.Ping() }\nfunc SwitchRun() { switch helper := 1; helper { case 1: _ = helper }; helper.Ping() }\n").unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "commit",
+            "-q",
+            "-m",
+            "statement initializers before package calls",
+        ]);
+        assert_ne!(git(&["rev-parse", "HEAD"]), initial_sha);
+        let changed = crate::index::incremental_index(&repo, &db, "review", url).unwrap();
+        assert!(
+            !changed.fell_back_to_full,
+            "must exercise actual Git-diff incremental indexing"
+        );
+        assert_eq!(changed.files_modified, 1);
+        assert_eq!(
+            std::fs::read(repo.join("lib/lib.go")).unwrap(),
+            unchanged_lib
+        );
+        let repaired = graph();
+        assert_ne!(repaired.0, before.0, "actual edit must replace caller UIDs");
+        let noop = crate::index::incremental_index(&repo, &db, "review", url).unwrap();
+        assert!(!noop.fell_back_to_full);
+        assert_eq!(noop.files_modified, 0);
+        assert_eq!(noop.files_added, 0);
+        assert_eq!(
+            graph(),
+            repaired,
+            "same-SHA incremental no-op preserves exact repaired graph"
         );
     }
 

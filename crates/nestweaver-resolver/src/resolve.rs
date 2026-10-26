@@ -12721,6 +12721,192 @@ export function readIt(b: Box) { size(); run(); b.run(); return value(); }
     }
 
     #[test]
+    fn go_statement_initializers_restore_package_imports_without_losing_inner_shadows() {
+        let app = r#"package app
+import helper "lib"
+type Local struct{}
+func (value Local) Ping() {}
+func localValue() Local { return Local{} }
+func Control() { helper.Ping() }
+func AfterIf() { if helper := 1; helper > 0 { _ = helper }; helper.Ping() }
+func AfterElseIf() {
+ if helper := 1; helper < 0 { _ = helper } else if helper := 2; helper > 0 { _ = helper }
+ helper.Ping()
+}
+func AfterSwitch() { switch helper := 1; helper { case 1: _ = helper }; helper.Ping() }
+func AfterTypeSwitch(value interface{}) { switch helper := 1; value.(type) { case int: _ = helper }; helper.Ping() }
+func AfterNestedIf() { if true { if helper := 1; helper > 0 { _ = helper }; helper.Ping() } }
+func InsideIf() { if helper := localValue(); true { helper.Ping() } }
+func InsideElse() { if helper := localValue(); false { _ = helper } else { helper.Ping() } }
+func InsideElseIf() { if helper := localValue(); false { _ = helper } else if true { helper.Ping() } }
+func InsideSwitch() { switch helper := localValue(); { default: helper.Ping() } }
+func InsideTypeSwitch(value interface{}) { switch helper := localValue(); value.(type) { case int: helper.Ping() } }
+"#;
+        let (files, edges) = review_edges(
+            &[
+                ("lib/lib.go", "package lib\nfunc Ping() {}\n"),
+                ("app.go", app),
+            ],
+            Language::Go,
+        );
+        // Each caller has only one Ping use: a post-statement success cannot
+        // conceal a mistaken import edge from an inner shadowed call.
+        assert_eq!(
+            review_callers(&files, &edges, "lib/lib.go", "Ping"),
+            [
+                "Control",
+                "AfterIf",
+                "AfterElseIf",
+                "AfterSwitch",
+                "AfterTypeSwitch",
+                "AfterNestedIf",
+            ]
+            .into_iter()
+            .map(|caller| uid(&files, "app.go", caller))
+            .collect(),
+            "only calls outside the initializer's lifetime may use the import: {edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "app.go", "Ping"),
+            [
+                "InsideIf",
+                "InsideElse",
+                "InsideElseIf",
+                "InsideSwitch",
+                "InsideTypeSwitch",
+            ]
+            .into_iter()
+            .map(|caller| uid(&files, "app.go", caller))
+            .collect(),
+            "initializer values still shadow throughout their statement: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn go_case_declarations_do_not_shadow_package_imports_in_sibling_or_later_code() {
+        let app = r#"package app
+import helper "lib"
+type Local struct{}
+func (value Local) Ping() {}
+func localValue() Local { return Local{} }
+func AfterCase(value int) { switch value { case 1: helper := 1; _ = helper }; helper.Ping() }
+func SiblingCase(value int) { switch value { case 1: helper := 1; _ = helper; case 2: helper.Ping() } }
+func SiblingDefault(value int) { switch value { case 1: helper := 1; _ = helper; default: helper.Ping() } }
+func AfterDefault(value int) { switch value { default: helper := 1; _ = helper }; helper.Ping() }
+func SiblingTypeCase(value interface{}) { switch value.(type) { case int: helper := 1; _ = helper; case string: helper.Ping() } }
+func AfterTypeDefault(value interface{}) { switch value.(type) { default: helper := 1; _ = helper }; helper.Ping() }
+func SiblingCommunication(ch <-chan int) { select { case <-ch: helper := 1; _ = helper; default: helper.Ping() } }
+func AfterCommunication(ch <-chan int) { select { case <-ch: helper := 1; _ = helper; default: }; helper.Ping() }
+func InsideCase(value int) { switch value { case 1: helper := localValue(); helper.Ping() } }
+func InsideDefault(value int) { switch value { default: helper := localValue(); helper.Ping() } }
+func InsideTypeCase(value interface{}) { switch value.(type) { case int: helper := localValue(); helper.Ping() } }
+func InsideCommunication(ch <-chan int) { select { case <-ch: helper := localValue(); helper.Ping(); default: } }
+"#;
+        let (files, edges) = review_edges(
+            &[
+                ("lib/lib.go", "package lib\nfunc Ping() {}\n"),
+                ("app.go", app),
+            ],
+            Language::Go,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "lib/lib.go", "Ping"),
+            [
+                "AfterCase",
+                "SiblingCase",
+                "SiblingDefault",
+                "AfterDefault",
+                "SiblingTypeCase",
+                "AfterTypeDefault",
+                "SiblingCommunication",
+                "AfterCommunication",
+            ]
+            .into_iter()
+            .map(|caller| uid(&files, "app.go", caller))
+            .collect(),
+            "case-local declarations must not escape their implicit block: {edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "app.go", "Ping"),
+            [
+                "InsideCase",
+                "InsideDefault",
+                "InsideTypeCase",
+                "InsideCommunication",
+            ]
+            .into_iter()
+            .map(|caller| uid(&files, "app.go", caller))
+            .collect(),
+            "case-local typed values must still shadow the imported package: {edges:#?}"
+        );
+    }
+
+    #[test]
+    fn go_statement_scopes_restore_outer_call_and_slice_receiver_origins() {
+        let app = r#"package app
+import outer "outer"
+import inner "inner"
+func AfterIf() { client := outer.New(); if client := inner.New(); true { _ = client }; client.Ping() }
+func AfterSwitch() { client := outer.New(); switch client := inner.New(); { default: _ = client }; client.Ping() }
+func AfterTypeSwitch(value interface{}) { client := outer.New(); switch client := inner.New(); value.(type) { case int: _ = client }; client.Ping() }
+func AfterCase(value int) { client := outer.New(); switch value { case 1: client := inner.New(); _ = client }; client.Ping() }
+func SiblingCase(value int) { client := outer.New(); switch value { case 1: client := inner.New(); _ = client; case 2: client.Ping() } }
+func AfterSlice() { clients := []outer.Client{{}}; if clients := []inner.Client{{}}; true { _ = clients }; for _, client := range clients { client.Ping() } }
+func InitializerRHS() { if outer := outer.New(); true { outer.Ping() } }
+func InsideIf() { if client := inner.New(); true { client.Ping() } }
+func InsideElse() { if client := inner.New(); false { _ = client } else { client.Ping() } }
+func InsideCase(value int) { switch value { case 1: client := inner.New(); client.Ping() } }
+"#;
+        let (files, edges) = review_edges(
+            &[
+                (
+                    "outer/outer.go",
+                    "package outer\ntype Client struct{}\nfunc New() Client { return Client{} }\nfunc (value Client) Ping() {}\n",
+                ),
+                (
+                    "inner/inner.go",
+                    "package inner\ntype Client struct{}\nfunc New() Client { return Client{} }\nfunc (value Client) Ping() {}\n",
+                ),
+                ("app.go", app),
+            ],
+            Language::Go,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "outer/outer.go", "Ping"),
+            [
+                "AfterIf",
+                "AfterSwitch",
+                "AfterTypeSwitch",
+                "AfterCase",
+                "SiblingCase",
+                "AfterSlice",
+                "InitializerRHS",
+            ]
+            .into_iter()
+            .map(|caller| uid(&files, "app.go", caller))
+            .collect(),
+            "factory and literal evidence must expire with the same scope as shadow bindings: {edges:#?}"
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "inner/inner.go", "Ping"),
+            ["InsideIf", "InsideElse", "InsideCase"]
+                .into_iter()
+                .map(|caller| uid(&files, "app.go", caller))
+                .collect(),
+            "identically named types cannot donate the inner receiver outside its scope: {edges:#?}"
+        );
+        assert!(
+            qa_calls(
+                &files,
+                &edges,
+                ("app.go", "InitializerRHS"),
+                ("outer/outer.go", "New", 3)
+            ),
+            "an initializer's RHS still sees the imported package before its own binding: {edges:#?}"
+        );
+    }
+
+    #[test]
     fn go_range_residual_forms_keep_exact_owners_in_fresh_and_incremental_resolution() {
         let app = "package app\nimport alias \"store\"\nfunc initialized() { var items = []alias.Store{{}}; for _, item := range items { item.Get() } }\nfunc identifier(items []alias.Store) { for _, item := range (( /* source */ items )) { item.Get() } }\nfunc literal() { for _, item := range ([]alias.Store{{}}) { item.Get() } }\nfunc factory() { for _, item := range (alias.All()) { item.Get() } }\nfunc named() { for _, item := range alias.Named() { item.Get() } }\nfunc pointer() { for _, item := range alias.NamedPointer() { item.Get() } }\nfunc assignedVarFactory() { var items = alias.Named(); for _, item := range items { item.Get() } }\nfunc shadowSource(items []alias.Store) { for _, items := range (items) { items.Get() } }\n";
         let input = [

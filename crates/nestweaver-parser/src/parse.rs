@@ -3805,6 +3805,7 @@ fn has_use_strict_directive(body: tree_sitter::Node<'_>, source_bytes: &[u8]) ->
 }
 
 fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
+    let go = node.language().name() == Some("go");
     let mut current = Some(node);
     let mut function_scoped = false;
     let mut hoisted_var = false;
@@ -3876,15 +3877,30 @@ fn lexical_scope(node: tree_sitter::Node<'_>) -> Option<LexicalScope> {
         // nw-800: a `catch` parameter is scoped to its clause, and a `let` or
         // `const` declared in a loop header to that loop. A declaration in
         // the loop body or the catch body stops at its own block first.
-        if matches!(
-            parent.kind(),
-            "statement_block"
-                | "block"
-                | "declaration_list"
-                | "catch_clause"
-                | "for_statement"
-                | "for_in_statement"
-        ) && !function_scoped
+        // Go's if/switch statements and every switch/select clause have
+        // implicit blocks. Their header/case declarations sit outside an
+        // explicit `block`, so stop here instead of leaking to the function.
+        // Qualify by grammar: this helper also serves JS/TS and Rust.
+        if !function_scoped
+            && (matches!(
+                parent.kind(),
+                "statement_block"
+                    | "block"
+                    | "declaration_list"
+                    | "catch_clause"
+                    | "for_statement"
+                    | "for_in_statement"
+            ) || go
+                && matches!(
+                    parent.kind(),
+                    "if_statement"
+                        | "expression_switch_statement"
+                        | "type_switch_statement"
+                        | "expression_case"
+                        | "type_case"
+                        | "communication_case"
+                        | "default_case"
+                ))
             || matches!(parent.kind(), "program" | "source_file")
         {
             return Some(LexicalScope {
@@ -13383,6 +13399,177 @@ fn main() {
             .scope
             .unwrap();
         assert!(range.end <= final_call.position);
+    }
+
+    fn parse_valid_go_scope_fixture(source: &str) -> ParsedFile {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error(), "valid Go syntax: {source}");
+        parse_source(Path::new("app.go"), source).unwrap()
+    }
+
+    #[test]
+    fn go_statement_initializers_share_shadow_and_assignment_lifetimes() {
+        for initializer in ["New()", "[]*Store{}"] {
+            let declaration = format!("local := {initializer}");
+            for statement in [
+                format!("if {declaration}; true {{ _ = local }} else {{ _ = local }}"),
+                format!("switch {declaration}; 1 {{ case 1: _ = local; default: _ = local }}"),
+                format!(
+                    "switch {declaration}; input.(type) {{ case int: _ = local; default: _ = local }}"
+                ),
+            ] {
+                let source = format!(
+                    "package app\ntype Store struct{{}}\nfunc New() *Store {{ return &Store{{}} }}\nfunc run(input interface{{}}) {{\n{statement}\n after()\n}}\n"
+                );
+                let parsed = parse_valid_go_scope_fixture(&source);
+                let scopes = local_scopes(&parsed, "local");
+                assert_eq!(scopes.len(), 1, "{statement}: {scopes:?}");
+                let scope = scopes[0];
+                let statement_start = source.find(&statement).unwrap();
+                assert_eq!(scope.start, statement_start, "{statement}");
+                assert_eq!(scope.end, statement_start + statement.len(), "{statement}");
+                assert_eq!(scope.position, source.find(&declaration).unwrap());
+                assert_eq!(scope.initialized_at, scope.position + declaration.len());
+                assert!(scope.end <= source.find("after()").unwrap());
+
+                let evidence = scoped_go_assignment_evidence(&source);
+                let local = evidence
+                    .local_declarations
+                    .iter()
+                    .find(|binding| binding.name == "local")
+                    .unwrap();
+                assert_eq!(local.scope, Some(scope), "{statement}");
+                match initializer {
+                    "New()" => {
+                        let assignment = evidence
+                            .call_assignments
+                            .iter()
+                            .find(|assignment| assignment.variable == "local")
+                            .unwrap();
+                        assert_eq!(assignment.scope, scope, "{statement}");
+                    }
+                    "[]*Store{}" => {
+                        let binding = evidence
+                            .go_slice_literals
+                            .iter()
+                            .find(|binding| binding.var_name == "local")
+                            .unwrap();
+                        assert_eq!(binding.scope, Some(scope), "{statement}");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn go_else_if_initializers_preserve_nested_visibility() {
+        let source = "package app\nfunc run() {\n if outer := New(); true { _ = outer } else if inner := New(); true {\n  _ = outer\n  _ = inner\n } else {\n  _ = outer\n  _ = inner\n }\n after()\n}\n";
+        let parsed = parse_valid_go_scope_fixture(source);
+        let outer = local_scopes(&parsed, "outer")[0];
+        let inner = local_scopes(&parsed, "inner")[0];
+        assert_eq!(outer.start, source.find("if outer").unwrap());
+        assert_eq!(inner.start, source.find("if inner").unwrap());
+        assert!(outer.start < inner.start);
+        assert_eq!(outer.end, inner.end, "both include the final else");
+        for (name, scope) in [("outer", outer), ("inner", inner)] {
+            let in_else = source.rfind(&format!("_ = {name}")).unwrap();
+            assert!(scope.initialized_at <= in_else && in_else < scope.end);
+            assert!(scope.end <= source.find("after()").unwrap());
+            let assignment = scoped_go_assignment_evidence(source)
+                .call_assignments
+                .into_iter()
+                .find(|assignment| assignment.variable == name)
+                .unwrap();
+            assert_eq!(assignment.scope, scope);
+        }
+    }
+
+    #[test]
+    fn go_case_declarations_share_shadow_and_assignment_clause_lifetimes() {
+        for declaration in ["local := New()", "var local = New()", "const local = 1"] {
+            for (header, case) in [
+                ("switch input", "case 1:"),
+                ("switch input.(type)", "case int:"),
+                ("select", "case <-ch:"),
+            ] {
+                for default_binding in [false, true] {
+                    let clause = format!(
+                        "{}\n {declaration}\n _ = local\n",
+                        if default_binding { "default:" } else { case }
+                    );
+                    let sibling = format!(
+                        "{}\n after()\n",
+                        if default_binding { case } else { "default:" }
+                    );
+                    let clauses = if default_binding {
+                        format!("{sibling}{clause}")
+                    } else {
+                        format!("{clause}{sibling}")
+                    };
+                    let source = format!(
+                        "package app\nfunc run(input interface{{}}, ch chan int) {{\n {header} {{\n{clauses}}}\n after()\n}}\n"
+                    );
+                    let parsed = parse_valid_go_scope_fixture(&source);
+                    let scopes = local_scopes(&parsed, "local");
+                    assert_eq!(scopes.len(), 1, "{source}: {scopes:?}");
+                    let scope = scopes[0];
+                    assert_eq!(scope.start, source.find(&clause).unwrap());
+                    assert_eq!(
+                        source[scope.start..scope.end].trim_end(),
+                        clause.trim_end(),
+                        "the implicit clause, not the switch/function: {source}"
+                    );
+                    let sibling_at = source.find(&sibling).unwrap();
+                    assert!(sibling_at < scope.start || scope.end <= sibling_at);
+                    assert!(scope.end <= source.rfind("after()").unwrap());
+                    let evidence = scoped_go_assignment_evidence(&source);
+                    let local = evidence
+                        .local_declarations
+                        .iter()
+                        .find(|binding| binding.name == "local")
+                        .unwrap();
+                    assert_eq!(local.scope, Some(scope));
+                    if declaration != "const local = 1" {
+                        let assignment = evidence
+                            .call_assignments
+                            .iter()
+                            .find(|assignment| assignment.variable == "local")
+                            .unwrap();
+                        assert_eq!(assignment.scope, scope);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn go_implicit_blocks_preserve_javascript_var_and_rust_let_scopes() {
+        let source = "function run(flag) { if (flag) { var insideIf = 1; } switch (flag) { case true: var insideCase = 2; break; default: break; } }\n";
+        for path in ["app.js", "app.ts"] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            for name in ["insideIf", "insideCase"] {
+                let scopes = local_scopes(&parsed, name);
+                assert_eq!(scopes.len(), 1, "{path}: {name}: {scopes:?}");
+                assert_eq!((scopes[0].start, scopes[0].end), (0, source.len() - 1));
+                assert!(scopes[0].hoisted_var, "{path}: {name}");
+            }
+        }
+
+        let source = "fn run(flag: bool) { let outer = 1; if flag { let inner = 2; use_value(inner); } use_value(outer); }";
+        let parsed = parse_source(Path::new("app.rs"), source).unwrap();
+        let outer = local_scopes(&parsed, "outer")[0];
+        let inner = local_scopes(&parsed, "inner")[0];
+        assert_eq!(
+            (outer.start, outer.end),
+            (source.find('{').unwrap(), source.len())
+        );
+        assert_eq!(inner.start, source.find("{ let inner").unwrap());
+        assert!(outer.start < inner.start && inner.end < outer.end);
     }
 
     #[test]

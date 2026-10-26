@@ -368,7 +368,10 @@ use std::path::Path;
 ///     origin, and added/recreated package members invalidate unchanged Go
 ///     importers through bounded same-package dependency seeds. Older graphs
 ///     can retain missing CALLS edges; force reindex each repository once.
-pub const RESOLVER_GENERATION: u32 = 16;
+/// 17 — Go initializer and case/default declarations end at their implicit
+///     statement/clause block. Parsed cache 11 invalidates overlong lifetimes;
+///     existing graphs need one force reindex to recover suppressed CALLS edges.
+pub const RESOLVER_GENERATION: u32 = 17;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

@@ -567,11 +567,13 @@ federation          (leaf: schema + proto only)
 
 ### Current resolver upgrade
 
-Resolver generation 16 preserves declaring-package origin through Go factory-call
-receiver chains and invalidates unchanged Go importers when package methods are
-added or recreated. Existing graphs can retain missing CALLS edges: run
+Resolver generation 17 confines Go initializer and case-clause bindings to their
+statement or clause so valid package and receiver calls recover after those scopes
+end. It retains generation 16's factory-call origins and package-member recovery.
+Existing graphs can retain missing CALLS edges: run
 `nestweaver index --repo <path> --force` once per repository after upgrading.
-The parsed cache and resolution-dependency sidecar formats are unchanged.
+Parsed-cache version 11 invalidates old lexical lifetimes for unchanged files;
+the resolution-dependency sidecar format is unchanged.
 
 ## Conventions
 
