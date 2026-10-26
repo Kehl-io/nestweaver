@@ -321,7 +321,6 @@ fn cli_embed_empty_scope_does_not_load_the_embedding_runtime() {
     let db_path = dir.path().join("test.lbug");
     let repo_dir = dir.path().join("repo");
     write_test_repo(&repo_dir);
-    index_repo(&repo_dir, &db_path);
 
     // This repository has symbols but no notes. A truly empty scope has
     // nothing to recover, even when the embedding runtime is unavailable.
@@ -353,6 +352,28 @@ cache_dir = {cache:?}
     )
     .unwrap();
     let _guard = helpers::server_guard::ServerGuard::start_with_config(&db_path, &config_path);
+    // Both commands use the configured daemon owned by this guard. Indexing
+    // before startup through the legacy helper could autostart a second owner
+    // when the binary is compiled without the CI-only direct-mode feature.
+    let index = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"))
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .args([
+            "index",
+            "--repo",
+            &repo_dir.display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--config",
+            &config_path.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "configured daemon index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
     // The preflight is a daemon RPC, so this must exercise the daemon route.
     // CI exports NESTWEAVER_NO_DAEMON=1 for the whole test job, which
     // `resolve_use_daemon` honors under GitHub Actions runner context — the
@@ -369,6 +390,8 @@ cache_dir = {cache:?}
             "notes",
             "--db",
             &db_path.display().to_string(),
+            "--config",
+            &config_path.display().to_string(),
         ])
         .output()
         .unwrap();
