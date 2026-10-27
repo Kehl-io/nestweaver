@@ -1,5 +1,49 @@
 # Changelog
 
+## [12.2.3](https://github.com/Kehl-io/nestweaver/compare/v12.2.2...v12.2.3) (2026-10-27)
+
+
+### Upgrade notes
+
+12.2.3 is a release-hardening update. It repairs Go receiver and lexical-scope
+resolution, incremental call-edge recovery, backup/restore and publication
+safety, authenticated device approval, Objective-C source reads, file-URI vault
+watching, source freshness and embedding-model recovery. Crypto dependency
+advisories are addressed without expanding the existing audit exceptions.
+
+**Re-index every repository once with `nestweaver index --repo <path> --force`**
+after upgrading: resolver generation is now 17 (12 in 12.2.2), and parsed cache
+is 11 (previously 8). Preserve your usual database and config bindings. Then
+run `nestweaver brain refresh <vault>` once per registered vault. A plain index
+at HEAD can leave old edges unchanged; `stale-check` exits 2 until repaired.
+
+
+### Bug Fixes
+
+* address validation findings and fixture ownership ([c97a607](https://github.com/Kehl-io/nestweaver/commit/c97a607e950687fb54a16427f2ed3c75994e1ebc))
+* bind compatibility metadata to admission witness ([1a6bb7e](https://github.com/Kehl-io/nestweaver/commit/1a6bb7e88d44004cbc1009dde18182e5ad27ec27))
+* complete direct compatibility and vault refresh proof ([1b4f492](https://github.com/Kehl-io/nestweaver/commit/1b4f492472c465e11b236c334e1d8fbfc64e5e95))
+* **deps:** clear crypto timing advisories ([be006b3](https://github.com/Kehl-io/nestweaver/commit/be006b332306ea22af3f8345152311add448825f))
+* encode restored lock checksums consistently ([8e214f2](https://github.com/Kehl-io/nestweaver/commit/8e214f27fb899408e4149992953e1f9a0c5454c0))
+* **go:** resolve remaining slice range receiver forms ([8a515ce](https://github.com/Kehl-io/nestweaver/commit/8a515ce4c695b4cfd6bfaf84db63b3c61f1881e0))
+* **go:** resolve remaining slice range receiver forms ([#521](https://github.com/Kehl-io/nestweaver/issues/521)) ([8a515ce](https://github.com/Kehl-io/nestweaver/commit/8a515ce4c695b4cfd6bfaf84db63b3c61f1881e0))
+* handle optional publication identities ([d12fe39](https://github.com/Kehl-io/nestweaver/commit/d12fe390d2ef20cd4769247419afeab947e79a6e))
+* harden publication safety and resolver correctness ([68319bc](https://github.com/Kehl-io/nestweaver/commit/68319bceed815dbcea434ed324bf1b00230fccb1))
+* harden publication, restore, and resolver correctness ([219b39f](https://github.com/Kehl-io/nestweaver/commit/219b39f98bf12ca3229a2d1a98574df37500378f))
+* include authenticated device approval production assets ([5c0f5fa](https://github.com/Kehl-io/nestweaver/commit/5c0f5faaeefcee5e8816f8c24c56c6963e11f9ee))
+* make interrupted restore ownership and finalization durable ([8b49646](https://github.com/Kehl-io/nestweaver/commit/8b496466051086a1609cc46c6e6099ecd0e77d56))
+* **parser:** respect Go initializer and clause lifetimes ([#523](https://github.com/Kehl-io/nestweaver/issues/523)) ([2a89d37](https://github.com/Kehl-io/nestweaver/commit/2a89d37989c8a55652bb2f88da2b98cd77332869))
+* preserve live restore incumbents without deletion authority ([9b2f7f8](https://github.com/Kehl-io/nestweaver/commit/9b2f7f81d873279604ac3b82a408b6e9b796fac5))
+* repair code handling and streamline CI ([#520](https://github.com/Kehl-io/nestweaver/issues/520)) ([794149e](https://github.com/Kehl-io/nestweaver/commit/794149e5c9e6bc54131a6cdab9fc52689c60f980))
+* repair Go inference, reads, approvals, and URI watches; trim CI ([794149e](https://github.com/Kehl-io/nestweaver/commit/794149e5c9e6bc54131a6cdab9fc52689c60f980))
+* repair Go ranges, Objective-C reads, device approval, and URI watches ([33a6d2f](https://github.com/Kehl-io/nestweaver/commit/33a6d2fc99f9175f216457d5442566acbcb9b81a))
+* **resolver:** infer remaining Go slice range forms safely ([94abe83](https://github.com/Kehl-io/nestweaver/commit/94abe8312ffdca97b44fc590ab78c0ec5cd657c2))
+* **resolver:** initialize range evidence in prebuilt type environments ([53190f1](https://github.com/Kehl-io/nestweaver/commit/53190f1f8f32b7f5708387879e3f3e6a03e3841e))
+* **resolver:** preserve exact Go owners during incremental resolution ([f2214a2](https://github.com/Kehl-io/nestweaver/commit/f2214a286bfd71c18d092c929b0d195ca2004436))
+* restore Go edges, embedding recovery and source freshness ([#522](https://github.com/Kehl-io/nestweaver/issues/522)) ([657934e](https://github.com/Kehl-io/nestweaver/commit/657934e4a35c377cb59ea4442fa39804aae0a7e9))
+* satisfy MCP conditional lint checks ([3cbb8c4](https://github.com/Kehl-io/nestweaver/commit/3cbb8c40224903ca72e4e9278f57d0ea60fd63f8))
+* traverse restore inventories through directory descriptors ([26929a6](https://github.com/Kehl-io/nestweaver/commit/26929a6ae3aaecc84c8246a85c1b9cba4b46e1e2))
+
 ## [12.2.2](https://github.com/Kehl-io/nestweaver/compare/v12.2.1...v12.2.2) (2026-10-23)
 
 

@@ -64,7 +64,7 @@ If optional dependencies were skipped, `nestweaver` exits 1 and names the platfo
 
 ## After you upgrade
 
-The current resolver generation is **12**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
+The current resolver generation is **17**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
 
 ```sh
 nestweaver stale-check
@@ -73,9 +73,12 @@ nestweaver brain refresh /path/to/vault   # once per registered vault
 ```
 
 `stale-check` exits 2 and reports `outdated_resolver` when a re-index is required.
-After upgrading to 12.2.2, run `index --repo <path> --force` once for each
-repository (resolver generation 12) and `brain refresh <vault>` once for each
-vault, so wikilinks and note-to-code links are derived by the new release.
+After upgrading to **12.2.3**, run `index --repo <path> --force` once for each
+repository (resolver generation 17, parsed cache 11) and `brain refresh <vault>`
+once for each registered vault. Keep your usual `--db` and `--config` bindings.
+The release repairs Go receiver and initializer scopes, incremental edge recovery,
+backup/restore safety, authenticated device approval, source freshness and
+embedding-model recovery. See the [changelog](https://github.com/Kehl-io/nestweaver/releases/tag/v12.2.3).
 
 ## License
 
