@@ -163,7 +163,7 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           # Pinned to the exact version the exit-code and outcomes.json
           # field-name comments below were verified against (`src/outcome.rs`
