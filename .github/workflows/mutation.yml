@@ -150,7 +150,7 @@ jobs:
         # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
         # in scripts/fetch-lbug-source.sh only.
         run: scripts/fetch-lbug-source.sh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-on-failure: true
           # Share the `build` cache the other Rust jobs populate, instead of a

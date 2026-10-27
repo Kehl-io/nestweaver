@@ -78,7 +78,7 @@ jobs:
         # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
         # in scripts/fetch-lbug-source.sh only.
         run: scripts/fetch-lbug-source.sh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Only main saves: branch and PR caches are unreadable elsewhere and
           # evicted main's under the 10 GB repository cap. Branches restore main's.
@@ -232,7 +232,7 @@ jobs:
         # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
         # in scripts/fetch-lbug-source.sh only.
         run: scripts/fetch-lbug-source.sh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         id: metal-cache
         with:
           # Only main saves: branch and PR caches are unreadable elsewhere and
@@ -713,7 +713,7 @@ jobs:
         # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
         # in scripts/fetch-lbug-source.sh only.
         run: scripts/fetch-lbug-source.sh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Only main saves: branch and PR caches are unreadable elsewhere and
           # evicted main's under the 10 GB repository cap. Branches restore main's.
@@ -893,7 +893,7 @@ jobs:
         # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
         # in scripts/fetch-lbug-source.sh only.
         run: scripts/fetch-lbug-source.sh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Restore the complete Build & Tests cache; consumers never publish it.
           save-if: false
@@ -961,7 +961,7 @@ jobs:
         # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
         # in scripts/fetch-lbug-source.sh only.
         run: scripts/fetch-lbug-source.sh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Restore the complete Build & Tests cache; consumers never publish it.
           save-if: false
@@ -1228,7 +1228,7 @@ jobs:
         # Sets LBUG_SOURCE_DIR for the lbug build. The tag and commit live
         # in scripts/fetch-lbug-source.sh only.
         run: scripts/fetch-lbug-source.sh
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Restore the complete Build & Tests cache; consumers never publish it.
           save-if: false
