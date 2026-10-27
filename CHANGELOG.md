@@ -3,6 +3,21 @@
 ## [12.2.3](https://github.com/Kehl-io/nestweaver/compare/v12.2.2...v12.2.3) (2026-10-27)
 
 
+### Upgrade notes
+
+12.2.3 is a release-hardening update. It repairs Go receiver and lexical-scope
+resolution, incremental call-edge recovery, backup/restore and publication
+safety, authenticated device approval, Objective-C source reads, file-URI vault
+watching, source freshness and embedding-model recovery. Crypto dependency
+advisories are addressed without expanding the existing audit exceptions.
+
+**Re-index every repository once with `nestweaver index --repo <path> --force`**
+after upgrading: resolver generation is now 17 (12 in 12.2.2), and parsed cache
+is 11 (previously 8). Preserve your usual database and config bindings. Then
+run `nestweaver brain refresh <vault>` once per registered vault. A plain index
+at HEAD can leave old edges unchanged; `stale-check` exits 2 until repaired.
+
+
 ### Bug Fixes
 
 * address validation findings and fixture ownership ([c97a607](https://github.com/Kehl-io/nestweaver/commit/c97a607e950687fb54a16427f2ed3c75994e1ebc))

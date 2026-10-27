@@ -1003,7 +1003,7 @@ immediately in normal operation.
 
 > **This section is about *latency*, not *correctness*.** Everything below
 > describes how fast ranks are served, and assumes the underlying edges are the
-> ones the current resolver would write. **`RESOLVER_GENERATION` is 11**
+> ones the current resolver would write. **`RESOLVER_GENERATION` is 17**
 > (`crates/nestweaver-engine/src/resolver_generation.rs`), and compatibility is
 > an exact match rather than a floor, so a graph indexed by any other release
 > serves ranks *quickly* and *wrongly*. Through generation 4 that meant edges
@@ -1028,11 +1028,13 @@ immediately in normal operation.
 > `__init__` re-exports, Kotlin/Java packages), resolves method calls on a
 > call or `new` receiver, links `new Foo()` to its class in Java, C#, PHP,
 > C++, Scala, Groovy and Dart, and attaches Go methods to their receiver type
-> (parsed cache 8). A graph indexed by any earlier generation must also be
+> (parsed cache 8). Generations 13–17 repair Go receiver origins, slice ranges,
+> incremental package-member recovery and initializer/case lifetimes (cache 11).
+> A graph indexed by any other generation must also be
 > rebuilt:
 > `stale-check` exits 2 and `dead-code` refuses until it matches. Re-index
 > every repo — `nestweaver index --repo <path> --force` — before trusting any
-> ranking on this server. After upgrading to 12.2.2, also run
+> ranking on this server. After upgrading to 12.2.3, also run
 > `nestweaver brain refresh <vault>` once for each vault.
 >
 > **`stale-check` detects this as of 9.0.0.** A generation-stale repo reports

@@ -207,24 +207,24 @@ notes below before using an older database with a new binary.
   generation15 additionally handles inferred `var` slices, parenthesized range
   sources and single named factory results. Parsed cache10 reparses unchanged
   declarations for normalized return types and complete var/const/parameter shadow guards.
-- **Upgrading to 12.2.2 needs a forced re-index of every repository and a
-  refresh of every vault.** It moves the
-  resolver generation from 11 to 12 and the parsed cache from 7 to 8, because
-  Go, Python, Kotlin/Java import resolution and method-call resolution changed:
-  run `nestweaver index --repo <path> --force` once for each repo.
-  `stale-check` exits 2 and `dead-code` refuses until you do; `blast-radius`
-  misses the new edges. The filemeta and resolution-deps sidecars also move
-  from 4 to 5, so the first `index` after upgrading is a full rebuild either
-  way. Then run `nestweaver brain refresh <vault>` once for each vault:
-  frontmatter `[[wikilink]]` relationships and `[[Note#^id]]` block references
-  resolve only after a vault is re-derived, and that is not automatic.
+- **Upgrading to 12.2.3 needs a forced re-index of every repository.**
+  Resolver generation 17 and parsed cache 11 include the Go receiver, package,
+  incremental-resolution and initializer-scope fixes delivered since 12.2.2
+  (generation 12 / cache 8). Run
+  `nestweaver index --repo <path> --force` once per repository, using your usual
+  `--db` and `--config` bindings. Plain incremental indexing can leave an
+  unchanged graph on its old generation. `stale-check` exits 2 until repaired.
+- **Refresh each registered vault once after upgrading.** Run
+  `nestweaver brain refresh <vault>` with the same bindings to re-derive
+  note-to-code relationships against the rebuilt graph. If upgrading from before
+  12.2.2, this also repairs frontmatter wikilinks and block references.
 - New databases do not need migration. Vaults do not carry a code resolver
   generation; see the detailed notes for separate Markdown derivation changes.
 
 <details>
 <summary>Detailed migration notes and changes for scripts and server clients</summary>
 
-**`RESOLVER_GENERATION` is 12. Every graph indexed by another generation must be
+**`RESOLVER_GENERATION` is 17. Every graph indexed by another generation must be
 re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
@@ -277,6 +277,12 @@ resolves more method calls (parsed cache 8):
 | `new Foo()` links the class in Java, C#, PHP, C++, Scala, Groovy and Dart; Rust trait default methods and turbofish calls resolve; a bare TS/JS `@decorator` references its function | Constructors, trait defaults and decorators are no longer unreachable |
 | Duplicate JS/TS `this.x =` properties collapse to one symbol, and a bodiless Rust `mod x;` no longer owns the lines below it | Fewer duplicate symbols and no false `IMPORTS` edges |
 
+Generations 13–17 add nested Go module and receiver ownership, typed slice
+range elements, inferred slice and named-return forms, factory-call receiver
+origins, recovery when package members are recreated, and correct if/switch/case
+binding lifetimes. 12.2.3 includes all of these changes (parsed cache 11).
+Existing missing edges require the forced re-index described above.
+
 All these kinds of staleness have the same remedy and the same symptom list.
 Until you re-index:
 
@@ -302,8 +308,8 @@ and leaves the repo on the old generation. Only a full re-index rewrites the
 edges.
 
 Vaults are not `Repo` nodes and carry no resolver generation, so the forced
-re-index does not touch them. Upgrading to 12.2.2 still needs one
-`brain refresh <vault>` per vault, for the vault link fixes described above.
+re-index does not touch them. After upgrading to 12.2.3, run one
+`brain refresh <vault>` per vault to re-derive links against the rebuilt code graph.
 
 **`stale-check` detects this as of 9.0.0.** A repo whose edges predate the
 running resolver reports `status: "outdated_resolver"`, `needs_reindex: true`,
