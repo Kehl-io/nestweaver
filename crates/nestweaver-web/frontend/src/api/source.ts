@@ -35,6 +35,16 @@ export function ambiguousCandidates(error: unknown): string[] | null {
 }
 
 /**
+ * The source route qualifies indexed ownership before these body failures.
+ * Arbitrary/network errors, missing proof and another path never establish it.
+ */
+export function unavailableSourceOwner(error: unknown, filePath: string): string | null {
+  if (!(error instanceof ApiError) || error.status !== 404 || error.file !== filePath ||
+    (error.code !== "source_not_available" && error.code !== "source_too_large")) return null;
+  return error.repo ?? null;
+}
+
+/**
  * Display name for a repo: its `name` override, else the basename of its url
  * (what the server itself derives), else the last segment of its uid.
  */

@@ -9,7 +9,7 @@ use nestweaver_schema::SymbolKind;
 pub(crate) struct PhpFunctions<'a> {
     definitions: HashMap<String, Vec<(&'a str, &'a RawSymbol)>>,
     references: HashMap<&'a str, &'a [RawReference]>,
-    calls: HashSet<(&'a str, usize)>,
+    calls: HashSet<(&'a str, usize, &'a str)>,
     incomplete: bool,
 }
 
@@ -30,7 +30,8 @@ impl<'a> PhpFunctions<'a> {
                 if reference.kind == ReferenceKind::PhpFunctionCall
                     && let Some(scope) = reference.scope
                 {
-                    this.calls.insert((file, scope.position));
+                    this.calls
+                        .insert((file, scope.position, reference.name.as_str()));
                 }
             }
             for symbol in symbols.iter().filter(|s| s.kind == SymbolKind::Function) {
@@ -58,7 +59,12 @@ impl<'a> PhpFunctions<'a> {
         reference: &RawReference,
     ) -> Option<Option<(&'a str, &'a RawSymbol)>> {
         let position = reference.scope?.position;
-        if reference.kind != ReferenceKind::Call || !self.calls.contains(&(file, position)) {
+        if reference.kind != ReferenceKind::Call
+            || reference.receiver.is_some()
+            || !self
+                .calls
+                .contains(&(file, position, reference.name.as_str()))
+        {
             return None;
         }
         if self.incomplete {

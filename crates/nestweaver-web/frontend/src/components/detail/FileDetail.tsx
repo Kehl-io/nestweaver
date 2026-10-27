@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../../api/client";
-import { ambiguousCandidates, sourceErrorText } from "../../api/source";
+import { ambiguousCandidates, sourceErrorText, unavailableSourceOwner } from "../../api/source";
 import type { SourceResponse, SymbolCandidate } from "../../api/types";
 import { useStore } from "../../stores";
 import { NodeActionBar } from "../actions/NodeActionBar";
@@ -66,12 +66,31 @@ export function FileDetail({ path }: FileDetailProps) {
     setLoading(true);
     setError(null);
 
+    const ownedSource = async (repo?: string): Promise<SourceResponse> => {
+      try {
+        const result = await api.source(path, 1, 12, { signal: controller.signal }, repo);
+        if (result.file !== path || !result.repo || (repo && result.repo !== repo)) {
+          throw new Error("File ownership is unavailable for the selected repository.");
+        }
+        return result;
+      } catch (error: unknown) {
+        const owner = unavailableSourceOwner(error, path);
+        if (!owner) throw error;
+        if (repo && owner !== repo) {
+          throw new Error("File ownership is unavailable for the selected repository.");
+        }
+        // Metadata remains useful when the qualified owner's body is remote,
+        // unreadable or oversized. CodePreview still renders its typed error.
+        return { file: path, repo: owner };
+      }
+    };
+
     const load = async () => {
       // Resolve ownership afresh even for a retained pick: repositories may
       // have stopped indexing this path since the last committed epoch.
       let fileSource: SourceResponse;
       try {
-        fileSource = await api.source(path, 1, 12, { signal: controller.signal });
+        fileSource = await ownedSource();
         if (!current()) return;
         if (pickedRepo && fileSource.repo !== pickedRepo) {
           setChoice(null);
@@ -85,7 +104,7 @@ export function FileDetail({ path }: FileDetailProps) {
         const validPick = pickedRepo && options.includes(pickedRepo) ? pickedRepo : undefined;
         setChoice({ path, workspaceId, candidates: options, repo: validPick });
         if (!validPick) throw error;
-        fileSource = await api.source(path, 1, 12, { signal: controller.signal }, validPick);
+        fileSource = await ownedSource(validPick);
       }
       if (!current()) return;
       if (!fileSource.repo || (pickedRepo && fileSource.repo !== pickedRepo)) {

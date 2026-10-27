@@ -5390,6 +5390,27 @@ fn normalize_markdown_target(
     }
 }
 
+/// Ordered exact identities for a Markdown URL. An explicit dot segment names
+/// a path relative to the source, not a second independently rooted candidate.
+/// Keep this policy shared by lookup and incremental dependency matching.
+fn markdown_target_paths(
+    target: &str,
+    folder: &str,
+    vault_root: Option<&Path>,
+) -> [Option<String>; 2] {
+    let source_path = normalize_markdown_target(target, folder, vault_root);
+    if !Path::new(target).is_absolute() && target.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return [source_path, None];
+    }
+    let root_path = normalize_markdown_target(target, "", vault_root);
+    if target.contains('/') {
+        [root_path, source_path]
+    } else {
+        [source_path, root_path]
+    }
+}
+
 /// Split a vault-relative folder into lowercased path components.
 ///
 /// Empty components are dropped so `""`, `"/"` and `"a//b"` normalise the way
@@ -5454,13 +5475,12 @@ fn wikilink_target_affected(
     // Persisted diagnostics intentionally keep original syntax. Conservatively
     // revisit both literal and URL identities; reparsing the source selects the
     // actual syntax before any edge is written.
-    let url_target =
-        normalize_markdown_target(wikilink_note_target(raw_target), folder, vault_root);
-    let root_url_target =
-        normalize_markdown_target(wikilink_note_target(raw_target), "", vault_root);
+    let url_targets = markdown_target_paths(wikilink_note_target(raw_target), folder, vault_root);
     affected_names.contains(&target)
-        || url_target.is_some_and(|path| affected_names.contains(&path.to_lowercase()))
-        || root_url_target.is_some_and(|path| affected_names.contains(&path.to_lowercase()))
+        || url_targets
+            .iter()
+            .flatten()
+            .any(|path| affected_names.contains(&path.to_lowercase()))
         || relative
             .as_ref()
             .is_some_and(|path| affected_names.contains(path))
@@ -5973,17 +5993,11 @@ impl<'a> WikilinkLookup<'a> {
 
     fn resolve_wikilink(&self, link: &RawWikilink, folder: &str) -> ResolvedWikilink {
         let outcome = if link.markdown_url {
-            // Preserve the existing explicit vault-relative path tier before
-            // source-relative lookup. Both candidates must name exact paths;
-            // URL normalization refusal never falls through to a basename.
-            let root_path = normalize_markdown_target(&link.target, "", self.vault_root.as_deref());
-            let source_path =
-                normalize_markdown_target(&link.target, folder, self.vault_root.as_deref());
-            let (first, second) = if link.target.contains('/') {
-                (root_path, source_path)
-            } else {
-                (source_path, root_path)
-            };
+            // The shared policy keeps explicit relative dot paths source-only,
+            // while preserving the existing vault-relative tier for other
+            // qualified paths. Refusal never falls through to a basename.
+            let [first, second] =
+                markdown_target_paths(&link.target, folder, self.vault_root.as_deref());
             if first
                 .as_ref()
                 .is_some_and(|path| self.ambiguous_paths.contains(&path.to_lowercase()))
@@ -6565,6 +6579,152 @@ mod tests {
         assert_eq!(heading_edges.len(), 1);
         assert_eq!(heading_edges[0].1, expected.uid);
         assert!(store.all_unresolved_wikilinks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn markdown_dot_relative_paths_bind_only_to_the_source_folder() {
+        let (_dir, root) = make_vault(&[
+            ("Target.md", "# Root Target\n"),
+            ("Target Space.md", "# Root Space\n"),
+            ("Missing.md", "# Root Homonym\n"),
+            ("nested/Target.md", "# Sibling Target\n"),
+            ("nested/Target Space.md", "# Sibling Space\n"),
+            (
+                "nested/source.md",
+                "# Source\n\n[dot](./Target.md)\n[internal](child/../Target.md)\n[encoded](./Target%20Space.md)\n[missing](./Missing.md)\n[internal missing](child/../Missing.md)\n[parent](../Target.md)\n[vault](nested/Target.md)\n",
+            ),
+        ]);
+        let (_, store) = index_markdown_directory_in_memory(&root, "owned", "v").unwrap();
+        let notes = store.list_notes(None).unwrap();
+        let uid = |path: &str| {
+            notes
+                .iter()
+                .find(|note| note.file_path == path)
+                .unwrap()
+                .uid
+                .clone()
+        };
+        let vault = store.list_vaults(None).unwrap().remove(0);
+        let edges = store
+            .wikilink_edges_for_vault(&vault.uid, "WIKILINK_TO_NOTE", "dst:Note")
+            .unwrap();
+        for (raw, path) in [
+            ("./Target.md", "nested/Target.md"),
+            ("child/../Target.md", "nested/Target.md"),
+            ("./Target%20Space.md", "nested/Target Space.md"),
+            ("../Target.md", "Target.md"),
+            ("nested/Target.md", "nested/Target.md"),
+        ] {
+            let matches: Vec<_> = edges.iter().filter(|edge| edge.4 == raw).collect();
+            assert_eq!(matches.len(), 1, "exactly one edge for {raw}");
+            assert_eq!(matches[0].1, uid(path), "wrong exact Note for {raw}");
+            assert_eq!(matches[0].2, 1.0);
+        }
+        assert_eq!(edges.len(), 5);
+        let unresolved: HashSet<_> = store
+            .all_unresolved_wikilinks()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.4)
+            .collect();
+        assert_eq!(
+            unresolved,
+            HashSet::from([
+                "./Missing.md".to_string(),
+                "child/../Missing.md".to_string(),
+            ])
+        );
+        for target in ["./Target.md", "child/../Target.md"] {
+            assert!(
+                !wikilink_target_affected(
+                    target,
+                    "nested/source.md",
+                    &HashSet::from(["target.md".to_string()]),
+                    Some(&root),
+                ),
+                "a root homonym is not the explicit relative target"
+            );
+            assert!(wikilink_target_affected(
+                target,
+                "nested/source.md",
+                &HashSet::from(["nested/target.md".to_string()]),
+                Some(&root),
+            ));
+        }
+    }
+
+    #[test]
+    fn markdown_dot_relative_relink_never_borrows_a_root_homonym() {
+        let (_dir, root) = make_vault(&[
+            ("Target.md", "# Root Homonym\n"),
+            (
+                "nested/source.md",
+                "# Source\n\n[dot](./Target.md)\n[internal](child/../Target.md)\n",
+            ),
+        ]);
+        let root = fs::canonicalize(root).unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        index_markdown_directory_with_store(
+            &store,
+            &root,
+            &root.join("unused.lbug"),
+            "owned",
+            "v",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 0);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 2);
+        // Hold the source outside the since scan: only dependency closure can
+        // repair its links as the sibling appears or changes identity.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let since = std::time::SystemTime::now();
+        let refresh = || {
+            index_markdown_directory_since_with_store_and_ignore(
+                &store,
+                &root,
+                "owned",
+                "v",
+                since,
+                &[],
+            )
+            .unwrap();
+        };
+        let assert_sibling_edges = || {
+            let notes = store.list_notes(None).unwrap();
+            let sibling = notes
+                .iter()
+                .find(|note| note.file_path == "nested/Target.md")
+                .unwrap();
+            let vault = store.list_vaults(None).unwrap().remove(0);
+            let edges = store
+                .wikilink_edges_for_vault(&vault.uid, "WIKILINK_TO_NOTE", "dst:Note")
+                .unwrap();
+            assert_eq!(edges.len(), 2);
+            assert!(
+                edges
+                    .iter()
+                    .all(|edge| edge.1 == sibling.uid && edge.2 == 1.0)
+            );
+            assert!(store.all_unresolved_wikilinks().unwrap().is_empty());
+        };
+        fs::write(root.join("nested/Target.md"), "# Sibling\n").unwrap();
+        refresh();
+        assert_sibling_edges();
+        fs::rename(root.join("nested/Target.md"), root.join("nested/Moved.md")).unwrap();
+        refresh();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 0);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 2);
+        fs::rename(root.join("nested/Moved.md"), root.join("nested/Target.md")).unwrap();
+        refresh();
+        assert_sibling_edges();
+        fs::remove_file(root.join("nested/Target.md")).unwrap();
+        refresh();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 0);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 2);
+        fs::write(root.join("nested/Target.md"), "# Recreated Sibling\n").unwrap();
+        refresh();
+        assert_sibling_edges();
     }
 
     #[test]

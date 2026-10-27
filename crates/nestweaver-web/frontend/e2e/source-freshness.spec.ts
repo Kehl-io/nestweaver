@@ -577,3 +577,99 @@ test("switching a retained file owner discards its delayed metadata response", a
       .toHaveAttribute("aria-pressed", "true");
   } finally { release(); }
 });
+
+for (const code of ["source_not_available", "source_too_large"] as const) {
+  test(`file metadata survives qualified ${code} without hiding preview failure`, async ({ page }) => {
+    const owner = "repo:unavailable-owner";
+    await page.route("**/api/v1/source?*", (route) => route.fulfill({ status: 404, json: {
+      error: code, message: "Indexed source cannot be read", file: "release-journey.js", repo: owner,
+    } }));
+    await page.route("**/api/v1/symbols/file?*", (route) => route.fulfill({ json: [
+      ...metadataRows(owner, "retainedMetadata"), ...metadataRows("repo:other", "mustNotPool"),
+    ] }));
+    await selectFile(page);
+    const { details, symbols } = fileDetails(page);
+    await expect(symbols).toHaveCount(2);
+    await expect(symbols.getByText("retainedMetadata0", { exact: true })).toBeVisible();
+    await expect(details.getByText("2 symbols", { exact: true })).toBeVisible();
+    await expect(details.getByRole("group", { name: "Node actions", exact: true })).toHaveCount(2);
+    await expect(details.getByRole("group", { name: "Node actions", exact: true }).last()).toBeVisible();
+    await expect(details).not.toContainText("mustNotPool");
+    await expect(details.getByText(code === "source_too_large"
+      ? "Source not available: release-journey.js is too large to preview."
+      : "Indexed source cannot be read", { exact: true })).toBeVisible();
+  });
+}
+
+test("unavailable owner picks preserve zero-symbol ambiguity and reject mismatched proof", async ({ page }) => {
+  await observeEvents(page);
+  const owners = ["repo:metadata-owner", "repo:zero-symbol-owner"];
+  let mismatch = false;
+  let requests = 0;
+  await page.route("**/api/v1/repos", (route) => route.fulfill({ json:
+    owners.map((uid) => ({ uid, name: uid, url: uid })) }));
+  await page.route("**/api/v1/source?*", (route) => {
+    const owner = new URL(route.request().url()).searchParams.get("repo");
+    if (!owner) return route.fulfill({ status: 409, json: {
+      error: "ambiguous_file", candidates: owners, message: "choose indexed owner", file: "release-journey.js",
+    } });
+    return route.fulfill({ status: 404, json: {
+      error: "source_not_available", message: "Picked source cannot be read", file: "release-journey.js",
+      repo: mismatch ? owners[0] : owner,
+    } });
+  });
+  await page.route("**/api/v1/symbols/file?*", (route) => {
+    requests += 1;
+    return route.fulfill({ json: metadataRows(owners[0], "onlyOwnerA") });
+  });
+  await selectFile(page);
+  const { details, symbols } = fileDetails(page);
+  const picker = details.getByRole("group", { name: "Repos containing release-journey.js", exact: true });
+  await expect(picker).toBeVisible();
+  await expect(symbols).toHaveCount(0);
+  expect(requests, "symbol rows cannot establish unique File ownership").toBe(0);
+  await picker.getByRole("button", { name: "Show release-journey.js from repo:metadata-owner", exact: true }).click();
+  await expect(symbols.getByText("onlyOwnerA0", { exact: true })).toBeVisible();
+  await expect(details.getByText("2 symbols", { exact: true })).toBeVisible();
+  await expect(details.getByText("Picked source cannot be read", { exact: true })).toBeVisible();
+  await expect(details.getByRole("group", { name: "Node actions", exact: true })).toHaveCount(2);
+  await expect(details.getByRole("group", { name: "Node actions", exact: true }).last()).toBeVisible();
+  await picker.getByRole("button", { name: "Show release-journey.js from repo:zero-symbol-owner", exact: true }).click();
+  await expect(details.getByText("0 symbols", { exact: true })).toBeVisible();
+  await expect(symbols).toHaveCount(0);
+  await expect(details).not.toContainText("onlyOwnerA");
+  const beforeMismatch = requests;
+  mismatch = true;
+  await emit(page);
+  await expect(details).toContainText("File ownership is unavailable for the selected repository.");
+  await expect(details.getByText("0 symbols", { exact: true })).toHaveCount(0);
+  expect(requests, "another owner's proof cannot authorize metadata").toBe(beforeMismatch);
+});
+
+for (const failure of ["missing-owner", "wrong-path", "wrong-code", "wrong-status", "network"] as const) {
+  test(`file metadata refuses ${failure} as ownership proof`, async ({ page }) => {
+    let requests = 0;
+    await page.route("**/api/v1/source?*", (route) => {
+      if (failure === "network") return route.abort("failed");
+      return route.fulfill({ status: failure === "wrong-status" ? 503 : 404, json: {
+        error: failure === "wrong-code" ? "source_not_indexed" : "source_not_available",
+        message: "Unqualified source failure",
+        file: failure === "wrong-path" ? "another-file.js" : "release-journey.js",
+        ...(failure === "missing-owner" ? {} : { repo: "repo:metadata" }),
+      } });
+    });
+    await page.route("**/api/v1/symbols/file?*", (route) => {
+      requests += 1;
+      return route.fulfill({ json: metadataRows("repo:metadata", "unsafeMetadata") });
+    });
+    await selectFile(page);
+    const { details, symbols } = fileDetails(page);
+    await expect(details).not.toContainText("Loading file...");
+    await expect(details).toContainText(failure === "network" ? "Failed to fetch"
+      : failure === "wrong-code" ? "Source not available: release-journey.js is not indexed."
+      : "Unqualified source failure");
+    await expect(symbols).toHaveCount(0);
+    await expect(details.getByText("0 symbols", { exact: true })).toHaveCount(0);
+    expect(requests).toBe(0);
+  });
+}

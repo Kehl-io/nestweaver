@@ -216,6 +216,37 @@ mod tests {
     }
 
     #[test]
+    fn php_chained_method_and_free_function_have_distinct_admission_facts() {
+        let source = "<?php\nfunction caller() { factory()->run(); factory()->factory(); }\n";
+        let parsed = parse_source(Path::new("chains.php"), source).unwrap();
+        assert!(!parsed.has_syntax_errors);
+        for (expression, method) in [
+            ("factory()->run()", "run"),
+            ("factory()->factory()", "factory"),
+        ] {
+            let position = source.find(expression).unwrap();
+            let at_position: Vec<_> = parsed
+                .references
+                .iter()
+                .filter(|r| r.scope.is_some_and(|scope| scope.position == position))
+                .collect();
+            assert!(at_position.iter().any(|r| r.kind == ReferenceKind::Call
+                && r.name == method
+                && r.receiver.as_deref() == Some("factory()")));
+            assert!(at_position.iter().any(|r| r.kind == ReferenceKind::Call
+                && r.name == "factory"
+                && r.receiver.is_none()));
+            let markers: Vec<_> = at_position
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::PhpFunctionCall)
+                .collect();
+            assert_eq!(markers.len(), 1, "only the named free factory is admitted");
+            assert_eq!(markers[0].name, "factory");
+            assert!(markers[0].receiver.is_none());
+        }
+    }
+
+    #[test]
     fn php_explicit_global_scope_is_distinct_from_unknown_graph_metadata() {
         let parsed = parse_source(Path::new("global.php"), "<?php\nnamespace { function global_fn() {} }\nnamespace Named { function namespaced_fn() {} }\n").unwrap();
         assert_eq!(

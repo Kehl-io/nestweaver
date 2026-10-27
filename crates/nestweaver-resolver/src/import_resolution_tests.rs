@@ -169,6 +169,56 @@ fn php_unknown_stored_namespace_metadata_refuses_global_borrowing() {
     assert!(edges.iter().any(|e| e.target_uid == "unresolved:helper"));
 }
 
+#[test]
+fn php_chained_member_calls_never_borrow_free_function_homonyms() {
+    for global_run in [false, true] {
+        let suffix = if global_run {
+            "function run() {}\n"
+        } else {
+            ""
+        };
+        let source = format!(
+            "<?php\nclass Worker {{\n public function run() {{}}\n public function factory() {{}}\n public function typedControl() {{ $this->run(); }}\n}}\nfunction factory(): Worker {{ return new Worker(); }}\nfunction chainedRun() {{ factory()->run(); }}\nfunction chainedSameName() {{ factory()->factory(); }}\n{suffix}"
+        );
+        let (files, edges) = resolve_typed(&[("chains.php", &source)], Language::Php);
+        let symbols = &files[0].1;
+        let uid = |name: &str, kind| {
+            let matches: Vec<_> = symbols
+                .iter()
+                .filter(|s| s.name == name && s.kind == kind)
+                .collect();
+            assert_eq!(matches.len(), 1);
+            symbol_uid(REPO, "chains.php", name, matches[0].start_line)
+        };
+        for (caller, method) in [("chainedRun", "run"), ("chainedSameName", "factory")] {
+            let actual: BTreeSet<_> = edges
+                .iter()
+                .filter(|e| {
+                    e.edge_type == EdgeType::Calls
+                        && e.confidence > 0.0
+                        && e.source_uid == uid(caller, nestweaver_schema::SymbolKind::Function)
+                })
+                .map(|e| e.target_uid.clone())
+                .collect();
+            // PHP return annotations are not extracted today. The existing
+            // member resolver therefore refuses an untyped factory chain;
+            // this repair must preserve that refusal instead of borrowing a
+            // free homonym. A separately typed self control remains resolvable.
+            assert_eq!(
+                actual,
+                BTreeSet::from([uid("factory", nestweaver_schema::SymbolKind::Function),]),
+                "{caller}/{method}, global run={global_run}"
+            );
+        }
+        let typed = uid("typedControl", nestweaver_schema::SymbolKind::Method);
+        let target = uid("run", nestweaver_schema::SymbolKind::Method);
+        assert!(edges.iter().any(|e| e.source_uid == typed
+            && e.target_uid == target
+            && e.edge_type == EdgeType::Calls
+            && e.confidence > 0.0));
+    }
+}
+
 fn resolve(
     inputs: &[(&str, &str)],
     language: Language,

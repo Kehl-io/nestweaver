@@ -243,8 +243,8 @@ notes below before using an older database with a new binary.
 <details>
 <summary>Detailed migration notes and changes for scripts and server clients</summary>
 
-**`RESOLVER_GENERATION` is 17. Every graph indexed by another generation must be
-re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
+**Current source uses `RESOLVER_GENERATION` 19; published 12.2.3 uses 17. Every
+graph indexed by a generation different from the running binary must be re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
 9.0.0 took it from 3 to 4, and generations 5 and 6 followed. The 9.0.0 bump

@@ -4803,45 +4803,28 @@ fn prepare_index_resolution(
         && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid))
     {
         let deps = resolution_deps.as_ref().unwrap();
-        let mut affected = deps.affected_files_for_repo(r_uid, &changed_or_removed);
-        if let Some(extra) = extra_dependents {
-            affected.extend(extra.iter().cloned());
-        }
+        // Share the exact source seed/closure with watcher environment
+        // preparation. Every cached source whose edges can be replaced needs
+        // its source-valid type environment, including negative PHP peers.
+        let mut affected = resolution_source_scope(
+            reader,
+            deps,
+            r_uid,
+            &changed_or_removed,
+            added_files,
+            eligible_files,
+            extra_dependents,
+        )?;
         for removed in removed_files {
             affected.remove(removed);
         }
-        // Dependency rows lose deleted targets. Recover unresolved imports
-        // and surviving members of an expanded Go package before the bounded
-        // closure, using the same seeds as incremental/watch scheduling.
-        //
-        // An untouched importer whose filemeta hits and whose parsed cache
-        // misses stays Unchanged and never enters the resolver view. Parse it
-        // into that view before resolution. The filter names it only after
-        // that parse is included: publication deletes outgoing edges for every
-        // filter member, and naming the importer earlier drops edges this
-        // pass cannot rebuild.
-        let mut seeded =
-            resolution_seeds_for_added_files(reader, deps, r_uid, added_files, eligible_files)?;
-        // PHP function lookup is repository-wide and has a negative dependency:
-        // adding a declaration can satisfy an unresolved call or make a formerly
-        // unique match ambiguous. File-edge/import dependency rows cannot name
-        // those callers. Reuse valid parses and conservatively revisit PHP only.
-        seeded.extend(php_function_resolution_peers(
-            &changed_or_removed,
-            eligible_files,
-        ));
-        // A restored barrel or package member changes every importer above
-        // it. Expand before selecting parses and deleting outgoing edges.
-        affected.extend(deps.affected_files_for_repo(r_uid, &seeded));
-        // Dependents reached through dependency rows obey the same rule: an
-        // unchanged one with a cold parsed cache is not in the resolver view,
-        // and naming it in the filter would delete edges nothing rebuilds.
-        seeded.extend(
-            affected
-                .iter()
-                .filter(|path| !actually_changed_files.contains(path.as_str()))
-                .cloned(),
-        );
+        // An unchanged filemeta hit can still have a cold parse cache. Do not
+        // clear its edges unless its parse actually joins the resolver view.
+        let seeded: HashSet<String> = affected
+            .iter()
+            .filter(|path| !actually_changed_files.contains(path.as_str()))
+            .cloned()
+            .collect();
         let included = include_missing_seeded_importer_parses(
             reader,
             parsed_files_for_resolver,
@@ -9833,6 +9816,29 @@ pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
     )
 }
 
+/// Shared source scope for both type-environment preparation and edge
+/// replacement. In particular, resolved file edges do not record PHP negative
+/// function-name dependencies, so unrelated PHP declarations can change a
+/// previously unresolved/unique call in any repository PHP source.
+fn resolution_source_scope(
+    reader: &dyn crate::content_reader::ContentReader,
+    deps: &crate::resolution_cache::ResolutionDeps,
+    r_uid: &str,
+    changed_or_removed: &HashSet<String>,
+    added: &HashSet<String>,
+    eligible: &HashSet<String>,
+    extra_dependents: Option<&HashSet<String>>,
+) -> anyhow::Result<HashSet<String>> {
+    let mut affected = deps.affected_files_for_repo(r_uid, changed_or_removed);
+    if let Some(extra) = extra_dependents {
+        affected.extend(extra.iter().cloned());
+    }
+    let mut seeded = resolution_seeds_for_added_files(reader, deps, r_uid, added, eligible)?;
+    seeded.extend(php_function_resolution_peers(changed_or_removed, eligible));
+    affected.extend(deps.affected_files_for_repo(r_uid, &seeded));
+    Ok(affected)
+}
+
 fn php_function_resolution_peers(
     changed: &HashSet<String>,
     eligible: &HashSet<String>,
@@ -10749,17 +10755,15 @@ pub(crate) fn prepare_watcher_batch_resolution(
         && !resolution_deps.is_empty_for_repo(r_uid)
     {
         let changed_or_removed: HashSet<String> = changed.union(&removed_files).cloned().collect();
-        let mut scope = resolution_deps.affected_files_for_repo(r_uid, &changed_or_removed);
-        scope.extend(graph_dependents.iter().cloned());
-        let recovered = resolution_seeds_for_added_files(
+        Some(resolution_source_scope(
             reader,
             &resolution_deps,
             r_uid,
+            &changed_or_removed,
             &added_files,
             &verified,
-        )?;
-        scope.extend(resolution_deps.affected_files_for_repo(r_uid, &recovered));
-        Some(scope)
+            Some(graph_dependents),
+        )?)
     } else {
         None
     };

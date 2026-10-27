@@ -4,12 +4,17 @@ export class ApiError extends Error {
   code?: string;
   /** Repo uids an ambiguous `/source` path matched (409 `ambiguous_file`). */
   candidates?: string[];
+  /** Qualified indexed owner on typed `/source` body-unavailable errors. */
+  repo?: string;
+  file?: string;
 
-  constructor(status: number, message: string, code?: string, candidates?: string[]) {
+  constructor(status: number, message: string, code?: string, candidates?: string[], repo?: string, file?: string) {
     super(message);
     this.status = status;
     this.code = code;
     this.candidates = candidates;
+    this.repo = repo;
+    this.file = file;
   }
 }
 
@@ -22,5 +27,7 @@ export function apiErrorFromBody(status: number, body: unknown, statusText: stri
   const candidates = Array.isArray(b.candidates)
     ? b.candidates.filter((c): c is string => typeof c === "string")
     : undefined;
-  return new ApiError(status, message, code, candidates);
+  const repo = typeof b.repo === "string" && b.repo ? b.repo : undefined;
+  const file = typeof b.file === "string" && b.file ? b.file : undefined;
+  return new ApiError(status, message, code, candidates, repo, file);
 }
