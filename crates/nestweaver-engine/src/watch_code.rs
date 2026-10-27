@@ -6589,16 +6589,41 @@ mod tests {
                 );
                 assert_calls();
             }
+            // This fixture calls the explicit-event publication primitive.
+            // An admitted existing-file hint publishes even for identical
+            // bytes; it must still preserve every exact edge and receiver.
             let before = edge_multiset(&store);
-            assert!(matches!(
-                process_fixture_batch(&watcher, &store, &repo, &root, &[root.join("models.php")]),
-                WatchBatchOutcome::Unchanged
-            ));
+            let hinted =
+                process_fixture_batch(&watcher, &store, &repo, &root, &[root.join("models.php")]);
+            assert!(
+                matches!(
+                    hinted,
+                    WatchBatchOutcome::Published {
+                        files_processed: 1,
+                        ..
+                    }
+                ),
+                "explicit unchanged-file hint must publish one file: {hinted:?}"
+            );
             assert_eq!(
                 edge_multiset(&store),
                 before,
-                "no-change batch must stay inert"
+                "hinted publication changed edges"
             );
+            assert_calls();
+
+            // Empty hints exercise this primitive's actual no-work branch.
+            let before_empty = edge_multiset(&store);
+            let generation = store.graph_generation();
+            let empty = process_fixture_batch(&watcher, &store, &repo, &root, &[]);
+            assert!(matches!(empty, WatchBatchOutcome::Unchanged), "{empty:?}");
+            assert_eq!(store.graph_generation(), generation);
+            assert_eq!(
+                edge_multiset(&store),
+                before_empty,
+                "empty hint batch changed edges"
+            );
+            assert_calls();
         }
     }
 
