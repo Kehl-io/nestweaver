@@ -12,6 +12,7 @@ pub mod markdown;
 pub(crate) mod markup;
 pub mod mermaid;
 pub mod parse;
+pub mod php;
 pub mod registry;
 pub mod scope_chain;
 pub mod svelte;

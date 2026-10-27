@@ -120,6 +120,9 @@ pub struct RawSection {
 /// `line` is 1-based relative to the body (post-frontmatter).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawWikilink {
+    /// Markdown URL syntax requires URL decoding; wikilink filenames remain literal.
+    #[serde(default)]
+    pub markdown_url: bool,
     pub target: String,
     pub heading_anchor: Option<String>,
     pub display: Option<String>,
@@ -740,6 +743,7 @@ fn push_wikilinks_from_line(
             }
         };
         out.push(RawWikilink {
+            markdown_url: false,
             target: resolved_target,
             heading_anchor: anchor,
             display,
@@ -1121,6 +1125,7 @@ fn extract_md_links(body: &str, sections: &[RawSection]) -> Vec<RawWikilink> {
                 .unwrap_or(0);
 
             out.push(RawWikilink {
+                markdown_url: true,
                 target,
                 heading_anchor: fragment,
                 display,
@@ -2373,6 +2378,37 @@ top 2 body
         assert_eq!(md_links[0].target, "other-note.md");
         assert_eq!(md_links[0].display.as_deref(), Some("Other Note"));
         assert!(!md_links[0].transclude);
+    }
+
+    #[test]
+    fn markdown_urls_keep_original_bytes_and_distinguish_literal_wikilinks() {
+        let note = parse_markdown(
+            "source.md",
+            "# Source\n\n[url](Target%20Space.md#part) [[Target%20Space]]\n",
+        )
+        .unwrap();
+        let url = note
+            .wikilinks
+            .iter()
+            .find(|link| link.markdown_url)
+            .unwrap();
+        assert_eq!(url.target, "Target%20Space.md");
+        assert_eq!(url.heading_anchor.as_deref(), Some("part"));
+        let literal = note
+            .wikilinks
+            .iter()
+            .find(|link| !link.markdown_url)
+            .unwrap();
+        assert_eq!(literal.target, "Target%20Space");
+        let restored: RawWikilink = serde_json::from_value(serde_json::json!({
+            "target": "Literal%20Name", "heading_anchor": null, "display": null,
+            "transclude": false, "section_idx": 0, "line": 1
+        }))
+        .unwrap();
+        assert!(
+            !restored.markdown_url,
+            "old serialized wikilinks remain literal"
+        );
     }
 
     #[test]

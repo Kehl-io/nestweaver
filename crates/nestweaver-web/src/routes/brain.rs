@@ -253,6 +253,7 @@ pub async fn resolve_wikilink(
                 }
                 other => ApiError::from(other),
             })?;
+        let vault = state.store.lookup_vault(&source.vault_uid)?;
         let notes = state.store.list_notes(Some(&source.vault_uid))?;
         let headings = state.store.list_headings_by_vault(&source.vault_uid)?;
         nestweaver_engine::index_md::resolve_note_wikilink(
@@ -260,6 +261,7 @@ pub async fn resolve_wikilink(
             &notes,
             &headings,
             &request.target,
+            std::path::Path::new(&vault.root_path),
         )
         .map_err(|code| {
             let message = match code {

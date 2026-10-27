@@ -187,6 +187,17 @@ pub enum ReferenceKind {
     /// `context` is the local declaration or original forwarded name, and
     /// `receiver` is the source module for a named re-export. Not an edge.
     ExportAlias,
+    /// PHP namespace region; scope is its exact byte range, name its namespace.
+    /// Metadata only, never an edge. Appended to retain old enum discriminants.
+    PhpNamespace,
+    /// PHP `use function` alias; name is local, context the absolute target.
+    PhpFunctionImport,
+    /// PHP ordinary `use` alias, usable as a namespace prefix in qualified calls.
+    /// Kept separate from function imports: it never binds a bare function call.
+    PhpNamespaceAlias,
+    /// Metadata identifying a PHP named function call, alongside its ordinary Call.
+    /// Distinguishes it from constructors and methods without changing Call consumers.
+    PhpFunctionCall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1818,6 +1829,11 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
     let mut cursor = QueryCursor::new();
     let source_bytes = source.as_bytes();
+    let php_namespaces = if lang == Language::Php {
+        crate::php::namespace_regions(tree.root_node(), source_bytes)
+    } else {
+        Vec::new()
+    };
     // Field, constructor, tuple and output-reference evidence share one
     // within-tree lexical inventory; append order remains unchanged below.
     let share_locals = matches!(
@@ -2173,7 +2189,15 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 } else {
                     None
                 };
-                let scope_chain = extract_scope_chain(node, source, lang_str);
+                let scope_chain = if lang == Language::Php && kind == SymbolKind::Function {
+                    Some(
+                        crate::php::namespace_for_position(&php_namespaces, node.start_byte())
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                } else {
+                    extract_scope_chain(node, source, lang_str)
+                };
                 if matches!(lang, Language::JavaScript | Language::TypeScript)
                     && kind == SymbolKind::Property
                     && node.kind() == "assignment_expression"
@@ -2209,6 +2233,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     "call" => ReferenceKind::Call,
                     "import" => ReferenceKind::Import,
                     "package" => ReferenceKind::PackageBinding,
+                    "php_function" => ReferenceKind::PhpFunctionCall,
                     "extends" => ReferenceKind::Extends,
                     "implements" => ReferenceKind::Implements,
                     "includes" => ReferenceKind::Includes,
@@ -2278,7 +2303,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 // nw-113: recorded after the intrinsic-element filter above, so
                 // a lowercase JSX tag (an HTML element, not a call) never mints
                 // an owner.
-                if kind == ReferenceKind::Call
+                if matches!(kind, ReferenceKind::Call | ReferenceKind::PhpFunctionCall)
                     && matches!(lang_str, "javascript" | "typescript" | "python" | "php")
                     && name != "require"
                 {
@@ -2437,7 +2462,17 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 };
 
                 references.push(RawReference {
-                    scope: if matches!(
+                    scope: if lang == Language::Php
+                        && matches!(kind, ReferenceKind::Call | ReferenceKind::PhpFunctionCall)
+                    {
+                        Some(LexicalScope {
+                            start: 0,
+                            end: source_bytes.len(),
+                            position: node.start_byte(),
+                            initialized_at: 0,
+                            hoisted_var: false,
+                        })
+                    } else if matches!(
                         lang,
                         Language::JavaScript | Language::TypeScript | Language::Rust | Language::Go
                     ) {
@@ -2457,6 +2492,10 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     }
 
     dedupe_js_assignment_properties(&mut symbols, &assignment_properties);
+
+    if lang == Language::Php {
+        crate::php::collect_namespace_bindings(tree.root_node(), source_bytes, &mut references);
+    }
 
     // Preserve exact import bindings as well as package exclusions.
     if matches!(lang, Language::JavaScript | Language::TypeScript) {

@@ -567,13 +567,21 @@ federation          (leaf: schema + proto only)
 
 ### Current resolver upgrade
 
-Resolver generation 18 and parsed-cache version 12 invalidate facts from before
-Scala grammar 0.26.3, which recovers declarations such as case-clause local classes
-and Scala 2 `export` identifiers. Existing graphs may lack those symbols: run
+Resolver generation 19 and parsed-cache version 13 add repo-wide PHP function
+namespace identities, `use function` aliases and duplicate refusal. Generation 18
+and cache 12's Scala grammar 0.26.3 repairs remain included. Existing graphs may
+lack those symbols and edges: run
 `nestweaver index --repo <path> --force` once per repository after upgrading.
 Rejecting an old parse cache does not repair an unchanged, already stored graph.
 Generation 17's Go initializer/case lifetimes and earlier receiver/package fixes
 remain included; the resolution-dependency sidecar format is unchanged.
+PHP declaration edits/additions/removals conservatively revisit repository PHP
+callers, reusing valid parses; unresolved names and ambiguity are negative
+dependencies absent from the file-edge/import-specifier cache.
+Markdown derivation version 3 separately re-derives eligible vault links for
+percent-encoded URL paths and root-contained absolute note paths. Run
+`nestweaver brain refresh <vault>` after upgrading; repository force indexing
+does not refresh vault links.
 
 ## Conventions
 

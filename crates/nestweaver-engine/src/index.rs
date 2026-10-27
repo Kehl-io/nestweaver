@@ -4822,6 +4822,14 @@ fn prepare_index_resolution(
         // pass cannot rebuild.
         let mut seeded =
             resolution_seeds_for_added_files(reader, deps, r_uid, added_files, eligible_files)?;
+        // PHP function lookup is repository-wide and has a negative dependency:
+        // adding a declaration can satisfy an unresolved call or make a formerly
+        // unique match ambiguous. File-edge/import dependency rows cannot name
+        // those callers. Reuse valid parses and conservatively revisit PHP only.
+        seeded.extend(php_function_resolution_peers(
+            &changed_or_removed,
+            eligible_files,
+        ));
         // A restored barrel or package member changes every importer above
         // it. Expand before selecting parses and deleting outgoing edges.
         affected.extend(deps.affected_files_for_repo(r_uid, &seeded));
@@ -4871,7 +4879,8 @@ fn prepare_index_resolution(
                 .map(|(path, ..)| path.clone())
                 .collect()
         });
-        let targets = go_package_peers_for_paths(&source_files, eligible_files);
+        let mut targets = go_package_peers_for_paths(&source_files, eligible_files);
+        targets.extend(php_function_resolution_peers(&source_files, eligible_files));
         let included = include_missing_seeded_importer_parses(
             reader,
             parsed_files_for_resolver,
@@ -4881,7 +4890,7 @@ fn prepare_index_resolution(
         );
         anyhow::ensure!(
             included == targets,
-            "could not hydrate Go package declaration targets before resolution"
+            "could not hydrate package/function declaration targets before resolution"
         );
     }
 
@@ -8466,7 +8475,14 @@ fn incremental_index_with_name_and_io_and_authority(
 
     // nw-008 Phase 2 — re-resolve reverse-dependents and surgically restore the
     // cross-file edges the per-file `DETACH DELETE` removed (same transaction).
-    let reresolved = reresolve_affected_dependents(&reader, &txn, &r_uid, &changed_files, &rdeps)?;
+    let reresolved = reresolve_affected_dependents(
+        &reader,
+        &txn,
+        &r_uid,
+        &changed_files,
+        &removed_files,
+        &rdeps,
+    )?;
     if reresolved > 0 {
         tracing::info!(
             edges = reresolved,
@@ -9005,7 +9021,14 @@ where
     // nw-008 Phase 2 — re-resolve the reverse-dependents computed in Phase 0
     // and surgically restore the cross-file edges that the per-file
     // `DETACH DELETE` removed (same transaction).
-    let reresolved = reresolve_affected_dependents(reader, &txn, &r_uid, &changed_files, &rdeps)?;
+    let reresolved = reresolve_affected_dependents(
+        reader,
+        &txn,
+        &r_uid,
+        &changed_files,
+        &removed_files,
+        &rdeps,
+    )?;
     if reresolved > 0 {
         tracing::info!(
             edges = reresolved,
@@ -9810,6 +9833,23 @@ pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
     )
 }
 
+fn php_function_resolution_peers(
+    changed: &HashSet<String>,
+    eligible: &HashSet<String>,
+) -> HashSet<String> {
+    if !changed
+        .iter()
+        .any(|path| detect_language(Path::new(path)) == Some(Language::Php))
+    {
+        return HashSet::new();
+    }
+    eligible
+        .iter()
+        .filter(|path| detect_language(Path::new(path)) == Some(Language::Php))
+        .cloned()
+        .collect()
+}
+
 /// Workspace packages and tsconfig aliases for import resolution. This is the
 /// discovery `build_reresolve_edges_unlogged` uses, so a stored alias or
 /// workspace specifier maps onto the same path the re-resolve pass sees.
@@ -10312,27 +10352,39 @@ fn reresolve_affected_dependents(
     conn: &nestweaver_store::DbConnection<'_>,
     r_uid: &str,
     changed: &std::collections::HashSet<String>,
+    removed: &std::collections::HashSet<String>,
     rdeps: &std::collections::HashSet<String>,
 ) -> Result<usize, anyhow::Error> {
-    if changed.is_empty() {
+    if changed.is_empty() && removed.is_empty() {
         return Ok(0);
     }
 
     let db_symbols = nestweaver_store::GraphStore::lookup_symbols_by_repo_on(conn, r_uid)
         .with_context(|| "lookup_symbols_by_repo_on for forward edge resolution")?;
-    let known_files = nestweaver_store::GraphStore::list_files_by_repo_on(conn, r_uid)
-        .with_context(|| "list_files_by_repo_on for forward edge resolution")?
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect();
+    let known_files: HashSet<String> =
+        nestweaver_store::GraphStore::list_files_by_repo_on(conn, r_uid)
+            .with_context(|| "list_files_by_repo_on for forward edge resolution")?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+    let changed_or_removed: HashSet<String> = changed.union(removed).cloned().collect();
+    let php_peers = php_function_resolution_peers(&changed_or_removed, &known_files);
     let insertable = build_reresolve_edges(
         reader,
         r_uid,
-        changed,
+        &changed_or_removed,
         rdeps,
         &db_symbols,
         &known_files,
         None,
+    )?;
+
+    // Rebuild just PHP function CALLS. A new/removed duplicate can invalidate
+    // an untouched caller even when neither surviving endpoint changed.
+    GraphStore::delete_function_calls_for_files_on(
+        conn,
+        r_uid,
+        &php_peers.iter().map(String::as_str).collect::<Vec<_>>(),
     )?;
 
     // Runs inside the same transaction as the mutation loop.
@@ -10855,6 +10907,8 @@ fn build_reresolve_edges_unlogged(
     // S = changed ∪ rdeps — files whose references need re-resolution.
     let mut scope: std::collections::HashSet<String> = changed.clone();
     scope.extend(rdeps.iter().cloned());
+    let php_peers = php_function_resolution_peers(changed, known_files);
+    scope.extend(php_peers.iter().cloned());
 
     let mut file_data: Vec<(String, Vec<RawSymbol>, Vec<RawReference>)> = Vec::new();
     let mut uid_to_file: HashMap<String, String> = HashMap::new();
@@ -10960,6 +11014,35 @@ fn build_reresolve_edges_unlogged(
         file_languages.insert(file_path.clone(), language);
         // Empty references: we only need these files as resolution
         // targets, not as resolution sources.
+        let mut symbols = symbols;
+        if language == Language::Php {
+            // A stored Symbol intentionally lacks parser namespace metadata.
+            // Hydrate only facts matching that exact stored symbol, never a
+            // changed-on-disk declaration with a different content hash/UID.
+            let parsed = prepared_file_data
+                .and_then(|prepared| prepared.get(&file_path))
+                .map(|(symbols, _)| symbols.clone())
+                .or_else(|| {
+                    reader
+                        .read_file(Path::new(&file_path))
+                        .ok()
+                        .and_then(|source| {
+                            parse_source(&reader.root().join(&file_path), &source).ok()
+                        })
+                        .map(|p| p.symbols)
+                });
+            if let Some(parsed) = parsed {
+                for symbol in &mut symbols {
+                    if let Some(fact) = parsed.iter().find(|fact| {
+                        fact.name == symbol.name
+                            && fact.start_line == symbol.start_line
+                            && fact.content_hash == symbol.content_hash
+                    }) {
+                        symbol.scope_chain = fact.scope_chain.clone();
+                    }
+                }
+            }
+        }
         file_data.push((file_path, symbols, Vec::new()));
     }
     // Symbol-less JS/TS files. Only JS/TS: the hydration below is what gives
@@ -11129,6 +11212,13 @@ fn build_reresolve_edges_unlogged(
             ) else {
                 return false;
             };
+            if php_peers.contains(sf)
+                && e.evidence
+                    .iter()
+                    .any(|e| e.kind == "php_namespace_function")
+            {
+                return true;
+            }
             sf != tf && (changed.contains(tf.as_str()) || changed.contains(sf.as_str()))
         })
         .collect();
@@ -23697,6 +23787,120 @@ module.exports = { check, plain };\n";
             sidecar.repos.contains_key(&new_uid),
             "the new origin uid must have a slice"
         );
+    }
+
+    #[test]
+    fn php_namespace_function_add_duplicate_remove_reindexes_unchanged_callers() {
+        for git_incremental in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let src = temp.path().join("repo");
+            let db = temp.path().join("php.lbug");
+            fs::create_dir_all(src.join("app")).unwrap();
+            fs::create_dir_all(src.join("lib")).unwrap();
+            fs::write(src.join("global.php"), "<?php\nfunction helper() {}\n").unwrap();
+            fs::write(
+                src.join("app/main.php"),
+                "<?php\nnamespace App;\nfunction run() { helper(); }\n",
+            )
+            .unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "commit.gpgSign=false",
+                    ])
+                    .args(args)
+                    .current_dir(&src)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap().trim().to_string()
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.name", "PHP fixture"]);
+            git(&["config", "user.email", "php@example.invalid"]);
+            let commit = || {
+                git(&["add", "-A"]);
+                git(&["commit", "-qm", "fixture"]);
+                git(&["rev-parse", "HEAD"])
+            };
+            let initial = commit();
+            let url = "https://example.invalid/php-namespace-lifecycle";
+            let repo = repo_uid("test", url);
+            index_directory(&src, &db, "test", url, &initial).unwrap();
+            let caller = symbol_uid(&repo, "app/main.php", "run", 3);
+            let targets = || {
+                let store = GraphStore::open(&db).unwrap();
+                let mut targets: Vec<_> = store
+                    .load_typed_edges()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.0 == caller && e.2 == "CALLS")
+                    .map(|e| e.1)
+                    .collect();
+                targets.sort();
+                targets
+            };
+            let update = || {
+                let head = commit();
+                if git_incremental {
+                    incremental_index(&src, &db, "test", url).unwrap();
+                } else {
+                    index_directory(&src, &db, "test", url, &head).unwrap();
+                }
+            };
+            let global = symbol_uid(&repo, "global.php", "helper", 2);
+            let namespaced = symbol_uid(&repo, "lib/helpers.php", "helper", 3);
+            assert_eq!(targets(), vec![global.clone()]);
+            fs::write(
+                src.join("lib/helpers.php"),
+                "<?php\nnamespace App;\nfunction helper() {}\n",
+            )
+            .unwrap();
+            // A cache-cold unchanged caller still needs to participate when a
+            // new namespace declaration changes its negative dependency.
+            for suffix in [".parsed_cache.bin", ".parsed_cache.log"] {
+                let path = crate::sidecar_path(&db, suffix);
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+            update();
+            assert_eq!(
+                targets(),
+                vec![namespaced.clone()],
+                "new namespace declaration must replace global fallback"
+            );
+            fs::write(
+                src.join("lib/duplicate.php"),
+                "<?php\nnamespace App;\nfunction helper() {}\n",
+            )
+            .unwrap();
+            update();
+            assert!(
+                targets().is_empty(),
+                "ambiguous namespace must not borrow the global fallback"
+            );
+            fs::remove_file(src.join("lib/duplicate.php")).unwrap();
+            update();
+            assert_eq!(targets(), vec![namespaced]);
+            fs::remove_file(src.join("lib/helpers.php")).unwrap();
+            update();
+            assert_eq!(targets(), vec![global]);
+            let before = targets();
+            let result =
+                index_directory(&src, &db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+            assert_eq!(result.files_count, 0, "no-change run must remain a no-op");
+            assert_eq!(targets(), before);
+        }
     }
 
     #[test]

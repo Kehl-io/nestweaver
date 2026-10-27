@@ -3144,7 +3144,9 @@ fn index_markdown_since_with_reader_mode(
             let source_reference_affected = section_note
                 .get(&source_section)
                 .and_then(|source_uid| note_path_by_uid.get(source_uid.as_str()))
-                .is_some_and(|path| wikilink_target_affected(&link_target, path, &affected_names));
+                .is_some_and(|path| {
+                    wikilink_target_affected(&link_target, path, &affected_names, Some(vault_root))
+                });
             if (target_note
                 .is_some_and(|uid| changed_uids.contains(uid) || removed_uids.contains(uid))
                 || source_reference_affected)
@@ -3162,7 +3164,12 @@ fn index_markdown_since_with_reader_mode(
         if !existing_note_uids.contains(&source_note) {
             continue;
         }
-        if wikilink_target_affected(&link_target, &source_path, &affected_names) {
+        if wikilink_target_affected(
+            &link_target,
+            &source_path,
+            &affected_names,
+            Some(vault_root),
+        ) {
             affected_sources.insert(source_note);
         }
     }
@@ -3290,7 +3297,7 @@ fn index_markdown_since_with_reader_mode(
             ));
         }
     }
-    let lookup = WikilinkLookup::build(&note_contexts);
+    let lookup = WikilinkLookup::build(&note_contexts, Some(vault_root));
     let context_by_uid: HashMap<&str, &NoteContext> = note_contexts
         .iter()
         .map(|context| (context.note_uid.as_str(), context))
@@ -4831,7 +4838,7 @@ where
     }
 
     // Wikilink resolution: build lookup indices once, then 5-priority match.
-    let lookup = WikilinkLookup::build(&note_contexts);
+    let lookup = WikilinkLookup::build(&note_contexts, Some(vault_root));
 
     // nw-122: (section, target_node, confidence, display_text, link_target).
     let mut wikilink_to_note: Vec<(String, String, f32, String, String)> = Vec::new();
@@ -5145,6 +5152,7 @@ pub fn resolve_note_wikilink(
     notes: &[Note],
     headings: &[Heading],
     target: &str,
+    vault_root: &Path,
 ) -> Result<WikilinkDestination, &'static str> {
     let mut headings_by_note: HashMap<&str, Vec<&Heading>> = HashMap::new();
     for heading in headings {
@@ -5212,7 +5220,7 @@ pub fn resolve_note_wikilink(
             }
         })
         .collect();
-    let lookup = WikilinkLookup::build(&contexts);
+    let lookup = WikilinkLookup::build(&contexts, Some(vault_root));
     let (note_target, anchor) = target
         .split_once('#')
         .map_or((target, None), |(note, heading)| (note, Some(heading)));
@@ -5240,6 +5248,7 @@ pub fn resolve_note_wikilink(
     }
     let resolved = lookup.resolve_wikilink(
         &RawWikilink {
+            markdown_url: false,
             target: note_target.to_string(),
             heading_anchor: anchor.map(str::to_string),
             display: None,
@@ -5309,6 +5318,78 @@ fn normalize_relative(source_folder: &str, key: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// Rebase only paths proven to belong to the originating vault. Component
+/// comparison prevents `/vault-other` prefix collisions; parent components and
+/// non-native separators are refused rather than guessed or basename-matched.
+fn normalize_absolute_target(target: &str, vault_root: Option<&Path>) -> Option<String> {
+    use std::path::Component;
+    let root = vault_root?;
+    let path = Path::new(target);
+    if !root.is_absolute() || !path.is_absolute() || target.contains('\\') {
+        return None;
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return None;
+    }
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    Some(relative.to_str()?.replace('\\', "/"))
+}
+
+/// Markdown link paths are URLs, unlike literal `[[wikilink]]` names. Decode
+/// once, keeping the original RawWikilink target untouched for diagnostics.
+/// Escaped separators, traversal and a second encoded layer are rejected.
+fn normalize_markdown_target(
+    target: &str,
+    folder: &str,
+    vault_root: Option<&Path>,
+) -> Option<String> {
+    let mut decoded = Vec::with_capacity(target.len());
+    let bytes = target.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = (bytes.get(index + 1).copied()? as char).to_digit(16)?;
+            let lo = (bytes.get(index + 2).copied()? as char).to_digit(16)?;
+            let byte = (hi * 16 + lo) as u8;
+            if matches!(byte, b'/' | b'\\' | b'%') || byte.is_ascii_control() {
+                return None;
+            }
+            decoded.push(byte);
+            index += 3;
+        } else {
+            if bytes[index].is_ascii_control() || bytes[index] == b'\\' {
+                return None;
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    if decoded
+        .split('/')
+        .zip(target.split('/'))
+        .any(|(decoded_part, original)| {
+            original.contains('%') && matches!(decoded_part, "." | "..")
+        })
+    {
+        return None;
+    }
+    if decoded.contains("://") || decoded.starts_with("//") {
+        return None;
+    }
+    if Path::new(&decoded).is_absolute() {
+        normalize_absolute_target(&decoded, vault_root)
+    } else {
+        normalize_relative(folder, &decoded)
+    }
+}
+
 /// Split a vault-relative folder into lowercased path components.
 ///
 /// Empty components are dropped so `""`, `"/"` and `"a//b"` normalise the way
@@ -5359,6 +5440,7 @@ fn wikilink_target_affected(
     raw_target: &str,
     source_path: &str,
     affected_names: &HashSet<String>,
+    vault_root: Option<&Path>,
 ) -> bool {
     let target = wikilink_note_target(raw_target)
         .trim()
@@ -5369,7 +5451,16 @@ fn wikilink_target_affected(
     // Join is insufficient for ../target: identities contain target, not
     // sub/../target. Use the same lexical normalization as note resolution.
     let relative = normalize_relative(folder, &target);
+    // Persisted diagnostics intentionally keep original syntax. Conservatively
+    // revisit both literal and URL identities; reparsing the source selects the
+    // actual syntax before any edge is written.
+    let url_target =
+        normalize_markdown_target(wikilink_note_target(raw_target), folder, vault_root);
+    let root_url_target =
+        normalize_markdown_target(wikilink_note_target(raw_target), "", vault_root);
     affected_names.contains(&target)
+        || url_target.is_some_and(|path| affected_names.contains(&path.to_lowercase()))
+        || root_url_target.is_some_and(|path| affected_names.contains(&path.to_lowercase()))
         || relative
             .as_ref()
             .is_some_and(|path| affected_names.contains(path))
@@ -5390,6 +5481,8 @@ struct WikilinkLookup<'a> {
     /// Path key → note_uid. Path keys are lowercased, with optional ".md"
     /// stripped, normalised to forward slashes.
     by_path: HashMap<String, &'a str>,
+    ambiguous_paths: HashSet<String>,
+    vault_root: Option<PathBuf>,
     /// Lowercased title → list of note_uids that have that title.
     by_title: HashMap<String, Vec<&'a str>>,
     /// Lowercased alias → list of note_uids that declare that alias.
@@ -5416,8 +5509,9 @@ struct WikilinkLookup<'a> {
 }
 
 impl<'a> WikilinkLookup<'a> {
-    fn build(notes: &'a [NoteContext]) -> Self {
+    fn build(notes: &'a [NoteContext], vault_root: Option<&Path>) -> Self {
         let mut by_path: HashMap<String, &'a str> = HashMap::new();
+        let mut ambiguous_paths = HashSet::new();
         let mut by_title: HashMap<String, Vec<&'a str>> = HashMap::new();
         let mut by_alias: HashMap<String, Vec<&'a str>> = HashMap::new();
         let mut by_stem: HashMap<String, Vec<&'a str>> = HashMap::new();
@@ -5431,11 +5525,19 @@ impl<'a> WikilinkLookup<'a> {
             known_uids.insert(note.note_uid.as_str());
             // Path forms: "folder/note", "folder/note.md", normalised lowercase.
             let path_lc = note.rel_path.replace('\\', "/").to_lowercase();
-            by_path.insert(path_lc.clone(), note.note_uid.as_str());
+            let mut insert_path = |key: String| {
+                if by_path
+                    .insert(key.clone(), note.note_uid.as_str())
+                    .is_some_and(|previous| previous != note.note_uid)
+                {
+                    ambiguous_paths.insert(key);
+                }
+            };
+            insert_path(path_lc.clone());
             if let Some(stripped) = path_lc.strip_suffix(".md") {
-                by_path.insert(stripped.to_string(), note.note_uid.as_str());
+                insert_path(stripped.to_string());
             } else if let Some(stripped) = path_lc.strip_suffix(".markdown") {
-                by_path.insert(stripped.to_string(), note.note_uid.as_str());
+                insert_path(stripped.to_string());
             }
 
             by_title
@@ -5483,6 +5585,8 @@ impl<'a> WikilinkLookup<'a> {
 
         Self {
             by_path,
+            ambiguous_paths,
+            vault_root: vault_root.map(Path::to_path_buf),
             by_title,
             by_alias,
             by_stem,
@@ -5555,6 +5659,12 @@ impl<'a> WikilinkLookup<'a> {
     /// `_Overview.md`. 38 real hub links were reported broken.
     fn resolve(&self, target: &str, source_folder: &str) -> ResolveOutcome {
         let key = target.trim().replace('\\', "/").to_lowercase();
+        if Path::new(target).is_absolute() {
+            return self.resolve_exact_path(normalize_absolute_target(
+                target,
+                self.vault_root.as_deref(),
+            ));
+        }
         // nw-166: markdown links keep their extension (`[x](codebase-recon.md)`),
         // but `by_path` is built from extension-stripped paths and the stem/title
         // tiers never carry one. Without this, a same-folder markdown link
@@ -5844,8 +5954,51 @@ impl<'a> WikilinkLookup<'a> {
         best.map(|uid| uid.to_string())
     }
 
+    fn resolve_exact_path(&self, path: Option<String>) -> ResolveOutcome {
+        let Some(path) = path else {
+            return ResolveOutcome::Unresolved;
+        };
+        let key = path.to_lowercase();
+        if self.ambiguous_paths.contains(&key) {
+            return ResolveOutcome::Unresolved;
+        }
+        match self.by_path.get(&key) {
+            Some(uid) => ResolveOutcome::Resolved(vec![ResolveCandidate {
+                note_uid: (*uid).to_string(),
+                confidence: 1.0,
+            }]),
+            None => ResolveOutcome::Unresolved,
+        }
+    }
+
     fn resolve_wikilink(&self, link: &RawWikilink, folder: &str) -> ResolvedWikilink {
-        let ResolveOutcome::Resolved(candidates) = self.resolve(&link.target, folder) else {
+        let outcome = if link.markdown_url {
+            // Preserve the existing explicit vault-relative path tier before
+            // source-relative lookup. Both candidates must name exact paths;
+            // URL normalization refusal never falls through to a basename.
+            let root_path = normalize_markdown_target(&link.target, "", self.vault_root.as_deref());
+            let source_path =
+                normalize_markdown_target(&link.target, folder, self.vault_root.as_deref());
+            let (first, second) = if link.target.contains('/') {
+                (root_path, source_path)
+            } else {
+                (source_path, root_path)
+            };
+            if first
+                .as_ref()
+                .is_some_and(|path| self.ambiguous_paths.contains(&path.to_lowercase()))
+            {
+                ResolveOutcome::Unresolved
+            } else {
+                match self.resolve_exact_path(first) {
+                    resolved @ ResolveOutcome::Resolved(_) => resolved,
+                    ResolveOutcome::Unresolved => self.resolve_exact_path(second),
+                }
+            }
+        } else {
+            self.resolve(&link.target, folder)
+        };
+        let ResolveOutcome::Resolved(candidates) = outcome else {
             return ResolvedWikilink {
                 targets: Vec::new(),
                 unresolved: true,
@@ -6344,6 +6497,243 @@ mod tests {
             fs::write(&path, content).unwrap();
         }
         (dir, root)
+    }
+
+    #[test]
+    fn markdown_url_paths_resolve_exact_uids_and_preserve_literal_percent_wikilinks() {
+        let (_dir, root) = make_vault(&[
+            ("source.md", "# Source\n"),
+            ("Target Space.md", "# Target Space\n"),
+            (
+                "nested/source.md",
+                "# Nested Source\n\n[up](../Target%20Space.md)\n[root](nested/Repeat.md)\n",
+            ),
+            ("Café.md", "# Café\n"),
+            ("Repeat.md", "# Root Repeat\n"),
+            ("nested/Repeat.md", "# Nested Repeat\n"),
+            ("Literal%20Name.md", "# Literal\n"),
+            ("Heading Note.md", "# Heading Note\n\n## Specific\n"),
+            ("Block.md", "# Block\n\nparagraph ^anchor\n"),
+        ]);
+        let root = fs::canonicalize(root).unwrap();
+        let absolute = root.join("nested/Repeat.md");
+        fs::write(root.join("source.md"), format!(
+            "# Source\n\n[space](Target%20Space.md)\n[unicode](Caf%C3%A9.md)\n[absolute]({})\n[[Literal%20Name]]\n[heading](Heading%20Note.md#specific)\n[[Block#^anchor]]\n", absolute.display()
+        )).unwrap();
+        let (_, store) = index_markdown_directory_in_memory(&root, "owned", "v").unwrap();
+        let notes = store.list_notes(None).unwrap();
+        let uid = |path: &str| {
+            notes
+                .iter()
+                .find(|note| note.file_path == path)
+                .unwrap()
+                .uid
+                .clone()
+        };
+        let vault = store.list_vaults(None).unwrap().remove(0);
+        let edges = store
+            .wikilink_edges_for_vault(&vault.uid, "WIKILINK_TO_NOTE", "dst:Note")
+            .unwrap();
+        let targets: HashSet<_> = edges.iter().map(|edge| edge.1.clone()).collect();
+        assert_eq!(
+            targets,
+            HashSet::from([
+                uid("Target Space.md"),
+                uid("Café.md"),
+                uid("nested/Repeat.md"),
+                uid("Literal%20Name.md"),
+                uid("Block.md"),
+            ])
+        );
+        assert!(edges.iter().any(|edge| edge.4 == "Target%20Space.md"));
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.4 == absolute.to_string_lossy())
+        );
+        assert!(edges.iter().all(|edge| edge.2 == 1.0));
+        let headings = store.list_headings_by_vault(&vault.uid).unwrap();
+        let expected = headings
+            .iter()
+            .find(|heading| {
+                heading.note_uid == uid("Heading Note.md") && heading.slug == "specific"
+            })
+            .unwrap();
+        let heading_edges = store
+            .wikilink_edges_for_vault(&vault.uid, "WIKILINK_TO_HEADING", "dst:Heading")
+            .unwrap();
+        assert_eq!(heading_edges.len(), 1);
+        assert_eq!(heading_edges[0].1, expected.uid);
+        assert!(store.all_unresolved_wikilinks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn markdown_url_paths_refuse_unsafe_and_missing_targets_without_basename_fallback() {
+        let (_dir, root) = make_vault(&[
+            ("source.md", "# Source\n"),
+            ("Target.md", "# Target\n"),
+            ("Target Space.md", "# Space\n"),
+        ]);
+        let root = fs::canonicalize(root).unwrap();
+        let invalid = [
+            "missing/Target.md".to_string(),
+            "Target%2520Space.md".to_string(),
+            "Target%GG.md".to_string(),
+            "%2e%2e/Target.md".to_string(),
+            "nested%2fTarget.md".to_string(),
+            "nested%5cTarget.md".to_string(),
+            "Target%00.md".to_string(),
+            "Target%FF.md".to_string(),
+            "../../Target.md".to_string(),
+            format!("{}-other/Target.md", root.display()),
+            format!("{}/../Target.md", root.display()),
+        ];
+        fs::write(
+            root.join("source.md"),
+            format!(
+                "# Source\n\n{}",
+                invalid
+                    .iter()
+                    .enumerate()
+                    .map(|(i, target)| format!("[bad{i}]({target})\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let (_, store) = index_markdown_directory_in_memory(&root, "owned", "v").unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 0);
+        let unresolved = store.all_unresolved_wikilinks().unwrap();
+        assert_eq!(unresolved.len(), invalid.len());
+        let targets: HashSet<_> = unresolved.iter().map(|row| row.4.clone()).collect();
+        for target in invalid {
+            assert!(targets.contains(&target), "missing diagnostic {target}");
+        }
+    }
+
+    #[test]
+    fn markdown_url_path_identity_refuses_case_collisions() {
+        let (_dir, root) = make_vault(&[("one.md", "# One\n"), ("two.md", "# Two\n")]);
+        let (_, store) = index_markdown_directory_in_memory(&root, "owned", "v").unwrap();
+        let notes = store.list_notes(None).unwrap();
+        let mut first = note_context_from_stored(&notes[0], Vec::new());
+        let mut second = note_context_from_stored(&notes[1], Vec::new());
+        first.rel_path = "Case.md".into();
+        second.rel_path = "case.md".into();
+        let contexts = [first, second];
+        let lookup = WikilinkLookup::build(&contexts, Some(&root));
+        assert!(matches!(
+            lookup.resolve_exact_path(Some("Case.md".into())),
+            ResolveOutcome::Unresolved
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn markdown_absolute_url_cannot_follow_an_outside_vault_symlink() {
+        let (dir, root) = make_vault(&[("source.md", "# Source\n"), ("Target.md", "# Local\n")]);
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("Target.md"), "# Outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("jump")).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        fs::write(
+            root.join("source.md"),
+            format!("# Source\n\n[escape]({}/jump/Target.md)\n", root.display()),
+        )
+        .unwrap();
+        let (_, store) = index_markdown_directory_in_memory(&root, "owned", "v").unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 0);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 1);
+        assert!(
+            store
+                .list_notes(None)
+                .unwrap()
+                .iter()
+                .all(|note| note.title != "Outside")
+        );
+    }
+
+    #[test]
+    fn markdown_url_relink_tracks_unchanged_sources_after_target_add_delete_and_recreation() {
+        let (_dir, root) = make_vault(&[("source.md", "# Source\n")]);
+        let root = fs::canonicalize(root).unwrap();
+        fs::write(
+            root.join("source.md"),
+            format!(
+                "# Source\n\n[space](Target%20Space.md)\n[absolute]({}/nested/Repeat.md)\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        let store = GraphStore::in_memory().unwrap();
+        let db_path = root.join("unused.lbug");
+        index_markdown_directory_with_store(&store, &root, &db_path, "owned", "v", &[]).unwrap();
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 2);
+        // Exclude the unchanged source from the since scan. Only dependency
+        // closure may bring it back when an encoded/absolute target appears.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let since = std::time::SystemTime::now();
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("Target Space.md"), "# Space\n").unwrap();
+        fs::write(root.join("nested/Repeat.md"), "# Repeat\n").unwrap();
+        index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            since,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 2);
+        assert!(store.all_unresolved_wikilinks().unwrap().is_empty());
+        let vault = store.list_vaults(None).unwrap().remove(0);
+        let expected: HashSet<_> = store
+            .list_notes(None)
+            .unwrap()
+            .iter()
+            .filter(|note| note.file_path != "source.md")
+            .map(|note| note.uid.clone())
+            .collect();
+        let actual: HashSet<_> = store
+            .wikilink_edges_for_vault(&vault.uid, "WIKILINK_TO_NOTE", "dst:Note")
+            .unwrap()
+            .iter()
+            .map(|edge| edge.1.clone())
+            .collect();
+        assert_eq!(actual, expected);
+        fs::rename(root.join("Target Space.md"), root.join("Renamed.md")).unwrap();
+        fs::remove_file(root.join("nested/Repeat.md")).unwrap();
+        index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            since,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(store.count_wikilink_edges().unwrap(), 0);
+        assert_eq!(store.all_unresolved_wikilinks().unwrap().len(), 2);
+        fs::rename(root.join("Renamed.md"), root.join("Target Space.md")).unwrap();
+        fs::write(root.join("nested/Repeat.md"), "# Repeat\n").unwrap();
+        index_markdown_directory_since_with_store_and_ignore(
+            &store,
+            &root,
+            "owned",
+            "v",
+            since,
+            &[],
+        )
+        .unwrap();
+        let actual: HashSet<_> = store
+            .wikilink_edges_for_vault(&vault.uid, "WIKILINK_TO_NOTE", "dst:Note")
+            .unwrap()
+            .iter()
+            .map(|edge| edge.1.clone())
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(store.all_unresolved_wikilinks().unwrap().is_empty());
     }
 
     /// nw-339 does NOT reproduce, and the fallback it asks for would be actively

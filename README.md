@@ -190,7 +190,7 @@ notes below before using an older database with a new binary.
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
 - For a compatible database, run `nestweaver stale-check --db <db>`. Current
-  source uses resolver generation **18**; published 12.2.3 uses **17**. If your
+  source uses resolver generation **19**; published 12.2.3 uses **17**. If your
   binary reports a generation-stale graph, run
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
@@ -202,12 +202,24 @@ notes below before using an older database with a new binary.
   statement or clause, restoring valid calls after those scopes end. Cached
   parses are invalidated to discard the old lexical lifetimes; existing graphs
   need the forced repository index above. Resolution-dependency format is unchanged.
-- Current source generation 18 and parsed cache 12 invalidate Scala parses from
+- Generation 18 and parsed cache 12 invalidate Scala parses from
   before the grammar 0.26.3 update, which recovers declarations such as local
   case classes and Scala 2 `export` identifiers. After upgrading to a release
   containing this change, force re-index each repository using the command above.
   An unchanged incremental run does not repair an older graph; `stale-check`
   continues to report it as outdated until the forced index succeeds.
+- Current source generation 19 and parsed cache 13 additionally repair PHP function
+  resolution by namespace across directories, including `use function` aliases
+  and duplicate refusal. Existing graphs need the forced repository index above.
+  PHP changes conservatively re-resolve repository PHP callers because a new
+  declaration can satisfy a previously unresolved call or create ambiguity.
+  Ordinary index/watcher scans reuse valid cached parses; Git/server incremental
+  repair reparses PHP peers. No-change runs remain no-ops.
+- Markdown derivation version 3 repairs percent-encoded Markdown URL paths and
+  proven absolute in-vault note paths. Eligible vaults disclose stale derivation
+  until re-derived; run `nestweaver brain refresh <vault> --db <db>` after upgrading.
+  This is separate from repository resolver generation; literal wikilinks keep
+  their existing spelling semantics.
 - The current source also infers method receivers from typed Go slice range
   elements, including qualified types and exact factory returns. Generation 14
   requires the same forced repository re-index to add the missing call edges;

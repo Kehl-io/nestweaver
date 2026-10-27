@@ -45,7 +45,13 @@
 
 ; Function call expressions
 (function_call_expression
-  function: (name) @name) @reference.call
+  function: (name) @name) @reference.call @reference.php_function
+
+(function_call_expression
+  function: (qualified_name) @name) @reference.call @reference.php_function
+
+(function_call_expression
+  function: (relative_name) @name) @reference.call @reference.php_function
 
 ; Member call expressions
 (member_call_expression
