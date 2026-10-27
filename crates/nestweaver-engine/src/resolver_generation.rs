@@ -371,7 +371,10 @@ use std::path::Path;
 /// 17 — Go initializer and case/default declarations end at their implicit
 ///     statement/clause block. Parsed cache 11 invalidates overlong lifetimes;
 ///     existing graphs need one force reindex to recover suppressed CALLS edges.
-pub const RESOLVER_GENERATION: u32 = 17;
+/// 18 — Scala grammar 0.26.3 recovers declarations such as case-clause local
+///     classes and Scala 2 export identifiers. Parsed cache 12 discards old
+///     parser facts; force reindex existing repositories to publish the new symbols.
+pub const RESOLVER_GENERATION: u32 = 18;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would
