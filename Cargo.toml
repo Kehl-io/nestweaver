@@ -53,7 +53,7 @@ tonic-build = "0.14"
 tonic-prost-build = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-jsonschema = { version = "0.59", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 blake3 = "1"
 sha2 = "0.11"
 hmac = "0.13"
@@ -72,7 +72,7 @@ memmap2 = "0.9"
 dirs = "7"
 rmp-serde = "1"
 bumpalo = "3"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 tokio-rustls = "0.26"
 async-stream = "0.3"
 futures = "0.3"

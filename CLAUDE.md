@@ -567,13 +567,13 @@ federation          (leaf: schema + proto only)
 
 ### Current resolver upgrade
 
-Resolver generation 17 confines Go initializer and case-clause bindings to their
-statement or clause so valid package and receiver calls recover after those scopes
-end. It retains generation 16's factory-call origins and package-member recovery.
-Existing graphs can retain missing CALLS edges: run
+Resolver generation 18 and parsed-cache version 12 invalidate facts from before
+Scala grammar 0.26.3, which recovers declarations such as case-clause local classes
+and Scala 2 `export` identifiers. Existing graphs may lack those symbols: run
 `nestweaver index --repo <path> --force` once per repository after upgrading.
-Parsed-cache version 11 invalidates old lexical lifetimes for unchanged files;
-the resolution-dependency sidecar format is unchanged.
+Rejecting an old parse cache does not repair an unchanged, already stored graph.
+Generation 17's Go initializer/case lifetimes and earlier receiver/package fixes
+remain included; the resolution-dependency sidecar format is unchanged.
 
 ## Conventions
 
