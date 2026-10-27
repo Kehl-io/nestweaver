@@ -189,8 +189,9 @@ notes below before using an older database with a new binary.
 - A database from before LadybugDB 0.21 needs a **publication rebuild**, not
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
-- For a compatible database, run `nestweaver stale-check --db <db>`. The
-  current resolver generation is **17**; any other generation requires
+- For a compatible database, run `nestweaver stale-check --db <db>`. Current
+  source uses resolver generation **18**; published 12.2.3 uses **17**. If your
+  binary reports a generation-stale graph, run
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - Generation 16 preserves declaring-package origin through Go factory-call
@@ -201,6 +202,12 @@ notes below before using an older database with a new binary.
   statement or clause, restoring valid calls after those scopes end. Cached
   parses are invalidated to discard the old lexical lifetimes; existing graphs
   need the forced repository index above. Resolution-dependency format is unchanged.
+- Current source generation 18 and parsed cache 12 invalidate Scala parses from
+  before the grammar 0.26.3 update, which recovers declarations such as local
+  case classes and Scala 2 `export` identifiers. After upgrading to a release
+  containing this change, force re-index each repository using the command above.
+  An unchanged incremental run does not repair an older graph; `stale-check`
+  continues to report it as outdated until the forced index succeeds.
 - The current source also infers method receivers from typed Go slice range
   elements, including qualified types and exact factory returns. Generation 14
   requires the same forced repository re-index to add the missing call edges;

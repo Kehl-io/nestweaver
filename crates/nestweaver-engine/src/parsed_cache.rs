@@ -63,7 +63,9 @@ use serde::{Deserialize, Serialize};
 /// 9 — scoped Go bindings and pointer/qualified composite literal evidence.
 /// 10 — canonical single Go result types and complete Go declaration shadow names.
 /// 11 — Go initializer and case/default bindings retain their implicit block lifetime.
-const CACHE_VERSION: u32 = 11;
+/// 12 — tree-sitter-scala 0.26.3 recovers case-clause declarations and calls
+///      previously missed by 0.26.2, including local case classes.
+const CACHE_VERSION: u32 = 12;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -570,6 +572,256 @@ mod tests {
         assert_eq!(
             result.type_info.as_ref().unwrap().return_type.as_deref(),
             Some("[]Store")
+        );
+    }
+
+    const SCALA_CASE_CLAUSE_SOURCE: &str = "object Main {\n def helper(x: Int): Int = x\n def run(x: Int): Int = x match {\n  case 1 =>\n   case class Local(value: Int)\n   helper(Local(1).value)\n  case _ => helper(0)\n }\n}\n";
+
+    fn legacy_scala_case_clause_parse() -> (String, CachedParseResult) {
+        let parsed =
+            nestweaver_parser::parse_source(Path::new("Main.scala"), SCALA_CASE_CLAUSE_SOURCE)
+                .unwrap();
+        assert!(!parsed.has_syntax_errors);
+        let mut stale = CachedParseResult {
+            symbols: parsed.symbols,
+            references: parsed.references,
+            type_bindings: parsed.type_bindings,
+        };
+        let local = stale.symbols.iter().find(|s| s.name == "Local").unwrap();
+        assert_eq!(local.kind, SymbolKind::Class);
+        assert_eq!(local.start_line, 5);
+        assert_eq!(stale.symbols.len(), 4);
+        // Model the observed 0.26.2 parse, not an empty-cache miss: Main,
+        // helper, run and their type facts survive under the SAME content key.
+        stale.symbols.retain(|s| s.name != "Local");
+        assert_eq!(
+            stale
+                .symbols
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Main", "helper", "run"]
+        );
+        assert_eq!(
+            stale
+                .references
+                .iter()
+                .filter(|r| r.start_line == 6)
+                .count(),
+            2
+        );
+        stale.references.retain(|r| r.start_line != 6);
+        assert!(stale.references.iter().any(|r| r.name == "helper"));
+        assert!(!stale.type_bindings.is_empty());
+        let hash = blake3::hash(SCALA_CASE_CLAUSE_SOURCE.as_bytes())
+            .to_hex()
+            .to_string();
+        (hash, stale)
+    }
+
+    fn seed_scala_version11_cache(path: &Path, hash: &str, stale: &CachedParseResult) {
+        let file = ParsedCacheFile {
+            version: 11,
+            entries: HashMap::from([(hash.to_string(), stale.clone())]),
+        };
+        std::fs::write(path, rmp_serde::to_vec_named(&file).unwrap()).unwrap();
+        let record = LogRecord {
+            version: 11,
+            hash: std::borrow::Cow::Borrowed(hash),
+            entry: std::borrow::Cow::Borrowed(stale),
+        };
+        let encoded = rmp_serde::to_vec_named(&record).unwrap();
+        let mut log = (encoded.len() as u32).to_le_bytes().to_vec();
+        log.extend(encoded);
+        std::fs::write(log_path(path), log).unwrap();
+    }
+
+    #[test]
+    fn scala_version11_base_and_append_log_are_independently_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (hash, stale) = legacy_scala_case_clause_parse();
+        for base_only in [true, false] {
+            let path = tmp
+                .path()
+                .join(if base_only { "base.bin" } else { "append.bin" });
+            seed_scala_version11_cache(&path, &hash, &stale);
+            std::fs::remove_file(if base_only {
+                log_path(&path)
+            } else {
+                path.clone()
+            })
+            .unwrap();
+            assert!(
+                ParsedCache::load(&path).get(&hash).is_none(),
+                "version-11 facts must be rejected from {}",
+                if base_only {
+                    "the base"
+                } else {
+                    "the append log alone"
+                }
+            );
+            let mut reader = ParsedCache::empty();
+            reader.refresh(&path);
+            assert!(
+                reader.get(&hash).is_none(),
+                "refresh must reject old facts too"
+            );
+        }
+    }
+
+    #[test]
+    fn scala_case_clause_cache_upgrade_and_force_reindex_repair_stored_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let source_path = repo.join("Main.scala");
+        std::fs::write(&source_path, SCALA_CASE_CLAUSE_SOURCE).unwrap();
+        let (hash, stale) = legacy_scala_case_clause_parse();
+        let db = tmp.path().join("graph.lbug");
+        let path = crate::sidecar_path(&db, ".parsed_cache.bin");
+        seed_scala_version11_cache(&path, &hash, &stale);
+        let url = "https://example.test/scala-case-cache";
+        let repo_uid = nestweaver_schema::repo_uid("review", url);
+        let local_uid = nestweaver_schema::symbol_uid(&repo_uid, "Main.scala", "Local", 5);
+        let file_uid = nestweaver_schema::file_uid(&repo_uid, "Main.scala");
+        let index = |force| {
+            crate::index::index_directory_with_options(
+                &repo,
+                &db,
+                "review",
+                url,
+                "unchanged",
+                force,
+                None,
+            )
+            .unwrap();
+        };
+        let graph = |expect_local| {
+            let store = nestweaver_store::GraphStore::open(&db).unwrap();
+            let symbols = store.list_all_symbols().unwrap();
+            assert_eq!(symbols.len(), if expect_local { 4 } else { 3 });
+            let locals: Vec<_> = symbols.iter().filter(|s| s.name == "Local").collect();
+            assert_eq!(locals.len(), usize::from(expect_local));
+            if expect_local {
+                assert_eq!(locals[0].uid, local_uid);
+                assert_eq!(locals[0].kind, SymbolKind::Class);
+                assert_eq!(locals[0].file_path, "Main.scala");
+                assert_eq!((locals[0].start_line, locals[0].end_line), (5, 5));
+            }
+            let edges = store.load_typed_edges().unwrap();
+            let run_uid = nestweaver_schema::symbol_uid(&repo_uid, "Main.scala", "run", 3);
+            let helper_uid = nestweaver_schema::symbol_uid(&repo_uid, "Main.scala", "helper", 2);
+            assert!(
+                edges
+                    .iter()
+                    .any(|e| e.0 == run_uid && e.1 == helper_uid && e.2 == "CALLS")
+            );
+            assert_eq!(
+                edges
+                    .iter()
+                    .filter(|e| e.0 == file_uid && e.1 == local_uid && e.2 == "DEFINES")
+                    .count(),
+                usize::from(expect_local),
+                "Local must have its exact file ownership edge only when present"
+            );
+            let mut symbols: Vec<_> = symbols.into_iter().map(|s| (s.uid, s.name)).collect();
+            symbols.sort();
+            let mut edges: Vec<_> = edges
+                .into_iter()
+                .map(|e| (e.0, e.1, e.2, e.3.to_bits(), e.4))
+                .collect();
+            edges.sort();
+            (symbols, edges)
+        };
+        // No filemeta exists yet. A real NONFORCED index must reject the
+        // nonempty v11 base/log and parse these unchanged bytes with 0.26.3.
+        index(false);
+        assert_eq!(
+            std::fs::read_to_string(&source_path).unwrap(),
+            SCALA_CASE_CLAUSE_SOURCE
+        );
+        let rewritten: ParsedCacheFile =
+            rmp_serde::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rewritten.version, CACHE_VERSION);
+        assert!(
+            rewritten.entries[&hash]
+                .symbols
+                .iter()
+                .any(|s| s.name == "Local")
+        );
+        let expected = graph(true);
+        assert_eq!(crate::resolver_generation::RESOLVER_GENERATION, 18);
+        assert_eq!(
+            crate::resolver_generation::load(&db).generation_for(&repo_uid),
+            18
+        );
+        index(false);
+        assert_eq!(
+            graph(true),
+            expected,
+            "warm same-source index keeps the new facts"
+        );
+
+        // Simulate a stored generation-17 graph: deleting only Local also
+        // removes its incident edges while preserving Main/helper/run and
+        // the filemeta hit. Cache invalidation alone is not graph migration.
+        {
+            let store = nestweaver_store::GraphStore::open(&db).unwrap();
+            let conn = store.begin_transaction().unwrap();
+            {
+                let mut statement = conn
+                    .prepare("MATCH (s:Symbol {uid: $uid}) DETACH DELETE s")
+                    .unwrap();
+                conn.execute(&mut statement, vec![("uid", local_uid.clone().into())])
+                    .unwrap();
+            }
+            store.commit_transaction(&conn).unwrap();
+        }
+        let mut generations = crate::resolver_generation::load(&db);
+        generations.repos.insert(repo_uid.clone(), 17);
+        std::fs::write(
+            crate::sidecar_path(&db, crate::resolver_generation::RESOLVER_GENERATION_SIDECAR),
+            serde_json::to_vec(&generations).unwrap(),
+        )
+        .unwrap();
+        seed_scala_version11_cache(&path, &hash, &stale);
+        let missing = graph(false);
+        index(false);
+        assert_eq!(
+            graph(false),
+            missing,
+            "unchanged warm no-op must not claim a repair"
+        );
+        assert_eq!(
+            crate::resolver_generation::load(&db).generation_for(&repo_uid),
+            17
+        );
+        assert_eq!(
+            crate::resolver_generation::load(&db).stale_repos([repo_uid.as_str()]),
+            vec![repo_uid.clone()],
+            "the unchanged generation-17 graph must still be disclosed as stale"
+        );
+        index(true);
+        assert_eq!(
+            graph(true),
+            expected,
+            "force reindex restores exact Local symbol/edges"
+        );
+        assert_eq!(
+            crate::resolver_generation::load(&db).generation_for(&repo_uid),
+            18
+        );
+        assert!(
+            crate::resolver_generation::load(&db)
+                .stale_repos([repo_uid.as_str()])
+                .is_empty(),
+            "successful force reindex must clear generation staleness"
+        );
+        index(false);
+        assert_eq!(
+            graph(true),
+            expected,
+            "post-upgrade warm facts remain durable"
         );
     }
 
