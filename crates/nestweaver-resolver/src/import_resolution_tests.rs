@@ -219,6 +219,43 @@ fn php_chained_member_calls_never_borrow_free_function_homonyms() {
     }
 }
 
+#[test]
+fn php_constructor_and_parameter_receivers_keep_unscoped_type_evidence() {
+    let source = "<?php\nclass Earlier { public function deliver() {} }\nclass Intended { public function deliver() {} }\nfunction constructed() { $bound = new Intended(); $bound->deliver(); }\nfunction parameter(Intended $bound) { $bound->deliver(); }\nfunction deliver() {}\n";
+    let (files, edges) = resolve_typed(&[("receivers.php", source)], Language::Php);
+    let expected = BTreeSet::from([
+        (
+            symbol_uid(REPO, "receivers.php", "constructed", 4),
+            symbol_uid(REPO, "receivers.php", "Intended", 3),
+        ),
+        (
+            symbol_uid(REPO, "receivers.php", "constructed", 4),
+            symbol_uid(REPO, "receivers.php", "deliver", 3),
+        ),
+        (
+            symbol_uid(REPO, "receivers.php", "parameter", 5),
+            symbol_uid(REPO, "receivers.php", "deliver", 3),
+        ),
+    ]);
+    let actual: BTreeSet<_> = edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::Calls && e.confidence > 0.0)
+        .map(|e| (e.source_uid.clone(), e.target_uid.clone()))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "must not borrow Earlier::deliver or global deliver"
+    );
+    assert!(
+        files[0]
+            .2
+            .iter()
+            .filter(|r| r.kind == nestweaver_parser::ReferenceKind::Call
+                && (r.receiver.is_some() || r.name == "Intended"))
+            .all(|r| r.scope.is_none())
+    );
+}
+
 fn resolve(
     inputs: &[(&str, &str)],
     language: Language,

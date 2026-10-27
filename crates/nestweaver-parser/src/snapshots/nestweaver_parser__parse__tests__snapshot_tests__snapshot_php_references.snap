@@ -51,13 +51,7 @@ expression: "parsed_references(\"simple.php\", &source)"
   start_line: 21
   context: class SimpleGreeter implements GreeterInterface
   receiver: ~
-- scope:
-    start: 0
-    end: 750
-    position: 397
-    initialized_at: 0
-    hoisted_var: false
-  name: log
+- name: log
   kind: Call
   start_line: 27
   context: "$this->log(\"Greeting $name\");"
@@ -84,24 +78,12 @@ expression: "parsed_references(\"simple.php\", &source)"
   start_line: 33
   context: return ucfirst($name);
   receiver: ~
-- scope:
-    start: 0
-    end: 750
-    position: 691
-    initialized_at: 0
-    hoisted_var: false
-  name: SimpleGreeter
+- name: SimpleGreeter
   kind: Call
   start_line: 46
   context: $greeter = new SimpleGreeter()
   receiver: ~
-- scope:
-    start: 0
-    end: 750
-    position: 723
-    initialized_at: 0
-    hoisted_var: false
-  name: greet
+- name: greet
   kind: Call
   start_line: 47
   context: return $greeter->greet($input);

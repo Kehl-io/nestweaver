@@ -220,19 +220,48 @@ mod tests {
         let source = "<?php\nfunction caller() { factory()->run(); factory()->factory(); }\n";
         let parsed = parse_source(Path::new("chains.php"), source).unwrap();
         assert!(!parsed.has_syntax_errors);
+        // The collision witness is the actual AST, independently of synthetic
+        // reference scope. Member calls intentionally have no lexical scope.
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP_ONLY.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
         for (expression, method) in [
             ("factory()->run()", "run"),
             ("factory()->factory()", "factory"),
         ] {
             let position = source.find(expression).unwrap();
+            let mut nodes = vec![tree.root_node()];
+            let mut collision_kinds = std::collections::HashSet::new();
+            while let Some(node) = nodes.pop() {
+                if node.start_byte() == position {
+                    collision_kinds.insert(node.kind());
+                }
+                let mut cursor = node.walk();
+                nodes.extend(node.named_children(&mut cursor));
+            }
+            assert!(collision_kinds.contains("function_call_expression"));
+            assert!(collision_kinds.contains("member_call_expression"));
+            let outer: Vec<_> = parsed
+                .references
+                .iter()
+                .filter(|r| {
+                    r.kind == ReferenceKind::Call
+                        && r.name == method
+                        && r.receiver.as_deref() == Some("factory()")
+                })
+                .collect();
+            assert_eq!(outer.len(), 1);
+            assert!(
+                outer[0].scope.is_none(),
+                "member receivers must use ordinary type lookup"
+            );
             let at_position: Vec<_> = parsed
                 .references
                 .iter()
                 .filter(|r| r.scope.is_some_and(|scope| scope.position == position))
                 .collect();
-            assert!(at_position.iter().any(|r| r.kind == ReferenceKind::Call
-                && r.name == method
-                && r.receiver.as_deref() == Some("factory()")));
             assert!(at_position.iter().any(|r| r.kind == ReferenceKind::Call
                 && r.name == "factory"
                 && r.receiver.is_none()));
@@ -244,6 +273,66 @@ mod tests {
             assert_eq!(markers[0].name, "factory");
             assert!(markers[0].receiver.is_none());
         }
+    }
+
+    #[test]
+    fn php_only_named_free_calls_receive_namespace_positions() {
+        let source = "<?php\nclass Carrier { public function method() {} public static function staticMethod() {} }\nfunction named() {}\nfunction caller(Carrier $input) {\n $bound = new Carrier();\n $bound->method();\n Carrier::staticMethod();\n $input?->method();\n named();\n Vendor\\helper();\n namespace\\local();\n}\n";
+        let parsed = parse_source(Path::new("receivers.php"), source).unwrap();
+        assert!(!parsed.has_syntax_errors);
+        for name in ["Carrier", "method", "staticMethod"] {
+            let captures: Vec<_> = parsed
+                .references
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::Call && r.name == name)
+                .collect();
+            assert!(
+                !captures.is_empty(),
+                "missing constructor/member/static control {name}"
+            );
+            assert!(captures.iter().all(|r| r.scope.is_none()));
+        }
+        let free_markers: Vec<_> = parsed
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::PhpFunctionCall)
+            .collect();
+        assert_eq!(free_markers.len(), 3);
+        for marker in free_markers {
+            let scope = marker.scope.unwrap();
+            assert!(
+                parsed
+                    .references
+                    .iter()
+                    .any(|r| r.kind == ReferenceKind::Call
+                        && r.name == marker.name
+                        && r.receiver.is_none()
+                        && r.scope.is_some_and(|s| s.position == scope.position))
+            );
+        }
+        for (var_name, kind) in [
+            ("$bound", crate::AstBindingKind::Constructor),
+            ("$input", crate::AstBindingKind::Parameter),
+        ] {
+            assert!(
+                parsed
+                    .type_bindings
+                    .iter()
+                    .any(|binding| binding.var_name == var_name
+                        && binding.type_name == "Carrier"
+                        && binding.kind == kind
+                        && binding.scope.is_none())
+            );
+        }
+        // Nullsafe member calls are not currently captured by php.scm; any
+        // present receiver capture must nevertheless remain unscoped.
+        assert!(
+            parsed
+                .references
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::Call && r.receiver.is_some())
+                .all(|r| r.scope.is_none())
+        );
     }
 
     #[test]

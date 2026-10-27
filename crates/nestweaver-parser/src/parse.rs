@@ -2462,9 +2462,16 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 };
 
                 references.push(RawReference {
+                    // Only actual named PHP free calls use positional namespace
+                    // identity. Member/static/constructor calls keep their
+                    // baseline unscoped TypeEnvironment lookup: PHP parameters
+                    // and constructor bindings are not lexical declarations.
                     scope: if lang == Language::Php
                         && matches!(kind, ReferenceKind::Call | ReferenceKind::PhpFunctionCall)
-                    {
+                        && node.kind() == "function_call_expression"
+                        && node.child_by_field_name("function").is_some_and(|callee| {
+                            matches!(callee.kind(), "name" | "qualified_name" | "relative_name")
+                        }) {
                         Some(LexicalScope {
                             start: 0,
                             end: source_bytes.len(),
