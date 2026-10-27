@@ -49,7 +49,7 @@ expression: "parsed_references(\"simple.php\", &source)"
 - name: GreeterInterface
   kind: Implements
   start_line: 21
-  context: "class SimpleGreeter implements GreeterInterface"
+  context: class SimpleGreeter implements GreeterInterface
   receiver: ~
 - scope:
     start: 0
@@ -71,7 +71,7 @@ expression: "parsed_references(\"simple.php\", &source)"
   name: ucfirst
   kind: Call
   start_line: 33
-  context: "return ucfirst($name);"
+  context: return ucfirst($name);
   receiver: ~
 - scope:
     start: 0
@@ -82,7 +82,7 @@ expression: "parsed_references(\"simple.php\", &source)"
   name: ucfirst
   kind: PhpFunctionCall
   start_line: 33
-  context: "return ucfirst($name);"
+  context: return ucfirst($name);
   receiver: ~
 - scope:
     start: 0
@@ -93,7 +93,7 @@ expression: "parsed_references(\"simple.php\", &source)"
   name: SimpleGreeter
   kind: Call
   start_line: 46
-  context: "$greeter = new SimpleGreeter()"
+  context: $greeter = new SimpleGreeter()
   receiver: ~
 - scope:
     start: 0
@@ -104,5 +104,5 @@ expression: "parsed_references(\"simple.php\", &source)"
   name: greet
   kind: Call
   start_line: 47
-  context: "return $greeter->greet($input);"
+  context: return $greeter->greet($input);
   receiver: $greeter

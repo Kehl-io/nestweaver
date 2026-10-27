@@ -77,7 +77,7 @@ export function FileDetail({ path }: FileDetailProps) {
         const owner = unavailableSourceOwner(error, path);
         if (!owner) throw error;
         if (repo && owner !== repo) {
-          throw new Error("File ownership is unavailable for the selected repository.");
+          throw new Error("File ownership is unavailable for the selected repository.", { cause: error });
         }
         // Metadata remains useful when the qualified owner's body is remote,
         // unreadable or oversized. CodePreview still renders its typed error.
