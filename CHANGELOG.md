@@ -1,5 +1,13 @@
 # Changelog
 
+## [12.2.4](https://github.com/Kehl-io/nestweaver/compare/v12.2.3...v12.2.4) (2026-10-28)
+
+
+### Bug Fixes
+
+* **engine:** invalidate Scala caches with Rust dependency updates ([#526](https://github.com/Kehl-io/nestweaver/issues/526)) ([9f1aeed](https://github.com/Kehl-io/nestweaver/commit/9f1aeedd5c194bc6e412a9652c107edcd5b087ea))
+* harden indexing, dependencies, and backup recovery ([#528](https://github.com/Kehl-io/nestweaver/issues/528)) ([c538ad0](https://github.com/Kehl-io/nestweaver/commit/c538ad0d1183035a9a3761238e57cf72ff84b605))
+
 ## [12.2.3](https://github.com/Kehl-io/nestweaver/compare/v12.2.2...v12.2.3) (2026-10-27)
 
 
