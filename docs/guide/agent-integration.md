@@ -11,8 +11,10 @@ nestweaver setup --db /absolute/path/to/nestweaver.lbug
 nestweaver brain status --db /absolute/path/to/nestweaver.lbug --json
 ```
 
-For a configured instance, pass its usual `--config /absolute/path/to/instance.toml`
-and `--db` bindings on every command. `setup` supports 16 adapters, but a written
+For a configured instance, keep the same `--db` binding and pass its usual
+`--config /absolute/path/to/instance.toml` on commands that accept configuration.
+`setup` accepts `--db`, not `--config`; its registration binds the database.
+`setup` supports 16 adapters, but a written
 file is not proof the client loaded it. Read its per-tool report: Aider uses the
 CLI, Cline needs its settings panel, and some adapters require manual correction
 (see [integration reference](https://docs.nestweaver.kehl.io/configuration/integrations/)).
