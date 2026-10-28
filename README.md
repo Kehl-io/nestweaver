@@ -86,7 +86,7 @@ Confidence-weighted blast radius with `impact_score` decay through edges; co-cha
 <td width="50%" valign="top">
 
 **16 AI Tool Integrations**<br>
-One-command setup for Claude Code, Cursor, Codex, Gemini CLI, Copilot CLI, Aider, Kiro, and more. Also offered automatically on the first interactive in-repo `index`.
+One-command setup for Claude Code, Cursor, Codex, Gemini CLI, GitHub Copilot in VS Code, Aider, Kiro, and more. Also offered automatically on the first interactive in-repo `index`.
 
 </td>
 </tr>
@@ -156,7 +156,7 @@ nestweaver setup claude-code --db "$(pwd)/nestweaver.lbug"
 `setup` detects supported tools and writes their MCP registration and
 instructions. Use an absolute database path so clients launched from another
 directory still query the same graph. It supports 16 integrations, including Claude Code, Cursor,
-Codex, Gemini CLI, and Copilot CLI. Most config files are written in the repo;
+Codex, Gemini CLI, and GitHub Copilot in VS Code. Most config files are written in the repo;
 Windsurf uses its user-level config, and Cline gets a printed snippet to paste.
 `setup` attempts every tool, lists what it wrote for each, and exits non-zero
 if any tool failed. Restart or reload your client and check
