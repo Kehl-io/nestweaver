@@ -14,6 +14,248 @@ const REPO: &str = "repo:test:imports";
 
 type Files = Vec<(String, Vec<RawSymbol>, Vec<RawReference>)>;
 
+#[test]
+fn php_functions_use_repo_namespace_identity_and_refuse_ambiguity() {
+    let inputs = [
+        (
+            "inc/global.php",
+            "<?php\nfunction fallback() {}\nfunction util_fn() {}\nfunction duplicate() {}\n",
+        ),
+        (
+            "lib/helpers.php",
+            "<?php\nnamespace App;\nfunction helper() {}\nfunction fallback() {}\n",
+        ),
+        (
+            "lib/vendor.php",
+            "<?php\nnamespace Vendor;\nfunction helper() {}\n",
+        ),
+        ("other/duplicate.php", "<?php\nfunction duplicate() {}\n"),
+        (
+            "app/main.php",
+            "<?php\nnamespace App;\nuse function Vendor\\helper as imported;\nuse Vendor as Alias;\nuse Vendor\\helper as classOnly;\nfunction run() {\nhelper();\nfallback();\nimported();\n\\util_fn();\nnamespace\\helper();\nAlias\\helper();\nclassOnly();\nduplicate();\n}\n",
+        ),
+        (
+            "entry.php",
+            "<?php\nrequire_once 'inc/global.php';\nutil_fn();\n",
+        ),
+    ];
+    let (files, edges) = resolve(&inputs, Language::Php, &WorkspaceContext::default());
+    let actual = calls(&files, &edges);
+    let expected = BTreeSet::from([
+        "app/main.php::run -> lib/helpers.php::helper".to_string(),
+        "app/main.php::run -> lib/helpers.php::fallback".to_string(),
+        "app/main.php::run -> lib/vendor.php::helper".to_string(),
+        "app/main.php::run -> inc/global.php::util_fn".to_string(),
+        "entry.php::<module> -> inc/global.php::util_fn".to_string(),
+    ]);
+    assert_eq!(actual, expected);
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.target_uid == "unresolved:classOnly" && e.confidence == 0.0)
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.target_uid == "unresolved:duplicate" && e.confidence == 0.0)
+    );
+    let helper_uid = symbol_uid(REPO, "lib/helpers.php", "helper", 3);
+    assert!(edges.iter().any(
+        |e| e.source_uid == symbol_uid(REPO, "app/main.php", "run", 6)
+            && e.target_uid == helper_uid
+    ));
+}
+
+#[test]
+fn php_braced_and_semicolon_regions_keep_same_file_homonyms_separate() {
+    for source in [
+        "<?php\nnamespace A {\nfunction x() {}\nfunction first() { x(); }\n}\nnamespace B {\nfunction x() {}\nfunction second() { x(); }\n}\n",
+        "<?php\nnamespace A;\nfunction x() {}\nfunction first() { x(); }\nnamespace B;\nfunction x() {}\nfunction second() { x(); }\n",
+    ] {
+        let (files, edges) = resolve(
+            &[("regions.php", source)],
+            Language::Php,
+            &WorkspaceContext::default(),
+        );
+        let symbols = &files[0].1;
+        for (caller, namespace) in [("first", "A"), ("second", "B")] {
+            let caller = symbols.iter().find(|s| s.name == caller).unwrap();
+            let target = symbols
+                .iter()
+                .find(|s| s.name == "x" && s.scope_chain.as_deref() == Some(namespace))
+                .unwrap();
+            assert!(edges.iter().any(|e| e.source_uid
+                == symbol_uid(REPO, "regions.php", &caller.name, caller.start_line)
+                && e.target_uid
+                    == symbol_uid(REPO, "regions.php", &target.name, target.start_line)));
+        }
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|e| e.edge_type == EdgeType::Calls && e.confidence > 0.0)
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn php_imports_are_region_scoped_and_names_are_ascii_case_insensitive() {
+    let input = [
+        (
+            "definitions.php",
+            "<?php\nnamespace Vendor;\nfunction helper() {}\nfunction second() {}\n",
+        ),
+        ("global.php", "<?php\nfunction helper() {}\n"),
+        (
+            "app.php",
+            "<?php\nnamespace A {\nuse function Vendor\\{helper as One, second};\nfunction first() { ONE(); second(); }\n}\nnamespace B {\nuse Vendor\\{function helper as Two, const VALUE, Other};\nfunction next() { Two(); One(); helper(); }\n}\nnamespace {\nfunction last() { HeLpEr(); }\n}\n",
+        ),
+    ];
+    let (files, edges) = resolve(&input, Language::Php, &WorkspaceContext::default());
+    assert_eq!(
+        calls(&files, &edges),
+        BTreeSet::from([
+            "app.php::first -> definitions.php::helper".into(),
+            "app.php::first -> definitions.php::second".into(),
+            "app.php::next -> definitions.php::helper".into(),
+            "app.php::next -> global.php::helper".into(),
+            "app.php::last -> global.php::helper".into(),
+        ])
+    );
+    assert!(edges.iter().any(|e| e.target_uid == "unresolved:One"));
+}
+
+#[test]
+fn php_function_lookup_never_borrows_a_method_or_foreign_language_function() {
+    let input = [
+        (
+            "app.php",
+            "<?php\nclass Worker {\nfunction helper() {}\nfunction run() { $this->helper(); }\n}\nfunction main() { helper(); js_only(); new Worker(); }\n",
+        ),
+        ("external.js", "function js_only() {}"),
+    ];
+    let (files, edges) = resolve(&input, Language::Php, &WorkspaceContext::default());
+    let actual = calls(&files, &edges);
+    assert!(actual.contains("app.php::run -> app.php::helper"));
+    assert!(actual.contains("app.php::main -> app.php::Worker"));
+    assert!(!actual.contains("app.php::main -> app.php::helper"));
+    assert!(!actual.contains("app.php::main -> external.js::js_only"));
+}
+
+#[test]
+fn php_unknown_stored_namespace_metadata_refuses_global_borrowing() {
+    let input = [
+        (
+            "app.php",
+            "<?php\nnamespace App;\nfunction run() { helper(); }\n",
+        ),
+        (
+            "unknown.php",
+            "<?php\nnamespace App;\nfunction helper() {}\n",
+        ),
+        ("global.php", "<?php\nfunction helper() {}\n"),
+    ];
+    let (mut files, _) = resolve(&input, Language::Php, &WorkspaceContext::default());
+    for symbol in &mut files[1].1 {
+        symbol.scope_chain = None;
+    }
+    files[1].2.clear();
+    let edges = crate::resolve_references(&files, Language::Php, REPO);
+    assert!(
+        calls(&files, &edges).is_empty(),
+        "an unqualified stored PHP function must not be assumed global"
+    );
+    assert!(edges.iter().any(|e| e.target_uid == "unresolved:helper"));
+}
+
+#[test]
+fn php_chained_member_calls_never_borrow_free_function_homonyms() {
+    for global_run in [false, true] {
+        let suffix = if global_run {
+            "function run() {}\n"
+        } else {
+            ""
+        };
+        let source = format!(
+            "<?php\nclass Worker {{\n public function run() {{}}\n public function factory() {{}}\n public function typedControl() {{ $this->run(); }}\n}}\nfunction factory(): Worker {{ return new Worker(); }}\nfunction chainedRun() {{ factory()->run(); }}\nfunction chainedSameName() {{ factory()->factory(); }}\n{suffix}"
+        );
+        let (files, edges) = resolve_typed(&[("chains.php", &source)], Language::Php);
+        let symbols = &files[0].1;
+        let uid = |name: &str, kind| {
+            let matches: Vec<_> = symbols
+                .iter()
+                .filter(|s| s.name == name && s.kind == kind)
+                .collect();
+            assert_eq!(matches.len(), 1);
+            symbol_uid(REPO, "chains.php", name, matches[0].start_line)
+        };
+        for (caller, method) in [("chainedRun", "run"), ("chainedSameName", "factory")] {
+            let actual: BTreeSet<_> = edges
+                .iter()
+                .filter(|e| {
+                    e.edge_type == EdgeType::Calls
+                        && e.confidence > 0.0
+                        && e.source_uid == uid(caller, nestweaver_schema::SymbolKind::Function)
+                })
+                .map(|e| e.target_uid.clone())
+                .collect();
+            // PHP return annotations are not extracted today. The existing
+            // member resolver therefore refuses an untyped factory chain;
+            // this repair must preserve that refusal instead of borrowing a
+            // free homonym. A separately typed self control remains resolvable.
+            assert_eq!(
+                actual,
+                BTreeSet::from([uid("factory", nestweaver_schema::SymbolKind::Function),]),
+                "{caller}/{method}, global run={global_run}"
+            );
+        }
+        let typed = uid("typedControl", nestweaver_schema::SymbolKind::Method);
+        let target = uid("run", nestweaver_schema::SymbolKind::Method);
+        assert!(edges.iter().any(|e| e.source_uid == typed
+            && e.target_uid == target
+            && e.edge_type == EdgeType::Calls
+            && e.confidence > 0.0));
+    }
+}
+
+#[test]
+fn php_constructor_and_parameter_receivers_keep_unscoped_type_evidence() {
+    let source = "<?php\nclass Earlier { public function deliver() {} }\nclass Intended { public function deliver() {} }\nfunction constructed() { $bound = new Intended(); $bound->deliver(); }\nfunction parameter(Intended $bound) { $bound->deliver(); }\nfunction deliver() {}\n";
+    let (files, edges) = resolve_typed(&[("receivers.php", source)], Language::Php);
+    let expected = BTreeSet::from([
+        (
+            symbol_uid(REPO, "receivers.php", "constructed", 4),
+            symbol_uid(REPO, "receivers.php", "Intended", 3),
+        ),
+        (
+            symbol_uid(REPO, "receivers.php", "constructed", 4),
+            symbol_uid(REPO, "receivers.php", "deliver", 3),
+        ),
+        (
+            symbol_uid(REPO, "receivers.php", "parameter", 5),
+            symbol_uid(REPO, "receivers.php", "deliver", 3),
+        ),
+    ]);
+    let actual: BTreeSet<_> = edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::Calls && e.confidence > 0.0)
+        .map(|e| (e.source_uid.clone(), e.target_uid.clone()))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "must not borrow Earlier::deliver or global deliver"
+    );
+    assert!(
+        files[0]
+            .2
+            .iter()
+            .filter(|r| r.kind == nestweaver_parser::ReferenceKind::Call
+                && (r.receiver.is_some() || r.name == "Intended"))
+            .all(|r| r.scope.is_none())
+    );
+}
+
 fn resolve(
     inputs: &[(&str, &str)],
     language: Language,

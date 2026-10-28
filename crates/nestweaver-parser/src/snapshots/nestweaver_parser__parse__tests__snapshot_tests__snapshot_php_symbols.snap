@@ -145,4 +145,4 @@ expression: "parsed_symbols(\"simple.php\", &source)"
   visibility: Inferred
   type_info: ~
   parent_name: ~
-  scope_chain: ~
+  scope_chain: "App\\Models"

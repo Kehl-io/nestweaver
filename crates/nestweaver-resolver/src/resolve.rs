@@ -251,6 +251,8 @@ pub fn resolve_references_with_file_languages(
     }
 
     let returned_constructions = returned_constructions(files, &sorted_symbols_per_file);
+    let php_functions =
+        crate::php::PhpFunctions::build(files, |file| language_for(file) == Language::Php);
 
     // Build a parent-type lookup from Extends references for MRO walk.
     // Maps child type name → list of parent type names.
@@ -378,6 +380,7 @@ pub fn resolve_references_with_file_languages(
                     repo_uid,
                     _type_envs,
                     &returned_constructions,
+                    &php_functions,
                 ) else {
                     continue;
                 };
@@ -503,6 +506,7 @@ pub fn resolve_references_with_file_languages(
                     repo_uid,
                     type_envs,
                     &returned_constructions,
+                    &php_functions,
                 ) {
                     if edge.target_uid.starts_with("sym:")
                         && edge.evidence.iter().any(|evidence| {
@@ -701,6 +705,7 @@ fn resolve_single_reference(
     repo_uid: &str,
     type_envs: Option<&std::collections::HashMap<String, crate::types::TypeEnvironment>>,
     returned_constructions: &ReturnedConstructions,
+    php_functions: &crate::php::PhpFunctions<'_>,
 ) -> Option<ResolvedEdge> {
     let edge_type = match reference.kind {
         ReferenceKind::Call | ReferenceKind::Macro => EdgeType::Calls,
@@ -715,6 +720,10 @@ fn resolve_single_reference(
         | ReferenceKind::Uses
         | ReferenceKind::LocalBinding
         | ReferenceKind::HoistedDeclaration
+        | ReferenceKind::PhpNamespace
+        | ReferenceKind::PhpFunctionImport
+        | ReferenceKind::PhpNamespaceAlias
+        | ReferenceKind::PhpFunctionCall
         | ReferenceKind::ExportAlias => return None,
     };
 
@@ -751,6 +760,36 @@ fn resolve_single_reference(
         Enclosing::ModuleScope => module_owner()?,
     };
     let source_uid = symbol_uid(repo_uid, file_path, &source_sym.name, source_sym.start_line);
+
+    if language == Language::Php
+        && let Some(target) = php_functions.resolve(file_path, reference)
+    {
+        return Some(match target {
+            Some((target_file, symbol)) => {
+                let confidence = confidence_score(
+                    if target_file == file_path {
+                        MatchType::SameFileExact
+                    } else {
+                        MatchType::ImportResolved
+                    },
+                    language,
+                );
+                ResolvedEdge {
+                    source_uid,
+                    target_uid: symbol_uid(repo_uid, target_file, &symbol.name, symbol.start_line),
+                    edge_type,
+                    confidence,
+                    link_type: None,
+                    evidence: vec![EdgeEvidence {
+                        kind: "php_namespace_function".into(),
+                        weight: confidence,
+                        note: None,
+                    }],
+                }
+            }
+            None => unresolved_edge(source_uid, &reference.name, edge_type),
+        });
+    }
 
     // nw-724: a parameter, let, or lambda binding is the target. Do not
     // continue on to a same-named function in this file or another.
