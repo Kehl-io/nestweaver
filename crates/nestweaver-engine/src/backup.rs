@@ -1633,6 +1633,48 @@ fn journal_proves_owned_tree(path: &Path, identity: Option<(u64, u64)>, paths: &
             .is_ok_and(|present| present.iter().all(|path| paths.contains(path)))
 }
 
+/// A retry can create its operational writer lock while leasing a partially
+/// copied graph, before recovery runs. Only that exact live creation may be
+/// added to an unvalidated destination's inventory; the entire destination is
+/// retained, never deleted. Original-aside and validated proofs stay strict.
+fn journal_proves_unvalidated_destination(path: &Path, journal: &RestoreJournal) -> bool {
+    if !matches!(
+        journal.phase,
+        RestorePhase::CopyInProgress | RestorePhase::OldDataPreserved
+    ) {
+        return false;
+    }
+    let Some(identity) = journal.destination_identity else {
+        return false;
+    };
+    if restore_directory_identity(path) != Some(identity) {
+        return false;
+    }
+    let Ok(present) = restore_tree_paths(path) else {
+        return false;
+    };
+    present.iter().all(|relative| {
+        if journal.destination_paths.contains(relative) {
+            return true;
+        }
+        let Some(graph) = journal.graph_path.as_deref() else {
+            return false;
+        };
+        let mut components = Path::new(graph).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+            || !journal
+                .source_checksums
+                .as_ref()
+                .is_some_and(|checksums| checksums.contains_key(graph))
+            || *relative != format!("{graph}.write.lock")
+        {
+            return false;
+        }
+        nestweaver_store::current_process_owns_created_write_lock(&path.join(graph), identity)
+    })
+}
+
 /// Rollback needs the entire original aside, not merely an owned subset.
 /// Partial destinations/cleanup still use the subset proof above.
 fn journal_proves_complete_owned_tree(
@@ -2397,11 +2439,16 @@ fn recover_interrupted_restore_inner(
         ) && data_dir.exists()
         {
             let journal = journal.as_ref().unwrap();
-            if journal_proves_owned_tree(
-                data_dir,
-                journal.destination_identity,
-                &journal.destination_paths,
-            ) {
+            let owned = if phase == Some(RestorePhase::StagingVerified) {
+                journal_proves_owned_tree(
+                    data_dir,
+                    journal.destination_identity,
+                    &journal.destination_paths,
+                )
+            } else {
+                journal_proves_unvalidated_destination(data_dir, journal)
+            };
+            if owned {
                 preserved = Some(preserve_unproven_copy(data_dir)?);
             } else if phase != Some(RestorePhase::StagingVerified)
                 || !(if matches!(
@@ -2447,11 +2494,7 @@ fn recover_interrupted_restore_inner(
             }
             let mut preserved = None;
             if data_dir.exists() {
-                if !journal_proves_owned_tree(
-                    data_dir,
-                    journal.destination_identity,
-                    &journal.destination_paths,
-                ) {
+                if !journal_proves_unvalidated_destination(data_dir, journal) {
                     refuse_backup!(
                         "backup restore refused: stale or ambiguous recovery journal cannot authorize deleting {}; both copies were preserved",
                         data_dir.display()
@@ -2610,10 +2653,14 @@ fn maybe_crash_mid_copy_for_test(source: &Path, dest: &Path) {
         return;
     }
     let _ = std::fs::create_dir_all(dest);
+    let first_name = std::env::var_os("NW_RESTORE_TEST_COPY_FIRST");
     if let Ok(entries) = std::fs::read_dir(source)
-        && let Some(first) = entries
-            .filter_map(Result::ok)
-            .find(|entry| entry.path().is_file())
+        && let Some(first) = entries.filter_map(Result::ok).find(|entry| {
+            entry.path().is_file()
+                && first_name
+                    .as_ref()
+                    .is_none_or(|name| entry.file_name() == *name)
+        })
     {
         let _ = std::fs::copy(first.path(), dest.join(first.file_name()));
     }
@@ -6833,6 +6880,272 @@ mod tests {
             assert!(!receipt.reservation.exists());
             assert!(!restore_journal_path(&data).exists());
         }
+    }
+
+    #[test]
+    fn retry_created_lock_restores_graph_and_non_graph_copies_with_owned_or_borrowed_authority() {
+        for borrowed in [false, true] {
+            for first in ["brain.lbug", "manifest.json"] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (data, archive, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+                generate_live_restore_artifacts(&data);
+                let original = tree_bytes(&data);
+                let child = run_restore_in_child_copy_mode(
+                    &archive,
+                    &data,
+                    "copy-midway",
+                    &[("NW_RESTORE_TEST_COPY_FIRST", first)],
+                    true,
+                );
+                assert_eq!(child.status.code(), Some(9));
+                let journal = read_restore_journal(&data).unwrap();
+                assert_eq!(journal.phase, RestorePhase::CopyInProgress);
+                assert!(
+                    !journal
+                        .destination_paths
+                        .contains(&"brain.lbug.write.lock".into())
+                );
+                let RestoreDisposition::PreserveLive { receipt } =
+                    journal.disposition.clone().unwrap()
+                else {
+                    panic!()
+                };
+                let mut partial = tree_bytes(&data);
+                assert_eq!(partial.len(), 1);
+                assert!(partial.contains_key(first));
+                assert_eq!(data.join("brain.lbug").exists(), first == "brain.lbug");
+                assert!(!data.join("brain.lbug.write.lock").exists());
+                assert_eq!(tree_bytes(&restoring_dir_for(&data)), original);
+                std::fs::remove_file(&archive).unwrap();
+
+                // This is the real nonvacuous CLI shape: both namespaces and
+                // every active/aside DB lease exist before backup_restore.
+                let outer = borrowed.then(|| acquire_restore_authority(&data).unwrap());
+                if borrowed {
+                    assert!(matches!(
+                        outer.as_ref(),
+                        Some(RestoreAuthority::Owned { .. })
+                    ));
+                    assert!(matches!(
+                        acquire_restore_authority(&data).unwrap(),
+                        RestoreAuthority::Borrowed
+                    ));
+                    assert_eq!(
+                        nestweaver_store::current_process_owns_created_write_lock(
+                            &data.join("brain.lbug"),
+                            journal.destination_identity.unwrap()
+                        ),
+                        first == "brain.lbug"
+                    );
+                }
+                let error = backup_restore(&RestoreConfig {
+                    snapshot_path: archive,
+                    data_dir: data.clone(),
+                    replace: true,
+                })
+                .unwrap_err();
+                assert_eq!(
+                    error
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .kind(),
+                    std::io::ErrorKind::NotFound,
+                    "recovery must complete before the missing archive error: {error:#}"
+                );
+                assert_eq!(tree_bytes(&data), original, "{borrowed}/{first}: {error:#}");
+                assert!(!restoring_dir_for(&data).exists());
+                assert!(!receipt.reservation.exists());
+                assert!(!restore_journal_path(&data).exists());
+                let preserved: Vec<_> = std::fs::read_dir(tmp.path())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.is_dir()
+                            && path
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with("data.preserved-")
+                    })
+                    .collect();
+                assert_eq!(preserved.len(), 1);
+                if first == "brain.lbug" {
+                    partial.insert("brain.lbug.write.lock".into(), Vec::new());
+                }
+                assert_eq!(tree_bytes(&preserved[0]), partial);
+                assert!(format!("{error:#}").contains(&preserved[0].display().to_string()));
+                // Renaming the preserved partial invalidates its old pathname
+                // proof even while an outer authority still holds its FD.
+                assert!(!nestweaver_store::current_process_owns_created_write_lock(
+                    &data.join("brain.lbug"),
+                    journal.destination_identity.unwrap()
+                ));
+                drop(outer);
+            }
+        }
+    }
+
+    #[test]
+    fn retry_created_lock_never_admits_foreign_or_changed_lock_ownership() {
+        use std::os::unix::fs::symlink;
+
+        for fault in [
+            "preexisting",
+            "retired",
+            "nonempty",
+            "hardlink",
+            "replacement",
+            "symlink",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (data, archive, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+            generate_live_restore_artifacts(&data);
+            let child = run_restore_in_child_copy_mode(
+                &archive,
+                &data,
+                "copy-midway",
+                &[("NW_RESTORE_TEST_COPY_FIRST", "brain.lbug")],
+                true,
+            );
+            assert_eq!(child.status.code(), Some(9));
+            assert_eq!(tree_bytes(&data).len(), 1);
+            let lock = data.join("brain.lbug.write.lock");
+            assert!(!lock.exists());
+            let journal = read_restore_journal(&data).unwrap();
+            if fault == "preexisting" {
+                std::fs::write(&lock, b"").unwrap();
+            }
+            let mut authority = Some(acquire_restore_authority(&data).unwrap());
+            if fault != "preexisting" {
+                assert!(journal_proves_unvalidated_destination(&data, &journal));
+            }
+            match fault {
+                "preexisting" => {}
+                "retired" => {
+                    // The volatile proof died with its authority. A subsequent
+                    // retry must not adopt even this known-old empty inode.
+                    drop(authority.take());
+                    authority = Some(acquire_restore_authority(&data).unwrap());
+                }
+                "nonempty" => std::fs::write(&lock, b"foreign lock bytes").unwrap(),
+                "hardlink" => std::fs::hard_link(&lock, tmp.path().join("linked-lock")).unwrap(),
+                "replacement" => {
+                    std::fs::rename(&lock, tmp.path().join("old-lock")).unwrap();
+                    std::fs::write(&lock, b"").unwrap();
+                }
+                "symlink" => {
+                    let old = tmp.path().join("old-lock");
+                    std::fs::rename(&lock, &old).unwrap();
+                    symlink(old, &lock).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !journal_proves_unvalidated_destination(&data, &journal),
+                "{fault}"
+            );
+            let active = tree_bytes(&data);
+            let aside = tree_bytes(&restoring_dir_for(&data));
+            let journal_bytes = std::fs::read(restore_journal_path(&data)).unwrap();
+            let RestoreDisposition::PreserveLive { receipt } = journal.disposition.unwrap() else {
+                panic!()
+            };
+            let reservation = tree_bytes(&receipt.reservation);
+            let error = recover_interrupted_restore(&data).unwrap_err();
+            assert!(format!("{error:#}").contains("both copies were preserved"));
+            assert_eq!(tree_bytes(&data), active, "{fault}");
+            assert_eq!(tree_bytes(&restoring_dir_for(&data)), aside, "{fault}");
+            assert_eq!(
+                std::fs::read(restore_journal_path(&data)).unwrap(),
+                journal_bytes
+            );
+            assert!(receipt.reservation.is_dir());
+            assert_eq!(tree_bytes(&receipt.reservation), reservation);
+            if fault == "symlink" {
+                assert_eq!(
+                    std::fs::read_link(&lock).unwrap(),
+                    tmp.path().join("old-lock")
+                );
+            }
+            drop(authority);
+        }
+    }
+
+    #[test]
+    fn retry_created_lock_requires_exact_unvalidated_journal_role_and_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, archive, _) = seed_marker_replay_dataset(tmp.path(), "brain.lbug");
+        generate_live_restore_artifacts(&data);
+        let child = run_restore_in_child_copy_mode(
+            &archive,
+            &data,
+            "copy-midway",
+            &[("NW_RESTORE_TEST_COPY_FIRST", "brain.lbug")],
+            true,
+        );
+        assert_eq!(child.status.code(), Some(9));
+        let _authority = acquire_restore_authority(&data).unwrap();
+        let journal = read_restore_journal(&data).unwrap();
+        assert!(journal_proves_unvalidated_destination(&data, &journal));
+        // The generic proof is unchanged and still refuses the unrecorded
+        // lock: no global filename allowlist has been introduced.
+        assert!(!journal_proves_owned_tree(
+            &data,
+            journal.destination_identity,
+            &journal.destination_paths
+        ));
+        for fault in [
+            "phase",
+            "identity",
+            "missing-role",
+            "nested-role",
+            "checksum",
+        ] {
+            let mut changed = journal.clone();
+            match fault {
+                "phase" => changed.phase = RestorePhase::CutoverValidated,
+                "identity" => {
+                    let (dev, ino) = changed.destination_identity.unwrap();
+                    changed.destination_identity = Some((dev, ino.wrapping_add(1)));
+                }
+                "missing-role" => changed.graph_path = None,
+                "nested-role" => changed.graph_path = Some("nested/brain.lbug".into()),
+                "checksum" => {
+                    changed
+                        .source_checksums
+                        .as_mut()
+                        .unwrap()
+                        .remove("brain.lbug");
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !journal_proves_unvalidated_destination(&data, &changed),
+                "{fault}"
+            );
+        }
+        let unexpected = data.join("foreign");
+        std::fs::write(&unexpected, b"DO_NOT_DELETE").unwrap();
+        assert!(!journal_proves_unvalidated_destination(&data, &journal));
+        std::fs::remove_file(unexpected).unwrap();
+        let old_data = tmp.path().join("exchanged-active");
+        std::fs::rename(&data, &old_data).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::copy(old_data.join("brain.lbug"), data.join("brain.lbug")).unwrap();
+        std::fs::write(data.join("brain.lbug.write.lock"), b"").unwrap();
+        assert!(!journal_proves_unvalidated_destination(&data, &journal));
+        let before = tree_bytes(&data);
+        let original_aside = tree_bytes(&restoring_dir_for(&data));
+        let journal_bytes = std::fs::read(restore_journal_path(&data)).unwrap();
+        assert!(recover_interrupted_restore(&data).is_err());
+        assert_eq!(tree_bytes(&data), before);
+        assert_eq!(tree_bytes(&restoring_dir_for(&data)), original_aside);
+        assert_eq!(
+            std::fs::read(restore_journal_path(&data)).unwrap(),
+            journal_bytes
+        );
     }
 
     #[test]

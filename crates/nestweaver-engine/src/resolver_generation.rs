@@ -374,7 +374,10 @@ use std::path::Path;
 /// 18 — Scala grammar 0.26.3 recovers declarations such as case-clause local
 ///     classes and Scala 2 export identifiers. Parsed cache 12 discards old
 ///     parser facts; force reindex existing repositories to publish the new symbols.
-pub const RESOLVER_GENERATION: u32 = 18;
+/// 19 — PHP functions resolve by their declared namespace across the repository,
+///      with function-use aliases, current-namespace/global precedence and
+///      duplicate refusal. Parsed cache 13 reparses namespace and call facts.
+pub const RESOLVER_GENERATION: u32 = 19;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

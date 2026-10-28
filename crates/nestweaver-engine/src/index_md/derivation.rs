@@ -12,7 +12,8 @@ use std::time::Duration;
 ///
 /// 2: an exact, unique name match resolves at 1.0 instead of a 0.90-0.95
 /// filename tier.
-pub const MARKDOWN_LINK_DERIVATION_VERSION: u32 = 2;
+/// 3: URL-path decoding and registered-root absolute Markdown note identity.
+pub const MARKDOWN_LINK_DERIVATION_VERSION: u32 = 3;
 const MAX_CAPTURE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CAPTURE_NOTES: usize = 100_000;
 const PREPARATION_BUDGET: Duration = Duration::from_secs(60);

@@ -32,7 +32,8 @@ pub struct SourceParams {
 }
 
 /// Every non-2xx body from this route is `{ error: <machine code>,
-/// message: <human text>, file? }`.
+/// message: <human text>, file? }`. Qualified body-unavailable errors also
+/// carry `repo`; ownership errors never claim a qualified owner.
 fn reject(status: StatusCode, error: &str, message: &str, file: Option<&str>) -> Response {
     let mut body = json!({ "error": error, "message": message });
     if let Some(file) = file {
@@ -43,6 +44,16 @@ fn reject(status: StatusCode, error: &str, message: &str, file: Option<&str>) ->
 
 fn not_found(error: &str, message: &str, file: &str) -> Response {
     reject(StatusCode::NOT_FOUND, error, message, Some(file))
+}
+
+/// Called only after the requested File and Repo ownership has been checked.
+/// Preview availability must not prevent clients using indexed metadata.
+fn body_unavailable(error: &str, message: &str, file: &str, repo: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": error, "message": message, "file": file, "repo": repo })),
+    )
+        .into_response()
 }
 
 fn internal(err: impl std::fmt::Display) -> Response {
@@ -277,10 +288,11 @@ pub async fn source(
     }
     // Only repos with a known local working tree can serve source from disk.
     let Some(repo_root) = repo.local_root().map(PathBuf::from) else {
-        return not_found(
+        return body_unavailable(
             "source_not_available",
             "the repo has no local working tree",
             &file,
+            &repo_uid,
         );
     };
 
@@ -292,10 +304,11 @@ pub async fn source(
         Err(join) => return internal(join),
         Ok(Read::Content(c)) => c,
         Ok(Read::NotAvailable) => {
-            return not_found(
+            return body_unavailable(
                 "source_not_available",
                 "the file is indexed but could not be read from disk",
                 &file,
+                &repo_uid,
             );
         }
         Ok(Read::Escapes) => {
@@ -308,10 +321,11 @@ pub async fn source(
         }
         Ok(Read::Redirected) => return not_found("source_not_indexed", NOT_INDEXED, &file),
         Ok(Read::TooLarge) => {
-            return not_found(
+            return body_unavailable(
                 "source_too_large",
                 &format!("file is larger than the {MAX_SOURCE_BYTES}-byte preview limit"),
                 &file,
+                &repo_uid,
             );
         }
     };

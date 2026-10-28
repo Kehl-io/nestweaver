@@ -4320,6 +4320,39 @@ impl GraphStore {
         Self::delete_resolved_edges_for_file_on(&conn, repo_uid, file_path)
     }
 
+    /// Clear function CALLS for an explicit source-file set in the caller's
+    /// transaction. Constructors and methods retain their existing edges.
+    pub fn delete_function_calls_for_files_on(
+        conn: &crate::db::StoreConnection<'_>,
+        repo_uid: &str,
+        file_paths: &[&str],
+    ) -> Result<(), StoreError> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
+        exec_params(
+            conn,
+            "MATCH (s:Symbol)-[r:CALLS]->(t:Symbol) WHERE s.repo_uid = $repo AND s.file_path IN $paths AND t.kind = $kind DELETE r",
+            vec![
+                ("repo", repo_uid.to_string().into()),
+                (
+                    "paths",
+                    lbug::Value::List(
+                        lbug::LogicalType::String,
+                        file_paths
+                            .iter()
+                            .map(|p| lbug::Value::String((*p).to_string()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "kind",
+                    nestweaver_schema::SymbolKind::Function.to_string().into(),
+                ),
+            ],
+        )
+    }
+
     /// [`Self::delete_resolved_edges_for_file`] on a caller-held connection,
     /// so a write transaction (a code watcher batch) clears and re-inserts a
     /// file's resolved edges atomically.

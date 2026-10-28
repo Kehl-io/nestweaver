@@ -65,7 +65,9 @@ use serde::{Deserialize, Serialize};
 /// 11 — Go initializer and case/default bindings retain their implicit block lifetime.
 /// 12 — tree-sitter-scala 0.26.3 recovers case-clause declarations and calls
 ///      previously missed by 0.26.2, including local case classes.
-const CACHE_VERSION: u32 = 12;
+/// 13 — PHP namespace regions, categorized use aliases and named-call identities
+///      preserve repo-wide function lookup across unchanged source.
+const CACHE_VERSION: u32 = 13;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -750,10 +752,10 @@ mod tests {
                 .any(|s| s.name == "Local")
         );
         let expected = graph(true);
-        assert_eq!(crate::resolver_generation::RESOLVER_GENERATION, 18);
+        const { assert!(crate::resolver_generation::RESOLVER_GENERATION >= 18) };
         assert_eq!(
             crate::resolver_generation::load(&db).generation_for(&repo_uid),
-            18
+            crate::resolver_generation::RESOLVER_GENERATION
         );
         index(false);
         assert_eq!(
@@ -809,7 +811,7 @@ mod tests {
         );
         assert_eq!(
             crate::resolver_generation::load(&db).generation_for(&repo_uid),
-            18
+            crate::resolver_generation::RESOLVER_GENERATION
         );
         assert!(
             crate::resolver_generation::load(&db)
@@ -1263,6 +1265,69 @@ mod tests {
 
         let cache = ParsedCache::load(&path);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn php_pre_namespace_version12_base_and_log_are_rejected() {
+        let source = "<?php\nnamespace App;\nfunction run() { helper(); }\n";
+        let parsed = nestweaver_parser::parse_source(Path::new("app.php"), source).unwrap();
+        let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        let stale = CachedParseResult {
+            symbols: parsed
+                .symbols
+                .into_iter()
+                .map(|mut symbol| {
+                    symbol.scope_chain = None;
+                    symbol
+                })
+                .collect(),
+            references: parsed
+                .references
+                .into_iter()
+                .filter(|r| {
+                    !matches!(
+                        r.kind,
+                        nestweaver_parser::ReferenceKind::PhpNamespace
+                            | nestweaver_parser::ReferenceKind::PhpFunctionImport
+                            | nestweaver_parser::ReferenceKind::PhpNamespaceAlias
+                            | nestweaver_parser::ReferenceKind::PhpFunctionCall
+                    )
+                })
+                .map(|mut reference| {
+                    reference.scope = None;
+                    reference
+                })
+                .collect(),
+            type_bindings: parsed.type_bindings,
+        };
+        for base in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("php.parsed_cache.bin");
+            if base {
+                let file = ParsedCacheFile {
+                    version: 12,
+                    entries: HashMap::from([(hash.clone(), stale.clone())]),
+                };
+                std::fs::write(&path, rmp_serde::to_vec_named(&file).unwrap()).unwrap();
+            } else {
+                let entry = LogRecord {
+                    version: 12,
+                    hash: std::borrow::Cow::Borrowed(&hash),
+                    entry: std::borrow::Cow::Borrowed(&stale),
+                };
+                let bytes = rmp_serde::to_vec_named(&entry).unwrap();
+                let mut file = std::fs::File::create(log_path(&path)).unwrap();
+                file.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
+                file.write_all(&bytes).unwrap();
+            }
+            let mut cache = ParsedCache::load(&path);
+            assert!(
+                cache.get(&hash).is_none(),
+                "legacy PHP facts from base={base} must not survive same-source upgrade"
+            );
+            cache.refresh(&path);
+            assert!(cache.get(&hash).is_none());
+        }
     }
 
     /// nw-688: a parse cached before the test-title change (version 1, where

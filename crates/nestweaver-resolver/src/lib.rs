@@ -3,6 +3,7 @@
 pub mod cross_repo;
 pub mod imports;
 pub mod lang;
+mod php;
 pub mod resolve;
 pub mod type_extractors;
 pub mod types;

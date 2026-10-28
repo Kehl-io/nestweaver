@@ -6520,6 +6520,114 @@ mod tests {
     }
 
     #[test]
+    fn watcher_php_negative_peers_keep_cached_self_method_environment() {
+        for cold_cache in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("models.php"), "<?php\nclass First {\n public function ping() {}\n}\nclass Second {\n public function ping() {}\n public function run() { $this->ping(); }\n}\nfunction exercise() { helper(); }\n").unwrap();
+            std::fs::write(root.join("deps.php"), "<?php\nfunction helper() {}\n").unwrap();
+            std::fs::write(
+                root.join("control.js"),
+                "function jsTarget() {}\nfunction jsRun() { jsTarget(); }\n",
+            )
+            .unwrap();
+            let db = dir.path().join("watch.lbug");
+            let url = format!("file://{}", root.display());
+            let repo = nestweaver_schema::repo_uid("test", &url);
+            crate::index::index_directory(&root, &db, "test", &url, "initial").unwrap();
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let watcher = CodeWatcher::new(&db, &root, "test");
+            let caller = nestweaver_schema::symbol_uid(&repo, "models.php", "run", 7);
+            let right = nestweaver_schema::symbol_uid(&repo, "models.php", "ping", 6);
+            let assert_calls = || {
+                let mut actual = std::collections::BTreeMap::new();
+                for (source, target, kind, _, _) in store.load_typed_edges().unwrap() {
+                    if source == caller && kind == "CALLS" {
+                        *actual.entry(target).or_insert(0) += 1;
+                    }
+                }
+                assert_eq!(
+                    actual,
+                    std::collections::BTreeMap::from([(right.clone(), 1)])
+                );
+                assert_matches_fresh(&store, &root, &url, "PHP peer method environment");
+            };
+            assert_calls();
+            let other = root.join("other.php");
+            for (label, content) in [
+                ("add", Some("<?php\nfunction unrelated() {}\n")),
+                ("edit", Some("<?php\nfunction editedUnrelated() {}\n")),
+                ("remove", None),
+            ] {
+                if cold_cache {
+                    let cache = crate::sidecar_path(&db, ".parsed_cache.bin");
+                    let _ = std::fs::remove_file(&cache);
+                    let _ = std::fs::remove_file(crate::parsed_cache::log_path(&cache));
+                    crate::parsed_cache::forget_log_length(&cache);
+                    let shared = shared_parsed_cache(&cache);
+                    let mut parsed = shared.lock().unwrap();
+                    parsed.refresh(&cache);
+                    assert_eq!(parsed.len(), 0, "cold case must clear the shared cache");
+                }
+                match content {
+                    Some(text) => std::fs::write(&other, text).unwrap(),
+                    None => std::fs::remove_file(&other).unwrap(),
+                }
+                assert!(
+                    matches!(
+                        process_fixture_batch(
+                            &watcher,
+                            &store,
+                            &repo,
+                            &root,
+                            std::slice::from_ref(&other)
+                        ),
+                        WatchBatchOutcome::Published { .. }
+                    ),
+                    "{label}"
+                );
+                assert_calls();
+            }
+            // This fixture calls the explicit-event publication primitive.
+            // An admitted existing-file hint publishes even for identical
+            // bytes; it must still preserve every exact edge and receiver.
+            let before = edge_multiset(&store);
+            let hinted =
+                process_fixture_batch(&watcher, &store, &repo, &root, &[root.join("models.php")]);
+            assert!(
+                matches!(
+                    hinted,
+                    WatchBatchOutcome::Published {
+                        files_processed: 1,
+                        ..
+                    }
+                ),
+                "explicit unchanged-file hint must publish one file: {hinted:?}"
+            );
+            assert_eq!(
+                edge_multiset(&store),
+                before,
+                "hinted publication changed edges"
+            );
+            assert_calls();
+
+            // Empty hints exercise this primitive's actual no-work branch.
+            let before_empty = edge_multiset(&store);
+            let generation = store.graph_generation();
+            let empty = process_fixture_batch(&watcher, &store, &repo, &root, &[]);
+            assert!(matches!(empty, WatchBatchOutcome::Unchanged), "{empty:?}");
+            assert_eq!(store.graph_generation(), generation);
+            assert_eq!(
+                edge_multiset(&store),
+                before_empty,
+                "empty hint batch changed edges"
+            );
+            assert_calls();
+        }
+    }
+
+    #[test]
     fn watcher_recreated_go_member_recovers_resolved_package_importers() {
         for cold_cache in [false, true] {
             let dir = tempfile::tempdir().unwrap();

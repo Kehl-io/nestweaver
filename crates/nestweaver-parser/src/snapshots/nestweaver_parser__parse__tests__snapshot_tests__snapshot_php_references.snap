@@ -3,15 +3,48 @@ source: crates/nestweaver-parser/src/parse.rs
 assertion_line: 11769
 expression: "parsed_references(\"simple.php\", &source)"
 ---
+- scope:
+    start: 7
+    end: 750
+    position: 7
+    initialized_at: 7
+    hoisted_var: false
+  name: "App\\Models"
+  kind: PhpNamespace
+  start_line: 3
+  context: ""
+  receiver: ~
 - name: "App\\Contracts\\Greeter"
   kind: Uses
   start_line: 5
   context: "use App\\Contracts\\Greeter;"
   receiver: ~
+- scope:
+    start: 7
+    end: 750
+    position: 30
+    initialized_at: 7
+    hoisted_var: false
+  name: Greeter
+  kind: PhpNamespaceAlias
+  start_line: 5
+  context: "App\\Contracts\\Greeter"
+  receiver: ~
 - name: "App\\Services\\Logger"
   kind: Uses
   start_line: 6
   context: "use App\\Services\\Logger;"
+  receiver: ~
+- scope:
+    start: 7
+    end: 750
+    position: 57
+    initialized_at: 7
+    hoisted_var: false
+  name: Logger
+  kind: PhpNamespaceAlias
+  start_line: 6
+  context: "App\\Services\\Logger"
   receiver: ~
 - name: GreeterInterface
   kind: Implements
@@ -23,8 +56,25 @@ expression: "parsed_references(\"simple.php\", &source)"
   start_line: 27
   context: "$this->log(\"Greeting $name\");"
   receiver: $this
-- name: ucfirst
+- scope:
+    start: 0
+    end: 750
+    position: 541
+    initialized_at: 0
+    hoisted_var: false
+  name: ucfirst
   kind: Call
+  start_line: 33
+  context: return ucfirst($name);
+  receiver: ~
+- scope:
+    start: 0
+    end: 750
+    position: 541
+    initialized_at: 0
+    hoisted_var: false
+  name: ucfirst
+  kind: PhpFunctionCall
   start_line: 33
   context: return ucfirst($name);
   receiver: ~

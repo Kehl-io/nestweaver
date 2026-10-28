@@ -2290,6 +2290,7 @@ async fn source_without_repo_is_409_when_path_is_ambiguous() {
     assert_eq!(s, StatusCode::CONFLICT);
     assert_eq!(j["error"], "ambiguous_file");
     assert_eq!(j["candidates"], json!(["repo:a", "repo:b"]));
+    assert!(j.get("repo").is_none(), "ambiguity must not claim an owner");
 }
 
 #[tokio::test]
@@ -2408,7 +2409,87 @@ async fn source_refuses_files_over_the_size_cap() {
     let (s, j) = get_json(&app, "/api/v1/source?file=src/big.ts&repo=repo:solo").await;
     assert_eq!(s, StatusCode::NOT_FOUND, "{j}");
     assert_eq!(j["error"], "source_too_large");
+    assert_eq!(j["repo"], "repo:solo");
+    assert_eq!(j["file"], "src/big.ts");
     assert!(j["message"].is_string(), "{j}");
+}
+
+#[tokio::test]
+async fn source_missing_indexed_body_preserves_unique_qualified_owner() {
+    let (_d, app) = solo_source_app(|_| {}, &["src/missing.ts"]);
+    for uri in [
+        "/api/v1/source?file=src/missing.ts",
+        "/api/v1/source?file=src/missing.ts&repo=repo:solo",
+    ] {
+        let (status, body) = get_json(&app, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "source_not_available");
+        assert_eq!(body["repo"], "repo:solo");
+        assert_eq!(body["file"], "src/missing.ts");
+        assert!(body.get("lines").is_none());
+    }
+}
+
+#[tokio::test]
+async fn source_unavailable_remote_owners_are_qualified_before_body_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = GraphStore::in_memory().unwrap();
+    // File ownership, including zero-symbol peers, is independent of symbol rows
+    // and of whether a local source tree is available.
+    for name in ["remote-a", "remote-b"] {
+        let repo_uid = format!("repo:{name}");
+        store
+            .insert_repo(&Repo {
+                uid: repo_uid.clone(),
+                url: format!("https://example.invalid/{name}"),
+                indexed_sha: "x".into(),
+                staleness_commits_behind: 0,
+                instance_id: String::new(),
+                name: Some(name.into()),
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: format!("file:{name}"),
+                path: "src/remote.ts".into(),
+                repo_uid,
+                content_hash: "h".into(),
+            })
+            .unwrap();
+    }
+    let app = create_router(AppState::new(store, None, dir.path().join("t.lbug")));
+    let (status, body) = get_json(&app, "/api/v1/source?file=src/remote.ts").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "ambiguous_file");
+    assert_eq!(
+        body["candidates"],
+        json!(["repo:remote-a", "repo:remote-b"])
+    );
+    assert!(body.get("repo").is_none());
+    for name in ["remote-a", "remote-b"] {
+        let repo = format!("repo:{name}");
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/source?file=src/remote.ts&repo={repo}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "source_not_available");
+        assert_eq!(body["repo"], repo);
+        assert_eq!(body["file"], "src/remote.ts");
+    }
+    let (status, body) = get_json(
+        &app,
+        "/api/v1/source?file=src/unindexed.ts&repo=repo:remote-a",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "source_not_indexed");
+    assert!(
+        body.get("repo").is_none(),
+        "unindexed paths have no owner proof"
+    );
 }
 
 /// nw-682: an oversized file of multi-byte UTF-8 whose cap (plus the one
@@ -2565,6 +2646,10 @@ async fn source_error_bodies_carry_code_and_message() {
         let (s, j) = get_json(&app, uri).await;
         assert_eq!(s, status, "{uri}: {j}");
         assert_eq!(j["error"], code, "{uri}: {j}");
+        assert!(
+            j.get("repo").is_none(),
+            "{uri}: ownership refusal must not claim an owner"
+        );
         assert!(
             j["message"].as_str().is_some_and(|m| !m.is_empty()),
             "{uri}: missing message: {j}"

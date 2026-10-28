@@ -72,9 +72,10 @@ export const api = {
     );
   },
 
-  symbolsInFile(path: string) {
+  symbolsInFile(path: string, init?: RequestInit) {
     return get<SymbolCandidate[]>(
       `/api/v1/symbols/file?path=${encodeURIComponent(path)}`,
+      init,
     );
   },
 
