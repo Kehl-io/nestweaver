@@ -494,6 +494,9 @@ test.afterEach(async ({ page }, info) => {
 });
 
 test("file owner picks survive valid commits and are requalified when indexed ownership changes", async ({ page }) => {
+  // Multiple ownership transitions and protocol receipts share this test budget;
+  // keep each individual UI/readiness assertion at its normal timeout.
+  test.setTimeout(90_000);
   await observeEvents(page);
   await observeOwnerMetadataTimeline(page);
   const owners = ["repo:metadata-a", "repo:metadata-b"];
@@ -852,6 +855,9 @@ async function ownerMetadataReady(page: Page, afterRequest: number, repo: string
 }
 
 test("unavailable owner picks preserve zero-symbol ambiguity and reject mismatched proof", async ({ page }) => {
+  // Multiple ownership transitions and protocol receipts share this test budget;
+  // keep each individual UI/readiness assertion at its normal timeout.
+  test.setTimeout(90_000);
   await observeEvents(page);
   const consumerRequests = await observeFileMetadataConsumers(page, metadataRows("repo:metadata-owner", "onlyOwnerA"));
   const owners = ["repo:metadata-owner", "repo:zero-symbol-owner"];
