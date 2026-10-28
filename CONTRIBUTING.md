@@ -428,13 +428,14 @@ up-to-date checks, and the `Required CI` check from a specific GitHub App.
 
 The public release is intentionally last. Release Please first creates a
 private draft without a tag. The workflow then checks out the exact release
-SHA, waits for that SHA's successful `CI` push run and `Required CI` job, builds
-all four targets, checksums each archive, extracts and smoke-tests the consumer
+SHA and builds all four targets in parallel with that SHA's main `CI` push
+run. It checksums each archive, extracts and smoke-tests the consumer
 layout, creates provenance attestations, and validates the exact eight-file
 bundle. Before publication, a protected-environment job proves Cargo, manifest,
 npm, and tag versions agree, validates the exact npm tarball contents and
 integrity, authenticates to npm, and observes whether the immutable version is
-already present. The publication job then replaces assets through the validated
+already present. The publication job requires that exact SHA's successful main
+`CI` push run and `Required CI` job before replacing assets through the validated
 release ID, compares every remote size and SHA-256 digest, and downloads each
 exact asset ID for a byte-for-byte check against the verified local files. Only
 then does it publish the draft and create the tag. npm publication is idempotent
