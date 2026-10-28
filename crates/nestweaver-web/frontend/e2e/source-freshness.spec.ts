@@ -430,7 +430,7 @@ async function observeOwnerMetadataTimeline(page: Page) {
       const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
       if (signal && !signals.has(signal)) signals.set(signal, ++signalSequence);
       const signalId = signal ? signals.get(signal) : null;
-      record("request", { requestId, signalId, url, hasInit: init !== undefined, aborted: signal?.aborted ?? false });
+      record("request", { requestId, signalId, url, hasInit: init !== undefined, validSignal: signal instanceof AbortSignal, aborted: signal?.aborted ?? false });
       signal?.addEventListener("abort", () => record("abort", { requestId, signalId, url }), { once: true });
       const pending = nativeFetch(input, init);
       // Observe before the application's await continuation, but return the
@@ -521,18 +521,30 @@ test("file owner picks survive valid commits and are requalified when indexed ow
   await expect(symbols.getByText("OwnerAownerBefore0", { exact: true })).toBeVisible();
   await expect(symbols).toHaveCount(2);
   await pick.focus();
+  const beforeRows = owners.flatMap((owner) => metadataRows(owner, `${owner === owners[0] ? "OwnerA" : "OwnerB"}ownerBefore`));
+  await settledMetadataConsumers(page, async () => metadataProtocol(await metadataEvents(page), beforeRows), 1);
   revision = "ownerAfter";
+  const beforeOwnerACommit = Math.max(0, ...(await metadataEvents(page)).map((event) => event.requestId ?? 0));
   await emit(page);
+  await ownerMetadataReady(page, beforeOwnerACommit, owners[0], owners);
   await expect(symbols.getByText("OwnerAownerAfter0", { exact: true })).toBeVisible();
   await expect(pick).toBeFocused();
   await expect(pick).toHaveAttribute("aria-pressed", "true");
   await expect(details).not.toContainText("OwnerBownerAfter");
+  const afterRows = owners.flatMap((owner) => metadataRows(owner, `${owner === owners[0] ? "OwnerA" : "OwnerB"}ownerAfter`));
+  await settledMetadataConsumers(page, async () => metadataProtocol((await metadataEvents(page))
+    .filter((event) => event.requestId !== undefined && event.requestId > beforeOwnerACommit), afterRows), 1);
   available = [owners[1]];
+  const beforeOwnerBCommit = Math.max(0, ...(await metadataEvents(page)).map((event) => event.requestId ?? 0));
   await emit(page);
+  await ownerMetadataReady(page, beforeOwnerBCommit, owners[1], available);
   await expect(symbols.getByText("OwnerBownerAfter0", { exact: true })).toBeVisible();
   await expect(details.getByText("2 symbols", { exact: true })).toBeVisible();
   await expect(details).not.toContainText("OwnerAownerAfter");
   await expect(picker).toHaveCount(0);
+  await settledMetadataConsumers(page, async () => metadataProtocol((await metadataEvents(page))
+    .filter((event) => event.requestId !== undefined && event.requestId > beforeOwnerBCommit),
+  metadataRows(owners[1], "OwnerBownerAfter")), 1);
 });
 
 test("failed file metadata never claims an empty successful symbol count", async ({ page }) => {
@@ -699,37 +711,149 @@ for (const code of ["source_not_available", "source_too_large"] as const) {
   });
 }
 
-interface FileMetadataConsumerCounts {
-  details: number;
-  evidence: number;
-  unexpected: number;
+interface MetadataEvent {
+  phase: string;
+  requestId?: number;
+  signalId?: number | null;
+  url?: string;
+  hasInit?: boolean;
+  validSignal?: boolean;
+  aborted?: boolean;
+  status?: number;
+  summary?: { count?: number; rows?: unknown[]; file?: string; repo?: string; error?: string; lines?: string[] };
 }
 
-async function observeFileMetadataConsumers(page: Page) {
-  // Audited call chain: FileDetail calls symbolsInFile(path, { signal });
-  // SourceEvidencePanel calls symbolsInFile(path) without init. client.ts and
-  // initialReadBarrier.ts forward init unchanged to fetch. Preserve it here.
-  await page.addInitScript(() => {
-    const nativeFetch = window.fetch.bind(window);
-    const counts = { details: 0, evidence: 0, unexpected: 0 };
-    Object.assign(window, { fileMetadataConsumers: counts });
-    window.fetch = (input, init) => {
-      if (String(input).includes("/api/v1/symbols/file?")) {
-        if (init?.signal instanceof AbortSignal) counts.details += 1;
-        else if (init === undefined) counts.evidence += 1;
-        else counts.unexpected += 1;
-      }
-      return nativeFetch(input, init);
-    };
-  });
-  return () => page.evaluate(() => ({ ...(window as unknown as {
-    fileMetadataConsumers: FileMetadataConsumerCounts;
-  }).fileMetadataConsumers }));
+async function metadataEvents(page: Page): Promise<MetadataEvent[]> {
+  return page.evaluate(() => (window as unknown as {
+    ownerMetadataTimeline: { events: MetadataEvent[] };
+  }).ownerMetadataTimeline.events);
+}
+
+function metadataProtocol(events: MetadataEvent[], expectedRows: unknown[]) {
+  const counts = { details: 0, evidence: 0, preview: 0, unexpected: 0, pending: 0 };
+  const requests = events.filter((event) => event.phase === "request");
+  const terminal = (request: MetadataEvent) => events.find((event) => event.requestId === request.requestId &&
+    ["json-decoded", "json-error", "fetch-error"].includes(event.phase));
+  const complete = (request: MetadataEvent) => {
+    const done = terminal(request);
+    if (!done) { counts.pending += 1; return false; }
+    const abort = events.find((event) => event.phase === "abort" && event.requestId === request.requestId);
+    if (done.aborted || (abort && events.indexOf(abort) < events.indexOf(done))) {
+      counts.unexpected += 1;
+      return false;
+    }
+    return true;
+  };
+  if (events.length >= 2000 || events.some((event) => event.phase === "observer-error")) counts.unexpected += 1;
+  // Inspect every source attempt too: aborted/incomplete traffic is not hidden
+  // merely because no metadata followed it. Completed-effect cleanup is valid.
+  for (const request of requests.filter((event) => event.url?.includes("/source?"))) {
+    if (!request.validSignal || request.signalId == null ||
+      new URL(request.url!, "http://fixture").searchParams.get("file") !== "release-journey.js") counts.unexpected += 1;
+    complete(request);
+  }
+  for (const request of requests.filter((event) => event.url?.includes("/symbols/file?"))) {
+    if (new URL(request.url!, "http://fixture").searchParams.get("path") !== "release-journey.js") {
+      counts.unexpected += 1;
+      continue;
+    }
+    if (!complete(request)) continue;
+    if (request.hasInit === false && request.signalId === null) { counts.evidence += 1; continue; }
+    if (!request.validSignal || request.signalId == null) { counts.unexpected += 1; continue; }
+    const sameSignal = requests.filter((event) => event.signalId === request.signalId);
+    const metadata = sameSignal.filter((event) => event.url?.includes("/symbols/file?"));
+    if (metadata.length !== 1) { counts.unexpected += 1; continue; }
+    const sources = sameSignal.filter((event) => event.url?.includes("/source?"));
+    const proof = sources.find((source) => {
+      const decoded = terminal(source);
+      const response = events.find((event) => event.phase === "response" && event.requestId === source.requestId);
+      const body = decoded?.summary;
+      return decoded?.phase === "json-decoded" && events.indexOf(decoded) < events.indexOf(request) &&
+        body?.file === "release-journey.js" && !!body.repo &&
+        (response?.status === 200 || (response?.status === 404 &&
+          ["source_not_available", "source_too_large"].includes(body.error ?? "")));
+    });
+    if (proof) { counts.details += 1; continue; }
+    const decoded = terminal(request);
+    const previewSource = sources.find((source) => events.indexOf(source) > events.indexOf(decoded!) &&
+      new URL(source.url!, "http://fixture").searchParams.get("file") === "release-journey.js" &&
+      new URL(source.url!, "http://fixture").searchParams.get("context") === "12");
+    if (!sources.length) { counts.pending += 1; continue; }
+    if (previewSource && sources.length === 1 && complete(previewSource) &&
+      decoded?.phase === "json-decoded" && decoded.summary?.count === expectedRows.length &&
+      JSON.stringify(decoded.summary.rows) === JSON.stringify(expectedRows)) counts.preview += 1;
+    else counts.unexpected += 1;
+  }
+  return counts;
+}
+
+async function observeFileMetadataConsumers(page: Page, expectedRows: unknown[]) {
+  // Full endpoint/builder sweep: FileDetail(source->metadata, same signal),
+  // Evidence(undefined-init metadata), useNodePreview(metadata->source, same
+  // signal). Preview runs in SceneBreadcrumbs; direct selection never opens
+  // NodePreviewCard. Fresh document/cache and each graph cache-clear must
+  // positively produce EXACTLY one Preview, never an optional ignored request.
+  await observeOwnerMetadataTimeline(page);
+  return async () => metadataProtocol(await metadataEvents(page), expectedRows);
+}
+
+async function settledMetadataConsumers(page: Page, read: () => ReturnType<typeof metadataProtocol> | Promise<ReturnType<typeof metadataProtocol>>, previews: number) {
+  await expect(page.getByRole("button", { name: "Close preview", exact: true })).toHaveCount(0);
+  await expect.poll(async () => {
+    const counts = await read();
+    return { preview: counts.preview, pending: counts.pending, unexpected: counts.unexpected,
+      evidenceObserved: counts.evidence > 0 };
+  }).toEqual({ preview: previews, pending: 0, unexpected: 0, evidenceObserved: true });
+  return read();
+}
+
+function assertExtraPrefetchDetected(events: MetadataEvent[], expectedRows: unknown[]) {
+  // Negative control: model an extra unauthorized FileDetail prefetch with the
+  // strongest possible Preview disguise (metadata->source, exact same payload).
+  // It MUST exceed the exact-one Preview budget, never disappear as benign I/O.
+  const metadata = events.find((event) => event.phase === "request" && event.validSignal &&
+    event.url?.includes("/symbols/file?") && !events.some((source) => source.phase === "request" &&
+      source.signalId === event.signalId && source.url?.includes("/source?") && events.indexOf(source) < events.indexOf(event)));
+  expect(metadata, "controlled fresh page has a positively observed Preview lineage").toBeDefined();
+  const maxId = Math.max(...events.map((event) => event.requestId ?? 0));
+  const extraSignal = Math.max(...events.map((event) => event.signalId ?? 0)) + 1;
+  const extra = events.filter((event) => event.signalId === metadata!.signalId && event.requestId !== undefined)
+    .map((event) => ({ ...event, signalId: extraSignal, requestId: event.requestId! + maxId }));
+  const disguised = metadataProtocol([...events, ...extra], expectedRows);
+  expect(disguised.preview, "extra prefetch cannot hide inside one allowed Preview").toBe(2);
+  expect(disguised.preview === 1 && disguised.unexpected === 0 && disguised.pending === 0).toBe(false);
+}
+
+async function ownerMetadataReady(page: Page, afterRequest: number, repo: string, owners: string[]) {
+  // Transport-only phase: never inspect DOM/store state to decide readiness.
+  // Preserve the original five-second UI assertions after this bounded phase.
+  await expect.poll(async () => {
+    const events = await metadataEvents(page);
+    if (events.length >= 2000 || events.some((event) => event.phase === "observer-error")) return false;
+    return events.filter((event) => event.phase === "request" && event.requestId! > afterRequest &&
+      event.url?.includes("/symbols/file?") && event.validSignal).some((metadata) => {
+      const sameSignal = events.filter((event) => event.signalId === metadata.signalId);
+      const requests = sameSignal.filter((event) => event.phase === "request");
+      const proof = sameSignal.find((event) => event.phase === "json-decoded" &&
+        event.summary?.file === "release-journey.js" && event.summary.repo === repo &&
+        JSON.stringify(event.summary.lines) === JSON.stringify([`${repo}:ownerAfter`]) &&
+        events.indexOf(event) < events.indexOf(metadata) && event.requestId! > afterRequest &&
+        sameSignal.some((response) => response.phase === "response" && response.requestId === event.requestId && response.status === 200));
+      if (!proof || requests[0]?.url?.includes("/symbols/file?") ||
+        sameSignal.some((event) => event.phase === "abort")) return false;
+      if (owners.length > 1 && !sameSignal.some((event) => event.phase === "json-decoded" &&
+        event.summary?.error === "ambiguous_file" && events.indexOf(event) < events.indexOf(proof))) return false;
+      const decoded = sameSignal.find((event) => event.phase === "json-decoded" && event.requestId === metadata.requestId);
+      const expected = owners.flatMap((owner) => metadataRows(owner, `${owner === "repo:metadata-a" ? "OwnerA" : "OwnerB"}ownerAfter`));
+      return decoded?.aborted === false && decoded.summary?.count === expected.length &&
+        JSON.stringify(decoded.summary.rows) === JSON.stringify(expected);
+    });
+  }).toBe(true);
 }
 
 test("unavailable owner picks preserve zero-symbol ambiguity and reject mismatched proof", async ({ page }) => {
   await observeEvents(page);
-  const consumerRequests = await observeFileMetadataConsumers(page);
+  const consumerRequests = await observeFileMetadataConsumers(page, metadataRows("repo:metadata-owner", "onlyOwnerA"));
   const owners = ["repo:metadata-owner", "repo:zero-symbol-owner"];
   let mismatch = false;
   await page.route("**/api/v1/repos", (route) => route.fulfill({ json:
@@ -752,40 +876,49 @@ test("unavailable owner picks preserve zero-symbol ambiguity and reject mismatch
   const picker = details.getByRole("group", { name: "Repos containing release-journey.js", exact: true });
   await expect(picker).toBeVisible();
   await expect(symbols).toHaveCount(0);
-  await expect.poll(async () => (await consumerRequests()).evidence).toBeGreaterThan(0);
+  await settledMetadataConsumers(page, consumerRequests, 1);
   expect((await consumerRequests()).details, "FileDetail must qualify File ownership before requesting rows").toBe(0);
   expect((await consumerRequests()).unexpected, "audited consumers retain their request init shape").toBe(0);
+  assertExtraPrefetchDetected(await metadataEvents(page), metadataRows("repo:metadata-owner", "onlyOwnerA"));
   const ambiguousRequests = await consumerRequests();
   const beforeAuthorizedPick = ambiguousRequests.details;
+  const beforeOwnerPickId = Math.max(0, ...(await metadataEvents(page)).map((event) => event.requestId ?? 0));
   await picker.getByRole("button", { name: "Show release-journey.js from repo:metadata-owner", exact: true }).click();
   await expect(symbols.getByText("onlyOwnerA0", { exact: true })).toBeVisible();
   // Positive control: the same observer sees actual authorized FileDetail I/O.
-  await expect.poll(async () => (await consumerRequests()).details).toBeGreaterThan(beforeAuthorizedPick);
+  await expect.poll(async () => (await consumerRequests()).details).toBe(beforeAuthorizedPick + 1);
   await expect(details.getByText("2 symbols", { exact: true })).toBeVisible();
   await expect(details.getByText("Picked source cannot be read", { exact: true })).toBeVisible();
   await expect(details.getByRole("group", { name: "Node actions", exact: true })).toHaveCount(2);
   await expect(details.getByRole("group", { name: "Node actions", exact: true }).last()).toBeVisible();
+  await settledMetadataConsumers(page, consumerRequests, 1);
+  const beforeZeroOwnerPickId = Math.max(0, ...(await metadataEvents(page)).map((event) => event.requestId ?? 0));
   await picker.getByRole("button", { name: "Show release-journey.js from repo:zero-symbol-owner", exact: true }).click();
   await expect(details.getByText("0 symbols", { exact: true })).toBeVisible();
   await expect(symbols).toHaveCount(0);
   await expect(details).not.toContainText("onlyOwnerA");
+  await settledMetadataConsumers(page, consumerRequests, 1);
   const authorizedRequests = await consumerRequests();
+  expect(authorizedRequests.details).toBe(beforeAuthorizedPick + 2);
   const beforeMismatch = authorizedRequests.details;
+  const beforeMismatchId = Math.max(0, ...(await metadataEvents(page)).map((event) => event.requestId ?? 0));
   mismatch = true;
   await emit(page);
   await expect(details).toContainText("File ownership is unavailable for the selected repository.");
   await expect(details.getByText("0 symbols", { exact: true })).toHaveCount(0);
+  await settledMetadataConsumers(page, consumerRequests, 2);
   expect((await consumerRequests()).details, "another owner's proof cannot authorize FileDetail metadata").toBe(beforeMismatch);
   expect((await consumerRequests()).unexpected).toBe(0);
   await test.info().attach("file-metadata-consumer-stages", {
     body: JSON.stringify({ ambiguous: ambiguousRequests, authorized: authorizedRequests,
-      mismatched: await consumerRequests() }), contentType: "application/json",
+      mismatched: await consumerRequests(), markers: { beforeOwnerPickId, beforeZeroOwnerPickId, beforeMismatchId },
+      events: await metadataEvents(page) }), contentType: "application/json",
   });
 });
 
 for (const failure of ["missing-owner", "wrong-path", "wrong-code", "wrong-status", "network"] as const) {
   test(`file metadata refuses ${failure} as ownership proof`, async ({ page }) => {
-    const consumerRequests = await observeFileMetadataConsumers(page);
+    const consumerRequests = await observeFileMetadataConsumers(page, metadataRows("repo:metadata", "unsafeMetadata"));
     await page.route("**/api/v1/source?*", (route) => {
       if (failure === "network") return route.abort("failed");
       return route.fulfill({ status: failure === "wrong-status" ? 503 : 404, json: {
@@ -806,11 +939,11 @@ for (const failure of ["missing-owner", "wrong-path", "wrong-code", "wrong-statu
       : "Unqualified source failure");
     await expect(symbols).toHaveCount(0);
     await expect(details.getByText("0 symbols", { exact: true })).toHaveCount(0);
-    await expect.poll(async () => (await consumerRequests()).evidence).toBeGreaterThan(0);
+    await settledMetadataConsumers(page, consumerRequests, 1);
     expect((await consumerRequests()).details, "unqualified source must not fetch FileDetail metadata").toBe(0);
     expect((await consumerRequests()).unexpected, "audited consumers retain their request init shape").toBe(0);
     await test.info().attach("file-metadata-consumers", {
-      body: JSON.stringify({ failure, counts: await consumerRequests() }), contentType: "application/json",
+      body: JSON.stringify({ failure, counts: await consumerRequests(), events: await metadataEvents(page) }), contentType: "application/json",
     });
   });
 }
