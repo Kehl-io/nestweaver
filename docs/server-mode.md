@@ -1003,8 +1003,8 @@ immediately in normal operation.
 
 > **This section is about *latency*, not *correctness*.** Everything below
 > describes how fast ranks are served, and assumes the underlying edges are the
-> ones the current resolver would write. **current source `RESOLVER_GENERATION` is 19**
-> (published 12.2.3 uses 17)
+> ones the current resolver would write. **12.2.4 `RESOLVER_GENERATION` is 19**
+> (12.2.3 used 17)
 > (`crates/nestweaver-engine/src/resolver_generation.rs`), and compatibility is
 > an exact match rather than a floor, so a graph indexed by any other release
 > serves ranks *quickly* and *wrongly*. Through generation 4 that meant edges
@@ -1034,7 +1034,7 @@ immediately in normal operation.
 > Generation 18 and parsed cache 12 additionally invalidate
 > Scala facts from before grammar 0.26.3, recovering declarations such as local
 > case classes and Scala 2 `export` identifiers when each repo is force-reindexed.
-> Current source generation 19 and parsed cache 13 add repo-wide PHP function
+> 12.2.4 generation 19 and parsed cache 13 add repo-wide PHP function
 > namespace lookup, categorized function aliases and duplicate refusal.
 > Markdown derivation version 3 separately refreshes eligible vault links for
 > encoded URL paths and absolute paths contained within the registered root.
@@ -1044,7 +1044,7 @@ immediately in normal operation.
 > rebuilt:
 > `stale-check` exits 2 and `dead-code` refuses until it matches. Re-index
 > every repo — `nestweaver index --repo <path> --force` — before trusting any
-> ranking on this server. After upgrading to 12.2.3, also run
+> ranking on this server. After upgrading to 12.2.4, also run
 > `nestweaver brain refresh <vault>` once for each vault.
 >
 > **`stale-check` detects this as of 9.0.0.** A generation-stale repo reports

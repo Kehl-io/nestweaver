@@ -1,5 +1,29 @@
 # Changelog
 
+## [12.2.4](https://github.com/Kehl-io/nestweaver/compare/v12.2.3...v12.2.4) (2026-10-28)
+
+
+### Bug Fixes
+
+* **engine:** invalidate Scala caches with Rust dependency updates ([#526](https://github.com/Kehl-io/nestweaver/issues/526)) ([9f1aeed](https://github.com/Kehl-io/nestweaver/commit/9f1aeedd5c194bc6e412a9652c107edcd5b087ea))
+* harden indexing, dependencies, and backup recovery ([#528](https://github.com/Kehl-io/nestweaver/issues/528)) ([c538ad0](https://github.com/Kehl-io/nestweaver/commit/c538ad0d1183035a9a3761238e57cf72ff84b605))
+
+### Upgrade notes
+
+Resolver generation 19 / parsed cache 13 require `index --repo <path> --force`
+once per repository, with the installation's usual `--db` and `--config` bindings.
+Refresh each registered vault with `brain refresh <vault>` for Markdown derivation
+version 3. Plain incremental indexing does not migrate unchanged graphs.
+
+### Release details
+
+* Restore PHP function namespace and `use function` alias resolution across directories; conservatively refresh callers when declarations change.
+* Repair selected-file metadata freshness across source, ownership and workspace changes.
+* Resolve encoded Markdown URL paths and proven absolute paths within the originating vault.
+* Recover interrupted restores using retry-owned write authority while preserving incumbents.
+* Refresh frontend dependencies and CI dependency pins; patch the build-time Markdown parser to pulldown-cmark 0.13.5 for RUSTSEC-2026-0414.
+* Add npm MCP ownership metadata and a version-matched `server.json` for a separately approved registry submission. Local MCP remains stdio with 43 tools (six in lite mode); installing a package does not index repositories or register a listing.
+
 ## [12.2.3](https://github.com/Kehl-io/nestweaver/compare/v12.2.2...v12.2.3) (2026-10-27)
 
 

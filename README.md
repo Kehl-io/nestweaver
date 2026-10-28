@@ -34,7 +34,7 @@ relationships. Indexing and structural queries run locally; semantic embeddings
 and shared-server connections are optional.
 
 [Quick Start](#quick-start) · [Install options](#install) ·
-[CLI reference](#cli-reference) · [MCP server](#mcp-server) ·
+[CLI reference](#cli-reference) · [MCP server](#mcp-server) · [Agent setup verification](docs/guide/agent-integration.md) ·
 [Upgrade guidance](#upgrading--re-index-before-you-trust-a-ranking)
 
 ---
@@ -189,8 +189,8 @@ notes below before using an older database with a new binary.
 - A database from before LadybugDB 0.21 needs a **publication rebuild**, not
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
-- For a compatible database, run `nestweaver stale-check --db <db>`. Current
-  source uses resolver generation **19**; published 12.2.3 uses **17**. If your
+- For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.4
+  uses resolver generation **19** (12.2.3 used **17**). If your
   binary reports a generation-stale graph, run
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
@@ -208,7 +208,7 @@ notes below before using an older database with a new binary.
   containing this change, force re-index each repository using the command above.
   An unchanged incremental run does not repair an older graph; `stale-check`
   continues to report it as outdated until the forced index succeeds.
-- Current source generation 19 and parsed cache 13 additionally repair PHP function
+- 12.2.4 generation 19 and parsed cache 13 additionally repair PHP function
   resolution by namespace across directories, including `use function` aliases
   and duplicate refusal. Existing graphs need the forced repository index above.
   PHP changes conservatively re-resolve repository PHP callers because a new
@@ -226,10 +226,10 @@ notes below before using an older database with a new binary.
   generation15 additionally handles inferred `var` slices, parenthesized range
   sources and single named factory results. Parsed cache10 reparses unchanged
   declarations for normalized return types and complete var/const/parameter shadow guards.
-- **Upgrading to 12.2.3 needs a forced re-index of every repository.**
-  Resolver generation 17 and parsed cache 11 include the Go receiver, package,
-  incremental-resolution and initializer-scope fixes delivered since 12.2.2
-  (generation 12 / cache 8). Run
+- **Upgrading to 12.2.4 needs a forced re-index of every repository.**
+  Resolver generation 19 and parsed cache 13 include Scala cache invalidation
+  and PHP namespace/function-alias resolution since 12.2.3 (generation 17 /
+  cache 11). Run
   `nestweaver index --repo <path> --force` once per repository, using your usual
   `--db` and `--config` bindings. Plain incremental indexing can leave an
   unchanged graph on its old generation. `stale-check` exits 2 until repaired.
@@ -243,7 +243,7 @@ notes below before using an older database with a new binary.
 <details>
 <summary>Detailed migration notes and changes for scripts and server clients</summary>
 
-**Current source uses `RESOLVER_GENERATION` 19; published 12.2.3 uses 17. Every
+**12.2.4 uses `RESOLVER_GENERATION` 19; 12.2.3 used 17. Every
 graph indexed by a generation different from the running binary must be re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
@@ -327,7 +327,7 @@ and leaves the repo on the old generation. Only a full re-index rewrites the
 edges.
 
 Vaults are not `Repo` nodes and carry no resolver generation, so the forced
-re-index does not touch them. After upgrading to 12.2.3, run one
+re-index does not touch them. After upgrading to 12.2.4, run one
 `brain refresh <vault>` per vault to re-derive links against the rebuilt code graph.
 
 **`stale-check` detects this as of 9.0.0.** A repo whose edges predate the

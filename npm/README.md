@@ -45,6 +45,12 @@ The database defaults to `./nestweaver.lbug` in the current directory. Pass `--d
   <img src="https://raw.githubusercontent.com/Kehl-io/nestweaver/main/npm/media/web-ui-symbol.png" width="720" alt="NestWeaver web UI with run_query selected, its source, and its callees">
 </p>
 
+After setup, reconnect the client and verify `brain_status`, a known symbol with
+`brain_search`, and its callers with `brain_impact`. A config file alone does not
+prove MCP activation. See the [agent verification guide](https://github.com/Kehl-io/nestweaver/blob/main/docs/guide/agent-integration.md).
+The package's `mcpName` is registry ownership metadata; a registry listing requires
+a separate submission.
+
 ## What agents get
 
 - **43 MCP tools** for context, impact, tests, and vault notes. The six-tool lite set is `brain_context`, `brain_search`, `brain_impact`, `brain_status`, `brain_guide`, and `detect_changes`.
@@ -64,7 +70,7 @@ If optional dependencies were skipped, `nestweaver` exits 1 and names the platfo
 
 ## After you upgrade
 
-The current resolver generation is **17**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
+The current resolver generation is **19**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
 
 ```sh
 nestweaver stale-check
@@ -73,12 +79,13 @@ nestweaver brain refresh /path/to/vault   # once per registered vault
 ```
 
 `stale-check` exits 2 and reports `outdated_resolver` when a re-index is required.
-After upgrading to **12.2.3**, run `index --repo <path> --force` once for each
-repository (resolver generation 17, parsed cache 11) and `brain refresh <vault>`
+After upgrading to **12.2.4**, run `index --repo <path> --force` once for each
+repository (resolver generation 19, parsed cache 13) and `brain refresh <vault>`
 once for each registered vault. Keep your usual `--db` and `--config` bindings.
-The release repairs Go receiver and initializer scopes, incremental edge recovery,
-backup/restore safety, authenticated device approval, source freshness and
-embedding-model recovery. See the [changelog](https://github.com/Kehl-io/nestweaver/releases/tag/v12.2.3).
+Markdown derivation version 3 repairs encoded and absolute in-vault note links.
+The release also repairs Scala cache invalidation, PHP namespace/alias resolution,
+selected-file metadata refresh and interrupted backup recovery, and updates
+frontend dependencies. See the [changelog](https://github.com/Kehl-io/nestweaver/releases/tag/v12.2.4).
 
 ## License
 
