@@ -486,4 +486,39 @@ check("release-please bumps every version this package publishes", () => {
   );
 });
 
+// Registry metadata must describe the same installable release as the wrapper.
+check("MCP Registry identity, version, and launch arguments match the npm package", () => {
+  const root = path.resolve(__dirname, "..");
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "server.json"), "utf8"));
+  const pkg = require("./package.json");
+  assert.strictEqual(manifest.name, "io.github.Kehl-io/nestweaver");
+  assert.strictEqual(pkg.mcpName, manifest.name);
+  assert.strictEqual(manifest.version, pkg.version);
+  assert.ok(manifest.description.length > 0 && manifest.description.length <= 100);
+  assert.strictEqual(manifest.packages.length, 1);
+  const entry = manifest.packages[0];
+  assert.strictEqual(entry.registryType, "npm");
+  assert.strictEqual(entry.identifier, pkg.name);
+  assert.strictEqual(entry.version, pkg.version);
+  assert.strictEqual(entry.runtimeHint, "npx");
+  assert.deepStrictEqual(entry.transport, { type: "stdio" });
+  assert.strictEqual(entry.packageArguments[0].value, "mcp");
+  assert.strictEqual(entry.packageArguments[0].type, "positional");
+  const database = entry.packageArguments[1];
+  assert.strictEqual(database.type, "named");
+  assert.strictEqual(database.name, "--db");
+  assert.strictEqual(database.format, "filepath");
+  assert.strictEqual(database.isRequired, true);
+  assert.strictEqual(database.default, undefined);
+});
+
+check("Release Please bumps both MCP Registry version fields", () => {
+  const config = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../release-please-config.json"), "utf8"));
+  const updates = config.packages["."]["extra-files"];
+  for (const jsonpath of ["$.version", "$.packages[0].version"]) {
+    assert.ok(updates.some((file) => file.type === "json" && file.path === "server.json" && file.jsonpath === jsonpath),
+      `Release Please must update server.json ${jsonpath}`);
+  }
+});
+
 console.log(`\nbin/nestweaver self-test passed (${passed} assertions)`);

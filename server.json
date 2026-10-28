@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Kehl-io/nestweaver",
+  "title": "NestWeaver",
+  "description": "Local code knowledge graph: search symbols, trace callers, and inspect change impact across repos.",
+  "repository": {
+    "url": "https://github.com/Kehl-io/nestweaver",
+    "source": "github"
+  },
+  "websiteUrl": "https://docs.nestweaver.kehl.io",
+  "version": "12.2.3",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "nestweaver",
+      "version": "12.2.3",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        },
+        {
+          "type": "named",
+          "name": "--db",
+          "description": "Absolute path to the local NestWeaver database used when indexing your repositories.",
+          "format": "filepath",
+          "isRequired": true,
+          "placeholder": "/absolute/path/to/nestweaver.lbug"
+        }
+      ]
+    }
+  ]
+}
