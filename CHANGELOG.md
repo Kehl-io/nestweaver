@@ -21,7 +21,7 @@ version 3. Plain incremental indexing does not migrate unchanged graphs.
 * Repair selected-file metadata freshness across source, ownership and workspace changes.
 * Resolve encoded Markdown URL paths and proven absolute paths within the originating vault.
 * Recover interrupted restores using retry-owned write authority while preserving incumbents.
-* Refresh frontend dependencies and CI dependency pins.
+* Refresh frontend dependencies and CI dependency pins; patch the build-time Markdown parser to pulldown-cmark 0.13.5 for RUSTSEC-2026-0414.
 * Add npm MCP ownership metadata and a version-matched `server.json` for a separately approved registry submission. Local MCP remains stdio with 43 tools (six in lite mode); installing a package does not index repositories or register a listing.
 
 ## [12.2.3](https://github.com/Kehl-io/nestweaver/compare/v12.2.2...v12.2.3) (2026-10-27)
