@@ -1052,7 +1052,7 @@ jobs:
       # Prebuilt binary via install-action instead of `cargo install cargo-audit`
       # (which compiles it from source on every run, ~3 min).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # cargo-audit 2026-09-02
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # cargo-audit 2026-09-02
         with:
           tool: cargo-audit
       # No `|| true`. This check is displayed as "Security Audit" on every pull
