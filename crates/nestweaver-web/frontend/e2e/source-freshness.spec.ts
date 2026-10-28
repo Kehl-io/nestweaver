@@ -406,8 +406,96 @@ test("file metadata rejects late older epochs and does not refetch for layout or
   } finally { release(); }
 });
 
+async function observeOwnerMetadataTimeline(page: Page) {
+  await page.addInitScript(() => {
+    const events: Record<string, unknown>[] = [];
+    const record = (phase: string, data: Record<string, unknown>) => {
+      if (events.length < 2000) events.push({ phase, wallMs: Date.now(), monotonicMs: performance.now(), ...data });
+    };
+    const snapshot = () => {
+      const panel = document.querySelector('[data-testid="detail-panel"]');
+      return { url: window.location.href,
+        symbols: Array.from(panel?.querySelectorAll("ul button") ?? [], (node) => node.textContent),
+        pressed: Array.from(panel?.querySelectorAll('button[aria-pressed="true"]') ?? [], (node) => node.getAttribute("aria-label")),
+        text: panel?.textContent?.slice(0, 4096) ?? null };
+    };
+    const signals = new WeakMap<AbortSignal, number>();
+    let signalSequence = 0;
+    let requestSequence = 0;
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!/\/api\/v1\/(?:source|symbols\/file)\?/.test(url)) return nativeFetch(input, init);
+      const requestId = ++requestSequence;
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      if (signal && !signals.has(signal)) signals.set(signal, ++signalSequence);
+      const signalId = signal ? signals.get(signal) : null;
+      record("request", { requestId, signalId, url, hasInit: init !== undefined, aborted: signal?.aborted ?? false });
+      signal?.addEventListener("abort", () => record("abort", { requestId, signalId, url }), { once: true });
+      const pending = nativeFetch(input, init);
+      // Observe before the application's await continuation, but return the
+      // original fetch and json promises: no extra await, clone or consumption.
+      void pending.then((response) => {
+        record("response", { requestId, signalId, url, status: response.status, aborted: signal?.aborted ?? false });
+        try {
+          const nativeJson = response.json.bind(response);
+          response.json = () => {
+            record("json-call", { requestId, signalId, url });
+            const decoded = nativeJson();
+            void decoded.then((body: unknown) => {
+              const summary = Array.isArray(body) ? { count: body.length, rows: body.slice(0, 40) }
+                : body && typeof body === "object" ? body : { body };
+              record("json-decoded", { requestId, signalId, url, aborted: signal?.aborted ?? false, summary });
+            }, (error: unknown) => record("json-error", { requestId, signalId, url, error: String(error) }));
+            return decoded;
+          };
+        } catch (error: unknown) { record("observer-error", { requestId, error: String(error) }); }
+      }, (error: unknown) => record("fetch-error", { requestId, signalId, url, error: String(error) }));
+      return pending;
+    };
+    let last = "";
+    let framePending = false;
+    const observer = new MutationObserver(() => {
+      const state = snapshot();
+      const serialized = JSON.stringify(state);
+      if (serialized === last) return;
+      last = serialized;
+      record("dom", state);
+      if (!framePending) {
+        framePending = true;
+        requestAnimationFrame(() => { framePending = false; record("animation-frame", snapshot()); });
+      }
+    });
+    observer.observe(document, { subtree: true, childList: true, characterData: true,
+      attributes: true, attributeFilter: ["aria-pressed", "aria-selected", "aria-busy"] });
+    Object.assign(window, { ownerMetadataTimeline: { events, snapshot } });
+  });
+}
+
+test.afterEach(async ({ page }, info) => {
+  if (info.title !== "file owner picks survive valid commits and are requalified when indexed ownership changes") return;
+  if (page.isClosed()) {
+    await info.attach("owner-metadata-timeline-unavailable", { body: "Page closed before diagnostic collection", contentType: "text/plain" });
+    return;
+  }
+  for (const settled of info.status !== info.expectedStatus ? [false, true] : [false]) {
+    const receipt = await page.evaluate(async (settled) => {
+      const probe = (window as unknown as { ownerMetadataTimeline?: {
+        events: Record<string, unknown>[]; snapshot: () => unknown;
+      } }).ownerMetadataTimeline;
+      if (settled) await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      return { wallMs: Date.now(), monotonicMs: performance.now(), settledFrames: settled ? 2 : 0,
+        events: probe?.events ?? [], final: probe?.snapshot() ?? null };
+    }, settled);
+    await info.attach(`owner-metadata-timeline-${settled ? "post-failure-frames" : "immediate"}`, {
+      body: JSON.stringify(receipt), contentType: "application/json",
+    });
+  }
+});
+
 test("file owner picks survive valid commits and are requalified when indexed ownership changes", async ({ page }) => {
   await observeEvents(page);
+  await observeOwnerMetadataTimeline(page);
   const owners = ["repo:metadata-a", "repo:metadata-b"];
   let available = owners;
   let revision = "ownerBefore";
@@ -483,6 +571,15 @@ function fileWorkspace(id: string, type: "all" | "repo", label: string) {
 test("workspace and path switches cannot commit old file metadata", async ({ page }) => {
   await observeEvents(page);
   await uncancelledMetadataTransport(page);
+  // The Files tree uses the scoped repository + top-symbol catalogues, not
+  // browser popstate. Keep the page mounted while selecting a real tree row.
+  await page.route(/\/api\/v1\/repos(?:\?|$)/, (route) => route.fulfill({ json: [{
+    uid: "repo:metadata", url: "https://fixture.invalid/metadata.git", indexed_sha: "fixture",
+    staleness_commits_behind: 0, instance_id: "fixture", name: "Metadata", root_path: null,
+  }] }));
+  await page.route("**/api/v1/symbols/top?**", (route) => route.fulfill({ json:
+    metadataRows("repo:metadata", "fileTree").map((row, i) => ({ ...row,
+      file_path: i === 0 ? "release-journey.js" : "metadata-other.js" })) }));
   const workspaces = [fileWorkspace("all", "all", "Metadata all"), fileWorkspace("repo:metadata", "repo", "Metadata scoped")];
   await page.route("**/api/v1/workspaces", (route) => route.fulfill({ json: { workspaces, _meta: workspaces[0]._meta } }));
   let revision = "scopeBefore";
@@ -515,15 +612,16 @@ test("workspace and path switches cannot commit old file metadata", async ({ pag
     await emit(page);
     await expect.poll(() => held).toBeGreaterThan(oldHeld);
     revision = "pathCurrent";
-    await page.evaluate(() => {
-      const url = new URL(window.location.href);
-      url.searchParams.set("node", "metadata-other.js");
-      url.searchParams.set("kind", "file");
-      window.history.pushState(null, "", url);
-      window.dispatchEvent(new PopStateEvent("popstate"));
-    });
+    const explorer = page.getByTestId("explorer-panel");
+    await explorer.getByRole("tab", { name: "Files", exact: true }).click();
+    const nextFile = explorer.getByRole("tree", { name: "Files", exact: true })
+      .getByRole("treeitem", { name: "metadata-other.js", exact: true });
+    await expect(nextFile).toBeVisible();
+    await nextFile.click();
+    await expect(nextFile).toHaveAttribute("aria-selected", "true");
     await expect(details.getByText("metadata-other.js", { exact: true }).first()).toBeVisible();
     await expect(symbols.getByText("pathCurrent0", { exact: true })).toBeVisible();
+    expect(new URL(page.url()).searchParams.get("node")).toBe("metadata-other.js");
     const delivered = await metadataDeliveryCount(page);
     release();
     await expect.poll(() => metadataDeliveryCount(page)).toBeGreaterThanOrEqual(delivered + held);
@@ -601,11 +699,39 @@ for (const code of ["source_not_available", "source_too_large"] as const) {
   });
 }
 
+interface FileMetadataConsumerCounts {
+  details: number;
+  evidence: number;
+  unexpected: number;
+}
+
+async function observeFileMetadataConsumers(page: Page) {
+  // Audited call chain: FileDetail calls symbolsInFile(path, { signal });
+  // SourceEvidencePanel calls symbolsInFile(path) without init. client.ts and
+  // initialReadBarrier.ts forward init unchanged to fetch. Preserve it here.
+  await page.addInitScript(() => {
+    const nativeFetch = window.fetch.bind(window);
+    const counts = { details: 0, evidence: 0, unexpected: 0 };
+    Object.assign(window, { fileMetadataConsumers: counts });
+    window.fetch = (input, init) => {
+      if (String(input).includes("/api/v1/symbols/file?")) {
+        if (init?.signal instanceof AbortSignal) counts.details += 1;
+        else if (init === undefined) counts.evidence += 1;
+        else counts.unexpected += 1;
+      }
+      return nativeFetch(input, init);
+    };
+  });
+  return () => page.evaluate(() => ({ ...(window as unknown as {
+    fileMetadataConsumers: FileMetadataConsumerCounts;
+  }).fileMetadataConsumers }));
+}
+
 test("unavailable owner picks preserve zero-symbol ambiguity and reject mismatched proof", async ({ page }) => {
   await observeEvents(page);
+  const consumerRequests = await observeFileMetadataConsumers(page);
   const owners = ["repo:metadata-owner", "repo:zero-symbol-owner"];
   let mismatch = false;
-  let requests = 0;
   await page.route("**/api/v1/repos", (route) => route.fulfill({ json:
     owners.map((uid) => ({ uid, name: uid, url: uid })) }));
   await page.route("**/api/v1/source?*", (route) => {
@@ -619,7 +745,6 @@ test("unavailable owner picks preserve zero-symbol ambiguity and reject mismatch
     } });
   });
   await page.route("**/api/v1/symbols/file?*", (route) => {
-    requests += 1;
     return route.fulfill({ json: metadataRows(owners[0], "onlyOwnerA") });
   });
   await selectFile(page);
@@ -627,9 +752,15 @@ test("unavailable owner picks preserve zero-symbol ambiguity and reject mismatch
   const picker = details.getByRole("group", { name: "Repos containing release-journey.js", exact: true });
   await expect(picker).toBeVisible();
   await expect(symbols).toHaveCount(0);
-  expect(requests, "symbol rows cannot establish unique File ownership").toBe(0);
+  await expect.poll(async () => (await consumerRequests()).evidence).toBeGreaterThan(0);
+  expect((await consumerRequests()).details, "FileDetail must qualify File ownership before requesting rows").toBe(0);
+  expect((await consumerRequests()).unexpected, "audited consumers retain their request init shape").toBe(0);
+  const ambiguousRequests = await consumerRequests();
+  const beforeAuthorizedPick = ambiguousRequests.details;
   await picker.getByRole("button", { name: "Show release-journey.js from repo:metadata-owner", exact: true }).click();
   await expect(symbols.getByText("onlyOwnerA0", { exact: true })).toBeVisible();
+  // Positive control: the same observer sees actual authorized FileDetail I/O.
+  await expect.poll(async () => (await consumerRequests()).details).toBeGreaterThan(beforeAuthorizedPick);
   await expect(details.getByText("2 symbols", { exact: true })).toBeVisible();
   await expect(details.getByText("Picked source cannot be read", { exact: true })).toBeVisible();
   await expect(details.getByRole("group", { name: "Node actions", exact: true })).toHaveCount(2);
@@ -638,17 +769,23 @@ test("unavailable owner picks preserve zero-symbol ambiguity and reject mismatch
   await expect(details.getByText("0 symbols", { exact: true })).toBeVisible();
   await expect(symbols).toHaveCount(0);
   await expect(details).not.toContainText("onlyOwnerA");
-  const beforeMismatch = requests;
+  const authorizedRequests = await consumerRequests();
+  const beforeMismatch = authorizedRequests.details;
   mismatch = true;
   await emit(page);
   await expect(details).toContainText("File ownership is unavailable for the selected repository.");
   await expect(details.getByText("0 symbols", { exact: true })).toHaveCount(0);
-  expect(requests, "another owner's proof cannot authorize metadata").toBe(beforeMismatch);
+  expect((await consumerRequests()).details, "another owner's proof cannot authorize FileDetail metadata").toBe(beforeMismatch);
+  expect((await consumerRequests()).unexpected).toBe(0);
+  await test.info().attach("file-metadata-consumer-stages", {
+    body: JSON.stringify({ ambiguous: ambiguousRequests, authorized: authorizedRequests,
+      mismatched: await consumerRequests() }), contentType: "application/json",
+  });
 });
 
 for (const failure of ["missing-owner", "wrong-path", "wrong-code", "wrong-status", "network"] as const) {
   test(`file metadata refuses ${failure} as ownership proof`, async ({ page }) => {
-    let requests = 0;
+    const consumerRequests = await observeFileMetadataConsumers(page);
     await page.route("**/api/v1/source?*", (route) => {
       if (failure === "network") return route.abort("failed");
       return route.fulfill({ status: failure === "wrong-status" ? 503 : 404, json: {
@@ -659,7 +796,6 @@ for (const failure of ["missing-owner", "wrong-path", "wrong-code", "wrong-statu
       } });
     });
     await page.route("**/api/v1/symbols/file?*", (route) => {
-      requests += 1;
       return route.fulfill({ json: metadataRows("repo:metadata", "unsafeMetadata") });
     });
     await selectFile(page);
@@ -670,6 +806,11 @@ for (const failure of ["missing-owner", "wrong-path", "wrong-code", "wrong-statu
       : "Unqualified source failure");
     await expect(symbols).toHaveCount(0);
     await expect(details.getByText("0 symbols", { exact: true })).toHaveCount(0);
-    expect(requests).toBe(0);
+    await expect.poll(async () => (await consumerRequests()).evidence).toBeGreaterThan(0);
+    expect((await consumerRequests()).details, "unqualified source must not fetch FileDetail metadata").toBe(0);
+    expect((await consumerRequests()).unexpected, "audited consumers retain their request init shape").toBe(0);
+    await test.info().attach("file-metadata-consumers", {
+      body: JSON.stringify({ failure, counts: await consumerRequests() }), contentType: "application/json",
+    });
   });
 }
