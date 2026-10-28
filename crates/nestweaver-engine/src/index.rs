@@ -10925,8 +10925,10 @@ fn build_reresolve_edges_unlogged(
             continue;
         }
         let abs_path = reader.root().join(rel_path);
-        let language = detect_language(&abs_path)
-            .ok_or_else(|| anyhow::anyhow!("missing language for re-resolved file {rel_str}"))?;
+        let Some(language) = detect_language(&abs_path) else {
+            // Removed paths also include contracts and other non-code inputs.
+            continue;
+        };
         let (raw_symbols, raw_references) = if let Some((symbols, references)) =
             prepared_file_data.and_then(|prepared| prepared.get(rel_str))
         {
@@ -18132,6 +18134,107 @@ module.exports = { check, plain };\n";
             collect(2).is_empty(),
             "past the ceiling the pass is skipped"
         );
+    }
+
+    #[test]
+    fn reresolve_non_code_seeds_preserve_complete_supported_source_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("App.js"),
+            "import Chosen from './Router.js';\nfunction app() {\n  Chosen();\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("Router.js"),
+            "export default function Router() {}\n",
+        )
+        .unwrap();
+        let url = "https://example.invalid/non-code-reresolve-seeds";
+        let (_, store) = index_directory_in_memory(&src, "test", url, "sha").unwrap();
+        let repo = repo_uid("test", url);
+        let symbols = store.lookup_symbols_by_repo(&repo).unwrap();
+        let reader = crate::content_reader::FilesystemReader::new(&src);
+        let supported = HashSet::from(["App.js".to_string()]);
+        let empty = HashSet::new();
+        let known = HashSet::from(["App.js".to_string(), "Router.js".to_string()]);
+        let edge_multiset = |edges: Vec<nestweaver_schema::ResolvedEdge>| {
+            let mut edges: Vec<_> = edges
+                .into_iter()
+                .map(|edge| {
+                    (
+                        edge.source_uid,
+                        edge.target_uid,
+                        format!("{:?}", edge.edge_type),
+                    )
+                })
+                .collect();
+            edges.sort();
+            edges
+        };
+        let baseline = edge_multiset(
+            build_reresolve_edges(
+                &reader,
+                &repo,
+                &supported,
+                &empty,
+                &symbols,
+                &known,
+                None,
+            )
+            .unwrap(),
+        );
+        let caller = symbol_uid(&repo, "App.js", "app", 2);
+        let target = symbol_uid(&repo, "Router.js", "Router", 1);
+        for kind in [
+            nestweaver_schema::EdgeType::Imports,
+            nestweaver_schema::EdgeType::Calls,
+        ] {
+            assert!(
+                baseline.contains(&(caller.clone(), target.clone(), format!("{kind:?}"))),
+                "supported source must retain its exact {kind:?} endpoint: {baseline:?}"
+            );
+        }
+
+        // Invalidations may name both existing non-code inputs and deleted or
+        // renamed-from paths. Neither category contributes code references.
+        let non_code = HashSet::from([
+            "openapi.yaml".to_string(),
+            "openapi.yml".to_string(),
+            "openapi.json".to_string(),
+            "README.md".to_string(),
+            "LICENSE".to_string(),
+        ]);
+        for present in [true, false] {
+            for path in &non_code {
+                if present {
+                    fs::write(src.join(path), "not a code source\n").unwrap();
+                } else {
+                    fs::remove_file(src.join(path)).unwrap();
+                }
+            }
+            let mut mixed = supported.clone();
+            mixed.extend(non_code.iter().cloned());
+            for (changed, dependents) in [(&mixed, &empty), (&supported, &non_code)] {
+                let actual = edge_multiset(
+                    build_reresolve_edges(
+                        &reader,
+                        &repo,
+                        changed,
+                        dependents,
+                        &symbols,
+                        &known,
+                        None,
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(
+                    actual, baseline,
+                    "non-code seeds must preserve every edge and multiplicity (present={present})"
+                );
+            }
+        }
     }
 
     #[test]

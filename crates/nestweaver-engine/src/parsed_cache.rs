@@ -752,7 +752,7 @@ mod tests {
                 .any(|s| s.name == "Local")
         );
         let expected = graph(true);
-        assert!(crate::resolver_generation::RESOLVER_GENERATION >= 18);
+        const { assert!(crate::resolver_generation::RESOLVER_GENERATION >= 18) };
         assert_eq!(
             crate::resolver_generation::load(&db).generation_for(&repo_uid),
             crate::resolver_generation::RESOLVER_GENERATION
