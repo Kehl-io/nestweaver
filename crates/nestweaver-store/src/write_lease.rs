@@ -1,8 +1,121 @@
 //! Canonical cross-process authority for database mutations.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+// Creation is evidence only while the exact successful authority still lives.
+// The registry never owns a descriptor and cannot extend an authority's life.
+static CREATED_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<CreatedWriteLockProof>>>> =
+    OnceLock::new();
+
+#[derive(Debug)]
+struct CreatedWriteLockProof {
+    db_path: PathBuf,
+    lock_path: PathBuf,
+    directory: std::fs::File,
+    lock: std::fs::File,
+    namespace_anchor: crate::stable_anchor::StableAnchor,
+}
+
+impl CreatedWriteLockProof {
+    fn matches(&self, db_path: &Path, directory_identity: (u64, u64)) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(parent) = self.db_path.parent() else {
+            return false;
+        };
+        let (Ok(directory), Ok(lock)) = (self.directory.metadata(), self.lock.metadata()) else {
+            return false;
+        };
+        self.db_path == db_path
+            && self.namespace_anchor.is_current()
+            && current_process_claims_write_lease(db_path)
+            && current_process_claims_namespace_lease(parent)
+            && directory.is_dir()
+            && (directory.dev(), directory.ino()) == directory_identity
+            && crate::stable_anchor::descriptor_matches_path(&self.directory, parent)
+            && lock.is_file()
+            && lock.len() == 0
+            && lock.nlink() == 1
+            && crate::stable_anchor::descriptor_matches_path(&self.lock, &self.lock_path)
+    }
+}
+
+#[derive(Debug)]
+struct CreatedWriteLockRegistration {
+    proof: Arc<CreatedWriteLockProof>,
+}
+
+impl CreatedWriteLockRegistration {
+    fn publish(proof: CreatedWriteLockProof) -> Result<Self, WriteLeaseError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = proof
+            .directory
+            .metadata()
+            .map_err(WriteLeaseError::Unavailable)?;
+        if !proof.matches(&proof.db_path, (directory.dev(), directory.ino())) {
+            return Err(WriteLeaseError::Unavailable(std::io::Error::other(
+                "created writer-lock proof changed before publication",
+            )));
+        }
+        let proof = Arc::new(proof);
+        let mut registry = CREATED_WRITE_LOCKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| {
+                WriteLeaseError::Unavailable(std::io::Error::other(
+                    "created writer-lock registry is poisoned",
+                ))
+            })?;
+        registry.insert(proof.db_path.clone(), Arc::downgrade(&proof));
+        Ok(Self { proof })
+    }
+}
+
+impl Drop for CreatedWriteLockRegistration {
+    fn drop(&mut self) {
+        let Some(registry) = CREATED_WRITE_LOCKS.get() else {
+            return;
+        };
+        // Poisoned evidence is never accepted by the reader. Still retract
+        // this exact entry before any authority descriptor can close.
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry
+            .get(&self.proof.db_path)
+            .is_some_and(|registered| registered.ptr_eq(&Arc::downgrade(&self.proof)))
+        {
+            registry.remove(&self.proof.db_path);
+        }
+    }
+}
+
+/// Prove an unjournaled operational lock was atomically created by a currently
+/// held restore acquisition in this exact directory. An existing empty name,
+/// an acquiring process claim, or a previous process's creation is not proof.
+/// This adds no authority: callers must still hold every restore namespace and
+/// database lease. No graph descriptor is opened or cloned by this predicate.
+pub fn current_process_owns_created_write_lock(
+    db_path: &Path,
+    directory_identity: (u64, u64),
+) -> bool {
+    let Some(registry) = CREATED_WRITE_LOCKS.get() else {
+        return false;
+    };
+    let Ok(registry) = registry.lock() else {
+        return false;
+    };
+    let db_path = canonical_db_path(db_path);
+    let Some(proof) = registry.get(&db_path).and_then(Weak::upgrade) else {
+        return false;
+    };
+    // Keep both the registry guard and temporary strong proof alive through
+    // validation. Registration removal cannot race a partial observation.
+    proof.matches(&db_path, directory_identity)
+}
 
 /// POSIX record locks are process-scoped and closing *any* descriptor for the
 /// same file releases every record lock that process holds on it. Reject a
@@ -178,6 +291,8 @@ pub fn write_lease_path(db_path: &Path) -> PathBuf {
 #[must_use = "the lease must be held for the complete mutation"]
 #[derive(Debug)]
 pub struct DbWriteLease {
+    // Retract volatile creation proof BEFORE closing any authority descriptor.
+    _created_write_lock: Option<CreatedWriteLockRegistration>,
     // System scratch roots such as /tmp cannot be destructively restored by
     // NestWeaver, so a database directly below one needs only the exact
     // database and sidecar authorities. Every replaceable data directory also
@@ -454,6 +569,15 @@ fn acquire_db_write_lease_inner(
     namespace: Option<&DbNamespaceLease>,
     allow_creation: bool,
 ) -> Result<DbWriteLease, WriteLeaseError> {
+    acquire_db_write_lease_inner_with_hook(db_path, namespace, allow_creation, || {})
+}
+
+fn acquire_db_write_lease_inner_with_hook(
+    db_path: &Path,
+    namespace: Option<&DbNamespaceLease>,
+    allow_creation: bool,
+    before_sidecar_lock: impl FnOnce(),
+) -> Result<DbWriteLease, WriteLeaseError> {
     let db_path = canonical_db_path(db_path);
     if !allow_creation {
         std::fs::metadata(&db_path).map_err(WriteLeaseError::Unavailable)?;
@@ -593,18 +717,81 @@ fn acquire_db_write_lease_inner(
         // process claim and the distinct sidecar flock below close the
         // same-process duplicate hole.
 
-        let lease_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lease_path)
-            .map_err(WriteLeaseError::Unavailable)?;
+        let (lease_file, created_proof) = if let Some(namespace) = namespace {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+            let parent = db_path.parent().ok_or_else(|| {
+                WriteLeaseError::Unavailable(std::io::Error::other(
+                    "restore database has no parent directory",
+                ))
+            })?;
+            let directory = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(parent)
+                .map_err(WriteLeaseError::Unavailable)?;
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&lease_path)
+            {
+                Ok(file) => {
+                    let proof = CreatedWriteLockProof {
+                        db_path: db_path.clone(),
+                        lock_path: lease_path.clone(),
+                        directory,
+                        // Duplicating this sidecar OFD retains its flock. Never
+                        // duplicate the graph FD: closing it releases POSIX locks.
+                        lock: file.try_clone().map_err(WriteLeaseError::Unavailable)?,
+                        namespace_anchor: namespace
+                            .anchor
+                            .try_clone()
+                            .map_err(WriteLeaseError::Unavailable)?,
+                    };
+                    let metadata = proof
+                        .directory
+                        .metadata()
+                        .map_err(WriteLeaseError::Unavailable)?;
+                    if !proof.matches(&db_path, (metadata.dev(), metadata.ino())) {
+                        return Err(WriteLeaseError::Unavailable(std::io::Error::other(
+                            "created writer lock or restore directory changed during acquisition",
+                        )));
+                    }
+                    (file, Some(proof))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .truncate(false)
+                        .open(&lease_path)
+                        .map_err(WriteLeaseError::Unavailable)?,
+                    None,
+                ),
+                Err(error) => return Err(WriteLeaseError::Unavailable(error)),
+            }
+        } else {
+            (
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&lease_path)
+                    .map_err(WriteLeaseError::Unavailable)?,
+                None,
+            )
+        };
+        before_sidecar_lock();
         lock_flock_with_inheritance_retry(&lease_file, libc::LOCK_EX)?;
-        Ok(lease_file)
+        let registration = created_proof
+            .map(CreatedWriteLockRegistration::publish)
+            .transpose()?;
+        Ok((lease_file, registration))
     })();
-    let lease_file = match remaining {
-        Ok(lease_file) => lease_file,
+    let (lease_file, created_write_lock) = match remaining {
+        Ok(held) => held,
         Err(error) => {
             if created_db_file {
                 // Close our descriptor first so the unlink cannot race this
@@ -626,6 +813,7 @@ fn acquire_db_write_lease_inner(
     // ownership knowledge cannot become stale or disappear early.
     let self_latch = crate::note_self_held_write_lease(&db_path);
     Ok(DbWriteLease {
+        _created_write_lock: created_write_lock,
         _namespace_file: namespace_file,
         _namespace_anchor: namespace_anchor,
         _db_file: db_file,
@@ -793,6 +981,269 @@ fn probe_posix_write_lock_state(path: &Path) -> WriteLeaseState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn directory_identity(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    fn created_lock_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        DbNamespaceLease,
+        DbWriteLease,
+        (u64, u64),
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let db = data.join("brain.lbug");
+        std::fs::write(&db, b"incumbent graph").unwrap();
+        let identity = directory_identity(&data);
+        let namespace = acquire_db_namespace_lease(&data).unwrap();
+        let authority = acquire_db_write_lease_under_namespace(&db, &namespace).unwrap();
+        assert!(current_process_owns_created_write_lock(&db, identity));
+        (root, db, namespace, authority, identity)
+    }
+
+    #[test]
+    fn created_restore_lock_proof_is_exact_and_retracted_before_authority_release() {
+        let (_root, db, namespace, mut authority, identity) = created_lock_fixture();
+        assert!(!current_process_owns_created_write_lock(
+            &db.with_file_name("sibling.lbug"),
+            identity
+        ));
+        assert!(!current_process_owns_created_write_lock(
+            &db,
+            (identity.0, identity.1.wrapping_add(1))
+        ));
+        // Exercise registration retirement while BOTH real authority FDs and
+        // the process claim are still live, rather than infer field ordering
+        // from a query made only after the whole authority has gone away.
+        drop(authority._created_write_lock.take());
+        assert!(!current_process_owns_created_write_lock(&db, identity));
+        assert!(current_process_claims_write_lease(&db));
+        assert_eq!(probe_flock_state(authority.path()), WriteLeaseState::Held);
+        drop(authority);
+        assert!(!current_process_owns_created_write_lock(&db, identity));
+        let existing = acquire_db_write_lease_under_namespace(&db, &namespace).unwrap();
+        assert!(!current_process_owns_created_write_lock(&db, identity));
+        assert!(existing._created_write_lock.is_none());
+    }
+
+    #[test]
+    fn preexisting_or_ordinary_writer_locks_never_gain_restore_creation_proof() {
+        for preexisting in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = root.path().join("brain.lbug");
+            std::fs::write(&db, b"incumbent").unwrap();
+            let identity = directory_identity(root.path());
+            if preexisting {
+                std::fs::write(write_lease_path(&db), b"").unwrap();
+                let namespace = acquire_db_namespace_lease(root.path()).unwrap();
+                let authority = acquire_db_write_lease_under_namespace(&db, &namespace).unwrap();
+                assert!(!current_process_owns_created_write_lock(&db, identity));
+                assert!(authority._created_write_lock.is_none());
+            } else {
+                let authority = acquire_db_write_lease(&db).unwrap();
+                assert!(!current_process_owns_created_write_lock(&db, identity));
+                assert!(authority._created_write_lock.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_crashed_process_created_lock_is_not_adopted_by_a_later_retry() {
+        const CHILD: &str = "NW_TEST_CRASH_CREATED_WRITER_LOCK";
+        if let Some(db) = std::env::var_os(CHILD) {
+            let db = Path::new(&db);
+            let parent = db.parent().unwrap();
+            let namespace = acquire_db_namespace_lease(parent).unwrap();
+            let _authority = acquire_db_write_lease_under_namespace(db, &namespace).unwrap();
+            assert!(current_process_owns_created_write_lock(
+                db,
+                directory_identity(parent)
+            ));
+            // Actual process death removes volatile proof without inventing
+            // persisted ownership for the next invocation.
+            // SAFETY: this test-only child exits immediately without unwinding.
+            unsafe { libc::_exit(9) };
+        }
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("brain.lbug");
+        std::fs::write(&db, b"incumbent").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "write_lease::tests::a_crashed_process_created_lock_is_not_adopted_by_a_later_retry",
+            ])
+            .env(CHILD, &db)
+            .output()
+            .unwrap();
+        assert_eq!(child.status.code(), Some(9));
+        let lock = write_lease_path(&db);
+        let original = std::fs::symlink_metadata(&lock).unwrap();
+        assert_eq!(original.len(), 0);
+        let namespace = acquire_db_namespace_lease(root.path()).unwrap();
+        let _authority = acquire_db_write_lease_under_namespace(&db, &namespace).unwrap();
+        assert!(!current_process_owns_created_write_lock(
+            &db,
+            directory_identity(root.path())
+        ));
+        use std::os::unix::fs::MetadataExt;
+        let retained = std::fs::symlink_metadata(lock).unwrap();
+        assert_eq!(
+            (original.dev(), original.ino()),
+            (retained.dev(), retained.ino())
+        );
+    }
+
+    #[test]
+    fn created_restore_lock_proof_revokes_mutated_linked_or_replaced_paths() {
+        use std::os::unix::fs::symlink;
+
+        for mutation in ["nonempty", "hardlink", "replacement", "symlink", "parent"] {
+            let (root, db, _namespace, authority, identity) = created_lock_fixture();
+            let lock = write_lease_path(&db);
+            match mutation {
+                "nonempty" => std::fs::write(&lock, b"foreign payload").unwrap(),
+                "hardlink" => std::fs::hard_link(&lock, root.path().join("other-link")).unwrap(),
+                "replacement" => {
+                    std::fs::rename(&lock, root.path().join("old-lock")).unwrap();
+                    std::fs::write(&lock, b"").unwrap();
+                }
+                "symlink" => {
+                    let old = root.path().join("old-lock");
+                    std::fs::rename(&lock, &old).unwrap();
+                    symlink(old, &lock).unwrap();
+                }
+                "parent" => {
+                    let data = db.parent().unwrap();
+                    std::fs::rename(data, root.path().join("displaced-data")).unwrap();
+                    std::fs::create_dir(data).unwrap();
+                    std::fs::write(&db, b"incumbent graph").unwrap();
+                    std::fs::write(&lock, b"").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(current_process_claims_write_lease(&db));
+            assert!(current_process_claims_namespace_lease(db.parent().unwrap()));
+            assert!(
+                !current_process_owns_created_write_lock(&db, identity),
+                "{mutation} must revoke the exact creation proof"
+            );
+            drop(authority);
+            assert!(std::fs::symlink_metadata(&lock).is_ok());
+        }
+    }
+
+    #[test]
+    fn cross_thread_created_lock_proof_is_unavailable_until_both_os_locks_are_held() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("brain.lbug");
+        std::fs::write(&db, b"incumbent").unwrap();
+        let identity = directory_identity(root.path());
+        let namespace = acquire_db_namespace_lease(root.path()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let db_ref = &db;
+            let namespace_ref = &namespace;
+            let acquiring = scope.spawn(move || {
+                acquire_db_write_lease_inner_with_hook(db_ref, Some(namespace_ref), true, || {
+                    // The graph POSIX lock and new sidecar exist, but the
+                    // sidecar flock has not been taken and nothing is public.
+                    ready_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                })
+                .unwrap()
+            });
+            ready_rx.recv().unwrap();
+            let before_flock = (
+                write_lease_path(&db).is_file(),
+                current_process_claims_write_lease(&db),
+                current_process_owns_created_write_lock(&db, identity),
+            );
+            // Complete the worker before asserting its paused-state witness:
+            // even a premature-publication regression must fail, not deadlock
+            // when scoped-thread unwinding waits for this receiver.
+            continue_tx.send(()).unwrap();
+            let authority = acquiring.join().unwrap();
+            assert!(before_flock.0);
+            assert!(before_flock.1);
+            assert!(!before_flock.2);
+            assert!(current_process_owns_created_write_lock(&db, identity));
+            drop(authority);
+            assert!(!current_process_owns_created_write_lock(&db, identity));
+        });
+    }
+
+    #[test]
+    fn failed_created_sidecar_flock_never_publishes_creation_proof() {
+        use std::io::{BufRead as _, Write as _};
+        const CHILD: &str = "NW_TEST_CREATED_SIDECAR_FLOCK";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            lock_flock_with_inheritance_retry(&file, libc::LOCK_EX).unwrap();
+            println!("sidecar-flock-held");
+            std::io::stdout().flush().unwrap();
+            let mut release = String::new();
+            std::io::stdin().read_line(&mut release).unwrap();
+            assert_eq!(release.trim(), "release");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("brain.lbug");
+        std::fs::write(&db, b"incumbent").unwrap();
+        let identity = directory_identity(root.path());
+        let namespace = acquire_db_namespace_lease(root.path()).unwrap();
+        let mut holder = None;
+        let mut before_flock_proof = None;
+        let result = acquire_db_write_lease_inner_with_hook(&db, Some(&namespace), true, || {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "write_lease::tests::failed_created_sidecar_flock_never_publishes_creation_proof",
+                    "--nocapture",
+                ])
+                .env(CHILD, write_lease_path(&db))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            loop {
+                let mut line = String::new();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0);
+                if line.contains("sidecar-flock-held") {
+                    break;
+                }
+            }
+            before_flock_proof = Some(current_process_owns_created_write_lock(&db, identity));
+            holder = Some((child, output));
+        });
+        let refused_while_held = matches!(&result, Err(WriteLeaseError::Held));
+        let proof_while_held = current_process_owns_created_write_lock(&db, identity);
+        let claim_while_held = current_process_claims_write_lease(&db);
+        let (mut child, mut output) = holder.unwrap();
+        let release = child.stdin.take().unwrap().write_all(b"release\n");
+        // Preserve observations from the genuinely held flock, but always
+        // release/drain/reap before asserting them, including on a regression.
+        let drain = std::io::copy(&mut output, &mut std::io::sink());
+        let exit = child.wait();
+        release.unwrap();
+        drain.unwrap();
+        assert!(exit.unwrap().success());
+        assert_eq!(before_flock_proof, Some(false));
+        assert!(refused_while_held);
+        assert!(!proof_while_held);
+        assert!(!claim_while_held);
+    }
 
     fn await_write_lease_free(db: &Path) {
         for _ in 0..100 {
