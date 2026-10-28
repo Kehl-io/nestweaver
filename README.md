@@ -1147,6 +1147,10 @@ CLI commands (`search`, `brain search`, `brain context`) also respect this setti
 
 ## MCP Server
 
+For manual installation and the proposed official registry listing, see the
+[MCP Registry guide](docs/guide/mcp-registry.md). Registry publication requires
+a separate npm release and maintainer approval.
+
 NestWeaver exposes **43 tools** via the [Model Context Protocol](https://modelcontextprotocol.io), giving any MCP-compatible AI agent structured access to your codebase graph without reading source files directly.
 
 > **Where that number comes from.** The registry is

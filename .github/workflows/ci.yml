@@ -164,6 +164,7 @@ jobs:
               - 'docs/**'
               - 'npm/**'
               - 'smithery.yaml'
+              - 'server.json'
             metal:
               - 'app/Sources/**'
               - 'app/Tests/**'
@@ -852,7 +853,7 @@ jobs:
       - name: Standard artifact release contracts
         run: |
           unset NESTWEAVER_NO_DAEMON NESTWEAVER_ALLOW_NO_DAEMON
-          for suite in release_selectors release_gates release_notes release_dead_code release_dead_code_witnesses release_routes release_publication; do
+          for suite in release_selectors release_gates release_notes release_dead_code release_dead_code_witnesses release_routes release_publication release_mcp_registry; do
             python3 "tests/support/$suite.py" --binary "$PWD/staged/standard/nestweaver"
           done
           python3 tests/support/release_selectors.py --binary "$PWD/staged/standard/nestweaver" --during-index

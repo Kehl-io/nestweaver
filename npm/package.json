@@ -40,5 +40,6 @@
     "type": "git",
     "url": "git+https://github.com/Kehl-io/nestweaver.git"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "mcpName": "io.github.Kehl-io/nestweaver"
 }
