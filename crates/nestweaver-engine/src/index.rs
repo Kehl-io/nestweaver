@@ -18174,16 +18174,8 @@ module.exports = { check, plain };\n";
             edges
         };
         let baseline = edge_multiset(
-            build_reresolve_edges(
-                &reader,
-                &repo,
-                &supported,
-                &empty,
-                &symbols,
-                &known,
-                None,
-            )
-            .unwrap(),
+            build_reresolve_edges(&reader, &repo, &supported, &empty, &symbols, &known, None)
+                .unwrap(),
         );
         let caller = symbol_uid(&repo, "App.js", "app", 2);
         let target = symbol_uid(&repo, "Router.js", "Router", 1);
@@ -18219,13 +18211,7 @@ module.exports = { check, plain };\n";
             for (changed, dependents) in [(&mixed, &empty), (&supported, &non_code)] {
                 let actual = edge_multiset(
                     build_reresolve_edges(
-                        &reader,
-                        &repo,
-                        changed,
-                        dependents,
-                        &symbols,
-                        &known,
-                        None,
+                        &reader, &repo, changed, dependents, &symbols, &known, None,
                     )
                     .unwrap(),
                 );
