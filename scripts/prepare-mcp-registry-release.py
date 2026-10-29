@@ -195,6 +195,21 @@ def prepare(version, commit, output, expected_manifest=None, fetch_github=github
     return receipt
 
 
+def verify_prepared(version, commit, output, fetch=public_json):
+    validate_inputs(version, commit)
+    receipt = json.loads((output / 'validation.json').read_text())
+    require(receipt.get('repository') == REPOSITORY and receipt.get('commit') == commit
+            and receipt.get('version') == version, 'prepared receipt does not match selected release')
+    data = (output / 'server.json').read_bytes()
+    require(hashlib.sha256(data).hexdigest() == receipt.get('manifest_sha256'),
+            'prepared manifest bytes changed after validation')
+    manifest = json.loads(data)
+    require(manifest.get('version') == version and manifest.get('name') == NAME,
+            'wrong prepared manifest')
+    registry_state(manifest, fetch=fetch, require_published=True)
+    return {'verified_version': endpoint(version), 'latest': endpoint('latest')}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version', required=True)
@@ -205,12 +220,7 @@ def main():
     parser.add_argument('--verify-published', action='store_true')
     args = parser.parse_args()
     if args.verify_published:
-        validate_inputs(args.version, args.expected_sha)
-        manifest = json.loads((args.output / 'server.json').read_text())
-        require(manifest.get('version') == args.version and manifest.get('name') == NAME,
-                'wrong prepared manifest')
-        registry_state(manifest, require_published=True)
-        print(json.dumps({'verified_version': endpoint(args.version), 'latest': endpoint('latest')}))
+        print(json.dumps(verify_prepared(args.version, args.expected_sha, args.output)))
         return
     receipt = prepare(args.version, args.expected_sha, args.output, args.expected_manifest_sha256)
     if args.github_output:
