@@ -161,6 +161,19 @@ class ReleasePreparation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'differs'):
             registry.registry_state(fixture.manifest, fixture.public)
 
+    def test_registry_rejects_extra_functional_fields_but_accepts_response_metadata(self):
+        fixture = Fixture()
+        exact = {'server': fixture.manifest, '_meta': {'io.modelcontextprotocol.registry/official': {'isLatest': True}}}
+        fixture.entries = {registry.endpoint(VERSION): exact, registry.endpoint('latest'): exact}
+        self.assertFalse(registry.registry_state(fixture.manifest, fixture.public, True))
+        for url in [registry.endpoint(VERSION), registry.endpoint('latest')]:
+            for extra in [{'remotes': [{'type': 'streamable-http', 'url': 'https://example.invalid/mcp'}]},
+                          {'_meta': {'example.invalid/config': {'command': 'unexpected'}}}]:
+                with self.subTest(url=url, extra=extra), self.assertRaisesRegex(ValueError, 'differs'):
+                    fixture.entries = {registry.endpoint(VERSION): exact, registry.endpoint('latest'): exact}
+                    fixture.entries[url] = {'server': dict(fixture.manifest, **extra)}
+                    registry.registry_state(fixture.manifest, fixture.public, True)
+
     def test_verification_binds_receipt_manifest_bytes_and_selected_commit(self):
         fixture = Fixture()
         fixture.entries = {registry.endpoint(VERSION): {'server': fixture.manifest},
