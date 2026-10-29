@@ -150,8 +150,10 @@ def endpoint(version):
 
 
 def matches_registry(payload, manifest):
-    actual = payload.get('server', {})
-    require(all(actual.get(key) == value for key, value in manifest.items()),
+    # Registry-owned status/timestamps live in the response envelope, not server.
+    # Extra server fields (notably remotes) can change how clients launch it.
+    actual = payload.get('server')
+    require(actual == manifest,
             'existing registry entry differs from the release manifest')
 
 
