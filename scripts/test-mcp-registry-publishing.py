@@ -161,6 +161,21 @@ class ReleasePreparation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'differs'):
             registry.registry_state(fixture.manifest, fixture.public)
 
+    def test_verification_binds_receipt_manifest_bytes_and_selected_commit(self):
+        fixture = Fixture()
+        fixture.entries = {registry.endpoint(VERSION): {'server': fixture.manifest},
+                           registry.endpoint('latest'): {'server': fixture.manifest}}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            fixture.prepare(directory)
+            self.assertEqual(registry.verify_prepared(VERSION, COMMIT, output, fixture.public),
+                             {'verified_version': registry.endpoint(VERSION), 'latest': registry.endpoint('latest')})
+            with self.assertRaisesRegex(ValueError, 'receipt does not match'):
+                registry.verify_prepared(VERSION, 'b' * 40, output, fixture.public)
+            (output / 'server.json').write_text(json.dumps(dict(fixture.manifest, title='Changed')))
+            with self.assertRaisesRegex(ValueError, 'bytes changed'):
+                registry.verify_prepared(VERSION, COMMIT, output, fixture.public)
+
     def test_missing_verification_and_downgrade_fail(self):
         fixture = Fixture()
         with self.assertRaisesRegex(ValueError, 'still absent'):
