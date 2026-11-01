@@ -7724,7 +7724,13 @@ impl NestWeaverDaemon for DaemonService {
             // the archive.
             instance_id: self.state.effective_data_instance_id(),
             workspace_path: if req.include_clones {
-                self.state.db_path.parent().map(|p| p.join("workspace"))
+                Some(bare_clone_root(
+                    &self.state.db_path,
+                    self.state
+                        .instance_cfg
+                        .as_ref()
+                        .map(|c| c.workspace.path.as_str()),
+                ))
             } else {
                 None
             },
@@ -17101,11 +17107,22 @@ pub async fn run_server(
                 .map(|config| config.cross_domain.clone())
                 .unwrap_or_default();
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
+            let worker_workspace_path = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| c.workspace.path.clone());
+            let worker_credential_method = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| c.git.credential_method.clone());
             let worker_handle = tokio::spawn(async move {
-                let workspace_dir = worker_db
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join("workspace");
+                // nw-827: `[workspace] path` when set, else `<db dir>/workspace`.
+                let workspace_dir = bare_clone_root(&worker_db, worker_workspace_path.as_deref());
+                tracing::info!(root = %workspace_dir.display(), "bare clone root");
+                nestweaver_engine::bare_clone::register_clone_root(
+                    &worker_db,
+                    workspace_dir.clone(),
+                );
                 // Recover jobs orphaned by a previous crash. At startup no worker is
                 // alive, so EVERY `running` row is orphaned — reclaim them all
                 // immediately instead of waiting out the ~30-min lease/threshold.
@@ -17117,7 +17134,8 @@ pub async fn run_server(
                 }
                 let workspace =
                     match nestweaver_engine::bare_clone::BareCloneWorkspace::new(&workspace_dir) {
-                        Ok(w) => w,
+                        // nw-828: bare clone/fetch authenticate per `[git] credential_method`.
+                        Ok(w) => w.with_credential_method(worker_credential_method),
                         Err(e) => {
                             tracing::error!("failed to create bare clone workspace: {e}");
                             return;
@@ -17222,6 +17240,8 @@ pub async fn run_server(
         let poll_state = Arc::clone(&state);
         let poll_job_queue = shared_job_queue_opt.clone();
         let poll_cfg = state.instance_cfg.clone();
+        // nw-828: the poll's ls-remote authenticates exactly like clone/fetch.
+        let poll_credential_method = poll_cfg.as_ref().map(|c| c.git.credential_method.clone());
         let poll_drained = Arc::clone(&state.drained);
         let mut poll_shutdown = shutdown_tx.subscribe();
         let mut scheduler_rx = scheduler_rx; // move into the spawned task
@@ -17275,6 +17295,22 @@ pub async fn run_server(
                 }
             }
 
+            // nw-882: probes run concurrently (bounded) and OFF this loop, so a
+            // dead remote costs one permit for one git timeout instead of
+            // stalling every other repo, the scheduler command channel, and
+            // shutdown. `in_flight` maps repo_id -> url for probes whose result
+            // is still wanted: RemoveRepo/Reload drop entries so a stale result
+            // is discarded rather than enqueued for a repo no longer tracked.
+            let permits = Arc::new(tokio::sync::Semaphore::new(POLL_PROBE_CONCURRENCY));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut probes: tokio::task::JoinSet<PollProbeOutcome> = tokio::task::JoinSet::new();
+            let mut in_flight = PollInFlight::default();
+            // An interval (not a per-iteration sleep): probe completions and
+            // scheduler commands must not keep resetting the poll tick.
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // the first tick completes immediately; skip it
+
             loop {
                 tokio::select! {
                     _ = poll_shutdown.changed() => break,
@@ -17286,11 +17322,13 @@ pub async fn run_server(
                                 }
                                 nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo { repo_id } => {
                                     scheduler.remove_repo(&repo_id);
+                                    in_flight.forget_repo(&repo_id);
                                 }
                                 nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig { repos, min_poll: new_min, max_poll: new_max } => {
                                     if let Some(m) = new_min { min_poll = m; }
                                     if let Some(m) = new_max { max_poll = m; }
                                     scheduler = PollScheduler::new(min_poll, max_poll);
+                                    in_flight.reset();
                                     for (id, url, ovr, branch) in repos {
                                         scheduler.add_repo(id, url, ovr, branch);
                                     }
@@ -17299,94 +17337,126 @@ pub async fn run_server(
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    _ = tick.tick() => {
                         // Skip polling when drained.
                         if poll_drained.load(std::sync::atomic::Ordering::Relaxed) {
                             continue;
                         }
-                        let due = scheduler.due_repos();
-                        for (repo_id, repo_url, branch) in due {
+                        for (repo_id, repo_url, branch) in scheduler.due_repos() {
+                            // A probe for this repo is still running (a slow
+                            // remote outlived its poll interval): don't stack
+                            // another one behind it.
+                            let Some(generation) = in_flight.try_dispatch(&repo_id, &repo_url) else {
+                                continue;
+                            };
                             // Determine which branch ref to check. If the repo
                             // config specifies a branch, use that ref; otherwise
                             // fall back to HEAD (symref of the remote's default
                             // branch) so we aren't hardcoded to "main".
-                            let url = repo_url.clone();
                             let ref_spec = branch.as_deref().unwrap_or("HEAD").to_string();
-                            // SSRF guard the remote probe too: reject internal targets
-                            // and pin the resolved IP (closes a DNS-rebinding vector on
-                            // the ls-remote ref probe, mirroring clone/fetch).
-                            let ls_guard = match nestweaver_engine::ssrf::guard_git_url(&url) {
-                                Ok(g) => g,
-                                Err(e) => {
-                                    tracing::warn!(url = %url, error = %e, "skipping poll: repo URL failed SSRF guard");
-                                    continue;
-                                }
-                            };
-                            // Run the ls-remote probe OFF the async runtime via
-                            // spawn_blocking, and bounded by GIT_TIMEOUT (which
-                            // kills+reaps the child): a hung remote no longer
-                            // stalls this scheduler task's runtime, and can never
-                            // block past the timeout. The status check inside
-                            // `probe_remote_sha` distinguishes a genuine failure
-                            // (Err → log+skip) from an unadvertised ref
-                            // (Ok(None) → nothing to enqueue).
-                            let probe_args = ls_guard.config_args.clone();
-                            let probe_url = url.clone();
-                            let probe_ref = ref_spec.clone();
-                            let probe = tokio::task::spawn_blocking(move || {
-                                probe_remote_sha(&probe_args, &probe_url, &probe_ref)
-                            })
-                            .await;
-                            let remote_sha = match probe {
-                                Ok(Ok(Some(sha))) => sha,
-                                Ok(Ok(None)) => continue,
-                                Ok(Err(e)) => {
-                                    tracing::warn!(url = %url, error = %e, "poll ls-remote failed");
-                                    continue;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(url = %url, error = %e, "poll ls-remote task panicked");
-                                    continue;
-                                }
-                            };
-                            // A completed ls-remote probe.
-                            nestweaver_web::routes::metrics::POLL_CHECKS.inc();
-                            let r_uid = nestweaver_schema::repo_uid(
-                                &poll_state.effective_data_instance_id(),
-                                &url,
+                            let probe_url = repo_url.clone();
+                            let probe_cred = poll_credential_method.clone();
+                            let task_repo = repo_id.clone();
+                            let task = spawn_poll_probe(
+                                &mut probes,
+                                Arc::clone(&permits),
+                                Arc::clone(&cancel),
+                                repo_id,
+                                repo_url,
+                                branch,
+                                generation,
+                                move |cancel| {
+                                    // SSRF guard the remote probe too: reject
+                                    // internal targets and pin the resolved IP
+                                    // (closes a DNS-rebinding vector on the
+                                    // ls-remote ref probe, mirroring
+                                    // clone/fetch). It does blocking DNS, so it
+                                    // runs here on the blocking thread, not on
+                                    // the async task.
+                                    let guard = nestweaver_engine::ssrf::guard_git_url(&probe_url)
+                                        .map_err(|e| anyhow::anyhow!("repo URL failed SSRF guard: {e}"))?;
+                                    probe_remote_sha(
+                                        &guard.config_args,
+                                        &probe_url,
+                                        &ref_spec,
+                                        probe_cred.as_deref(),
+                                        cancel,
+                                    )
+                                },
                             );
-                            let indexed_sha = poll_store.lookup_repo(&r_uid)
-                                .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
-                            if remote_sha != indexed_sha {
-                                // A new commit was observed on the remote.
-                                nestweaver_web::routes::metrics::POLL_CHANGES_DETECTED.inc();
+                            in_flight.track(task, task_repo, generation);
+                        }
+                    }
+                    Some(joined) = probes.join_next_with_id(), if !probes.is_empty() => {
+                        let (task, outcome) = match joined {
+                            Ok(done) => done,
+                            Err(e) => {
+                                // The wrapper never panics in practice; if it
+                                // does, free the repo so it is polled again.
+                                tracing::warn!(error = %e, "poll probe task failed");
+                                in_flight.failed(e.id());
+                                continue;
                             }
-                            if remote_sha != indexed_sha
-                                && let Some(ref jq) = poll_job_queue
-                                && let Ok(queue) = jq.lock()
-                            {
-                                let canonical_id =
-                                    nestweaver_engine::jobs::canonical_repo_id(&url);
-                                let _ = queue.upsert(
-                                    &canonical_id,
-                                    &url,
-                                    nestweaver_engine::jobs::JobTrigger::Poll,
-                                    branch.as_deref(),
-                                );
-                                // A new commit was just observed — record it so
-                                // the scheduler's adaptive interval shortens for
-                                // active repos. Only on new-commit detection;
-                                // calling this every poll would peg the interval
-                                // at the min_poll floor.
-                                scheduler.update_commit_time(
-                                    &repo_id,
-                                    std::time::Instant::now(),
-                                );
+                        };
+                        // Discard results for repos removed/reloaded meanwhile
+                        // (stale generation) and any that finish during a drain.
+                        let drained = poll_drained.load(std::sync::atomic::Ordering::Relaxed);
+                        if !in_flight.finish(task, &outcome.repo_id, outcome.generation, drained) {
+                            continue;
+                        }
+                        let PollProbeOutcome { repo_id, url, branch, result, .. } = outcome;
+                        // The status check inside `probe_remote_sha`
+                        // distinguishes a genuine failure (Err → log+skip) from
+                        // an unadvertised ref (Ok(None) → nothing to enqueue).
+                        let remote_sha = match result {
+                            Ok(Some(sha)) => sha,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                tracing::warn!(url = %url, error = %e, "poll ls-remote failed");
+                                continue;
                             }
+                        };
+                        // A completed ls-remote probe.
+                        nestweaver_web::routes::metrics::POLL_CHECKS.inc();
+                        let r_uid = nestweaver_schema::repo_uid(
+                            &poll_state.effective_data_instance_id(),
+                            &url,
+                        );
+                        let indexed_sha = poll_store.lookup_repo(&r_uid)
+                            .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
+                        if remote_sha != indexed_sha {
+                            // A new commit was observed on the remote.
+                            nestweaver_web::routes::metrics::POLL_CHANGES_DETECTED.inc();
+                        }
+                        if remote_sha != indexed_sha
+                            && let Some(ref jq) = poll_job_queue
+                            && let Ok(queue) = jq.lock()
+                        {
+                            let canonical_id =
+                                nestweaver_engine::jobs::canonical_repo_id(&url);
+                            let _ = queue.upsert(
+                                &canonical_id,
+                                &url,
+                                nestweaver_engine::jobs::JobTrigger::Poll,
+                                branch.as_deref(),
+                            );
+                            // A new commit was just observed — record it so
+                            // the scheduler's adaptive interval shortens for
+                            // active repos. Only on new-commit detection;
+                            // calling this every poll would peg the interval
+                            // at the min_poll floor.
+                            scheduler.update_commit_time(
+                                &repo_id,
+                                std::time::Instant::now(),
+                            );
                         }
                     }
                 }
             }
+            // Shutdown: stop waiting on probes and kill any git still running
+            // so the runtime can exit without waiting out the network timeout.
+            cancel.store(true, Ordering::Release);
+            probes.abort_all();
         });
     }
 
@@ -18266,6 +18336,149 @@ fn proto_to_atomic_change(
     }
 }
 
+/// Root directory of the server's bare clones (nw-827): `[workspace] path`
+/// when set, else `<db dir>/workspace`. One definition for the worker, backup
+/// and manifest recovery.
+pub(crate) fn bare_clone_root(db_path: &Path, workspace_path: Option<&str>) -> PathBuf {
+    nestweaver_engine::bare_clone::bare_clone_root(db_path, workspace_path)
+}
+
+/// Most poll probes (`git ls-remote`) in flight at once (nw-882).
+const POLL_PROBE_CONCURRENCY: usize = 8;
+
+/// A finished poll probe, handed back to the scheduler loop.
+struct PollProbeOutcome {
+    repo_id: String,
+    url: String,
+    branch: Option<String>,
+    /// [`PollInFlight`] generation the probe was dispatched under.
+    generation: u64,
+    result: anyhow::Result<Option<String>>,
+}
+
+/// Bookkeeping for poll probes whose results are still wanted (nw-882).
+///
+/// One probe per repo at a time; a result is accepted only if its repo is still
+/// tracked under the same generation (RemoveRepo/Reload bump it, so a probe that
+/// outlives a remove + re-add never enqueues its stale url/branch) and the
+/// daemon is not draining.
+#[derive(Default)]
+struct PollInFlight {
+    generation: u64,
+    /// repo_id -> (generation at dispatch, url)
+    entries: std::collections::HashMap<String, (u64, String)>,
+    /// probe task -> repo_id, so a failed task can free its repo.
+    tasks: std::collections::HashMap<tokio::task::Id, (String, u64)>,
+}
+
+impl PollInFlight {
+    /// Register a probe for `repo_id`; `None` if one is already running.
+    fn try_dispatch(&mut self, repo_id: &str, url: &str) -> Option<u64> {
+        if self.entries.contains_key(repo_id) {
+            return None;
+        }
+        self.entries
+            .insert(repo_id.to_string(), (self.generation, url.to_string()));
+        Some(self.generation)
+    }
+
+    fn track(&mut self, task: tokio::task::Id, repo_id: String, generation: u64) {
+        self.tasks.insert(task, (repo_id, generation));
+    }
+
+    /// The repo was removed: drop its entry and invalidate its running probe.
+    fn forget_repo(&mut self, repo_id: &str) {
+        self.entries.remove(repo_id);
+        self.generation += 1;
+    }
+
+    /// Config reload: every running probe becomes stale.
+    fn reset(&mut self) {
+        self.entries.clear();
+        self.generation += 1;
+    }
+
+    /// A probe finished. True when its result should be acted on.
+    fn finish(
+        &mut self,
+        task: tokio::task::Id,
+        repo_id: &str,
+        generation: u64,
+        drained: bool,
+    ) -> bool {
+        self.tasks.remove(&task);
+        match self.entries.get(repo_id) {
+            Some((entry_generation, _)) if *entry_generation == generation => {
+                self.entries.remove(repo_id);
+                !drained
+            }
+            _ => false,
+        }
+    }
+
+    /// A probe task died without an outcome: free its repo for the next tick.
+    fn failed(&mut self, task: tokio::task::Id) {
+        // Only the entry this task owns: a stale task (its repo was removed
+        // and re-dispatched since) must not free the newer probe's entry.
+        if let Some((repo_id, generation)) = self.tasks.remove(&task)
+            && self
+                .entries
+                .get(&repo_id)
+                .is_some_and(|(entry_generation, _)| *entry_generation == generation)
+        {
+            self.entries.remove(&repo_id);
+        }
+    }
+}
+
+/// Run `probe` on the blocking pool once a concurrency permit is free, and
+/// collect its outcome in `set`. The permit is held for the probe's whole
+/// execution (not just its queueing), so at most `permits` probes run at once.
+/// `probe` receives the shared cancel flag and must stop promptly when it is
+/// set; a probe that starts after cancellation returns an error immediately.
+fn spawn_poll_probe<F>(
+    set: &mut tokio::task::JoinSet<PollProbeOutcome>,
+    permits: Arc<tokio::sync::Semaphore>,
+    cancel: Arc<AtomicBool>,
+    repo_id: String,
+    url: String,
+    branch: Option<String>,
+    generation: u64,
+    probe: F,
+) -> tokio::task::Id
+where
+    F: FnOnce(&AtomicBool) -> anyhow::Result<Option<String>> + Send + 'static,
+{
+    set.spawn(async move {
+        let result = match permits.acquire_owned().await {
+            Ok(permit) => {
+                let flag = Arc::clone(&cancel);
+                match tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    if flag.load(Ordering::Acquire) {
+                        anyhow::bail!("poll probe cancelled");
+                    }
+                    probe(&flag)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => Err(anyhow::anyhow!("poll probe task panicked: {e}")),
+                }
+            }
+            Err(e) => Err(anyhow::anyhow!("poll probe limiter closed: {e}")),
+        };
+        PollProbeOutcome {
+            repo_id,
+            url,
+            branch,
+            generation,
+            result,
+        }
+    })
+    .id()
+}
+
 /// Probe a remote's ref SHA via `git ls-remote`, with a hard timeout.
 ///
 /// This is the blocking body run off the async runtime by the poll scheduler.
@@ -18281,18 +18494,27 @@ fn probe_remote_sha(
     config_args: &[String],
     url: &str,
     ref_spec: &str,
+    credential_method: Option<&str>,
+    cancel: &AtomicBool,
 ) -> anyhow::Result<Option<String>> {
     let mut cmd = std::process::Command::new("git");
+    // nw-828: same isolation + `[git] credential_method` wiring as the bare
+    // clone/fetch commands (one shared function).
+    nestweaver_engine::git_cmd::apply_git_isolation_with_credentials(&mut cmd, credential_method);
     cmd.args(config_args);
-    cmd.args(["ls-remote", url, ref_spec]);
-    let output = nestweaver_engine::git_cmd::run_git_with_timeout(
+    cmd.args(["ls-remote", "--", url, ref_spec]);
+    let output = nestweaver_engine::git_cmd::run_git_with_timeout_cancellable(
         cmd,
         nestweaver_engine::git_cmd::git_net_timeout(),
+        cancel,
     )?;
     if !output.status.success() {
         anyhow::bail!(
             "git ls-remote failed for {url} ({ref_spec}): {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            nestweaver_engine::bare_clone::with_credential_hint(
+                String::from_utf8_lossy(&output.stderr).trim(),
+                credential_method,
+            )
         );
     }
     let sha = String::from_utf8_lossy(&output.stdout)
@@ -24982,7 +25204,7 @@ repos = ["alpha"]
         init_repo(&repo);
         let url = format!("file://{}", repo.display());
 
-        let sha = probe_remote_sha(&[], &url, "HEAD")
+        let sha = probe_remote_sha(&[], &url, "HEAD", None, &AtomicBool::new(false))
             .expect("ls-remote against a valid repo should succeed")
             .expect("HEAD should advertise a SHA");
         assert_eq!(sha.len(), 40, "should be a full SHA, got {sha:?}");
@@ -24998,8 +25220,14 @@ repos = ["alpha"]
         init_repo(&repo);
         let url = format!("file://{}", repo.display());
 
-        let result = probe_remote_sha(&[], &url, "refs/heads/does-not-exist")
-            .expect("ls-remote itself should still succeed for an unknown ref");
+        let result = probe_remote_sha(
+            &[],
+            &url,
+            "refs/heads/does-not-exist",
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("ls-remote itself should still succeed for an unknown ref");
         assert!(
             result.is_none(),
             "an unadvertised ref must be None, not a SHA"
@@ -25016,11 +25244,155 @@ repos = ["alpha"]
         let tmp = tempfile::TempDir::new().unwrap();
         let bogus = format!("file://{}/not-a-repo", tmp.path().display());
 
-        let result = probe_remote_sha(&[], &bogus, "HEAD");
+        let result = probe_remote_sha(&[], &bogus, "HEAD", None, &AtomicBool::new(false));
         assert!(
             result.is_err(),
             "a non-zero git exit must be an error, not Ok(None): {result:?}"
         );
+    }
+
+    /// nw-882: probes run concurrently up to the permit limit instead of one
+    /// after another. Four 400ms probes under four permits finish in about one
+    /// probe's time; under two permits no more than two ever overlap.
+    #[tokio::test]
+    async fn poll_probes_run_concurrently_and_bounded_nw_882() {
+        use std::sync::atomic::AtomicUsize;
+        for (limit, expect_max) in [(4usize, 4usize), (2, 2)] {
+            let permits = Arc::new(tokio::sync::Semaphore::new(limit));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let running = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let mut set = tokio::task::JoinSet::new();
+            let start = Instant::now();
+            for i in 0..4 {
+                let running = running.clone();
+                let peak = peak.clone();
+                spawn_poll_probe(
+                    &mut set,
+                    permits.clone(),
+                    cancel.clone(),
+                    format!("r{i}"),
+                    format!("https://example.invalid/{i}"),
+                    None,
+                    0,
+                    move |_| {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(400));
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        Ok(Some("sha".to_string()))
+                    },
+                );
+            }
+            let mut done = 0;
+            while let Some(outcome) = set.join_next().await {
+                assert!(outcome.unwrap().result.unwrap().is_some());
+                done += 1;
+            }
+            assert_eq!(done, 4);
+            assert_eq!(peak.load(Ordering::SeqCst), expect_max, "limit {limit}");
+            if limit == 4 {
+                // Serial would be 1.6s.
+                assert!(start.elapsed() < Duration::from_millis(1200));
+            }
+        }
+    }
+
+    /// nw-882: the in-flight bookkeeping behind the poll loop.
+    #[tokio::test]
+    async fn poll_in_flight_dedups_and_discards_stale_results_nw_882() {
+        let id = |_: ()| tokio::spawn(async {}).id();
+        let mut f = PollInFlight::default();
+
+        // A second dispatch is skipped while the first runs.
+        let g = f.try_dispatch("a", "https://x/a").unwrap();
+        assert!(f.try_dispatch("a", "https://x/a").is_none());
+        let t = id(());
+        f.track(t, "a".into(), g);
+        assert!(f.finish(t, "a", g, false), "fresh result accepted");
+        assert!(f.try_dispatch("a", "https://x/a").is_some(), "freed");
+
+        // A removed repo's result is discarded.
+        let mut f = PollInFlight::default();
+        let g = f.try_dispatch("a", "u").unwrap();
+        f.forget_repo("a");
+        assert!(!f.finish(id(()), "a", g, false));
+
+        // Drained: result discarded, entry still freed.
+        let g = f.try_dispatch("b", "u").unwrap();
+        assert!(!f.finish(id(()), "b", g, true));
+        assert!(f.try_dispatch("b", "u").is_some());
+
+        // Remove + re-add + redispatch: the old probe's result is stale and
+        // must not consume the new probe's entry.
+        let mut f = PollInFlight::default();
+        let old = f.try_dispatch("a", "old").unwrap();
+        f.forget_repo("a");
+        let new = f.try_dispatch("a", "new").unwrap();
+        assert_ne!(old, new);
+        assert!(!f.finish(id(()), "a", old, false));
+        assert!(f.finish(id(()), "a", new, false));
+
+        // Reload invalidates everything.
+        let g = f.try_dispatch("c", "u").unwrap();
+        f.reset();
+        assert!(!f.finish(id(()), "c", g, false));
+
+        // A dead probe task frees its repo.
+        let mut f = PollInFlight::default();
+        f.try_dispatch("d", "u").unwrap();
+        let t = id(());
+        f.track(t, "d".into(), 0);
+        f.failed(t);
+        assert!(f.try_dispatch("d", "u").is_some());
+
+        // A stale task failing must not free a newer entry for the same repo.
+        let mut f = PollInFlight::default();
+        let old = f.try_dispatch("e", "old").unwrap();
+        let stale = id(());
+        f.track(stale, "e".into(), old);
+        f.forget_repo("e");
+        let new = f.try_dispatch("e", "new").unwrap();
+        f.failed(stale);
+        assert!(f.try_dispatch("e", "new").is_none(), "newer entry survives");
+        assert!(f.finish(id(()), "e", new, false));
+    }
+
+    /// nw-882: setting the shared cancel flag releases probes that are still
+    /// running, and probes still queued behind the limiter never start work.
+    #[tokio::test]
+    async fn poll_probes_stop_on_cancel_nw_882() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..3 {
+            spawn_poll_probe(
+                &mut set,
+                permits.clone(),
+                cancel.clone(),
+                format!("r{i}"),
+                format!("https://example.invalid/{i}"),
+                None,
+                0,
+                |cancel| {
+                    // Stand-in for a hung git: runs until cancelled.
+                    while !cancel.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    anyhow::bail!("cancelled")
+                },
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let start = Instant::now();
+        cancel.store(true, Ordering::Release);
+        let mut finished = 0;
+        while let Some(outcome) = set.join_next().await {
+            assert!(outcome.unwrap().result.is_err());
+            finished += 1;
+        }
+        assert_eq!(finished, 3);
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     /// Dropping the request-future scope (client cancel / disconnect) must trip

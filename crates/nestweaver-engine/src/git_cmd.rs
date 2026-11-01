@@ -125,6 +125,56 @@ pub fn apply_git_isolation(cmd: &mut Command) {
     apply_isolation_with(cmd, &[]);
 }
 
+/// `credential.helper` for `credential_method = "env"`: reads git's key=value
+/// request from stdin and prints `GH_TOKEN` for `get` on GitHub hosts only.
+const ENV_TOKEN_HELPER: &str = r#"!f() { test "$1" = get || return 0; h=; while IFS== read -r k v; do test "$k" = host && h=$v; done; if test -n "$GH_TOKEN" && { test "$h" = github.com || { test -n "$GH_HOST" && test "$h" = "$GH_HOST"; }; }; then printf '%s\n' 'username=x-access-token' "password=$GH_TOKEN"; fi; return 0; }; f"#;
+
+/// The ordered `credential.helper` values a `[git] credential_method` selects
+/// (nw-828). A leading empty value resets whatever came before; later values
+/// append. This is the ONE definition of the per-method auth wiring: `pull`
+/// renders it as `-c credential.helper=<v>` arguments and the isolated
+/// bare-clone/fetch/ls-remote paths render it as `GIT_CONFIG_*` entries
+/// ([`apply_git_isolation_with_credentials`]), so the two can never disagree.
+///
+/// `credential-helper` (and `None`/unknown) selects nothing: it means "ambient
+/// Git authentication", which isolation deliberately withholds.
+pub fn credential_helper_values(method: Option<&str>) -> Vec<&'static str> {
+    match method {
+        Some("gh") => vec!["", "!gh auth git-credential"],
+        Some("ssh") => vec![""],
+        Some("env") => {
+            // An explicitly supplied askpass program is Git's native env
+            // protocol. Otherwise expose GH_TOKEN only through helper stdin/
+            // stdout; the token never appears in argv or the remote URL. The
+            // helper answers only for `github.com` (or the non-empty
+            // `$GH_HOST`), so an admin-supplied URL on any other host that
+            // answers 401 is never handed the token.
+            if std::env::var_os("GIT_ASKPASS").is_none() {
+                vec!["", ENV_TOKEN_HELPER]
+            } else {
+                vec![""]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// [`apply_git_isolation`] plus the credential helper `method` selects.
+///
+/// Isolation resets `credential.helper` and points `GIT_CONFIG_GLOBAL` at
+/// `/dev/null`, so without this no helper can ever answer for a server-mode
+/// https remote. The selected helper is appended to the same `GIT_CONFIG_*`
+/// list *after* the reset, so ordering inside one list (not `-c`-versus-env
+/// precedence) decides the outcome. Nothing else is relaxed: no global/system
+/// config is read, and `core.askPass` stays empty.
+pub fn apply_git_isolation_with_credentials(cmd: &mut Command, method: Option<&str>) {
+    let extra: Vec<(OsString, OsString)> = credential_helper_values(method)
+        .into_iter()
+        .map(|v| (OsString::from("credential.helper"), OsString::from(v)))
+        .collect();
+    apply_isolation_with(cmd, &extra);
+}
+
 /// Config every isolated invocation sets, in `GIT_CONFIG_KEY_n` order.
 const ISOLATION_CONFIG: &[(&str, &str)] = &[
     ("credential.helper", ""),
@@ -378,7 +428,19 @@ fn kill_group_reap_drain(
 /// reaped, and an error is returned — the call never blocks past `timeout` plus
 /// one poll interval, even against a blackholed remote.
 pub fn run_git_with_timeout(cmd: Command, timeout: Duration) -> Result<Output> {
-    run_git_with_output_limit(cmd, timeout, None)
+    run_git_with_output_limit(cmd, timeout, None, None)
+}
+
+/// [`run_git_with_timeout`] that also stops when `cancel` becomes true: the
+/// process group is killed and reaped within one poll interval and an error is
+/// returned (nw-882: lets the poll scheduler abandon in-flight probes on
+/// shutdown instead of waiting out the network timeout).
+pub fn run_git_with_timeout_cancellable(
+    cmd: Command,
+    timeout: Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Output> {
+    run_git_with_output_limit(cmd, timeout, None, Some(cancel))
 }
 
 /// Bound each output pipe before allocation, failing rather than returning a
@@ -388,13 +450,14 @@ pub fn run_git_with_timeout_and_output_limit(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> Result<Output> {
-    run_git_with_output_limit(cmd, timeout, Some(max_output_bytes))
+    run_git_with_output_limit(cmd, timeout, Some(max_output_bytes), None)
 }
 
 fn run_git_with_output_limit(
     mut cmd: Command,
     timeout: Duration,
     max_output_bytes: Option<usize>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -457,6 +520,10 @@ fn run_git_with_output_limit(
 
     let start = Instant::now();
     let status = loop {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+            let _ = kill_group_reap_drain(pgid, child, stdout_reader, stderr_reader);
+            anyhow::bail!("git command cancelled");
+        }
         if read_failed.load(std::sync::atomic::Ordering::Acquire) {
             let _ = kill_group_reap_drain(pgid, child, stdout_reader, stderr_reader);
             anyhow::bail!("failed to read bounded git output");
@@ -722,7 +789,7 @@ pub(crate) mod hostile_repo {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A repository's own config names programs Git would run. Plain Git runs
@@ -1204,5 +1271,140 @@ mod tests {
             env_secs("NESTWEAVER_GIT_CMD_TEST_UNSET_XYZ", 42),
             Duration::from_secs(42)
         );
+    }
+
+    /// Build a PATH that finds a fake `gh` answering the git-credential `get`
+    /// protocol with a synthetic password.
+    #[cfg(unix)]
+    pub(crate) fn fake_gh_path(dir: &Path) -> OsString {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = dir.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\n[ \"$1 $2 $3\" = 'auth git-credential get' ] || exit 1\nprintf '%s\\n' username=fixture password=synthetic-test-token\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut paths = vec![dir.to_path_buf()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::join_paths(paths).unwrap()
+    }
+
+    /// nw-828: under full isolation (empty global config, `credential.helper=`
+    /// reset) the configured `gh` helper must still answer, and without a
+    /// credential method nothing answers (the pre-fix behavior).
+    #[cfg(unix)]
+    #[test]
+    fn isolation_with_credentials_invokes_gh_helper_nw_828() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fake_gh_path(dir.path());
+        let run = |method: Option<&str>| {
+            let mut cmd = Command::new("git");
+            cmd.args(["credential", "fill"])
+                .current_dir(dir.path())
+                .env("PATH", &path);
+            apply_git_isolation_with_credentials(&mut cmd, method);
+            // `run_git_with_timeout` re-applies plain isolation; that must keep
+            // the credential entries added above.
+            run_git_with_timeout_stdin(cmd, b"protocol=https\nhost=example.invalid\n\n")
+        };
+        let with_gh = run(Some("gh"));
+        assert!(
+            with_gh.contains("password=synthetic-test-token"),
+            "gh helper must answer under isolation: {with_gh}"
+        );
+        let without = run(None);
+        assert!(
+            !without.contains("synthetic-test-token"),
+            "no credential_method => isolation withholds every helper: {without}"
+        );
+        // ssh selects no helper at all.
+        assert!(!run(Some("ssh")).contains("synthetic-test-token"));
+    }
+
+    /// Feed stdin to an already-isolated command and return stdout. (The
+    /// shared runner nulls stdin, so credential protocol tests drive git
+    /// directly after the same env application.)
+    #[cfg(unix)]
+    fn run_git_with_timeout_stdin(mut cmd: Command, input: &[u8]) -> String {
+        use std::io::Write;
+        apply_git_isolation(&mut cmd); // must be a no-op on top of the above
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
+    }
+
+    /// nw-828: pull's `-c` rendering and the isolated env rendering come from
+    /// the same table.
+    #[test]
+    fn credential_helper_values_per_method() {
+        assert_eq!(
+            credential_helper_values(Some("gh")),
+            vec!["", "!gh auth git-credential"]
+        );
+        assert_eq!(credential_helper_values(Some("ssh")), vec![""]);
+        if std::env::var_os("GIT_ASKPASS").is_none() {
+            let env = credential_helper_values(Some("env"));
+            assert_eq!(env.len(), 2);
+            assert_eq!(env[0], "");
+            assert!(env[1].starts_with("!f()"));
+        }
+        assert!(credential_helper_values(Some("credential-helper")).is_empty());
+        assert!(credential_helper_values(None).is_empty());
+    }
+
+    /// nw-882: a cancelled command is killed promptly instead of running to
+    /// the timeout.
+    #[test]
+    fn cancel_flag_kills_running_command_nw_882() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let err = run_git_with_timeout_cancellable(cmd, Duration::from_secs(60), &cancel)
+            .expect_err("cancelled command must error");
+        setter.join().unwrap();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The `env` method hands `GH_TOKEN` to github.com and `$GH_HOST` only,
+    /// through a real `git credential fill` under isolation.
+    #[cfg(unix)]
+    #[test]
+    fn env_helper_answers_only_for_github_hosts() {
+        if std::env::var_os("GIT_ASKPASS").is_some() {
+            return; // the env method defers to an operator askpass
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fill = |host: &str, gh_host: Option<&str>| {
+            let mut cmd = Command::new("git");
+            cmd.args(["credential", "fill"])
+                .current_dir(dir.path())
+                .env("GH_TOKEN", "synthetic-env-token")
+                .env_remove("GH_HOST");
+            if let Some(h) = gh_host {
+                cmd.env("GH_HOST", h);
+            }
+            apply_git_isolation_with_credentials(&mut cmd, Some("env"));
+            run_git_with_timeout_stdin(cmd, format!("protocol=https\nhost={host}\n\n").as_bytes())
+        };
+        assert!(fill("github.com", None).contains("password=synthetic-env-token"));
+        assert!(!fill("example.com", None).contains("synthetic-env-token"));
+        assert!(!fill("ghe.example.com", None).contains("synthetic-env-token"));
+        assert!(fill("ghe.example.com", Some("ghe.example.com")).contains("synthetic-env-token"));
+        assert!(!fill("example.com", Some("ghe.example.com")).contains("synthetic-env-token"));
     }
 }

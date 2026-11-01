@@ -5958,7 +5958,7 @@ fn try_read_symbols_from_bare(
 ) -> Option<nestweaver_engine::read_symbols::ReadSymbolsResult> {
     // Derive workspace root from the thread-local db_path.
     let db_path = current_db_path(store).ok()?;
-    let workspace_root = db_path.parent()?.join("workspace");
+    let workspace_root = nestweaver_engine::bare_clone::effective_clone_root(&db_path);
     if !workspace_root.is_dir() {
         return None;
     }
@@ -6062,7 +6062,7 @@ fn inline_body_reader_resolver(store: &GraphStore) -> Option<BoxedInlineBodyReso
         return None;
     }
     let db_path = current_db_path(store).ok()?;
-    let workspace_root = db_path.parent()?.join("workspace");
+    let workspace_root = nestweaver_engine::bare_clone::effective_clone_root(&db_path);
     if !workspace_root.is_dir() {
         return None;
     }

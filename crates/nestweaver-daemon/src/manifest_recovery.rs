@@ -306,11 +306,14 @@ fn capture_repo(
             repo.uid
         );
         let workspace = nestweaver_engine::bare_clone::BareCloneWorkspace {
-            root: state
-                .db_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("workspace"),
+            root: super::bare_clone_root(
+                &state.db_path,
+                state
+                    .instance_cfg
+                    .as_ref()
+                    .map(|c| c.workspace.path.as_str()),
+            ),
+            credential_method: None,
         };
         let clones = workspace.list_clones()?;
         let mut matching = clones

@@ -595,10 +595,22 @@ Configure how the server authenticates to Git remotes:
 
 ```toml
 [git]
-credential_method = "gh"    # use `gh auth token` (GitHub CLI)
-# credential_method = "env" # use GIT_ASKPASS or GH_TOKEN env var
-# credential_method = "ssh" # use SSH keys
+credential_method = "gh"    # use `gh auth git-credential` (GitHub CLI)
+# credential_method = "env" # use GIT_ASKPASS, or GH_TOKEN for github.com / $GH_HOST only
+# credential_method = "ssh" # use SSH keys (ssh:// repo URLs)
 ```
+
+The method applies to the bare clone, fetch and the poll `ls-remote`, and is read at
+startup (restart to change it). `credential-helper` means ambient git config, which
+server mode withholds on purpose, so it authenticates nothing there.
+
+### Clone root
+
+Bare clones live under `[workspace] path` when set (`~` expands; a relative path is
+relative to the database directory), else `workspace/` beside the database. The
+daemon logs the effective root at startup (`bare clone root`). A backup restore puts
+clones under `workspace/` beside the database; with a custom `path`, the worker
+re-clones into the configured root after a restore.
 
 ---
 
@@ -659,7 +671,7 @@ During rotation, the server checks the new secret first, falls back to the old s
 
 ## Adaptive Polling
 
-The server automatically polls repos for changes using `git ls-remote`. The polling interval adapts based on repo activity:
+The server automatically polls repos for changes using `git ls-remote`. Probes run concurrently, at most 8 at a time, so a hung remote costs one slot for one git timeout rather than stalling the other repos, scheduler commands or shutdown. The polling interval adapts based on repo activity:
 
 ```
 base     = time_since_last_commit / 2
