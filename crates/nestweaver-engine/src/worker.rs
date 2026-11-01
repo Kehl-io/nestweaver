@@ -109,6 +109,9 @@ pub struct WorkerPool {
     /// Populated from the instance config by the daemon; empty by default, so
     /// an unconfigured pool indexes everything as code (the prior behaviour).
     repo_types: Arc<HashMap<String, RepoType>>,
+    /// nw-908: per-repo `[[repos]] exclude` / `unskip`, keyed like
+    /// `repo_types`. Repos absent from the map use the default policy.
+    repo_policies: Arc<HashMap<String, RepoReadPolicy>>,
     index_limits: crate::index_limits::IndexLimits,
     note_limits: crate::index_limits::NoteLimits,
     /// nw-673: the instance's `[cross_domain]` settings for the discovery
@@ -133,6 +136,7 @@ impl WorkerPool {
             semaphore: Arc::new(Semaphore::new(concurrency)),
             shutdown_started: None,
             repo_types: Arc::new(HashMap::new()),
+            repo_policies: Arc::new(HashMap::new()),
             index_limits: crate::index_limits::IndexLimits::default(),
             note_limits: crate::index_limits::NoteLimits::default(),
             cross_domain: Arc::new(crate::config::CrossDomainConfig::default()),
@@ -159,6 +163,14 @@ impl WorkerPool {
     /// supplying the full set is also fine.
     pub fn with_repo_types(mut self, repo_types: HashMap<String, RepoType>) -> Self {
         self.repo_types = Arc::new(repo_types);
+        self
+    }
+
+    /// Attach per-repo `exclude` / `unskip` policies (nw-908), keyed by
+    /// [`canonical_repo_id`] of each repo's URL like [`Self::with_repo_types`].
+    /// The bare-clone reader then applies them exactly as the local reader does.
+    pub fn with_repo_policies(mut self, policies: HashMap<String, RepoReadPolicy>) -> Self {
+        self.repo_policies = Arc::new(policies);
         self
     }
 
@@ -242,6 +254,7 @@ impl WorkerPool {
     ) {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         let repo_types = self.repo_types.clone();
+        let repo_policies = self.repo_policies.clone();
         let index_limits = self.index_limits;
         let note_limits = self.note_limits;
         let cross_domain = Arc::clone(&self.cross_domain);
@@ -415,6 +428,7 @@ impl WorkerPool {
             let write_gate = write_gate.clone();
             let circuit_breakers = circuit_breakers.clone();
             let repo_types = repo_types.clone();
+            let repo_policies = repo_policies.clone();
             let cross_domain = Arc::clone(&cross_domain);
             let relink_wake = Arc::clone(&relink_wake);
             let reindex_tracker = self.reindex_tracker.clone();
@@ -432,6 +446,10 @@ impl WorkerPool {
                         .get(&canonical_repo_id(&job_clone.repo_url))
                         .cloned()
                         .unwrap_or(RepoType::Code);
+                    let repo_policy = repo_policies
+                        .get(&canonical_repo_id(&job_clone.repo_url))
+                        .cloned()
+                        .unwrap_or_default();
                     tokio::task::spawn_blocking(move || {
                         // nw-286: resolve the instance HERE, once per job, on
                         // the blocking pool — the resolver consults the store,
@@ -445,7 +463,11 @@ impl WorkerPool {
                             &instance_id,
                             Some(&circuit_breakers),
                             repo_type,
-                        )?;
+                        )?
+                        .map(|prepared| PreparedIndexJob {
+                            policy: repo_policy,
+                            ..prepared
+                        });
 
                         // Check if the job was cancelled (admin repo removal)
                         // before indexing. Verifies both ID and repo_id to
@@ -636,6 +658,47 @@ struct PreparedIndexJob {
     remote_sha: String,
     /// How the repo's contents should be indexed (code vs markdown vault).
     repo_type: RepoType,
+    /// `[[repos]] exclude` / `unskip` for the bare reader (nw-908).
+    policy: RepoReadPolicy,
+    /// The workspace's `[git] credential_method`, so the blob prefetch
+    /// authenticates like the fetch that preceded it (nw-832).
+    credential_method: Option<String>,
+}
+
+/// The per-repo eligibility settings the bare-clone reader must honour so a
+/// server-indexed repo holds what a locally indexed one does (nw-908).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoReadPolicy {
+    /// `[[repos]] exclude` globs.
+    pub exclude: Vec<String>,
+    /// `[[repos]] unskip` directory names.
+    pub unskip: Vec<String>,
+}
+
+impl RepoReadPolicy {
+    /// The policy `config` declares for the repo at `repo_url`.
+    ///
+    /// THE one place a bare-clone policy is resolved from configuration: the
+    /// worker, the daemon's per-repo policy map and manifest recovery all call
+    /// it, so what the worker indexes under and what recovery recomputes the
+    /// fingerprint under cannot disagree (nw-908). Resolution is
+    /// [`InstanceConfig::exclude_globs_for`] / `unskip_names_for`, the same
+    /// lookup the local readers use.
+    pub fn for_url(config: &crate::config::InstanceConfig, repo_url: &str) -> Self {
+        Self {
+            exclude: config.exclude_globs_for(repo_url, None).to_vec(),
+            unskip: config.unskip_names_for(repo_url, None).to_vec(),
+        }
+    }
+
+    /// Apply this policy to a bare reader. Call BEFORE
+    /// `local_objects_only()` (which consumes the reader).
+    pub fn apply(
+        &self,
+        reader: crate::content_reader::GitBareReader,
+    ) -> Result<crate::content_reader::GitBareReader, anyhow::Error> {
+        Ok(reader.excluding(&self.exclude)?.unskipping(&self.unskip))
+    }
 }
 
 fn prepare_job(
@@ -707,6 +770,8 @@ fn prepare_job(
         bare_path,
         remote_sha,
         repo_type,
+        policy: RepoReadPolicy::default(),
+        credential_method: workspace.credential_method.clone(),
     }))
 }
 
@@ -1135,9 +1200,14 @@ where
         &prepared.remote_sha,
         reader_limits,
     );
+    let reader = prepared
+        .policy
+        .apply(reader)?
+        .with_credential_method(prepared.credential_method.clone());
 
     match prepared.repo_type {
         RepoType::Vault => {
+            prefetch_blobs_before_index(&reader, prepared, None, nestweaver_parser::is_markdown);
             // Markdown-vault repo: index Note/Section/Heading nodes via the
             // markdown indexer, then record the indexed SHA on the Repo node
             // (nw-003) so an unchanged vault is skipped on the next poll. The
@@ -1192,6 +1262,16 @@ where
                     &prepared.remote_sha,
                 );
 
+            // The incremental indexer falls back to a FULL index when the
+            // recorded eligibility policy differs from the reader's (a
+            // changed exclude/unskip); prefetch the set it will really read.
+            let policy_matches = crate::index::repo_policy_matches_reader(store, &r_uid, &reader)?;
+            prefetch_blobs_before_index(
+                &reader,
+                prepared,
+                (can_incremental && policy_matches).then_some(indexed_sha),
+                crate::index::is_parseable,
+            );
             let outcome = if can_incremental {
                 let result = crate::index::incremental_index_with_reader_and_write_gate(
                     &reader,
@@ -1241,6 +1321,28 @@ where
             );
             Ok(outcome)
         }
+    }
+}
+
+/// nw-832: fetch every blob the coming index will read in one batched fetch
+/// instead of letting `cat-file --batch` lazy-fetch them one `git fetch` (and,
+/// over ssh, one handshake) at a time. Best-effort: a failure here is logged
+/// and the index proceeds with the old per-blob lazy fetch.
+fn prefetch_blobs_before_index(
+    reader: &crate::content_reader::GitBareReader,
+    prepared: &PreparedIndexJob,
+    previous_sha: Option<&str>,
+    wants: fn(&std::path::Path) -> bool,
+) {
+    match reader.prefetch_for_index(previous_sha, wants) {
+        Ok(0) => {}
+        Ok(count) => {
+            tracing::info!(repo = %prepared.repo_url, blobs = count, "prefetched blobs in batch")
+        }
+        Err(e) => tracing::warn!(
+            repo = %prepared.repo_url,
+            "blob prefetch failed; falling back to per-blob fetch: {e:#}"
+        ),
     }
 }
 
@@ -1540,6 +1642,245 @@ mod tests {
             store.graph_generation() > 0,
             "server-mode reader indexing should invalidate generation-keyed caches"
         );
+    }
+
+    /// Index `files` through the real prepare/commit path and return which of
+    /// `names` the store holds as symbols afterwards.
+    fn index_bytes_through_worker(
+        files: &[(&str, &[u8])],
+        policy: RepoReadPolicy,
+        names: &[&str],
+    ) -> Result<Vec<String>, anyhow::Error> {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        std::fs::create_dir_all(&src).unwrap();
+        create_source_repo(&src, &[("seed.rs", "pub fn seed() {}\n")]);
+        for (path, bytes) in files {
+            let full = src.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, bytes).unwrap();
+        }
+        for args in [&["add", "."][..], &["commit", "-m", "more"][..]] {
+            Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+        }
+        let url = format!("file://{}", src.display());
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let job = make_code_job(1, "r", &url);
+        let mut prepared = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)?
+            .expect("a fresh repo has work to do");
+        prepared.policy = policy;
+        commit_prepared_job(&prepared, &store, "inst")?;
+        Ok(names
+            .iter()
+            .filter(|name| !store.lookup_symbols_by_name(name).unwrap().is_empty())
+            .map(|name| name.to_string())
+            .collect())
+    }
+
+    /// nw-899: one non-UTF-8 tracked file must not fail the repo index. The
+    /// local index keeps the file lossily; the server index now does too.
+    #[test]
+    fn non_utf8_tracked_file_does_not_fail_the_server_index() {
+        let found = index_bytes_through_worker(
+            &[("latin1.rs", b"pub fn latin1_ok() {}\n// caf\xe9\n")],
+            RepoReadPolicy::default(),
+            &["seed", "latin1_ok"],
+        )
+        .expect("a Latin-1 file must not dead-letter the whole repo");
+        assert_eq!(found, ["seed", "latin1_ok"]);
+    }
+
+    /// nw-908: `[[repos]] exclude` and `unskip` reach the server-side reader
+    /// (the report's fixture: the server held the exact inverse of local).
+    #[test]
+    fn repo_exclude_and_unskip_apply_to_the_server_index() {
+        let files: &[(&str, &[u8])] = &[
+            ("escape/ex.rs", b"pub fn excluded_fn() {}\n"),
+            ("vendor/v.rs", b"pub fn vendor_fn() {}\n"),
+        ];
+        let names = ["excluded_fn", "vendor_fn"];
+        let default = index_bytes_through_worker(files, RepoReadPolicy::default(), &names).unwrap();
+        assert_eq!(default, ["excluded_fn"], "default: vendor/ pruned");
+        let policy = RepoReadPolicy {
+            exclude: vec!["escape/**".to_string()],
+            unskip: vec!["vendor".to_string()],
+        };
+        let configured = index_bytes_through_worker(files, policy, &names).unwrap();
+        assert_eq!(configured, ["vendor_fn"], "configured: the inverse");
+    }
+
+    fn config_with_repo_policy(url: &str) -> crate::config::InstanceConfig {
+        crate::config::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "{url}"
+exclude = ["escape/**"]
+unskip = ["vendor"]
+"#
+        ))
+        .unwrap()
+    }
+
+    /// nw-908: the worker and manifest recovery build their reader through
+    /// `RepoReadPolicy::for_url(..).apply(..)`; the eligibility fingerprint
+    /// that yields is the configured one, and an undeclared repo gets the
+    /// default (so recovery recomputes what the worker recorded).
+    #[test]
+    fn repo_read_policy_resolves_from_config_and_applies_to_the_reader() {
+        let url = "https://example.com/org/repo.git";
+        let config = config_with_repo_policy(url);
+        let policy = RepoReadPolicy::for_url(&config, url);
+        assert_eq!(policy.exclude, ["escape/**"]);
+        assert_eq!(policy.unskip, ["vendor"]);
+        assert_eq!(
+            RepoReadPolicy::for_url(&config, "https://example.com/org/other.git"),
+            RepoReadPolicy::default()
+        );
+
+        let bare = std::path::Path::new("/nonexistent/repo.git");
+        let limits = crate::index_limits::IndexLimits::default();
+        let applied = policy
+            .apply(crate::content_reader::GitBareReader::with_limits(
+                bare, "sha", limits,
+            ))
+            .unwrap();
+        let by_hand = crate::content_reader::GitBareReader::with_limits(bare, "sha", limits)
+            .excluding(&["escape/**".to_string()])
+            .unwrap()
+            .unskipping(&["vendor".to_string()]);
+        let default = crate::content_reader::GitBareReader::with_limits(bare, "sha", limits);
+        use crate::content_reader::ContentReader;
+        assert_eq!(
+            applied.eligibility_fingerprint(),
+            by_hand.eligibility_fingerprint()
+        );
+        assert_ne!(
+            applied.eligibility_fingerprint(),
+            default.eligibility_fingerprint()
+        );
+        // `local_objects_only` (manifest recovery) keeps the policy.
+        assert_eq!(
+            applied.local_objects_only().eligibility_fingerprint(),
+            by_hand.eligibility_fingerprint()
+        );
+    }
+
+    /// A source repo for blobless-clone worker tests: partial clones allowed,
+    /// `n` files under src/ plus `vendor/v.rs` (pruned by default).
+    fn filterable_source(src: &std::path::Path, n: usize) {
+        use crate::content_reader::test_util::allow_partial_clone;
+        let files: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("src/f{i}.rs"), format!("pub fn f{i}() {{}}\n")))
+            .chain(std::iter::once((
+                "vendor/v.rs".to_string(),
+                "pub fn vendor_fn() {}\n".to_string(),
+            )))
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        create_source_repo(src, &refs);
+        allow_partial_clone(src);
+    }
+
+    /// nw-832: through the real worker path, indexing a blobless bare clone
+    /// fetches its blobs in O(1) fetch runs, not one per file.
+    #[test]
+    fn worker_index_of_a_blobless_clone_fetches_blobs_in_one_run() {
+        use crate::content_reader::test_util::{keep_each_fetch_as_a_pack, pack_count};
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        filterable_source(&src, 12);
+        let url = format!("file://{}", src.display());
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let job = make_code_job(1, "r", &url);
+        let prepared = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)
+            .unwrap()
+            .unwrap();
+        keep_each_fetch_as_a_pack(&prepared.bare_path);
+        let before = pack_count(&prepared.bare_path);
+        commit_prepared_job(&prepared, &store, "inst").unwrap();
+        // Default policy prunes vendor/, so 12 src blobs arrive in ONE fetch.
+        assert_eq!(pack_count(&prepared.bare_path) - before, 1);
+        assert!(!store.lookup_symbols_by_name("f11").unwrap().is_empty());
+    }
+
+    /// nw-832 / review R2: when the recorded eligibility policy differs from
+    /// the reader's, the incremental indexer falls back to a FULL index, so the
+    /// prefetch must cover the full eligible set, not just the diff. Here a
+    /// changed `unskip` makes the never-fetched `vendor/v.rs` (unchanged
+    /// between the two commits) part of the index; diff-only prefetch would
+    /// fetch it lazily as a second run.
+    #[test]
+    fn policy_change_makes_the_incremental_prefetch_cover_the_full_set() {
+        use crate::content_reader::test_util::{keep_each_fetch_as_a_pack, pack_count};
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        filterable_source(&src, 4);
+        let url = format!("file://{}", src.display());
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let job = make_code_job(1, "r", &url);
+
+        let first = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)
+            .unwrap()
+            .unwrap();
+        keep_each_fetch_as_a_pack(&first.bare_path);
+        commit_prepared_job(&first, &store, "inst").unwrap();
+        assert!(
+            store
+                .lookup_symbols_by_name("vendor_fn")
+                .unwrap()
+                .is_empty()
+        );
+
+        commit_file(&src, "src/new.rs", "pub fn new_one() {}\n", "two");
+        let mut second = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)
+            .unwrap()
+            .expect("a new commit has work to do");
+        second.policy = RepoReadPolicy {
+            exclude: Vec::new(),
+            unskip: vec!["vendor".to_string()],
+        };
+        let before = pack_count(&second.bare_path);
+        commit_prepared_job(&second, &store, "inst").unwrap();
+        assert_eq!(
+            pack_count(&second.bare_path) - before,
+            1,
+            "new.rs and the newly eligible vendor/v.rs arrive in ONE fetch"
+        );
+        assert!(
+            !store
+                .lookup_symbols_by_name("vendor_fn")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.lookup_symbols_by_name("new_one").unwrap().is_empty());
     }
 
     #[test]

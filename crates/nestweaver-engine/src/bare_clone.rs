@@ -159,6 +159,31 @@ fn fetch_operands(branch: Option<&str>) -> Vec<String> {
     args
 }
 
+/// Operands for fetching specific objects (by full oid) from `origin`.
+///
+/// This is what git's own lazy fetch of promisor blobs runs, minus the
+/// one-process-per-object cost: `-c fetch.negotiationAlgorithm=noop` skips
+/// negotiation (the clone has nothing these objects build on), `--filter` keeps
+/// the promisor semantics, and the oids come after `--` so none can be read as
+/// an option.
+fn fetch_objects_operands(oids: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-c",
+        "fetch.negotiationAlgorithm=noop",
+        "fetch",
+        "origin",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--filter=blob:none",
+        "--",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    args.extend(oids.iter().cloned());
+    args
+}
+
 /// A single blobless bare clone of a remote git repository.
 #[derive(Debug, Clone)]
 pub struct BareClone {
@@ -205,12 +230,33 @@ impl BareClone {
     /// bare repo. Without this, `git fetch origin <branch>` in a bare clone
     /// only updates FETCH_HEAD, and `rev-parse origin/<branch>` fails.
     pub fn fetch_branch(&self, branch: Option<&str>) -> Result<()> {
-        // SSRF guard: validate + resolve the remote immediately before fetching,
-        // pinning the connect IP for http(s) (DNS-rebinding defense). Non-remote
-        // schemes (file://, git://) are rejected here (see `guard_clone_url`).
+        self.run_fetch(self.fetch_command(fetch_operands(branch))?)
+    }
+
+    /// Fetch specific objects (full oids) from origin in ONE `git fetch`
+    /// (nw-832). Goes through the same guarded, credentialed command as
+    /// [`Self::fetch_branch`] (SSRF guard + pinned IP, isolation,
+    /// `[git] credential_method` helper, low-speed guards, hard timeout), so a
+    /// batched blob prefetch authenticates exactly like the clone and fetch do.
+    pub fn fetch_objects(&self, oids: &[String]) -> Result<()> {
+        if oids.is_empty() {
+            return Ok(());
+        }
+        self.run_fetch(self.fetch_command(fetch_objects_operands(oids))?)
+    }
+
+    /// The `git -C <clone> <operands>` command every fetch runs: SSRF-guarded
+    /// immediately before use, pinning the connect IP for http(s) (DNS-rebinding
+    /// defense); non-remote schemes (file://, git://) are rejected here (see
+    /// `guard_clone_url`).
+    fn fetch_command(&self, operands: Vec<String>) -> Result<Command> {
         let guard = guard_clone_url(&self.url)?;
         let mut cmd = net_git_command(&guard, self.credential_method.as_deref());
-        cmd.arg("-C").arg(&self.path).args(fetch_operands(branch));
+        cmd.arg("-C").arg(&self.path).args(operands);
+        Ok(cmd)
+    }
+
+    fn run_fetch(&self, cmd: Command) -> Result<()> {
         // Hard timeout so a blackholed remote can't wedge the worker (and its
         // semaphore permit) forever — it kills+reaps the process group on timeout.
         let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
@@ -1551,6 +1597,51 @@ mod tests {
         };
         assert!(fill(Some("gh")).contains("password=synthetic-test-token"));
         assert!(!fill(None).contains("synthetic-test-token"));
+    }
+
+    /// nw-832: the batched object fetch is built by the same command path as
+    /// `fetch_branch`, so it carries the `[git] credential_method` helper,
+    /// the isolation env, and the object operands - and never a second
+    /// hand-built git invocation.
+    #[test]
+    fn fetch_objects_uses_the_credentialed_fetch_command_nw_832() {
+        let env_of = |cmd: &Command| -> Vec<String> {
+            cmd.get_envs()
+                .filter(|(k, _)| k.to_string_lossy().starts_with("GIT_CONFIG_VALUE_"))
+                .filter_map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+                .collect()
+        };
+        let clone = |method: Option<&str>| BareClone {
+            path: PathBuf::from("/nonexistent/repo.git"),
+            url: "file:///nonexistent/src".to_string(),
+            credential_method: method.map(str::to_string),
+        };
+        let oids = vec!["a".repeat(40), "b".repeat(40)];
+
+        let gh = clone(Some("gh"));
+        let cmd = gh.fetch_command(fetch_objects_operands(&oids)).unwrap();
+        assert!(
+            env_of(&cmd).contains(&"!gh auth git-credential".to_string()),
+            "the gh helper must reach the object fetch: {:?}",
+            env_of(&cmd)
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dash = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&args[dash + 1..], oids.as_slice());
+        assert!(args.contains(&"--filter=blob:none".to_string()));
+        assert!(args.contains(&"fetch".to_string()) && args.contains(&"origin".to_string()));
+
+        // Same helper table as fetch_branch for the same method, and none
+        // without one.
+        let branch_cmd = gh.fetch_command(fetch_operands(None)).unwrap();
+        assert_eq!(env_of(&branch_cmd), env_of(&cmd));
+        let plain = clone(None)
+            .fetch_command(fetch_objects_operands(&oids))
+            .unwrap();
+        assert!(!env_of(&plain).contains(&"!gh auth git-credential".to_string()));
     }
 
     /// nw-828: the workspace's method reaches every `BareClone` it hands out.

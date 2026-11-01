@@ -6483,6 +6483,20 @@ pub(crate) fn is_parseable(path: &Path) -> bool {
     detect_language(path).is_some()
 }
 
+/// Whether the eligibility policy recorded for `r_uid` is the one `reader`
+/// would index under now. When it is not, an incremental index cannot trust
+/// its diff and falls back to a full one. One predicate, asked by the
+/// incremental indexer and by the server worker's blob prefetch (nw-832), so
+/// the prefetch covers exactly the set the indexer will read.
+pub(crate) fn repo_policy_matches_reader<R: crate::content_reader::ContentReader + ?Sized>(
+    store: &nestweaver_store::GraphStore,
+    r_uid: &str,
+    reader: &R,
+) -> Result<bool, anyhow::Error> {
+    Ok(store.get_repo_index_policy(r_uid)?.as_deref()
+        == Some(reader.eligibility_fingerprint().as_str()))
+}
+
 /// Where a candidate [`nestweaver_schema::Contract`] came from. Ordered worst
 /// to best: a spec declaration always outranks a route inferred from handler
 /// source, which is the preference the old `declared_uids` guard encoded.
@@ -8560,9 +8574,7 @@ where
         .filter(|sha| !sha.is_empty())
         .ok_or_else(|| anyhow::anyhow!("incremental index requires an existing indexed repo"))?;
 
-    if store.get_repo_index_policy(&r_uid)?.as_deref()
-        != Some(reader.eligibility_fingerprint().as_str())
-    {
+    if !repo_policy_matches_reader(store, &r_uid, reader)? {
         let result = index_with_reader_and_write_gate(
             reader,
             store,

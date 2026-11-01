@@ -1302,6 +1302,16 @@ impl InstanceConfig {
         config.server.indexing.validate()?;
         crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
         crate::index_limits::NoteLimits::new(config.indexing.max_note_bytes)?;
+        // nw-908: `[[repos]] exclude` globs are compiled by every reader that
+        // honours them, including the server worker for each job. An invalid
+        // glob must fail the config load, not dead-letter every index job of
+        // that repo. Compiled by the reader itself, so the load check and the
+        // use can never disagree about what is valid.
+        for repo in &config.repos {
+            crate::content_reader::FilesystemReader::new(Path::new("."))
+                .excluding(&repo.exclude)
+                .map_err(|e| e.context(format!("[[repos]] {}: invalid exclude", repo.url)))?;
+        }
         if let Some(limit) = config.limits.default_result_limit
             && !(1..=1000).contains(&limit)
         {
@@ -2607,6 +2617,36 @@ use_git_activity = false
             .expect("vendored repo");
         assert_eq!(live.use_git_activity, None);
         assert_eq!(vendored.use_git_activity, Some(false));
+    }
+
+    /// nw-908: an invalid `[[repos]] exclude` glob fails the config load.
+    #[test]
+    fn invalid_repo_exclude_glob_fails_config_load() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[repos]]
+url = "https://example.com/org/bad.git"
+exclude = ["src/[unclosed"]
+"#
+        );
+        let error = InstanceConfig::from_toml_str(&toml).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("bad.git") && text.contains("exclude"),
+            "{text}"
+        );
+        let ok = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[repos]]
+url = "https://example.com/org/good.git"
+exclude = ["src/**", "*.gen.rs"]
+"#
+        );
+        InstanceConfig::from_toml_str(&ok).expect("valid globs load");
     }
 
     #[test]

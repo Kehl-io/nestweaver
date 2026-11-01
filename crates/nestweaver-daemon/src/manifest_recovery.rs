@@ -6,6 +6,7 @@ use nestweaver_engine::content_reader::{ContentReader, FilesystemReader, GitBare
 use nestweaver_engine::manifest::{
     self, ManifestInputs, ManifestUnavailable, ManifestUnavailableReason,
 };
+use nestweaver_engine::worker::RepoReadPolicy;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, atomic::Ordering};
@@ -327,8 +328,21 @@ fn capture_repo(
             "{}: multiple recorded bare clones",
             repo.uid
         );
+        // nw-908: the SAME policy the worker indexed this clone under
+        // (`RepoReadPolicy::for_url` + `apply`), or the recomputed fingerprint
+        // would never match the recorded one for a repo with an exclude or
+        // unskip. Applied before `local_objects_only`, which consumes the reader.
+        let policy = config
+            .map(|c| RepoReadPolicy::for_url(c, &repo.url))
+            .unwrap_or_default();
         Box::new(
-            GitBareReader::with_limits(&clone.path, &repo.indexed_sha, limits).local_objects_only(),
+            policy
+                .apply(GitBareReader::with_limits(
+                    &clone.path,
+                    &repo.indexed_sha,
+                    limits,
+                ))?
+                .local_objects_only(),
         )
     };
     let policy = state.store.get_repo_index_policy(&repo.uid)?;

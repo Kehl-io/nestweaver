@@ -13734,6 +13734,24 @@ fn build_repo_types(
         .collect()
 }
 
+/// Build the per-repo `exclude` / `unskip` map consumed by
+/// [`nestweaver_engine::worker::WorkerPool::with_repo_policies`] (nw-908), keyed
+/// like [`build_repo_types`].
+fn build_repo_policies(
+    config: &nestweaver_engine::InstanceConfig,
+) -> std::collections::HashMap<String, nestweaver_engine::worker::RepoReadPolicy> {
+    config
+        .repos
+        .iter()
+        .map(|repo| {
+            (
+                nestweaver_engine::jobs::canonical_repo_id(&repo.url),
+                nestweaver_engine::worker::RepoReadPolicy::for_url(config, &repo.url),
+            )
+        })
+        .collect()
+}
+
 /// Hard upper bound on client/peer-supplied traversal depth, enforced in ALL modes.
 const HARD_MAX_DEPTH: u64 = 64;
 
@@ -17125,6 +17143,12 @@ pub async fn run_server(
                 .as_ref()
                 .map(|c| build_repo_types(&c.repos))
                 .unwrap_or_default();
+            // nw-908: `[[repos]] exclude` / `unskip` reach the bare reader.
+            let worker_repo_policies = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| build_repo_policies(c))
+                .unwrap_or_default();
             let worker_index_limits = state
                 .instance_cfg
                 .as_ref()
@@ -17180,6 +17204,7 @@ pub async fn run_server(
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
                     .with_shutdown_started(worker_shutdown_started)
                     .with_repo_types(worker_repo_types)
+                    .with_repo_policies(worker_repo_policies)
                     .with_index_limits(worker_index_limits)
                     .with_note_limits(worker_note_limits)
                     .with_cross_domain_config(worker_cross_domain);
@@ -27266,6 +27291,129 @@ repos = ["alpha"]
             .map(|f| f.repo_uid.as_str())
             .collect();
         assert_eq!(refused, ["repo:beta"], "{:?}", snapshot.failures);
+    }
+
+    /// nw-908: manifest recovery recomputes a server repo's eligibility
+    /// fingerprint with the SAME `[[repos]] exclude`/`unskip` policy the worker
+    /// indexed it under. Before, it rebuilt the bare reader with no policy, so
+    /// the fingerprint never matched for any configured repo and the manifest
+    /// debt was never paid.
+    #[tokio::test]
+    async fn manifest_recovery_uses_the_workers_repo_policy_for_bare_clones() {
+        use nestweaver_engine::content_reader::{ContentReader, GitBareReader};
+        use nestweaver_engine::worker::RepoReadPolicy;
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let mut state = test_state_with_writer();
+        let dir = state.db_path.parent().unwrap().to_path_buf();
+        let src = dir.join("policy-src");
+        std::fs::create_dir_all(src.join("escape")).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn kept() {}\n").unwrap();
+        std::fs::write(src.join("escape/gen.rs"), "pub fn generated() {}\n").unwrap();
+        git(&src, &["init", "-q"]);
+        git(&src, &["config", "user.email", "t@t.t"]);
+        git(&src, &["config", "user.name", "t"]);
+        git(&src, &["add", "."]);
+        git(&src, &["commit", "-q", "-m", "init"]);
+        // A remote-style url: a `file://` url would read as a local checkout.
+        let url = "https://example.com/org/policy.git".to_string();
+        let clone = dir.join("workspace").join("policy.git");
+        std::fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        git(
+            &dir,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &src.display().to_string(),
+                &clone.display().to_string(),
+            ],
+        );
+        git(&clone, &["remote", "set-url", "origin", &url]);
+        let sha = git(&clone, &["rev-parse", "HEAD"]);
+
+        let workspace_root = dir.join("workspace").display().to_string();
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "default"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "{workspace_root}"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "{url}"
+exclude = ["escape/**"]
+unskip = ["vendor"]
+"#
+        ))
+        .unwrap();
+        let limits = config.indexing.limits();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.server_mode = true;
+        state_mut.instance_cfg = Some(Arc::new(config.clone()));
+        state
+            .store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:policy".into(),
+                url: url.clone(),
+                indexed_sha: sha.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        // Counterweight: a policy recorded WITHOUT the configured exclude
+        // (what an unconfigured reader would compute) is refused for this repo.
+        state
+            .store
+            .set_repo_index_policy(
+                "repo:policy",
+                &GitBareReader::with_limits(&clone, &sha, limits).eligibility_fingerprint(),
+            )
+            .unwrap();
+        let refused = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
+        assert_eq!(refused.failures.len(), 1, "{:?}", refused.failures);
+
+        // The worker's construction records the configured fingerprint.
+        let worker_reader = RepoReadPolicy::for_url(&config, &url)
+            .apply(GitBareReader::with_limits(&clone, &sha, limits))
+            .unwrap();
+        state
+            .store
+            .set_repo_index_policy("repo:policy", &worker_reader.eligibility_fingerprint())
+            .unwrap();
+        let accepted = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
+        assert!(accepted.failures.is_empty(), "{:?}", accepted.failures);
     }
 
     /// nw-705: the manifest rebuild is per repository. One repo it must refuse

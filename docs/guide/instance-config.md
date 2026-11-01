@@ -458,6 +458,12 @@ Notes:
   first-index fallback — so every route indexes the same files.
 - **Changing `exclude` needs a re-index** of that repo. Previously-indexed files
   are not retroactively removed by editing the config alone.
+- **Server mode honours `exclude` and `unskip` too.** Repos the server clones and
+  indexes (blobless bare clones) apply them exactly as a local index does. A
+  change takes effect at that repo's next indexed commit, or immediately if you
+  force a re-index; the next index after the change is a full one. Source files
+  that are not valid UTF-8 are indexed with the invalid bytes replaced, as they
+  are locally, rather than failing the repo.
 
 ### Optional sections
 

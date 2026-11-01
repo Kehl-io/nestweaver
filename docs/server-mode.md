@@ -558,7 +558,7 @@ When TLS is enabled:
 
 ## Repo Configuration
 
-Repos are declared in the instance config. The server clones them as blobless bare repos (~90% smaller than full clones) and indexes them automatically. Each `[[repos]]` entry requires `url`; `name` is an optional display alias, and `type` is optional (`code` is the default, `vault` indexes Markdown).
+Repos are declared in the instance config. The server clones them as blobless bare repos (~90% smaller than full clones) and indexes them automatically. Each `[[repos]]` entry requires `url`; `name` is an optional display alias, and `type` is optional (`code` is the default, `vault` indexes Markdown). `exclude` and `unskip` apply to server-side indexing as they do locally (see [Excludes](guide/instance-config.md)); a change takes effect at the next indexed commit or a forced re-index.
 
 ```toml
 [[repos]]

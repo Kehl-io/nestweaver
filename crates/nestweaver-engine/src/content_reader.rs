@@ -302,6 +302,78 @@ pub trait ContentReader: Send + Sync {
     }
 }
 
+/// Turn the bytes of one SOURCE file into the string the parser sees.
+///
+/// The single decode path for [`FilesystemReader::read_file`] AND
+/// [`GitBareReader::read_file`] (nw-899): the bare reader decoded strictly
+/// while this reader decoded lossily, so one Latin-1 tracked file failed an
+/// entire server-side repo index that the local index completed. Two readers
+/// that must agree on what a file contains share this function so they
+/// cannot drift apart again.
+///
+/// Order matters: binary sniff, lossy UTF-8, NUL strip, lone-CR rewrite.
+/// Callers apply their own size ceiling to the raw bytes BEFORE calling and
+/// to the decoded text after, as the two readers obtain bytes differently.
+fn decode_source_bytes(rel_path: &Path, raw: Vec<u8>) -> Result<String> {
+    // Genuinely binary content would decode into garbage symbols, so skip it
+    // using the NUL-byte heuristic that ripgrep, git and grep all use: a file is
+    // binary iff it contains a NUL, tested over the leading window.
+    const BINARY_SNIFF_BYTES: usize = 8192;
+    if raw[..raw.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+        return Err(BinarySource {
+            path: rel_path.display().to_string(),
+        }
+        .into());
+    }
+    let source = match String::from_utf8(raw) {
+        Ok(valid) => valid,
+        Err(invalid) => String::from_utf8_lossy(invalid.as_bytes()).into_owned(),
+    };
+    // nw-335: the binary sniff above is WINDOWED -- the leading 8 KiB, which
+    // is what ripgrep, git and grep all look at. A NUL PAST that window is
+    // never seen, so a mostly-text file carrying one is (correctly) accepted
+    // as text and (incorrectly) carries the byte into the graph, where the
+    // store's WHOLE-string corruption canary then refuses the row and one
+    // bad row empties a whole-corpus scan. The reported file had its NUL at
+    // offset 47,354. Widening the sniff would reclassify such files as
+    // binary and lose them entirely; dropping the byte keeps the file.
+    //
+    // This covers the CODE pipeline (symbol signatures and summaries are
+    // content columns too). The markdown pipeline is covered independently
+    // at `parse_markdown`, because the watcher reads notes with
+    // `fs::read_to_string` and never passes through here.
+    let source = nestweaver_parser::strip_nul_bytes(&source).into_owned();
+    // nw-386: normalise LONE CR (a `\r` not followed by `\n`) to `\n`.
+    //
+    // Classic-Mac / lone-CR files contributed ZERO symbols and said nothing
+    // about it. With no `\n` anywhere in the file, a leading `//` or `#`
+    // line comment never terminates and tree-sitter swallows the entire
+    // source: a measured 4-file fixture (`hdr.rs`, `hdr.py`, `hdr.go` plus
+    // one LF control) reported `files_processed: 4, symbols_found: 1,
+    // skipped_count: 0, coverage_status: "complete"`. Three files
+    // contributed nothing and the index called that complete.
+    //
+    // The second symptom needs no comment: every symbol's span collapses to
+    // line 1, so `read_symbols`' `read_span` — which splits on `text.lines()`
+    // — hands back the WHOLE FILE for each symbol with `truncated: false`.
+    //
+    // It is language-dependent, which is why no fixture caught it:
+    // JavaScript survives because tree-sitter honours CR as a line
+    // terminator per ECMAScript; Rust, Python, Ruby and Go do not.
+    //
+    // CRLF IS ALREADY CORRECT and must stay untouched — exact line numbers,
+    // byte-identical `read-symbols` bodies. So this rewrites only the LONE
+    // CR and steps over `\r\n` verbatim. Mixed CRLF-then-CR was already fine
+    // for the same reason (the first `\n` terminates the header).
+    //
+    // BYTE LENGTH IS PRESERVED: one ASCII `\r` becomes one ASCII `\n`, so
+    // every byte offset the store already holds stays valid and the
+    // oversize check below is unaffected. Borrows when there is no lone CR,
+    // so the overwhelmingly common path costs one scan and no allocation —
+    // the same shape as `strip_nul_bytes` next door.
+    Ok(normalize_lone_cr(&source).into_owned())
+}
+
 /// Rewrite lone `\r` line endings to `\n`, leaving `\r\n` byte-for-byte alone.
 ///
 /// nw-386. See the call site in [`FilesystemReader::read_file`] for the failure
@@ -856,9 +928,19 @@ impl FilesystemReader {
     /// The compiled repository policy for watcher events, including deleted
     /// paths that cannot be rediscovered by a filesystem walk.
     pub fn accepts_path(&self, rel: &Path) -> bool {
-        !ContentReader::skips_path(self, rel)
-            && !self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel))
-            && !rel.ancestors().skip(1).any(|dir| {
+        !ContentReader::skips_path(self, rel) && !self.matches_exclude(rel)
+    }
+
+    /// Whether a configured `[[repos]] exclude` glob names `rel` or a
+    /// directory enclosing it.
+    ///
+    /// nw-908: the ONE implementation of the exclude predicate. The bare-clone
+    /// reader holds a `FilesystemReader` as its policy and asks this, so a
+    /// server-indexed repo and a locally indexed one cannot disagree about
+    /// which tracked files an operator excluded.
+    pub(crate) fn matches_exclude(&self, rel: &Path) -> bool {
+        self.excludes.as_ref().is_some_and(|gs| gs.is_match(rel))
+            || rel.ancestors().skip(1).any(|dir| {
                 !dir.as_os_str().is_empty() && dir_is_excluded(self.dir_excludes.as_ref(), dir)
             })
     }
@@ -1144,60 +1226,7 @@ impl ContentReader for FilesystemReader {
         bounded
             .read_to_end(&mut raw)
             .map_err(|e| io_read_error("read", &abs, e))?;
-        // Genuinely binary content would decode into garbage symbols, so skip it
-        // using the NUL-byte heuristic that ripgrep, git and grep all use: a file is
-        // binary iff it contains a NUL, tested over the leading window.
-        const BINARY_SNIFF_BYTES: usize = 8192;
-        if raw[..raw.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
-            return Err(BinarySource {
-                path: rel_path.display().to_string(),
-            }
-            .into());
-        }
-        let source = String::from_utf8_lossy(&raw).into_owned();
-        // nw-335: the binary sniff above is WINDOWED -- the leading 8 KiB, which
-        // is what ripgrep, git and grep all look at. A NUL PAST that window is
-        // never seen, so a mostly-text file carrying one is (correctly) accepted
-        // as text and (incorrectly) carries the byte into the graph, where the
-        // store's WHOLE-string corruption canary then refuses the row and one
-        // bad row empties a whole-corpus scan. The reported file had its NUL at
-        // offset 47,354. Widening the sniff would reclassify such files as
-        // binary and lose them entirely; dropping the byte keeps the file.
-        //
-        // This covers the CODE pipeline (symbol signatures and summaries are
-        // content columns too). The markdown pipeline is covered independently
-        // at `parse_markdown`, because the watcher reads notes with
-        // `fs::read_to_string` and never passes through here.
-        let source = nestweaver_parser::strip_nul_bytes(&source).into_owned();
-        // nw-386: normalise LONE CR (a `\r` not followed by `\n`) to `\n`.
-        //
-        // Classic-Mac / lone-CR files contributed ZERO symbols and said nothing
-        // about it. With no `\n` anywhere in the file, a leading `//` or `#`
-        // line comment never terminates and tree-sitter swallows the entire
-        // source: a measured 4-file fixture (`hdr.rs`, `hdr.py`, `hdr.go` plus
-        // one LF control) reported `files_processed: 4, symbols_found: 1,
-        // skipped_count: 0, coverage_status: "complete"`. Three files
-        // contributed nothing and the index called that complete.
-        //
-        // The second symptom needs no comment: every symbol's span collapses to
-        // line 1, so `read_symbols`' `read_span` — which splits on `text.lines()`
-        // — hands back the WHOLE FILE for each symbol with `truncated: false`.
-        //
-        // It is language-dependent, which is why no fixture caught it:
-        // JavaScript survives because tree-sitter honours CR as a line
-        // terminator per ECMAScript; Rust, Python, Ruby and Go do not.
-        //
-        // CRLF IS ALREADY CORRECT and must stay untouched — exact line numbers,
-        // byte-identical `read-symbols` bodies. So this rewrites only the LONE
-        // CR and steps over `\r\n` verbatim. Mixed CRLF-then-CR was already fine
-        // for the same reason (the first `\n` terminates the header).
-        //
-        // BYTE LENGTH IS PRESERVED: one ASCII `\r` becomes one ASCII `\n`, so
-        // every byte offset the store already holds stays valid and the
-        // oversize check below is unaffected. Borrows when there is no lone CR,
-        // so the overwhelmingly common path costs one scan and no allocation —
-        // the same shape as `strip_nul_bytes` next door.
-        let source = normalize_lone_cr(&source).into_owned();
+        let source = decode_source_bytes(rel_path, raw)?;
         if source.len() as u64 > self.limits.max_source_file_bytes() {
             return Err(SourceTooLarge {
                 path: rel_path.display().to_string(),
@@ -1508,6 +1537,10 @@ fn discard_exact<R: Read>(r: &mut R, mut n: usize) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Blob oids per prefetch `git fetch` run: 1000 x 41 bytes keeps the command
+/// line far below `ARG_MAX`.
+const PREFETCH_CHUNK: usize = 1000;
+
 /// A persistent, pooled `git cat-file --batch` subprocess.
 ///
 /// Spawned once per [`GitBareReader`] (lazily, on the first read) and reused for
@@ -1718,6 +1751,14 @@ pub struct GitBareReader {
     local_objects_only: bool,
     sha: String,
     limits: IndexLimits,
+    /// `[[repos]] exclude` / `unskip` policy (nw-908). A `FilesystemReader`
+    /// used purely as the holder of the compiled globs and the unskip set, so
+    /// the bare reader asks the SAME matcher the local reader does instead of
+    /// carrying a second copy of the rules. It never reads a file.
+    policy: FilesystemReader,
+    /// `[git] credential_method` for the network fetches this reader makes
+    /// (the blob prefetch, nw-832). `None` keeps the credential-less isolation.
+    credential_method: Option<String>,
     /// Lazily-spawned pooled `cat-file --batch` process. `None` until the first
     /// read; reset to `None` if the process dies so the next read re-spawns.
     batch: Mutex<Option<CatFileBatch>>,
@@ -1730,6 +1771,8 @@ impl GitBareReader {
             local_objects_only: false,
             sha: sha.to_string(),
             limits: IndexLimits::default(),
+            policy: FilesystemReader::new(bare_path),
+            credential_method: None,
             batch: Mutex::new(None),
         }
     }
@@ -1740,8 +1783,30 @@ impl GitBareReader {
             local_objects_only: false,
             sha: sha.to_string(),
             limits,
+            policy: FilesystemReader::new(bare_path),
+            credential_method: None,
             batch: Mutex::new(None),
         }
+    }
+
+    /// Authenticate the blob prefetch like the clone and fetch do
+    /// (`[git] credential_method`, nw-828/nw-832).
+    pub fn with_credential_method(mut self, method: Option<String>) -> Self {
+        self.credential_method = method;
+        self
+    }
+
+    /// Attach `[[repos]] exclude` globs (nw-908), matched exactly as
+    /// [`FilesystemReader::excluding`] matches them.
+    pub fn excluding(mut self, globs: &[String]) -> Result<Self> {
+        self.policy = self.policy.excluding(globs)?;
+        Ok(self)
+    }
+
+    /// Re-admit `SKIP_DIRS` names for this repo (`[[repos]] unskip`, nw-908).
+    pub fn unskipping(mut self, names: &[String]) -> Self {
+        self.policy = self.policy.unskipping(names);
+        self
     }
 
     /// Repair never fetches missing promisor blobs or unknown remotes.
@@ -1794,9 +1859,226 @@ impl GitBareReader {
             .with_context(|| format!("git ls-tree {} -- {}", self.sha, rel_path.display()))
     }
 
+    /// Fetch the blobs behind `wanted` in as few `git fetch` runs as possible
+    /// (nw-832).
+    ///
+    /// A blobless bare clone (`--filter=blob:none`) holds trees but no file
+    /// bodies, and `cat-file --batch` lazy-fetches each missing blob in its own
+    /// `git fetch` child, which over ssh is a fresh handshake per file (~1
+    /// file/s measured on a real server; 26s for 300 files even over a local
+    /// `file://` remote). Asking for the whole set once turns N fetches into
+    /// ceil(N / [`PREFETCH_CHUNK`]).
+    ///
+    /// Requires git >= 2.29 (`--no-write-fetch-head`) and, for the
+    /// missing-object probe to stay off the network, >= 2.44
+    /// (`GIT_NO_LAZY_FETCH`); on an older git the call errors and the index
+    /// falls back to per-blob fetches. Only the blobs the caller names are
+    /// fetched: files the indexer reads for other reasons (build manifests,
+    /// OpenAPI specs, anything `wants` rejects) still lazy-fetch individually,
+    /// and a file a later `.brainignore` drops may have been fetched needlessly.
+    ///
+    /// Best-effort by contract: a failed prefetch only means the later reads
+    /// lazy-fetch as before, so callers log and carry on. Returns how many
+    /// blobs were requested from the remote. Never runs for a
+    /// `local_objects_only` reader (repair must not touch the network).
+    ///
+    /// The fetch is guarded exactly like `BareClone::fetch_branch`: the origin
+    /// URL goes through the SSRF guard and the connect IP is pinned. git's own
+    /// lazy fetch has no such guard.
+    pub fn prefetch_blobs(&self, wanted: &[PathBuf]) -> Result<usize> {
+        if self.local_objects_only || wanted.is_empty() {
+            return Ok(0);
+        }
+        let git = |args: &[&str]| -> Result<std::process::Output> {
+            let mut cmd = Command::new("git");
+            cmd.arg("-C")
+                .arg(&self.bare_path)
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .args(args);
+            run_git_with_timeout(cmd, git_net_timeout())
+        };
+
+        // path -> blob oid for the requested files, from the committed tree.
+        let tree = git(&["ls-tree", "-r", "-z", &self.sha])?;
+        anyhow::ensure!(
+            tree.status.success(),
+            "git ls-tree failed: {}",
+            String::from_utf8_lossy(&tree.stderr).trim()
+        );
+        let wanted: HashSet<&Path> = wanted.iter().map(PathBuf::as_path).collect();
+        let mut wanted_oids: HashSet<String> = HashSet::new();
+        for record in tree.stdout.split(|&b| b == 0) {
+            let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let path = PathBuf::from(String::from_utf8_lossy(&record[tab + 1..]).into_owned());
+            if !wanted.contains(path.as_path()) {
+                continue;
+            }
+            let mut meta = record[..tab].split(|&b| b == b' ');
+            let (mode, kind, oid) = (meta.next(), meta.next(), meta.next());
+            if kind == Some(b"blob")
+                && mode != Some(b"120000")
+                && let Some(oid) = oid
+            {
+                wanted_oids.insert(String::from_utf8_lossy(oid).into_owned());
+            }
+        }
+        if wanted_oids.is_empty() {
+            return Ok(0);
+        }
+
+        // Which of the commit's objects are absent locally. `--missing=print`
+        // reports them as `?<oid>` instead of failing or lazy-fetching.
+        let missing = git(&[
+            "rev-list",
+            "--objects",
+            "--no-walk",
+            "--missing=print",
+            "--no-object-names",
+            &self.sha,
+        ])?;
+        anyhow::ensure!(
+            missing.status.success(),
+            "git rev-list --missing failed: {}",
+            String::from_utf8_lossy(&missing.stderr).trim()
+        );
+        let mut to_fetch: Vec<String> = String::from_utf8_lossy(&missing.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix('?'))
+            .filter(|oid| wanted_oids.contains(*oid))
+            .map(str::to_string)
+            .collect();
+        to_fetch.sort();
+        if to_fetch.is_empty() {
+            return Ok(0);
+        }
+
+        // One guarded, credentialed fetch per chunk, built by the same
+        // `BareClone` path as the clone's own fetches (SSRF guard, isolation,
+        // `[git] credential_method`, timeouts): no second hand-built command.
+        let clone = crate::bare_clone::BareClone {
+            path: self.bare_path.clone(),
+            url: crate::bare_clone::read_origin_url(&self.bare_path)?,
+            credential_method: self.credential_method.clone(),
+        };
+        for chunk in to_fetch.chunks(PREFETCH_CHUNK) {
+            clone.fetch_objects(chunk)?;
+        }
+        Ok(to_fetch.len())
+    }
+
+    /// Prefetch what an index of this reader at `self.sha` will read (nw-832):
+    /// every file `list_files` yields when `previous_sha` is `None` (a full
+    /// index), or just the files changed since `previous_sha` (incremental).
+    /// `wants` narrows to the kind of file the indexer parses.
+    pub fn prefetch_for_index(
+        &self,
+        previous_sha: Option<&str>,
+        wants: fn(&Path) -> bool,
+    ) -> Result<usize> {
+        let paths: Vec<PathBuf> = match previous_sha {
+            None => self.list_files()?,
+            Some(old) => crate::git_diff::detect_changes(&self.bare_path, old, &self.sha)?
+                .into_iter()
+                .filter_map(|change| match change {
+                    crate::git_diff::FileChange::Added(path)
+                    | crate::git_diff::FileChange::Modified(path) => Some(path),
+                    crate::git_diff::FileChange::Renamed { to, .. } => Some(to),
+                    crate::git_diff::FileChange::Deleted(_) => None,
+                })
+                .collect(),
+        };
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| wants(path) && ContentReader::accepts_path(self, path))
+            .collect();
+        self.prefetch_blobs(&paths)
+    }
+
+    /// `read_file` with the decode step chosen by the caller: lossy source
+    /// decoding by default, strict for policy files (see [`BlobDecoder`]).
+    fn read_file_decoded(&self, rel_path: &Path, decode: BlobDecoder) -> Result<String> {
+        let text = self.read_blob_decoded(rel_path, decode)?;
+        // Parity with `FilesystemReader::read_file`: the byte cap is checked on
+        // the blob, but lossy decoding can GROW the text (each invalid byte
+        // becomes a 3-byte U+FFFD), so the decoded string is held to the same
+        // ceiling and refused with the same typed error.
+        let limit = self.limits.max_source_file_bytes();
+        if text.len() as u64 > limit {
+            return Err(SourceTooLarge {
+                path: rel_path.display().to_string(),
+                observed_bytes: text.len() as u64,
+                limit_bytes: limit,
+            }
+            .into());
+        }
+        Ok(text)
+    }
+
+    fn read_blob_decoded(&self, rel_path: &Path, decode: BlobDecoder) -> Result<String> {
+        if self.local_objects_only {
+            return self.read_file_via_show(rel_path, decode);
+        }
+        let mut guard = self.batch.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Lazily spawn the pooled batch process on the first read.
+        if guard.is_none() {
+            match CatFileBatch::spawn(&self.bare_path, self.limits.max_source_file_bytes()) {
+                Ok(batch) => *guard = Some(batch),
+                Err(err) => {
+                    tracing::warn!(
+                        "cat-file --batch spawn failed ({err}); falling back to git show"
+                    );
+                    drop(guard);
+                    return self.read_file_via_show(rel_path, decode);
+                }
+            }
+        }
+
+        let batch = guard.as_mut().expect("batch initialized above");
+        match batch.request(&self.sha, rel_path) {
+            // nw-386: normalise lone CR here, not at the caller — see
+            // `decode_git_blob`.
+            Ok(BatchObject::Found(content)) => decode(rel_path, content),
+            Ok(BatchObject::Missing) => anyhow::bail!(
+                "path {} not found at {} in {}",
+                rel_path.display(),
+                self.sha,
+                self.bare_path.display()
+            ),
+            Ok(BatchObject::TooLarge(observed_bytes)) => {
+                // Mirror the filesystem oversized-file skip: the blob was already
+                // read-and-discarded (never materialized) so the stream stays
+                // framed. Do NOT fall back to `git show` — that would re-read the
+                // oversized blob whole. Return Err so callers skip this one file
+                // (their existing read_file Err branch) without failing the index.
+                tracing::warn!(
+                    "skipping oversized blob {} (exceeds {} bytes)",
+                    rel_path.display(),
+                    self.limits.max_source_file_bytes()
+                );
+                Err(SourceTooLarge {
+                    path: rel_path.display().to_string(),
+                    observed_bytes,
+                    limit_bytes: self.limits.max_source_file_bytes(),
+                }
+                .into())
+            }
+            Err(err) => {
+                // The batch process likely died — discard it (so the next read
+                // re-spawns) and fall back to a one-shot `git show`.
+                tracing::warn!("cat-file --batch read failed ({err}); falling back to git show");
+                *guard = None;
+                drop(guard);
+                self.read_file_via_show(rel_path, decode)
+            }
+        }
+    }
+
     /// One-shot fallback read used when the pooled `cat-file --batch` process is
     /// unavailable (failed to spawn, or died mid-stream).
-    fn read_file_via_show(&self, rel_path: &Path) -> Result<String> {
+    fn read_file_via_show(&self, rel_path: &Path, decode: BlobDecoder) -> Result<String> {
         let spec = format!("{}:{}", self.sha, rel_path.display());
         // Enforce the size cap BEFORE transferring content, mirroring the batch
         // path's `TooLarge` skip. `git cat-file -s` reports the blob size without
@@ -1858,11 +2140,21 @@ impl GitBareReader {
         // It fires on spawn failure and on mid-stream process death, so leaving
         // it un-normalised would make correctness depend on whether a `git`
         // subprocess happened to survive.
-        decode_git_blob(rel_path, output.stdout)
+        decode(rel_path, output.stdout)
     }
 }
 
+/// How the bytes of a blob become text. [`decode_git_blob`] for source,
+/// [`decode_git_blob_strict`] for policy files.
+type BlobDecoder = fn(&Path, Vec<u8>) -> Result<String>;
+
 /// Decode blob bytes handed back by git into the source string the parser sees.
+///
+/// nw-899: this is [`decode_source_bytes`], the SAME function
+/// [`FilesystemReader::read_file`] uses (binary sniff, lossy UTF-8, NUL strip,
+/// lone-CR rewrite). It used to be a strict `String::from_utf8`, so one Latin-1
+/// tracked file failed the whole server-side repo index with an error the
+/// local index never raised.
 ///
 /// nw-386, SECOND CALL SITE. `normalize_lone_cr` shipped wired only into
 /// [`FilesystemReader::read_file`], and the comment on its test called that
@@ -1886,6 +2178,13 @@ impl GitBareReader {
 /// [`normalize_lone_cr`]. Returns the original `String` untouched, with no
 /// second allocation, whenever there is no lone CR to rewrite.
 fn decode_git_blob(rel_path: &Path, bytes: Vec<u8>) -> Result<String> {
+    decode_source_bytes(rel_path, bytes)
+}
+
+/// Strict decode for POLICY files (`.brainignore`), the bare-clone twin of
+/// [`FilesystemReader::read_optional_file`]: an invalid byte must be an error,
+/// not a U+FFFD that silently changes a pattern (nw-684 Task 5c).
+fn decode_git_blob_strict(rel_path: &Path, bytes: Vec<u8>) -> Result<String> {
     let text = String::from_utf8(bytes)
         .with_context(|| format!("non-utf8 content in {}", rel_path.display()))?;
     // Destructured rather than `.into_owned()`: on the overwhelmingly common
@@ -1946,18 +2245,40 @@ impl ContentReader for GitBareReader {
             }
             .into());
         }
-        self.read_file(rel_path).map(Some)
+        self.read_file_decoded(rel_path, decode_git_blob_strict)
+            .map(Some)
     }
 
     fn eligibility_fingerprint(&self) -> String {
-        crate::hash::blake3_hex(
-            &serde_json::json!({
-                // v2 (nw-652): `target` is gated on a build manifest.
-                "reader": "git-bare-v2",
-                "max_source_file_bytes": self.limits.max_source_file_bytes(),
-            })
-            .to_string(),
-        )
+        let mut payload = serde_json::json!({
+            // v2 (nw-652): `target` is gated on a build manifest.
+            "reader": "git-bare-v2",
+            "max_source_file_bytes": self.limits.max_source_file_bytes(),
+        });
+        // nw-908: a configured exclude/unskip changes what the repo holds, so
+        // it must change the fingerprint. Only when present: an unconfigured
+        // repo keeps its stored fingerprint, so this fix does not force a
+        // full re-index of every repo that never set either.
+        if !self.policy.exclude_patterns.is_empty() || !self.policy.unskip.is_empty() {
+            let mut excludes = self.policy.exclude_patterns.clone();
+            excludes.sort();
+            excludes.dedup();
+            let mut unskip: Vec<_> = self.policy.unskip.iter().collect();
+            unskip.sort();
+            payload["excludes"] = serde_json::json!(excludes);
+            payload["unskip"] = serde_json::json!(unskip);
+        }
+        crate::hash::blake3_hex(&payload.to_string())
+    }
+
+    /// nw-908: the same matcher the local reader uses; the manifest gate is
+    /// answered from this reader's tree via [`Self::has_file`].
+    fn accepts_path(&self, rel: &Path) -> bool {
+        !ContentReader::skips_path(self, rel) && !self.policy.matches_exclude(rel)
+    }
+
+    fn unskipped_skip_dirs(&self) -> &HashSet<String> {
+        &self.policy.unskip
     }
 
     fn superseded_eligibility_fingerprints(&self) -> Vec<String> {
@@ -1971,63 +2292,7 @@ impl ContentReader for GitBareReader {
     }
 
     fn read_file(&self, rel_path: &Path) -> Result<String> {
-        if self.local_objects_only {
-            return self.read_file_via_show(rel_path);
-        }
-        let mut guard = self.batch.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Lazily spawn the pooled batch process on the first read.
-        if guard.is_none() {
-            match CatFileBatch::spawn(&self.bare_path, self.limits.max_source_file_bytes()) {
-                Ok(batch) => *guard = Some(batch),
-                Err(err) => {
-                    tracing::warn!(
-                        "cat-file --batch spawn failed ({err}); falling back to git show"
-                    );
-                    drop(guard);
-                    return self.read_file_via_show(rel_path);
-                }
-            }
-        }
-
-        let batch = guard.as_mut().expect("batch initialized above");
-        match batch.request(&self.sha, rel_path) {
-            // nw-386: normalise lone CR here, not at the caller — see
-            // `decode_git_blob`.
-            Ok(BatchObject::Found(content)) => decode_git_blob(rel_path, content),
-            Ok(BatchObject::Missing) => anyhow::bail!(
-                "path {} not found at {} in {}",
-                rel_path.display(),
-                self.sha,
-                self.bare_path.display()
-            ),
-            Ok(BatchObject::TooLarge(observed_bytes)) => {
-                // Mirror the filesystem oversized-file skip: the blob was already
-                // read-and-discarded (never materialized) so the stream stays
-                // framed. Do NOT fall back to `git show` — that would re-read the
-                // oversized blob whole. Return Err so callers skip this one file
-                // (their existing read_file Err branch) without failing the index.
-                tracing::warn!(
-                    "skipping oversized blob {} (exceeds {} bytes)",
-                    rel_path.display(),
-                    self.limits.max_source_file_bytes()
-                );
-                Err(SourceTooLarge {
-                    path: rel_path.display().to_string(),
-                    observed_bytes,
-                    limit_bytes: self.limits.max_source_file_bytes(),
-                }
-                .into())
-            }
-            Err(err) => {
-                // The batch process likely died — discard it (so the next read
-                // re-spawns) and fall back to a one-shot `git show`.
-                tracing::warn!("cat-file --batch read failed ({err}); falling back to git show");
-                *guard = None;
-                drop(guard);
-                self.read_file_via_show(rel_path)
-            }
-        }
+        self.read_file_decoded(rel_path, decode_git_blob)
     }
 
     fn list_files(&self) -> Result<Vec<PathBuf>> {
@@ -2103,13 +2368,16 @@ impl ContentReader for GitBareReader {
         // committed `target/` is pruned only when the tree also holds a
         // `Cargo.toml` (or `CACHEDIR.TAG`) where the gate looks for one.
         let tree: HashSet<PathBuf> = files.iter().cloned().collect();
+        //
+        // nw-908: `unskip` re-admits SKIP_DIRS names and `exclude` drops tracked
+        // paths, both answered by the policy reader the local walk uses.
         files.retain(|path| {
             !crate::index::path_in_skip_dirs(
                 path,
                 crate::index::SKIP_DIRS,
-                crate::index::nothing_unskipped(),
+                &self.policy.unskip,
                 &|probe| tree.contains(probe),
-            )
+            ) && !self.policy.matches_exclude(path)
         });
         Ok(files)
     }
@@ -2771,11 +3039,18 @@ mod tests {
 
     // ---------- GitBareReader tests ----------
 
+    use super::test_util::{blobless_bare_repo, missing_blobs, pack_count};
     use std::process::Command;
 
     /// Helper: create a source repo with files, commit, and clone as bare.
     /// Returns (TempDir, bare_path, sha).
     fn setup_bare_repo(files: &[(&str, &str)]) -> (TempDir, PathBuf, String) {
+        let files: Vec<(&str, &[u8])> = files.iter().map(|(p, c)| (*p, c.as_bytes())).collect();
+        setup_bare_repo_bytes(&files)
+    }
+
+    /// `setup_bare_repo` for fixtures whose bytes are not valid UTF-8.
+    fn setup_bare_repo_bytes(files: &[(&str, &[u8])]) -> (TempDir, PathBuf, String) {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("src_repo");
         std::fs::create_dir_all(&src).unwrap();
@@ -2854,6 +3129,325 @@ mod tests {
         (tmp, bare, sha)
     }
 
+    /// The byte fixtures the two readers must agree on (nw-899).
+    const DECODE_FIXTURES: &[(&str, &[u8])] = &[
+        ("latin1.rs", b"fn f(){}\n// caf\xe9\n"),
+        ("utf8.rs", "fn g(){}\n// caf\u{e9}\n".as_bytes()),
+        ("nul_early.rs", b"fn h(){}\0\n"),
+        ("lone_cr.rs", b"// header\rfn one() {}\r"),
+        ("crlf.rs", b"// header\r\nfn one() {}\r\n"),
+    ];
+
+    fn fixture_source_for_nul_late() -> Vec<u8> {
+        // A NUL past the 8 KiB sniff window: text, with the byte dropped.
+        let mut bytes = b"fn late(){}\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'a', 9000));
+        bytes.extend_from_slice(b"\0\n// caf\xe9\n");
+        bytes
+    }
+
+    /// nw-899: the bare reader must decode a blob exactly as the filesystem
+    /// reader decodes the same bytes. It used to hard-fail on any non-UTF-8
+    /// blob (strict `from_utf8`), which dead-lettered a whole server-side repo
+    /// index that the local index completed.
+    #[test]
+    fn bare_and_filesystem_readers_decode_every_fixture_identically() {
+        let late = fixture_source_for_nul_late();
+        let mut files: Vec<(&str, &[u8])> = DECODE_FIXTURES.to_vec();
+        files.push(("nul_late.rs", late.as_slice()));
+        let (_tmp, bare, sha) = setup_bare_repo_bytes(&files);
+        let fs_dir = TempDir::new().unwrap();
+        for (name, bytes) in &files {
+            std::fs::write(fs_dir.path().join(name), bytes).unwrap();
+        }
+        let fs_reader = FilesystemReader::new(fs_dir.path());
+        let bare_reader = GitBareReader::new(&bare, &sha);
+        // `local_objects_only` forces the `git show` fallback decode point.
+        let show_reader = GitBareReader::new(&bare, &sha).local_objects_only();
+        for (name, _) in &files {
+            let path = Path::new(name);
+            let expected = fs_reader.read_file(path);
+            for (label, reader) in [("batch", &bare_reader), ("show", &show_reader)] {
+                let got = reader.read_file(path);
+                match (&expected, &got) {
+                    (Ok(e), Ok(g)) => assert_eq!(e, g, "{name} via {label}"),
+                    (Err(e), Err(g)) => assert_eq!(
+                        e.downcast_ref::<BinarySource>().is_some(),
+                        g.downcast_ref::<BinarySource>().is_some(),
+                        "{name} via {label}: {e:#} vs {g:#}"
+                    ),
+                    _ => panic!("{name} via {label}: filesystem {expected:?} vs bare {got:?}"),
+                }
+            }
+        }
+        // The headline case, spelled out: Latin-1 keeps its file, lossily.
+        assert_eq!(
+            bare_reader.read_file(Path::new("latin1.rs")).unwrap(),
+            "fn f(){}\n// caf\u{fffd}\n"
+        );
+        assert!(
+            bare_reader
+                .read_file(Path::new("nul_early.rs"))
+                .unwrap_err()
+                .downcast_ref::<BinarySource>()
+                .is_some(),
+            "a leading NUL is binary on the bare reader too"
+        );
+    }
+
+    /// Lossy decoding can grow text (each invalid byte becomes a 3-byte
+    /// U+FFFD). The bare reader holds the DECODED text to the source ceiling
+    /// exactly as `FilesystemReader::read_file` does, with the same typed error.
+    #[test]
+    fn bare_reader_refuses_text_that_lossy_decoding_grew_past_the_limit() {
+        let limit = crate::index_limits::MIN_MAX_SOURCE_FILE_BYTES;
+        let blob = vec![0xe9u8; 600]; // 600 bytes <= limit, 1800 once decoded
+        let (_tmp, bare, sha) = setup_bare_repo_bytes(&[("grown.rs", &blob)]);
+        let limits = crate::index_limits::IndexLimits::new(limit).unwrap();
+        let bare_reader = GitBareReader::with_limits(&bare, &sha, limits);
+        let show_reader = GitBareReader::with_limits(&bare, &sha, limits).local_objects_only();
+        let fs_dir = TempDir::new().unwrap();
+        std::fs::write(fs_dir.path().join("grown.rs"), &blob).unwrap();
+        let fs_reader = FilesystemReader::with_limits(fs_dir.path(), limits);
+
+        let expected = fs_reader.read_file(Path::new("grown.rs")).unwrap_err();
+        assert!(expected.downcast_ref::<SourceTooLarge>().is_some());
+        for (label, reader) in [("batch", &bare_reader), ("show", &show_reader)] {
+            let got = reader.read_file(Path::new("grown.rs")).unwrap_err();
+            assert!(
+                got.downcast_ref::<SourceTooLarge>().is_some(),
+                "{label}: {got:#}"
+            );
+        }
+    }
+
+    /// nw-899 counterweight: POLICY files stay strict on the bare reader, as
+    /// on the filesystem reader (nw-684 Task 5c) - an invalid byte in a
+    /// `.brainignore` must not become U+FFFD and change a pattern.
+    #[test]
+    fn bare_reader_optional_policy_file_stays_strict_on_invalid_utf8() {
+        let (_tmp, bare, sha) =
+            setup_bare_repo_bytes(&[(".brainignore", b"secret\xe9/\n"), ("a.rs", b"fn a(){}\n")]);
+        let reader = GitBareReader::new(&bare, &sha);
+        let err = reader
+            .read_optional_file(Path::new(".brainignore"))
+            .unwrap_err();
+        assert!(
+            err.chain()
+                .any(|c| c.downcast_ref::<std::string::FromUtf8Error>().is_some()),
+            "{err:#}"
+        );
+        assert_eq!(reader.read_optional_file(Path::new("nope")).unwrap(), None);
+    }
+
+    fn sorted(mut v: Vec<PathBuf>) -> Vec<PathBuf> {
+        v.sort();
+        v
+    }
+
+    /// nw-908: `[[repos]] exclude` / `unskip` apply to the bare reader exactly
+    /// as to the filesystem reader - same listing, same per-path verdicts.
+    #[test]
+    fn bare_reader_honours_exclude_and_unskip_like_the_filesystem_reader() {
+        let files: &[(&str, &str)] = &[
+            ("src/keep.rs", "fn keep(){}\n"),
+            ("escape/ex.rs", "fn excluded_fn(){}\n"),
+            ("vendor/v.rs", "fn vendor_fn(){}\n"),
+            ("gen/out.gen.rs", "fn generated(){}\n"),
+        ];
+        let (tmp, bare, sha) = setup_bare_repo(files);
+        let excludes = vec!["escape/**".to_string(), "*.gen.rs".to_string()];
+        let unskip = vec!["vendor".to_string()];
+
+        let bare_reader = GitBareReader::new(&bare, &sha)
+            .excluding(&excludes)
+            .unwrap()
+            .unskipping(&unskip);
+        let fs_reader = FilesystemReader::new(&tmp.path().join("src_repo"))
+            .excluding(&excludes)
+            .unwrap()
+            .unskipping(&unskip);
+
+        let listed = sorted(bare_reader.list_files().unwrap());
+        assert_eq!(
+            listed,
+            vec![PathBuf::from("src/keep.rs"), PathBuf::from("vendor/v.rs")],
+            "excluded files are gone and the unskipped vendor/ is back"
+        );
+        let fs_listed: Vec<PathBuf> = sorted(fs_reader.list_files().unwrap())
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .collect();
+        assert_eq!(listed, fs_listed, "bare and filesystem listings agree");
+
+        for (path, _) in files {
+            assert_eq!(
+                ContentReader::accepts_path(&bare_reader, Path::new(path)),
+                ContentReader::accepts_path(&fs_reader, Path::new(path)),
+                "accepts_path({path}) must agree (incremental route)"
+            );
+            assert_eq!(
+                ContentReader::skips_path(&bare_reader, Path::new(path)),
+                ContentReader::skips_path(&fs_reader, Path::new(path)),
+                "skips_path({path}) must agree (incremental route)"
+            );
+        }
+    }
+
+    /// nw-908: policy changes the eligibility fingerprint, but an unconfigured
+    /// repo keeps its stored one (no forced re-index for everyone).
+    #[test]
+    fn bare_reader_fingerprint_tracks_policy_and_keeps_the_default() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[("a.rs", "fn a(){}\n")]);
+        let default = GitBareReader::new(&bare, &sha).eligibility_fingerprint();
+        let legacy = crate::hash::blake3_hex(
+            &serde_json::json!({
+                "reader": "git-bare-v2",
+                "max_source_file_bytes": IndexLimits::default().max_source_file_bytes(),
+            })
+            .to_string(),
+        );
+        assert_eq!(default, legacy, "unconfigured fingerprint is unchanged");
+        let excluded = GitBareReader::new(&bare, &sha)
+            .excluding(&["a/**".to_string()])
+            .unwrap();
+        let unskipped = GitBareReader::new(&bare, &sha).unskipping(&["public".to_string()]);
+        assert_ne!(default, excluded.eligibility_fingerprint());
+        assert_ne!(default, unskipped.eligibility_fingerprint());
+        assert_ne!(
+            excluded.eligibility_fingerprint(),
+            unskipped.eligibility_fingerprint()
+        );
+    }
+
+    /// nw-832: prefetching N blobs of a blobless clone is O(1) fetches (one
+    /// pack here), not one per blob; and it fetches only what was asked for.
+    #[test]
+    fn prefetch_blobs_fetches_a_blobless_clone_in_one_run() {
+        let (_tmp, bare, sha) = blobless_bare_repo(40);
+        let reader = GitBareReader::new(&bare, &sha);
+        let before = pack_count(&bare);
+        assert_eq!(missing_blobs(&bare, &sha), 40);
+
+        // Everything but f0.rs..f4.rs (stand-in for excluded/unparseable files).
+        let wanted: Vec<PathBuf> = (5..40).map(|i| PathBuf::from(format!("f{i}.rs"))).collect();
+        let fetched = reader.prefetch_blobs(&wanted).unwrap();
+
+        assert_eq!(fetched, 35);
+        assert_eq!(
+            pack_count(&bare) - before,
+            1,
+            "35 blobs must arrive in a single fetch"
+        );
+        assert_eq!(
+            missing_blobs(&bare, &sha),
+            5,
+            "unrequested blobs stay remote"
+        );
+        // Idempotent: nothing left to fetch for the same set.
+        assert_eq!(reader.prefetch_blobs(&wanted).unwrap(), 0);
+        assert_eq!(pack_count(&bare) - before, 1);
+        // And reads of prefetched files do not fetch again.
+        for i in 5..40 {
+            reader.read_file(Path::new(&format!("f{i}.rs"))).unwrap();
+        }
+        assert_eq!(pack_count(&bare) - before, 1);
+    }
+
+    /// nw-832 baseline: without a prefetch, lazy reads cost one fetch per blob.
+    #[test]
+    fn lazy_reads_without_prefetch_fetch_once_per_blob() {
+        let (_tmp, bare, sha) = blobless_bare_repo(6);
+        let reader = GitBareReader::new(&bare, &sha);
+        let before = pack_count(&bare);
+        for i in 0..6 {
+            reader.read_file(Path::new(&format!("f{i}.rs"))).unwrap();
+        }
+        assert!(
+            pack_count(&bare) - before >= 6,
+            "premise of nw-832: one fetch per lazily-read blob"
+        );
+    }
+
+    /// nw-832: `prefetch_for_index` covers the full-index set (every listed
+    /// parseable file) and the incremental set (only files changed since the
+    /// previous SHA), and `local_objects_only` never touches the network.
+    #[test]
+    fn prefetch_for_index_covers_full_and_incremental_sets() {
+        let (tmp, bare, sha) = blobless_bare_repo(12);
+        let src = tmp.path().join("src");
+        let reader = GitBareReader::new(&bare, &sha);
+        let before = pack_count(&bare);
+        assert_eq!(
+            GitBareReader::new(&bare, &sha)
+                .local_objects_only()
+                .prefetch_for_index(None, crate::index::is_parseable)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            missing_blobs(&bare, &sha),
+            12,
+            "repair mode fetches nothing"
+        );
+
+        assert_eq!(
+            reader
+                .prefetch_for_index(None, crate::index::is_parseable)
+                .unwrap(),
+            12
+        );
+        assert_eq!(pack_count(&bare) - before, 1);
+
+        // Incremental: a new commit touching two files, one added.
+        std::fs::write(src.join("f1.rs"), "pub fn f1_changed() {}\n").unwrap();
+        std::fs::write(src.join("new.rs"), "pub fn new_one() {}\n").unwrap();
+        for args in [&["add", "."][..], &["commit", "-q", "-m", "two"][..]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&src)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let fetch = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args([
+                "fetch",
+                "-q",
+                "origin",
+                "+HEAD:refs/heads/next",
+                "--filter=blob:none",
+            ])
+            .output()
+            .unwrap();
+        assert!(fetch.status.success(), "{fetch:?}");
+        let new_sha = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&bare)
+                .args(["rev-parse", "refs/heads/next"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let next = GitBareReader::new(&bare, &new_sha);
+        let before = pack_count(&bare);
+        assert_eq!(
+            next.prefetch_for_index(Some(&sha), crate::index::is_parseable)
+                .unwrap(),
+            2,
+            "only the changed f1.rs and the added new.rs"
+        );
+        assert_eq!(pack_count(&bare) - before, 1);
+    }
+
     #[test]
     fn git_bare_reader_read_file() {
         let (_tmp, bare, sha) = setup_bare_repo(&[
@@ -2922,12 +3516,16 @@ mod tests {
         // from the public surface, and a fix applied to only one of the two
         // arms would be correct until the day a subprocess died.
         assert_eq!(
-            reader.read_file_via_show(Path::new("cr.rs")).unwrap(),
+            reader
+                .read_file_via_show(Path::new("cr.rs"), decode_git_blob)
+                .unwrap(),
             lf,
             "the git-show fallback must normalise identically to the batch path"
         );
         assert_eq!(
-            reader.read_file_via_show(Path::new("crlf.rs")).unwrap(),
+            reader
+                .read_file_via_show(Path::new("crlf.rs"), decode_git_blob)
+                .unwrap(),
             crlf,
             "the git-show fallback must leave CRLF alone"
         );
@@ -3388,17 +3986,23 @@ mod tests {
         let reader = GitBareReader::new(&bare, &sha);
 
         assert_eq!(
-            reader.read_file_via_show(Path::new("hello.txt")).unwrap(),
+            reader
+                .read_file_via_show(Path::new("hello.txt"), decode_git_blob)
+                .unwrap(),
             "world"
         );
         assert_eq!(
             reader
-                .read_file_via_show(Path::new("dir/nested.txt"))
+                .read_file_via_show(Path::new("dir/nested.txt"), decode_git_blob)
                 .unwrap(),
             "deep"
         );
         // A missing path must error rather than return empty content.
-        assert!(reader.read_file_via_show(Path::new("absent.txt")).is_err());
+        assert!(
+            reader
+                .read_file_via_show(Path::new("absent.txt"), decode_git_blob)
+                .is_err()
+        );
     }
 
     // ---------- T6.1: non-ASCII paths, symlinks, gitlinks ----------
@@ -3577,7 +4181,9 @@ mod tests {
             &sha,
             IndexLimits::new(limit).expect("test limit is valid"),
         );
-        let error = reader.read_file_via_show(Path::new("big.rs")).unwrap_err();
+        let error = reader
+            .read_file_via_show(Path::new("big.rs"), decode_git_blob)
+            .unwrap_err();
         let oversized = error.downcast_ref::<SourceTooLarge>().unwrap();
         assert_eq!(oversized.observed_bytes, limit + 1);
         assert_eq!(oversized.limit_bytes, limit);
@@ -3898,5 +4504,103 @@ mod non_utf8_tests {
         let reader = FilesystemReader::new(dir.path());
         let source = reader.read_file(Path::new("ok.js")).unwrap();
         assert_eq!(source, "const a = '\u{1F600}';\n");
+    }
+}
+
+/// Fixtures for tests that need a blobless bare clone whose fetches can be
+/// counted (shared by the reader and worker prefetch tests, nw-832).
+#[cfg(test)]
+pub(crate) mod test_util {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// Run git in `dir`, asserting success; returns trimmed stdout.
+    pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Mark a source repo as serving partial clones and any-oid wants.
+    pub(crate) fn allow_partial_clone(src: &Path) {
+        git(src, &["config", "uploadpack.allowFilter", "true"]);
+        git(src, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    }
+
+    /// Keep every fetch into `bare` as its own pack (the default unpacks small
+    /// fetches loose), so the number of fetch runs is the pack count.
+    pub(crate) fn keep_each_fetch_as_a_pack(bare: &Path) {
+        git(bare, &["config", "fetch.unpackLimit", "1"]);
+        git(bare, &["config", "transfer.unpackLimit", "1"]);
+    }
+
+    /// A source repo of `file_count` one-function files, cloned blobless as a
+    /// bare repo with every fetch kept as its own pack.
+    pub(crate) fn blobless_bare_repo(file_count: usize) -> (TempDir, PathBuf, String) {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q"]);
+        git(&src, &["config", "user.email", "t@t.t"]);
+        git(&src, &["config", "user.name", "t"]);
+        allow_partial_clone(&src);
+        for i in 0..file_count {
+            std::fs::write(
+                src.join(format!("f{i}.rs")),
+                format!("pub fn f{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        git(&src, &["add", "."]);
+        git(&src, &["commit", "-q", "-m", "init"]);
+        let bare = tmp.path().join("repo.git");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                "--filter=blob:none",
+                &format!("file://{}", src.display()),
+                &bare.display().to_string(),
+            ],
+        );
+        keep_each_fetch_as_a_pack(&bare);
+        let sha = git(&bare, &["rev-parse", "HEAD"]);
+        (tmp, bare, sha)
+    }
+
+    /// Number of packs in `bare` (one per kept fetch).
+    pub(crate) fn pack_count(bare: &Path) -> usize {
+        std::fs::read_dir(bare.join("objects/pack"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "pack")
+            })
+            .count()
+    }
+
+    /// Blobs of `sha`'s tree not present locally (nothing is fetched).
+    pub(crate) fn missing_blobs(bare: &Path, sha: &str) -> usize {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(bare)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args(["rev-list", "--objects", "--no-walk", "--missing=print", sha])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with('?'))
+            .count()
     }
 }
