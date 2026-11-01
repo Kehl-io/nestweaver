@@ -236,18 +236,18 @@ pub async fn connect_upstream(
     // Connect and validate via HealthCheck.
     let mut endpoint = Channel::from_shared(grpc_url.clone()).context("invalid upstream URL")?;
 
-    if let Some(ca_path) = ca_cert {
-        let pem = std::fs::read(ca_path)
-            .with_context(|| format!("failed to read CA cert: {}", ca_path.display()))?;
-        let ca = tonic::transport::Certificate::from_pem(pem);
-        let tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca);
-        endpoint = endpoint.tls_config(tls).context("TLS config failed")?;
-    }
+    // nw-833: https:// gets system roots by default; --ca-cert adds to them.
+    endpoint =
+        nestweaver_federation::upstream::configure_endpoint_tls(endpoint, &grpc_url, ca_cert)?;
 
-    let channel = endpoint
-        .connect()
-        .await
-        .context("failed to connect to upstream server")?;
+    let channel = endpoint.connect().await.with_context(|| {
+        if grpc_url.starts_with("https://") {
+            "failed to connect to upstream server (TLS: system roots are trusted by default; \
+             for a private CA pass --ca-cert <pem>)"
+        } else {
+            "failed to connect to upstream server (plain-text http/grpc; use grpcs:// for TLS)"
+        }
+    })?;
 
     let mut client =
         nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
@@ -292,6 +292,7 @@ pub async fn connect_upstream(
         mode,
         timeout: "1s".to_string(),
         ca_cert: ca_cert.map(|p| p.display().to_string()),
+        fallback_timeout: None,
     };
 
     let saved_path = save_upstream(&config)?;

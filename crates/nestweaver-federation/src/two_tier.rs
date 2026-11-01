@@ -14,7 +14,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::dispatch::dispatch_json_rpc_authed_profile;
-use crate::health::{effective_timeout, eject_with_cap, is_upstream_down};
+use crate::health::{effective_timeout, eject_with_cap, handle_query_timeout, is_upstream_down};
 use crate::results::inject_or_wrap_provenance;
 use crate::upstream::UpstreamHandle;
 
@@ -116,10 +116,12 @@ pub async fn two_tier_query_profile(
         }
         Err(_) => {
             debug!(tool = %tool, "org-wide two-tier query timed out");
-            eject_with_cap(
+            handle_query_timeout(
+                upstream.mode,
                 upstream,
                 upstreams,
                 ejection_guard,
+                timeout,
                 "two-tier query timed out",
             );
             None
@@ -732,5 +734,43 @@ mod tests {
             "non-complete status must survive the re-render, got {summary:?}"
         );
         assert!(summary.contains("Risk: Medium."));
+    }
+
+    /// nw-905: one two-tier timeout is not an outage. A listener that accepts
+    /// and never answers makes the adaptive deadline fire exactly once.
+    #[tokio::test]
+    async fn a_single_two_tier_timeout_does_not_eject_the_upstream() {
+        use crate::discovery::{RoutingMode, UpstreamConfig};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = std::thread::spawn(move || {
+            // Hold the connection open without speaking HTTP/2.
+            let conn = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            drop(conn);
+        });
+        let cfg = UpstreamConfig {
+            name: Some("slow".into()),
+            url: format!("http://127.0.0.1:{port}"),
+            token: None,
+            repos: vec![],
+            mode: RoutingMode::Merge,
+            timeout: "200ms".into(),
+            ca_cert: None,
+            fallback_timeout: None,
+        };
+        let upstreams = vec![UpstreamHandle::from_config(&cfg).unwrap()];
+        let guard = Mutex::new(());
+        let out = two_tier_query(
+            json!({"changed_symbols": []}),
+            &upstreams,
+            &guard,
+            "blast_radius",
+            &json!({}),
+        )
+        .await;
+        assert!(upstreams[0].is_healthy(), "one timeout must not eject");
+        assert!(out.is_object());
+        drop(held);
     }
 }

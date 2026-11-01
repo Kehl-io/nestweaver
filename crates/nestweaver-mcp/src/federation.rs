@@ -167,6 +167,7 @@ pub fn upstream_entry_to_config(entry: &nestweaver_engine::UpstreamEntry) -> Ups
         repos: entry.repos.clone(),
         timeout: entry.timeout.clone(),
         ca_cert: entry.ca_cert.clone(),
+        fallback_timeout: entry.fallback_timeout.clone(),
     }
 }
 
@@ -483,6 +484,20 @@ timeout = "2s"
         assert_eq!(cfg.repos, vec!["acme/*".to_string()]);
         assert_eq!(cfg.timeout, "2s");
         assert_eq!(cfg.ca_cert, None);
+        assert_eq!(cfg.fallback_timeout, None);
+    }
+
+    #[test]
+    fn upstream_entry_carries_fallback_timeout() {
+        // nw-834: instance.toml `[[upstream]] fallback_timeout` reaches the
+        // federation config (the engine entry denies unknown keys).
+        let entry: nestweaver_engine::UpstreamEntry =
+            toml::from_str("url = \"http://127.0.0.1:19999\"\nfallback_timeout = \"750ms\"\n")
+                .expect("valid entry");
+        assert_eq!(
+            upstream_entry_to_config(&entry).fallback_timeout.as_deref(),
+            Some("750ms")
+        );
     }
 
     #[test]
@@ -526,6 +541,7 @@ timeout = "2s"
             mode: RoutingMode::Merge,
             timeout: "200ms".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
         };
         FederationState {
             upstreams: vec![UpstreamHandle::from_config(&cfg).expect("handle")],

@@ -7527,7 +7527,7 @@ impl std::error::Error for ToolTargetNotFound {}
 /// The metadata code (under `NW_ERROR_CODE_METADATA_KEY`) the daemon stamps
 /// on a status raised by [`ToolTargetNotFound`]; the envelope itself rides in
 /// the status details.
-pub const TOOL_TARGET_NOT_FOUND_CODE: &str = "tool-target-not-found";
+pub use nestweaver_engine::node_scope::TOOL_TARGET_NOT_FOUND_CODE;
 
 /// Build a [`ToolTargetNotFound`]. `did_you_mean` is omitted when empty, the
 /// nw-481 convention the CLI's envelope already follows.

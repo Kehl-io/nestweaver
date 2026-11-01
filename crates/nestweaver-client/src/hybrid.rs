@@ -24,8 +24,8 @@ use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 
 use nestweaver_federation::dispatch::dispatch_json_rpc_authed_profile;
 use nestweaver_federation::health::{
-    MaintenanceProbe, code_is_down, effective_timeout, eject_with_cap, is_upstream_down,
-    local_sha_for_server_repo,
+    MaintenanceProbe, code_is_down, effective_timeout, eject_with_cap, handle_query_timeout,
+    is_upstream_down, local_entry_for_server_repo, local_is_behind,
 };
 use nestweaver_federation::results::{
     concat_fanout, count_results, inject_or_wrap_provenance, merge_structured_results,
@@ -289,22 +289,8 @@ impl HybridClient {
         let mut fallback_mode = false;
         let repo_hint = extract_repo_hint(params);
 
-        // Let the upstream's RoutingMode override the per-tool default.
-        // LocalOnly and TwoTier are never overridden (they have tool-specific
-        // semantics), but Merge/LocalFirst/ServerPreferred can be promoted.
-        if routing != ToolRouting::LocalOnly
-            && routing != ToolRouting::TwoTier
-            && routing != ToolRouting::Combined
-            && let Some(upstream) = find_upstream_for_repo(&self.upstreams, repo_hint)
-        {
-            match upstream.mode {
-                RoutingMode::Primary => routing = ToolRouting::ServerPreferred,
-                RoutingMode::Merge => routing = ToolRouting::Merge,
-                RoutingMode::Fallback => {
-                    routing = ToolRouting::LocalFirst;
-                    fallback_mode = true;
-                }
-            }
+        if let Some(upstream) = find_upstream_for_repo(&self.upstreams, repo_hint) {
+            (routing, fallback_mode) = apply_mode_override(routing, upstream.mode);
         }
 
         // Populate `_meta.stale_repos` provenance from the background-computed
@@ -529,9 +515,15 @@ impl HybridClient {
         let repo_hint = extract_repo_hint(params);
         let selected_idx = find_upstream_for_repo(&self.upstreams, repo_hint)
             .and_then(|u| self.upstreams.iter().position(|x| std::ptr::eq(x, u)));
+        // The deadline the server future runs under, kept so a miss can be
+        // fed back into the latency estimate (nw-905).
+        let merge_deadline = selected_idx.map(|idx| {
+            let u = &self.upstreams[idx];
+            effective_timeout(u.mode, u)
+        });
         let server_task = selected_idx.map(|idx| {
             let u = &self.upstreams[idx];
-            let timeout = effective_timeout(u.mode, u);
+            let timeout = merge_deadline.unwrap_or(u.timeout);
             let mut client = u.client();
             let token = u.auth_token().map(|t| t.to_string());
             let tool = tool_name.to_string();
@@ -620,11 +612,8 @@ impl HybridClient {
                             "merge query failed",
                         );
                     }
-                } else {
-                    warn!(
-                        error = %e,
-                        "merge: upstream rejected query (server healthy — not ejecting); check auth token / arguments"
-                    );
+                } else if let Some(idx) = selected_idx {
+                    log_upstream_rejection(&self.upstreams[idx].name, &e);
                 }
                 let mut result = local;
                 inject_or_wrap_provenance(&mut result, &["local"], &[]);
@@ -633,10 +622,14 @@ impl HybridClient {
             Err(_) => {
                 debug!("merge: server query timed out, using local only");
                 if let Some(idx) = selected_idx {
-                    eject_with_cap(
-                        &self.upstreams[idx],
+                    // `timeout` was captured when the server future was built.
+                    let u = &self.upstreams[idx];
+                    handle_query_timeout(
+                        u.mode,
+                        u,
                         &self.upstreams,
                         &self.ejection_guard,
+                        merge_deadline.unwrap_or(u.timeout),
                         "merge query timed out",
                     );
                 }
@@ -748,10 +741,9 @@ impl HybridClient {
                     status.repo_count = server_repos.len();
 
                     for server_repo in &server_repos {
-                        if let Some(local_sha) =
-                            local_sha_for_server_repo(&local_states, &server_repo.repo_url)
-                            && local_sha != server_repo.indexed_sha.as_str()
-                            && !server_repo.indexed_sha.is_empty()
+                        if let Some((local_url, local_sha)) =
+                            local_entry_for_server_repo(&local_states, &server_repo.repo_url)
+                            && local_is_behind(local_url, local_sha, &server_repo.indexed_sha).await
                         {
                             status.stale_repos.push(server_repo.repo_url.clone());
                         }
@@ -854,11 +846,7 @@ impl HybridClient {
                         "query failed",
                     );
                 } else {
-                    warn!(
-                        upstream = %upstream.name,
-                        error = %e,
-                        "upstream rejected query (server healthy — not ejecting); check auth token / arguments"
-                    );
+                    log_upstream_rejection(&upstream.name, &e);
                 }
                 Err(e)
             }
@@ -868,10 +856,12 @@ impl HybridClient {
                     timeout_ms = timeout.as_millis() as u64,
                     "upstream query timed out"
                 );
-                eject_with_cap(
+                handle_query_timeout(
+                    upstream.mode,
                     upstream,
                     &self.upstreams,
                     &self.ejection_guard,
+                    timeout,
                     "query timed out",
                 );
                 anyhow::bail!("upstream query timed out after {}ms", timeout.as_millis())
@@ -1124,6 +1114,83 @@ fn find_upstream_for_repo<'a>(
     upstreams.iter().find(|u| u.is_healthy())
 }
 
+/// Why a HEALTHY upstream answered a query with a gRPC error (nw-872).
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamRejection {
+    /// Missing/expired/insufficient credentials.
+    Auth,
+    /// The server is fine and simply has no such target (e.g. a note that
+    /// only exists in the local vault). Expected under federation.
+    TargetNotFound,
+    /// Anything else: the status code and message are logged verbatim.
+    Other,
+}
+
+use nestweaver_engine::node_scope::TOOL_TARGET_NOT_FOUND_CODE as TARGET_NOT_FOUND_CODE;
+
+fn classify_upstream_rejection(err: &anyhow::Error) -> UpstreamRejection {
+    let Some(status) = err.chain().find_map(|e| e.downcast_ref::<tonic::Status>()) else {
+        return UpstreamRejection::Other;
+    };
+    if matches!(
+        status.code(),
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+    ) {
+        return UpstreamRejection::Auth;
+    }
+    let stamped = status
+        .metadata()
+        .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+        .and_then(|v| v.to_str().ok());
+    if stamped == Some(TARGET_NOT_FOUND_CODE) {
+        return UpstreamRejection::TargetNotFound;
+    }
+    UpstreamRejection::Other
+}
+
+/// Log a rejection from a healthy upstream with its real gRPC status. The old
+/// text blamed "auth token / arguments" for every rejection and, formatting
+/// only the outermost context, dropped the status (nw-872: a `note_get` miss
+/// on a server that does not hold the note read as an auth failure).
+fn log_upstream_rejection(upstream: &str, err: &anyhow::Error) {
+    match classify_upstream_rejection(err) {
+        UpstreamRejection::TargetNotFound => {
+            debug!(upstream, error = %format!("{err:#}"), "upstream has no match for this query (server healthy)");
+        }
+        UpstreamRejection::Auth => {
+            warn!(upstream, error = %format!("{err:#}"), "upstream rejected credentials (server healthy — not ejecting); check the auth token");
+        }
+        UpstreamRejection::Other => {
+            warn!(upstream, error = %format!("{err:#}"), "upstream rejected query (server healthy — not ejecting)");
+        }
+    }
+}
+
+/// Let the upstream's `RoutingMode` override the per-tool default category.
+/// Returns the (possibly rewritten) routing and whether Fallback mode applies.
+///
+/// Only Merge/LocalFirst/ServerPreferred tools are promoted. LocalOnly,
+/// TwoTier, Combined, Continuation and FanOut carry tool-specific semantics
+/// (response shape, truncation flags, stitching) that a generic merge /
+/// server-only route would break, so the mode never rewrites them (nw-904).
+fn apply_mode_override(routing: ToolRouting, mode: RoutingMode) -> (ToolRouting, bool) {
+    if matches!(
+        routing,
+        ToolRouting::LocalOnly
+            | ToolRouting::TwoTier
+            | ToolRouting::Combined
+            | ToolRouting::Continuation
+            | ToolRouting::FanOut
+    ) {
+        return (routing, false);
+    }
+    match mode {
+        RoutingMode::Primary => (ToolRouting::ServerPreferred, false),
+        RoutingMode::Merge => (ToolRouting::Merge, false),
+        RoutingMode::Fallback => (ToolRouting::LocalFirst, true),
+    }
+}
+
 /// Extract a repo hint from query params — checks `repos[0]`, `repo`, `repo_url`.
 fn extract_repo_hint(params: &Value) -> Option<&str> {
     params
@@ -1139,6 +1206,8 @@ fn query_targets_stale_repo(repo_hint: Option<&str>, stale_repos: &[String]) -> 
     if stale_repos.is_empty() {
         return false;
     }
+    // No hint: the query is not scoped to one repo, so any genuinely stale
+    // repo (staleness itself no longer false-positives, nw-906) may affect it.
     let Some(repo_hint) = repo_hint else {
         return true;
     };
@@ -1147,11 +1216,24 @@ fn query_targets_stale_repo(repo_hint: Option<&str>, stale_repos: &[String]) -> 
         .any(|stale| repo_urls_equivalent(stale, repo_hint))
 }
 
-fn repo_urls_equivalent(a: &str, b: &str) -> bool {
-    normalized_repo_key(a) == normalized_repo_key(b)
-        || repo_name(a)
-            .zip(repo_name(b))
-            .is_some_and(|(a_name, b_name)| a_name.eq_ignore_ascii_case(&b_name))
+/// Does a query's repo `hint` name the `stale` repo? Full canonical identity
+/// (`host/owner/name`) always matches. A hostless `owner/name` hint matches a
+/// stale repo whose key ends with that `owner/name` (segment-aligned), and a
+/// bare `name` matches by leaf. A hint that names a different owner never
+/// matches by leaf (nw-906).
+fn repo_urls_equivalent(stale: &str, hint: &str) -> bool {
+    let stale_key = normalized_repo_key(stale);
+    let hint_key = normalized_repo_key(hint);
+    if stale_key == hint_key {
+        return true;
+    }
+    if hint_key.is_empty() || hint.contains("://") || hint.contains('@') {
+        return false;
+    }
+    if !hint_key.contains('/') {
+        return repo_name(stale).is_some_and(|leaf| leaf.eq_ignore_ascii_case(&hint_key));
+    }
+    stale_key.ends_with(&format!("/{hint_key}"))
 }
 
 fn fallback_should_query_server(local_count: usize, stale_repo: bool) -> bool {
@@ -1305,10 +1387,12 @@ pub async fn flow_trace_with_stitching(
                     boundary = %boundary.canonical_id,
                     "FlowTraceContinue timed out"
                 );
-                eject_with_cap(
+                handle_query_timeout(
+                    upstream.mode,
                     upstream,
                     &client.upstreams,
                     &client.ejection_guard,
+                    up_timeout,
                     "flow_trace continue timed out",
                 );
                 break;
@@ -1790,6 +1874,7 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
         };
         let cfg2 = UpstreamConfig {
             name: Some("partner".to_string()),
@@ -1799,6 +1884,7 @@ mod tests {
             mode: RoutingMode::Merge,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
         };
 
         let h1 = UpstreamHandle::from_config(&cfg1).unwrap();
@@ -1912,6 +1998,7 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
         };
         let handle = UpstreamHandle::from_config(&cfg).unwrap();
         handle.mark_unhealthy();
@@ -1932,6 +2019,7 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
         };
         let handle = UpstreamHandle::from_config(&cfg).unwrap();
         let health = handle.health_ref();
@@ -1969,6 +2057,7 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
         };
         let cfg_partner = UpstreamConfig {
             name: Some("partner".to_string()),
@@ -1978,6 +2067,7 @@ mod tests {
             mode: RoutingMode::Merge,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
         };
 
         let h1 = UpstreamHandle::from_config(&cfg_acme).unwrap();
@@ -2063,5 +2153,125 @@ mod tests {
             RoutingMode::Fallback => ToolRouting::LocalFirst,
         };
         assert_eq!(overridden, ToolRouting::Merge);
+    }
+
+    // ── nw-904: tool-specific routing survives the mode override ─────────
+
+    #[test]
+    fn fanout_and_continuation_tools_are_never_rewritten_by_mode() {
+        for tool in ["regex_search", "count_patterns"] {
+            assert_eq!(tool_routing(tool), ToolRouting::FanOut, "{tool}");
+            for mode in [
+                RoutingMode::Fallback,
+                RoutingMode::Merge,
+                RoutingMode::Primary,
+            ] {
+                assert_eq!(
+                    apply_mode_override(ToolRouting::FanOut, mode),
+                    (ToolRouting::FanOut, false),
+                    "{tool} under {mode:?}"
+                );
+            }
+        }
+        assert_eq!(
+            apply_mode_override(ToolRouting::Continuation, RoutingMode::Merge).0,
+            ToolRouting::Continuation
+        );
+    }
+
+    #[test]
+    fn mode_override_still_promotes_overridable_tools() {
+        assert_eq!(
+            apply_mode_override(ToolRouting::Merge, RoutingMode::Fallback),
+            (ToolRouting::LocalFirst, true)
+        );
+        assert_eq!(
+            apply_mode_override(ToolRouting::LocalFirst, RoutingMode::Primary),
+            (ToolRouting::ServerPreferred, false)
+        );
+        assert_eq!(
+            apply_mode_override(ToolRouting::ServerPreferred, RoutingMode::Merge),
+            (ToolRouting::Merge, false)
+        );
+        for fixed in [
+            ToolRouting::LocalOnly,
+            ToolRouting::TwoTier,
+            ToolRouting::Combined,
+        ] {
+            assert_eq!(apply_mode_override(fixed, RoutingMode::Primary).0, fixed);
+        }
+    }
+
+    // ── nw-872: honest rejection classification ──────────────────────────
+
+    #[test]
+    fn healthy_upstream_note_miss_is_not_blamed_on_auth() {
+        let mut status = tonic::Status::internal("tool note_get failed: no note found");
+        status.metadata_mut().insert(
+            nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+            TARGET_NOT_FOUND_CODE.parse().unwrap(),
+        );
+        let err = anyhow::Error::new(status).context("note_get RPC failed");
+        assert_eq!(
+            classify_upstream_rejection(&err),
+            UpstreamRejection::TargetNotFound
+        );
+        // The rendered form keeps the real status, not just the context.
+        assert!(format!("{err:#}").contains("no note found"));
+    }
+
+    #[test]
+    fn auth_and_other_rejections_are_distinguished() {
+        let auth = anyhow::Error::new(tonic::Status::unauthenticated("bad token"))
+            .context("note_get RPC failed");
+        assert_eq!(classify_upstream_rejection(&auth), UpstreamRejection::Auth);
+        let other = anyhow::Error::new(tonic::Status::invalid_argument("bad arg"));
+        assert_eq!(
+            classify_upstream_rejection(&other),
+            UpstreamRejection::Other
+        );
+        // An unstamped NotFound (e.g. an unknown RPC) is NOT a benign lookup
+        // miss; it stays a warning with its status.
+        let unstamped = anyhow::Error::new(tonic::Status::not_found("no such method"));
+        assert_eq!(
+            classify_upstream_rejection(&unstamped),
+            UpstreamRejection::Other
+        );
+        assert_eq!(
+            classify_upstream_rejection(&anyhow::anyhow!("plain")),
+            UpstreamRejection::Other
+        );
+    }
+
+    // ── nw-906: stale-repo targeting ─────────────────────────────────────
+
+    #[test]
+    fn unhinted_queries_are_forced_when_a_repo_is_stale_and_not_when_none_is() {
+        let stale = vec!["https://github.com/acme/api".to_string()];
+        assert!(query_targets_stale_repo(None, &stale));
+        assert!(!query_targets_stale_repo(None, &[]));
+        assert!(query_targets_stale_repo(
+            Some("git@github.com:acme/api.git"),
+            &stale
+        ));
+        assert!(query_targets_stale_repo(Some("api"), &stale));
+    }
+
+    #[test]
+    fn stale_hint_matches_by_owner_name_without_cross_org_leaf_matches() {
+        let stale = vec!["https://github.com/acme/api".to_string()];
+        assert!(query_targets_stale_repo(Some("acme/api"), &stale));
+        assert!(query_targets_stale_repo(Some("ACME/API"), &stale));
+        assert!(!query_targets_stale_repo(Some("other-org/api"), &stale));
+        assert!(!query_targets_stale_repo(
+            Some("https://github.com/other-org/api"),
+            &stale
+        ));
+        assert!(!query_targets_stale_repo(
+            Some("github.com/other/api"),
+            &stale
+        ));
+        // Segment-aligned: `me/api` must not match `acme/api`.
+        assert!(!query_targets_stale_repo(Some("me/api"), &stale));
     }
 }

@@ -946,6 +946,10 @@ pub struct UpstreamEntry {
     /// Path to CA certificate PEM file for self-signed TLS.
     #[serde(default)]
     pub ca_cert: Option<String>,
+    /// Cap on the upstream deadline in `fallback` mode, bounded by `timeout`
+    /// (default 200ms). nw-834.
+    #[serde(default)]
+    pub fallback_timeout: Option<String>,
 }
 
 fn default_upstream_mode() -> String {

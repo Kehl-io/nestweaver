@@ -9,7 +9,7 @@ description = "Federation coordinator for NestWeaver — upstream discovery, rou
 nestweaver-schema = { workspace = true }
 nestweaver-proto = { workspace = true }
 tonic = { workspace = true }
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "rt", "process"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

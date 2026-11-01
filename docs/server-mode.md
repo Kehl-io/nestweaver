@@ -744,7 +744,7 @@ nestweaver brain status
 
 The client discovers upstream servers from (highest priority first):
 
-1. `NESTWEAVER_UPSTREAM` and `NESTWEAVER_TOKEN` environment variables
+1. `NESTWEAVER_UPSTREAM`, `NESTWEAVER_TOKEN` and `NESTWEAVER_CA_CERT` environment variables (`NESTWEAVER_CA_CERT` is the path to a CA PEM, for CI thin clients that must trust a private CA from `server init-tls` without a config file in the checkout)
 2. `.nestweaver/server.toml` in the current repo (checked into source)
 3. `~/.config/nestweaver/upstreams.toml` (user config, written by `nestweaver connect`)
 4. `instance.toml` `[[upstream]]` section
@@ -758,6 +758,7 @@ Check this file into your repo so every developer auto-connects:
 url = "grpcs://nestweaver.internal:9378"
 token = "${NESTWEAVER_TOKEN}"
 mode = "fallback"
+# ca_cert = "/path/to/ca.crt"   # optional, same as the other config files
 ```
 
 ### User-level config (~/.config/nestweaver/upstreams.toml)
@@ -781,13 +782,20 @@ url = "grpcs://nestweaver.internal:9378"
 token = "${NESTWEAVER_TOKEN}"
 mode = "fallback"
 timeout = "1s"                # optional: upstream request ceiling (default 1s)
+fallback_timeout = "200ms"    # optional: fallback-mode deadline cap (default 200ms, never above timeout)
 ca_cert = "/path/to/ca.crt"   # optional: for self-signed certificates
 ```
 
 When connecting to a server using self-signed TLS certificates (e.g., generated
-by `nestweaver server init-tls`), set `ca_cert` to the path of the CA certificate
-PEM file. This tells the client to trust the server's certificate even though it
-is not signed by a public CA.
+by `nestweaver server init-tls`), set `ca_cert` (or `--ca-cert` on
+`nestweaver connect`, or `NESTWEAVER_CA_CERT` for env discovery) to the path of
+the CA certificate PEM file. When `ca_cert` is set, **only that CA** is trusted for the upstream
+(it pins the server). With no `ca_cert`, a `grpcs://` URL verifies against the
+operating system's trust store, so a server behind a publicly trusted
+certificate (for example a reverse proxy with a Let's Encrypt certificate)
+needs no extra configuration. If the host has no system CA roots and no
+`ca_cert` is given, the connection fails with an error that names `--ca-cert`
+and `NESTWEAVER_CA_CERT`.
 
 ---
 
@@ -871,10 +879,15 @@ server data can overlap.
 
 ### Staleness detection
 
-The client compares local `indexed_sha` against server `RepoStates` using `git ls-remote`. When local state is behind:
+The client compares local `indexed_sha` against the server's `RepoStates` in a background task, matching repos by full canonical identity (`host/owner/name`; a same-named repo in another org never matches, and a path-only local checkout pairs with a server repo by unique directory name). A repo is stale only when the local index is **behind**:
+- a path-only local checkout that is ahead of (or already contains) the server's indexed commit is not stale. This is checked with a bounded (2 s), non-blocking `git merge-base --is-ancestor`; if it cannot be checked (git missing, commit not in the checkout, timeout), a differing SHA is conservatively treated as stale
+- a local repo registered by remote URL has no checkout path the client can inspect, so a differing SHA is treated as stale even when the local copy is ahead (limitation: the daemon's `RepoState` does not yet carry a root path)
+- a non-git directory (SHA `local`) or an empty SHA is unknown, not stale
+
+When a repo is stale:
 - `brain_status` shows `stale_repos` in the response
 - Results include `_meta.sources` indicating which data sources contributed
-- Fallback mode automatically routes stale repos to the server
+- Fallback mode routes the query to the server when any repo is genuinely stale; a query that names a repo (`repo`, `repos[0]`, `repo_url`) is matched to the stale list by canonical identity, `owner/name`, or bare name
 
 ### Upstream timeout
 
@@ -888,10 +901,14 @@ timeout = "1s"    # ceiling; the live deadline is adaptive (see below)
 
 The live per-query deadline is **adaptive and mode-aware**, not a fixed value. The client scales off a rolling EWMA of observed upstream latencies and clamps the result per routing mode:
 
-- **`fallback`** keeps the deadline tight — capped at **200ms** (`FALLBACK_MODE_CAP` in `crates/nestweaver-federation/src/health.rs`, pinned by `effective_timeout_fallback_capped_at_200ms`) — so the local fast path is never blocked waiting on the server.
+- **`fallback`** keeps the deadline tight — the deadline is capped at **200ms** by default (`DEFAULT_FALLBACK_CAP` in `crates/nestweaver-federation/src/upstream.rs`, pinned by `effective_timeout_fallback_capped_at_200ms`) — so the local fast path is never blocked waiting on the server. Set `fallback_timeout` on the upstream to raise or lower that cap (it is always bounded by `timeout`): with `timeout = "1s"` and `fallback_timeout = "750ms"` fallback mode waits up to 750ms. Use this for an off-site server where TLS plus round-trip alone exceeds 200ms. `fallback_timeout` is accepted in `upstreams.toml`, `.nestweaver/server.toml` and `instance.toml` `[[upstream]]`.
 - **`merge`** and **`primary`** allow up to the configured `timeout` ceiling (default 1s) — the richer org-wide answer is the whole point of those modes.
 
-On a cold start (no latency samples yet) the mode ceiling is used directly. Raising `timeout` only affects `merge`/`primary`; the fallback cap is fixed.
+On a cold start (no latency samples yet) the mode ceiling is used directly.
+
+A timeout does not by itself eject the upstream. A timed-out call raises the latency estimate (so the next deadline widens instead of staying near the 50ms floor), and the upstream is passively ejected only after **two consecutive timeouts at the full mode ceiling**; any successful call resets the count. Connection failures and `Unavailable`/`DeadlineExceeded` statuses returned by the server still eject immediately; the client's own deadline always fires first (the transport backstop is `timeout` + 1s), so a plain slow response is a timeout, not a `DeadlineExceeded` status. An upstream that rejects a query with some other status (for example a `note_get` for a note the server does not hold) is healthy and is not ejected; its real gRPC status is logged.
+
+Tools with their own response shape (`regex_search`, `count_patterns`, `flow_trace`, and the other local-only, two-tier and combined tools) keep their tool-specific routing in every mode.
 
 ---
 
