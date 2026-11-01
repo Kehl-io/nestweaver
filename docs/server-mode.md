@@ -39,10 +39,62 @@ nestweaver daemon --db ./brain.lbug run \
 | `--acme-production` | Use the Let's Encrypt **production** directory. The default is **staging** (untrusted certs, high rate limits), so issuance can be debugged without a rate-limit ban. Pass this only once the staging flow works end to end |
 | `--port-file <path>` | Write the actual bound port to this file — the way to read an ephemeral `--bind …:0` port programmatically |
 
+A `--bind` that is not a literal socket address (`localhost:9378`, `0:9378`,
+`myhost:9378`) is resolved once at startup, and both the gRPC and MCP HTTP
+listeners bind exactly that validated address set (MCP on port + 1). If every resolved address is loopback it
+is treated as loopback; if any is not, or the name cannot be resolved, it is
+treated as non-loopback and requires both `--auth-token` and TLS.
+
 `--acme-*` is a third TLS option alongside self-signed (`server init-tls`) and
 bring-your-own (`--tls-cert`/`--tls-key`); see [TLS Setup](#tls-setup).
 
+### Runtime directory and systemd
+
+The daemon's socket, pidfile, and lock live in
+`$XDG_RUNTIME_DIR/nestweaver/<instance>/`. When `XDG_RUNTIME_DIR` is unset
+(a systemd **system** unit, cron, a sanitized launcher) on Linux, the daemon
+uses `/run/user/<uid>/nestweaver/<instance>/` if that directory exists and is
+owned by the same user (it is where an interactive session of that user
+resolves `XDG_RUNTIME_DIR`), and otherwise
+`~/.local/state/nestweaver/<instance>/`.
+
+The daemon, the CLI, and the MCP stdio server all resolve this through one
+shared function, and clients probe two places: the resolved runtime directory
+first, then the `~/.local/state/nestweaver/<instance>/` directory (a daemon
+started before `/run/user/<uid>` existed, or by an older release, lives there).
+The daemon itself binds only the first. `/run/user/<uid>` exists only while the
+user has a login session or lingering enabled, so a system unit running as that
+user needs lingering:
+
+```ini
+# /etc/systemd/system/nestweaver-server.service
+[Unit]
+Description=NestWeaver server
+After=network-online.target
+
+[Service]
+User=nestweaver
+# Optional: pin the runtime dir explicitly instead of relying on the
+# /run/user/<uid> fallback. Must match the CLI user's XDG_RUNTIME_DIR.
+# Environment=XDG_RUNTIME_DIR=/run/user/%U
+ExecStart=/usr/local/bin/nestweaver daemon --db /var/lib/nestweaver/brain.lbug run --config /etc/nestweaver/instance.toml --server --bind 0.0.0.0:9378 --tls-cert /etc/nestweaver/tls/server.pem --tls-key /etc/nestweaver/tls/server.key
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo loginctl enable-linger nestweaver   # keeps /run/user/<uid> present
+```
+
+Residual case: if `/run/user/<uid>` did not exist when the daemon started (so it
+used the state directory) and a later CLI has `XDG_RUNTIME_DIR` set, the CLI
+still finds the daemon through the state-directory candidate.
+
 ### Environment variables
+
+All flags### Environment variables
 
 All flags can be set via environment variables:
 
@@ -319,6 +371,18 @@ The server listens on two ports: gRPC (:9378) and MCP-over-HTTP (:9379). The web
 The MCP HTTP listener inherits the `--bind` IP and is **gRPC port + 1** for fixed binds. So `--bind 0.0.0.0:9378` exposes MCP-over-HTTP (with `/webhook`, `/admin/api/*`, and `/metrics`) on `0.0.0.0:9379` — relevant when publishing ports from Docker. Exception: with an ephemeral `--bind 127.0.0.1:0` the gRPC port is OS-assigned at runtime, so the MCP listener binds its own ephemeral port (`:0`) instead of gRPC + 1; read both actual ports from the daemon's port file or startup log.
 
 The MCP endpoint is **`POST /mcp`** on the HTTP port.
+
+Rate limits are per principal, not per `mcp-session-id`: the bucket is keyed by
+the bearer token and its role (admin or query), so minting additional sessions,
+or changing source address, does not add request budget. **All clients sharing
+one query token share its 120 requests/minute**; a session is additionally
+capped on its own. Admin-token requests are not rate limited.
+
+Tool calls are bounded to 30 seconds. A read-only tool past the deadline is
+cancelled and reports `exceeded 30s timeout`. A **mutating** tool cannot be
+aborted mid-write: past the deadline the response says it is still running and
+may still commit. Check the result (for example with `brain_status`) before
+re-issuing it.
 
 ### MCP request IDs and cancellation
 
@@ -750,6 +814,13 @@ one: `POST /admin/api/repos/{id}/reindex`, or `nestweaver index --repo <path>
 # gh-style browser onboarding
 nestweaver connect grpcs://nestweaver.internal:9378 --device
 ```
+
+The verification URI is built from the request `Host` (or the HTTP/2
+`:authority`) and `X-Forwarded-Proto`. Only `http`/`https` schemes and a valid
+`host[:port]` are honored; anything else falls back to the address the server
+itself serves on. The client opens the URL in your browser only when it is
+`http(s)` and its host is the server you connected to; otherwise it just prints
+it.
 
 This runs the OAuth 2.0 Device Authorization Grant (RFC 8628): the client prints a short user code, opens your browser to the verification page, and waits while an admin approves the request. On approval the issued token is written to your client config automatically — no token needs to be shared out-of-band. `--device` is implied when you omit `--token`, so `nestweaver connect <url>` alone triggers the same flow.
 
@@ -1207,6 +1278,18 @@ nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
 nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
   --data-dir ./restored-brain --force
 ```
+
+`--data-dir` must be the real directory, not a symlink to one (a trailing `/`
+does not change that): restore replaces the directory itself, so a symlinked
+path is refused with the target to use instead.
+
+Recovering from an earlier failed restore into a symlinked path (a real
+directory now sits where the link was, `<dir>.restoring` is the old link, and
+`<dir>.restoring.journal` exists, so every retry is refused): confirm the
+link's real target holds no data you need, remove the new real directory, move
+`<dir>.restoring` back to `<dir>` (restoring the link), delete
+`<dir>.restoring.journal`, then re-run the restore against the link's real
+target path.
 
 `--force` requires a physically bound NestWeaver graph and a recognized layout.
 A database filename, copied marker or `publication.json` alone does not

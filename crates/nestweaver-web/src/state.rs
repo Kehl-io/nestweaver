@@ -443,4 +443,8 @@ pub struct AdminState {
     /// [`HostResolver`] / [`system_resolver`] — production wires the real
     /// resolver, tests inject a synthetic one.
     pub resolver: HostResolver,
+    /// `host:port` the device-flow endpoints are served on, used to build the
+    /// verification URI when the request carries no usable `Host` (nw-884).
+    /// `None` when the daemon cannot name one (ephemeral port).
+    pub advertised_authority: Option<String>,
 }

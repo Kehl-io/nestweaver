@@ -13150,43 +13150,22 @@ fn mcp_daemon_heartbeat_loop(
     }
 }
 
-/// Socket candidates for this process, then the launchd state-dir socket on
-/// macOS when `XDG_RUNTIME_DIR` points somewhere else (nw-729).
+/// Socket candidates for this process: the shared runtime dir first, then the
+/// legacy state-dir socket (nw-829). The directory list is the SAME function the
+/// daemon and CLI use (`nestweaver_schema::runtime_paths`); this crate cannot
+/// depend on the daemon crate (cycle), so the leaf schema crate owns it.
 #[cfg(feature = "daemon")]
-fn mcp_socket_candidates(
-    instance_id: &str,
-    xdg_runtime_dir: Option<&str>,
-) -> Vec<std::path::PathBuf> {
-    let caller = match xdg_runtime_dir {
-        Some(xdg) => std::path::PathBuf::from(xdg)
-            .join("nestweaver")
-            .join(instance_id)
-            .join("daemon.sock"),
-        None => mcp_state_socket(instance_id),
-    };
-    // Second candidate is macOS-only. Avoid `mut` so Linux clippy (`-D unused-mut`)
-    // accepts the single-path return.
-    #[cfg(target_os = "macos")]
-    {
-        let supervised = mcp_state_socket(instance_id);
-        if supervised != caller {
-            return vec![caller, supervised];
-        }
-    }
-    vec![caller]
+fn mcp_socket_candidates(instance_id: &str) -> Vec<std::path::PathBuf> {
+    mcp_socket_candidates_from(nestweaver_schema::runtime_paths::runtime_candidate_dirs(
+        instance_id,
+    ))
 }
 
 #[cfg(feature = "daemon")]
-fn mcp_state_socket(instance_id: &str) -> std::path::PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join(".local/state")
-        })
-        .join("nestweaver")
-        .join(instance_id)
-        .join("daemon.sock")
+fn mcp_socket_candidates_from(dirs: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    dirs.into_iter()
+        .map(|dir| dir.join("daemon.sock"))
+        .collect()
 }
 
 #[cfg(feature = "daemon")]
@@ -13213,8 +13192,7 @@ fn mcp_instance_id(db_path: &std::path::Path) -> String {
 
 #[cfg(feature = "daemon")]
 fn accepting_mcp_socket(db_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-    mcp_socket_candidates(&mcp_instance_id(db_path), xdg.as_deref())
+    mcp_socket_candidates(&mcp_instance_id(db_path))
         .into_iter()
         .find(|sock| std::os::unix::net::UnixStream::connect(sock).is_ok())
 }
@@ -13249,14 +13227,13 @@ async fn connect_daemon_channel(
 /// Ensure the daemon is running (spawning it if needed) and return the
 /// socket path. Mirrors `nestweaver_client::autostart::ensure_daemon`.
 ///
-/// The socket-path derivation is inlined from `nestweaver_daemon::lifecycle`
-/// to avoid a dependency cycle (nestweaver-mcp → nestweaver-daemon → nestweaver-mcp).
-// TODO: deduplicate with nestweaver_daemon::lifecycle::socket_path()
+/// The socket directories come from `nestweaver_schema::runtime_paths`, the
+/// same source `nestweaver_daemon::lifecycle` uses (this crate cannot depend on
+/// the daemon crate: nestweaver-mcp → nestweaver-daemon → nestweaver-mcp).
 #[cfg(feature = "daemon")]
 fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     let instance_id = mcp_instance_id(db_path);
-    let candidates = mcp_socket_candidates(&instance_id, xdg.as_deref());
+    let candidates = mcp_socket_candidates(&instance_id);
 
     // Already listening — including a launchd job whose socket is not under
     // this process's XDG_RUNTIME_DIR. Do not spawn `daemon start` over it.
@@ -39096,7 +39073,6 @@ mod lookup_not_found_contract_tests {
 #[cfg(all(test, feature = "daemon"))]
 mod daemon_supervision_tests {
     use super::is_daemon_transport_failure;
-    use super::mcp_socket_candidates;
 
     #[test]
     fn transport_failure_matches_a_dead_daemon_and_not_an_application_error() {
@@ -39119,24 +39095,32 @@ mod daemon_supervision_tests {
     }
 
     #[test]
-    fn socket_candidates_follow_xdg_then_the_supervised_dir_on_macos() {
-        let caller_only = mcp_socket_candidates("abcd1234", None);
-        assert_eq!(caller_only.len(), 1);
-        assert!(caller_only[0].ends_with("daemon.sock"));
-
-        let hidden = mcp_socket_candidates("abcd1234", Some("/tmp/nw-mcp-xdg"));
-        assert_eq!(
-            hidden[0],
-            std::path::PathBuf::from("/tmp/nw-mcp-xdg/nestweaver/abcd1234/daemon.sock")
+    fn socket_candidates_match_the_shared_runtime_paths() {
+        // nw-829 parity: the MCP crate resolves the same directories as the
+        // daemon/CLI because both call `nestweaver_schema::runtime_paths`. With
+        // no XDG and a per-user runtime dir, the primary is that dir (NOT the
+        // state dir the old MCP twin used) and the state dir is the legacy
+        // second candidate.
+        use nestweaver_schema::runtime_paths as rp;
+        let id = "abcd1234";
+        let dirs = rp::runtime_candidate_dirs_with(
+            None,
+            Some(std::path::PathBuf::from("/run/user/7")),
+            id,
         );
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(hidden.len(), 2);
-            assert_ne!(hidden[0], hidden[1]);
-            assert!(hidden[1].ends_with("nestweaver/abcd1234/daemon.sock"));
-        }
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(hidden.len(), 1);
+        let socks = super::mcp_socket_candidates_from(dirs);
+        assert_eq!(
+            socks,
+            vec![
+                std::path::PathBuf::from("/run/user/7/nestweaver/abcd1234/daemon.sock"),
+                rp::state_runtime_dir(id).join("daemon.sock"),
+            ]
+        );
+        // The env-driven entry point is built from the same function.
+        assert_eq!(
+            super::mcp_socket_candidates(id),
+            super::mcp_socket_candidates_from(rp::runtime_candidate_dirs(id))
+        );
     }
 }
 

@@ -1866,16 +1866,76 @@ fn device_error(error: &str) -> (StatusCode, Json<DeviceErrorResponse>) {
 /// Derive the externally-visible base URL of this server from request headers,
 /// honoring a reverse-proxy `X-Forwarded-Proto`. Used to build the verification
 /// URIs handed back to the developer.
-fn verification_base(headers: &axum::http::HeaderMap) -> String {
+///
+/// nw-884: both header values are attacker-influenceable (the endpoint is
+/// unauthenticated and a proxy may forward arbitrary `X-Forwarded-Proto`), and
+/// the result is handed to a client that opens it. So the scheme is restricted
+/// to `http`/`https` and the host to a plain `host[:port]` authority; anything
+/// else falls back to the safe defaults rather than being echoed.
+fn verification_base(
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    advertised: Option<&str>,
+) -> String {
+    // HTTP/2 carries the authority in `:authority` (the request URI), not a
+    // `host` header; try the header first, then the URI, then the address the
+    // daemon itself serves on.
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1");
+        .and_then(valid_authority)
+        .or_else(|| uri.authority().and_then(|a| valid_authority(a.as_str())))
+        .or_else(|| advertised.and_then(valid_authority))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| v == "http" || v == "https")
+        .unwrap_or_else(|| "http".to_string());
     format!("{scheme}://{host}")
+}
+
+/// A syntactically valid `host[:port]` authority: no userinfo, a DNS name /
+/// IPv4 / bracketed IPv6 host, and a numeric port <= 65535 when present.
+fn valid_authority(raw: &str) -> Option<String> {
+    let h = raw.trim();
+    if h.is_empty()
+        || h.len() > 255
+        || !h
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+    {
+        return None;
+    }
+    let authority: axum::http::uri::Authority = h.parse().ok()?;
+    let host = authority.host();
+    let rest = h.strip_prefix(host)?;
+    let host_ok = if let Some(inner) = host.strip_prefix('[') {
+        inner
+            .strip_suffix(']')
+            .is_some_and(|v| v.parse::<std::net::Ipv6Addr>().is_ok())
+    } else {
+        host.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+            && !host.contains(':')
+            && !host.ends_with('-')
+    };
+    if !host_ok {
+        return None;
+    }
+    if !rest.is_empty() {
+        let port = rest.strip_prefix(':')?;
+        if port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return None;
+        }
+    }
+    Some(h.to_string())
 }
 
 /// POST /auth/device — start a device-authorization grant (no auth).
@@ -1884,6 +1944,7 @@ fn verification_base(headers: &axum::http::HeaderMap) -> String {
 /// along with the verification URIs and polling parameters per RFC 8628 §3.2.
 pub async fn device_authorize(
     State(state): State<Arc<AdminState>>,
+    uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<DeviceAuthResponse>, (StatusCode, String)> {
     let device_code = uuid::Uuid::new_v4().to_string();
@@ -1924,7 +1985,7 @@ pub async fn device_authorize(
         code
     };
 
-    let base = verification_base(&headers);
+    let base = verification_base(&headers, &uri, state.advertised_authority.as_deref());
     let verification_uri = format!("{base}/admin/device-approve");
     let verification_uri_complete = format!("{base}/admin/device-approve?user_code={user_code}");
 
@@ -2314,6 +2375,7 @@ mod tests {
             write_gate: None,
             job_queue: None,
             resolver: test_resolver(),
+            advertised_authority: None,
         })
     }
 
@@ -2578,6 +2640,7 @@ url = "https://github.com/example/existing"
             // — this test asserts on config persistence, not on DNS behaviour,
             // and the real resolver made it depend on live network access.
             resolver: test_resolver(),
+            advertised_authority: None,
         });
 
         let app = Router::new()
@@ -3053,6 +3116,7 @@ credential_method = "ssh"
             write_gate: None,
             job_queue: None,
             resolver: std::sync::Arc::new(|_host: &str| Ok(vec!["10.0.0.1".parse().unwrap()])),
+            advertised_authority: None,
         });
 
         let app = Router::new()
@@ -3209,6 +3273,7 @@ credential_method = "ssh"
             write_gate: None,
             job_queue: None,
             resolver: crate::state::system_resolver(),
+            advertised_authority: None,
         });
         let app = Router::new()
             .route("/admin/api/repos/{id}", delete(remove_repo))
@@ -3856,5 +3921,72 @@ credential_method = "ssh"
             assert!(bounded.check(key)); // drains each bucket
         }
         assert!(!bounded.check("ip:c"));
+    }
+
+    #[test]
+    fn verification_base_rejects_non_http_schemes_and_hostile_hosts() {
+        // nw-884: attacker-controlled X-Forwarded-Proto / Host must never be
+        // echoed into a verification URI the client will open.
+        let mk = |host: Option<&str>, proto: Option<&str>| {
+            let mut h = axum::http::HeaderMap::new();
+            if let Some(v) = host {
+                h.insert("host", v.parse().unwrap());
+            }
+            if let Some(v) = proto {
+                h.insert("x-forwarded-proto", v.parse().unwrap());
+            }
+            verification_base(
+                &h,
+                &axum::http::Uri::from_static("/auth/device"),
+                Some("nw.bound:9379"),
+            )
+        };
+        assert_eq!(
+            mk(Some("nw.example:9378"), Some("https")),
+            "https://nw.example:9378"
+        );
+        assert_eq!(
+            mk(Some("nw.example"), Some("HTTPS, http")),
+            "https://nw.example"
+        );
+        assert_eq!(
+            mk(Some("127.0.0.1"), Some("javascript")),
+            "http://127.0.0.1"
+        );
+        assert_eq!(mk(Some("127.0.0.1"), Some("file")), "http://127.0.0.1");
+        assert_eq!(mk(Some("[::1]:9378"), None), "http://[::1]:9378");
+        // Invalid or missing Host falls back to the daemon's own address,
+        // never to an echoed value and not to loopback.
+        for bad in [
+            "evil.test/x?y@z",
+            "user@evil.test",
+            ":",
+            "a:b:c",
+            "[[",
+            "host:notaport",
+            "-",
+            "h:99999",
+            "host:",
+            "[::1",
+            "a b",
+        ] {
+            assert_eq!(
+                mk(Some(bad), Some("https")),
+                "https://nw.bound:9379",
+                "{bad}"
+            );
+        }
+        assert_eq!(mk(None, None), "http://nw.bound:9379");
+    }
+
+    #[test]
+    fn verification_base_uses_the_request_uri_authority_for_http2() {
+        // HTTP/2 has no Host header; the authority is on the request URI.
+        let h = axum::http::HeaderMap::new();
+        let uri: axum::http::Uri = "https://nw.example:9379/auth/device".parse().unwrap();
+        assert_eq!(
+            verification_base(&h, &uri, Some("nw.bound:9379")),
+            "http://nw.example:9379"
+        );
     }
 }

@@ -321,14 +321,31 @@ fn select_restart_config(
 }
 
 fn open_verified_live_pidfile(instance_id: &str, health_pid: u32) -> Result<fs::File> {
-    let mut last_error = None;
+    // nw-829: the legacy state-dir candidate is usually absent. Report the
+    // first error from a candidate whose pidfile EXISTS (that is the real
+    // diagnostic, e.g. "lock is not held"), falling back to the first error.
+    let is_missing = |error: &anyhow::Error| {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        })
+    };
+    let mut reported: Option<anyhow::Error> = None;
     for path in nestweaver_daemon::lifecycle::pidfile_candidates(instance_id) {
         match open_verified_live_pidfile_at(&path, health_pid) {
             Ok(file) => return Ok(file),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                if reported
+                    .as_ref()
+                    .is_none_or(|prev| is_missing(prev) && !is_missing(&error))
+                {
+                    reported = Some(error);
+                }
+            }
         }
     }
-    Err(last_error.expect("pidfile candidates is never empty"))
+    Err(reported.expect("pidfile candidates is never empty"))
 }
 
 fn open_verified_live_pidfile_at(path: &Path, health_pid: u32) -> Result<fs::File> {
@@ -427,13 +444,17 @@ fn adopt_pidfileless_incumbent(
     instance_id: &str,
     health: &nestweaver_proto::HealthCheckResponse,
 ) -> std::result::Result<(), String> {
-    let mut last_error = String::from("no daemon socket accepted a connection");
+    // nw-829: with the legacy state-dir candidate present, a plain "cannot
+    // connect" for it must not mask the peer-credential refusal for the
+    // candidate that DID accept a connection.
+    let mut connect_error = String::from("no daemon socket accepted a connection");
+    let mut peer_error: Option<String> = None;
     let mut corroborated = false;
     for socket in nestweaver_daemon::lifecycle::daemon_socket_candidates(instance_id) {
         let stream = match std::os::unix::net::UnixStream::connect(&socket) {
             Ok(stream) => stream,
             Err(error) => {
-                last_error = format!(
+                connect_error = format!(
                     "cannot connect to daemon socket {}: {error}",
                     socket.display()
                 );
@@ -441,14 +462,14 @@ fn adopt_pidfileless_incumbent(
             }
         };
         if let Err(error) = socket_peer_matches_health(&stream, health.pid) {
-            last_error = error;
+            peer_error = Some(error);
             continue;
         }
         corroborated = true;
         break;
     }
     if !corroborated {
-        return Err(last_error);
+        return Err(peer_error.unwrap_or(connect_error));
     }
     adoption_lock_verdict(
         nestweaver_daemon::lifecycle::db_write_lock(db_path),

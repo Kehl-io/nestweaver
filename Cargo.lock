@@ -4232,7 +4232,6 @@ dependencies = [
  "anyhow",
  "axum",
  "dashmap",
- "dirs 7.0.0",
  "hyper-util",
  "jsonschema",
  "libc",
@@ -4338,7 +4337,9 @@ dependencies = [
 name = "nestweaver-schema"
 version = "12.2.4"
 dependencies = [
+ "dirs 7.0.0",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.1",

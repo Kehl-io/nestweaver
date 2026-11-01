@@ -13387,8 +13387,9 @@ fn replica_mounts_admin_api(read_only: bool, admin_token_configured: bool) -> bo
 /// encrypted (`--tls-cert` + `--tls-key`). Loopback binds, and bind strings
 /// that cannot be parsed as a socket address (e.g. `localhost:9378`), retain
 /// the pre-existing auth-only requirement. Returns the first violated invariant.
-fn validate_bind_security(
+fn validate_bind_security_resolved(
     bind_addr: &str,
+    resolved: &[std::net::SocketAddr],
     auth_token: &Option<String>,
     tls_cert: &Option<PathBuf>,
     tls_key: &Option<PathBuf>,
@@ -13417,17 +13418,107 @@ fn validate_bind_security(
             }
         }
         Err(_) => {
-            // Bind string isn't a socket address (e.g. `localhost:9378`); we cannot
-            // confirm it is loopback. Preserve the auth-only requirement.
+            // Bind string isn't a literal socket address (e.g. `localhost:9378`,
+            // `0:9378`). nw-879: `resolved` is the address set the listeners will
+            // actually bind (resolved ONCE by the caller). If every address is
+            // loopback the bind is process-local (auth-only requirement
+            // preserved); if ANY address is non-loopback, or nothing resolved,
+            // fail closed and demand auth AND TLS.
+            let all_loopback =
+                !resolved.is_empty() && resolved.iter().all(|a| a.ip().is_loopback());
             if auth_token.is_none() {
                 anyhow::bail!(
                     "Cannot determine if bind address '{bind_addr}' is loopback. \
                      Use --auth-token or specify an IP address."
                 );
             }
+            if !all_loopback && !tls_enabled {
+                anyhow::bail!(
+                    "Cannot bind to '{bind_addr}' without TLS: it is not a loopback \
+                     address (or could not be proven to be one), so bearer tokens and \
+                     source data would be sent in cleartext. Provide --tls-cert and \
+                     --tls-key (or bind to a loopback address)."
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// Resolve `--bind` ONCE into the exact address set both listeners bind
+/// (nw-879). A literal `ip:port` is itself; a name is looked up. A lookup
+/// failure yields an empty set, which the validator treats as non-loopback.
+async fn resolve_bind_addrs(bind_addr: &str) -> Vec<std::net::SocketAddr> {
+    if let Ok(addr) = bind_addr.parse::<std::net::SocketAddr>() {
+        return vec![addr];
+    }
+    match tokio::net::lookup_host(bind_addr).await {
+        Ok(addrs) => addrs.collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Resolve the bind once, validate every resolved address, and return the
+/// validated set to bind. An empty set is an error (nothing to bind).
+async fn resolve_and_validate_bind(
+    bind_addr: &str,
+    auth_token: &Option<String>,
+    tls_cert: &Option<PathBuf>,
+    tls_key: &Option<PathBuf>,
+    acme_enabled: bool,
+) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    let resolved = resolve_bind_addrs(bind_addr).await;
+    validate_bind_security_resolved(
+        bind_addr,
+        &resolved,
+        auth_token,
+        tls_cert,
+        tls_key,
+        acme_enabled,
+    )?;
+    if resolved.is_empty() {
+        anyhow::bail!("Cannot resolve bind address '{bind_addr}' to any socket address");
+    }
+    Ok(resolved)
+}
+
+/// The MCP HTTP listener address paired with a gRPC listener address: same
+/// IP, port + 1 (or 0 for an ephemeral gRPC port).
+fn mcp_addr_for(grpc: std::net::SocketAddr) -> anyhow::Result<std::net::SocketAddr> {
+    if grpc.port() == 0 {
+        return Ok(std::net::SocketAddr::from((grpc.ip(), 0)));
+    }
+    let port = grpc.port().checked_add(1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "MCP port overflow: gRPC port {} + 1 exceeds u16::MAX",
+            grpc.port()
+        )
+    })?;
+    Ok(std::net::SocketAddr::from((grpc.ip(), port)))
+}
+
+/// Synchronous resolve-and-validate for tests.
+#[cfg(test)]
+fn validate_bind_security(
+    bind_addr: &str,
+    auth_token: &Option<String>,
+    tls_cert: &Option<PathBuf>,
+    tls_key: &Option<PathBuf>,
+    acme_enabled: bool,
+) -> anyhow::Result<()> {
+    use std::net::ToSocketAddrs;
+    let resolved: Vec<_> = bind_addr
+        .to_socket_addrs()
+        .map(|a| a.collect())
+        .unwrap_or_default();
+    validate_bind_security_resolved(
+        bind_addr,
+        &resolved,
+        auth_token,
+        tls_cert,
+        tls_key,
+        acme_enabled,
+    )
 }
 
 /// Whether an `--acme-domain` request can ACTUALLY provide TLS in THIS build.
@@ -15827,14 +15918,17 @@ pub async fn run_server(
     // guard above has already bailed, so here a non-loopback ACME-only bind
     // would fail closed rather than being waved through as "TLS" and then
     // serving cleartext.
+    // The resolved set is kept and bound as-is by both listeners (nw-879).
+    let mut resolved_bind: Vec<std::net::SocketAddr> = Vec::new();
     if let Some(ref opts) = server_opts {
-        validate_bind_security(
+        resolved_bind = resolve_and_validate_bind(
             &opts.bind_addr,
             &opts.auth_token,
             &opts.tls_cert,
             &opts.tls_key,
             acme_provides_tls(opts.acme_domain.is_some()),
-        )?;
+        )
+        .await?;
     }
 
     // Reject any present webhook secret that is too short to be safe.
@@ -16630,6 +16724,14 @@ pub async fn run_server(
                 // checkpoint and crashes with SIGBUS on macOS.
                 job_queue: shared_job_queue_opt.clone(),
                 resolver: nestweaver_web::state::system_resolver(),
+                // nw-884: the address the device-flow routes are served on
+                // (the MCP HTTP listener), for the verification URI when the
+                // request has no usable Host. Unknown for an ephemeral port.
+                advertised_authority: resolved_bind
+                    .first()
+                    .and_then(|a| mcp_addr_for(*a).ok())
+                    .filter(|a| a.port() != 0)
+                    .map(|a| a.to_string()),
             });
             // Store the admin state so serve_ui can mount the admin API on
             // the web UI server as well (shared Arc = same state).
@@ -16679,13 +16781,13 @@ pub async fn run_server(
         // The request surface is audited panic-free today; this guards future edits.
         mcp_router = mcp_router.layer(tower_http::catch_panic::CatchPanicLayer::new());
 
-        // Parse the bind address to determine the MCP port.  When the gRPC
-        // bind uses port 0 (OS-assigned), the MCP server also binds to port 0
-        // and records the actual port in the port file (second line).
-        let mcp_bind_addr: std::net::SocketAddr = opts
-            .bind_addr
-            .parse()
-            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+        // The MCP listener binds the SAME validated address set as gRPC, each
+        // with port + 1 (port 0 stays ephemeral and is recorded in the port
+        // file). nw-879: no loopback fallback for a non-literal bind.
+        let mcp_bind_addrs: Vec<std::net::SocketAddr> = resolved_bind
+            .iter()
+            .map(|addr| mcp_addr_for(*addr))
+            .collect::<anyhow::Result<_>>()?;
 
         // T5.1 defense-in-depth: a non-loopback MCP HTTP listener MUST be
         // authenticated. `validate_bind_security` already forces `--auth-token`
@@ -16693,27 +16795,17 @@ pub async fn run_server(
         // but that guarantee is indirect. Assert it directly at bind time so a
         // future refactor that weakens the upstream check fails loudly here
         // rather than silently exposing an unauthenticated network surface.
-        if !mcp_bind_addr.ip().is_loopback() && mcp_auth_token.is_none() {
+        if let Some(addr) = mcp_bind_addrs
+            .iter()
+            .find(|a| !a.ip().is_loopback() && mcp_auth_token.is_none())
+        {
             anyhow::bail!(
                 "refusing to bind MCP HTTP listener to non-loopback {} without \
                  authentication — validate_bind_security should have required \
                  --auth-token; this is a bug, not a config error",
-                mcp_bind_addr
+                addr
             );
         }
-        let mcp_bind = if mcp_bind_addr.port() == 0 {
-            std::net::SocketAddr::from((mcp_bind_addr.ip(), 0))
-        } else {
-            std::net::SocketAddr::from((
-                mcp_bind_addr.ip(),
-                mcp_bind_addr.port().checked_add(1).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "MCP port overflow: gRPC port {} + 1 exceeds u16::MAX",
-                        mcp_bind_addr.port()
-                    )
-                })?,
-            ))
-        };
 
         // ACME auto-TLS (opt-in via --acme-domain) takes precedence over manual
         // --tls-cert. On success both listeners share the ACME acceptor; gRPC
@@ -16851,9 +16943,9 @@ pub async fn run_server(
             manual_tls_config
         };
 
-        let mcp_listener = tokio::net::TcpListener::bind(mcp_bind)
+        let mcp_listener = tokio::net::TcpListener::bind(&mcp_bind_addrs[..])
             .await
-            .with_context(|| format!("bind MCP HTTP: {mcp_bind}"))?;
+            .with_context(|| format!("bind MCP HTTP: {mcp_bind_addrs:?}"))?;
         let mcp_actual_addr = mcp_listener.local_addr()?;
         let mcp_tls_label = if tls_config.is_some() { " (TLS)" } else { "" };
         tracing::info!(%mcp_actual_addr, "MCP HTTP server listening{}", mcp_tls_label);
@@ -16865,7 +16957,7 @@ pub async fn run_server(
         // Finish every fallible public-listener setup step before spawning
         // either server. Otherwise a TCP bind/port-file error would return
         // from run_server while a detached MCP task still owned the store.
-        let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
+        let tcp_listener = tokio::net::TcpListener::bind(&resolved_bind[..])
             .await
             .with_context(|| format!("bind TCP: {}", opts.bind_addr))?;
         let actual_addr = tcp_listener.local_addr()?;
@@ -25672,6 +25764,77 @@ repos = ["alpha"]
 
         // Non-loopback bind with auth token AND TLS is acceptable.
         assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &key, false).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_security_requires_tls_for_non_literal_bind() {
+        // nw-879: `0:PORT` resolves to 0.0.0.0 but is not a literal SocketAddr;
+        // it must still require TLS. Unresolvable names fail closed too.
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+        let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
+        assert!(validate_bind_security("0:19389", &tok, &None, &None, false).is_err());
+        assert!(validate_bind_security("0:19389", &tok, &cert, &key, false).is_ok());
+        assert!(
+            validate_bind_security("no-such-host.invalid:9378", &tok, &None, &None, false).is_err()
+        );
+        // A name that resolves only to loopback keeps the auth-only rule.
+        assert!(validate_bind_security("localhost:9378", &tok, &None, &None, false).is_ok());
+        assert!(validate_bind_security("localhost:9378", &None, &None, &None, false).is_err());
+    }
+
+    #[test]
+    fn mcp_addr_follows_the_grpc_ip_with_port_plus_one() {
+        // nw-879: for a name that resolved to a routable IP the MCP listener
+        // must use THAT ip (old code fell back to 127.0.0.1:0).
+        let grpc: std::net::SocketAddr = "0.0.0.0:19389".parse().unwrap();
+        assert_eq!(
+            mcp_addr_for(grpc).unwrap(),
+            "0.0.0.0:19390".parse().unwrap()
+        );
+        let eph: std::net::SocketAddr = "10.1.2.3:0".parse().unwrap();
+        assert_eq!(mcp_addr_for(eph).unwrap(), "10.1.2.3:0".parse().unwrap());
+        assert!(mcp_addr_for("1.2.3.4:65535".parse().unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_bind_returns_the_set_both_listeners_bind() {
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+        let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
+        // `0` resolves to 0.0.0.0: refused without TLS, returned with TLS.
+        assert!(
+            resolve_and_validate_bind("0:19389", &tok, &None, &None, false)
+                .await
+                .is_err()
+        );
+        let set = resolve_and_validate_bind("0:19389", &tok, &cert, &key, false)
+            .await
+            .unwrap();
+        assert!(
+            set.iter()
+                .all(|a| a.port() == 19389 && !a.ip().is_loopback())
+        );
+        // Unresolvable: never silently becomes a loopback bind.
+        assert!(
+            resolve_and_validate_bind("no-such-host.invalid:9378", &tok, &cert, &key, false)
+                .await
+                .is_err()
+        );
+        // A resolved set with a non-loopback member needs TLS even if the
+        // classification is done on an explicit (mixed) answer set.
+        let mixed: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:9378".parse().unwrap(),
+            "192.0.2.7:9378".parse().unwrap(),
+        ];
+        assert!(
+            validate_bind_security_resolved("multi.test:9378", &mixed, &tok, &None, &None, false)
+                .is_err()
+        );
+        assert!(
+            validate_bind_security_resolved("multi.test:9378", &mixed, &tok, &cert, &key, false)
+                .is_ok()
+        );
     }
 
     #[test]

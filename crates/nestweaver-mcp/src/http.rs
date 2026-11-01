@@ -268,6 +268,13 @@ pub struct McpHttpState {
     /// operator configures repo-scoping.
     pub permission_source: Arc<dyn nestweaver_engine::authz::PermissionSource>,
     pub client_rate_limiter: Arc<HttpRateLimiter>,
+    /// Per-tool-call deadline ([`DEFAULT_TOOL_TIMEOUT_SECS`] unless a test
+    /// shortens it). Per-state so a test seam cannot affect other tests.
+    pub tool_timeout: Duration,
+    /// Test seam: block the dispatch thread this long before running the tool,
+    /// so a test can drive the timeout arm deterministically.
+    #[cfg(test)]
+    test_dispatch_delay: Option<Duration>,
     /// Lazily-loaded embedding model for semantic search, shared with the
     /// daemon's gRPC path. Populated by a background task when the `embed`
     /// feature is enabled.
@@ -383,6 +390,9 @@ impl McpHttpState {
             admin_token: None,
             permission_source,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
+            tool_timeout: Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS),
+            #[cfg(test)]
+            test_dispatch_delay: None,
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             embed_model_provider: None,
             search_index_provider: None,
@@ -419,6 +429,9 @@ impl McpHttpState {
             admin_token,
             permission_source,
             client_rate_limiter: Arc::new(HttpRateLimiter::new(RATE_LIMIT_PER_MIN)),
+            tool_timeout: Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS),
+            #[cfg(test)]
+            test_dispatch_delay: None,
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             embed_model_provider: None,
             search_index_provider: None,
@@ -598,6 +611,22 @@ fn add_provenance_metadata(
     }
 }
 
+/// Client-facing text for a tool that exceeded [`DEFAULT_TOOL_TIMEOUT_SECS`].
+///
+/// nw-883: a mutating tool cannot be aborted, so the honest report is "still
+/// running, outcome unknown", never a plain failure a client would retry.
+fn tool_timeout_message(name: &str, mutation: bool) -> String {
+    if mutation {
+        format!(
+            "{name} is still running after {DEFAULT_TOOL_TIMEOUT_SECS}s and was NOT cancelled: \
+             it may still complete and commit. Do not retry; check the result (for example \
+             with brain_status) before re-issuing it."
+        )
+    } else {
+        format!("{name} query exceeded {DEFAULT_TOOL_TIMEOUT_SECS}s timeout")
+    }
+}
+
 /// Check per-session rate limit. Returns `true` if the request is allowed.
 fn check_session_rate_limit(sessions: &DashMap<String, McpSession>, session_id: &str) -> bool {
     if let Some(mut entry) = sessions.get_mut(session_id) {
@@ -623,32 +652,37 @@ fn check_session_rate_limit(sessions: &DashMap<String, McpSession>, session_id: 
 
 /// Derive the rate-limit bucket key for a request.
 ///
-/// `trust_session_id` MUST be false for `initialize` and any other pre-session
-/// request: there the `mcp-session-id` header is attacker-controlled and not
-/// yet bound to a real session. Keying on it in that case would let a caller
-/// rotate the header on every `initialize` and mint a brand-new full bucket
-/// each time, never getting throttled. Pre-session requests instead fall back
-/// to a stable client identity — the peer IP when available, otherwise the
-/// bearer identity, otherwise a single shared anonymous bucket — so the
-/// identity gets throttled regardless of how the header is rotated.
+/// nw-907: the key is the PRINCIPAL, never the client-supplied
+/// `mcp-session-id`. A session id is mintable on demand (each `initialize`
+/// creates one), so keying on it let a single token multiply its request
+/// budget by minting sessions. For an authenticated request the principal is
+/// the bearer token and its role (`tok:<role>:<first 16 hex of sha256>`); the
+/// raw token is never part of the key, and the peer address is NOT used, so a
+/// token cannot multiply its budget by changing source address. Without auth
+/// the only identity is the peer IP, else a single shared anonymous bucket.
+/// Per-session fairness is still enforced separately by
+/// [`check_session_rate_limit`], which draws in addition to this bucket.
 fn http_client_rate_limit_key(
     provided_bearer: Option<&str>,
-    session_id: Option<&str>,
     peer_ip: Option<std::net::IpAddr>,
-    trust_session_id: bool,
     admin_bypass_rate_limit: bool,
 ) -> String {
-    if admin_bypass_rate_limit {
-        return "bearer:admin".to_string();
-    }
-    if trust_session_id && let Some(sid) = session_id {
-        return format!("session:{sid}");
+    use sha2::{Digest, Sha256};
+    if let Some(token) = provided_bearer {
+        let role = if admin_bypass_rate_limit {
+            "admin"
+        } else {
+            "query"
+        };
+        let digest = Sha256::digest(token.as_bytes());
+        let mut hex = String::with_capacity(16);
+        for byte in &digest[..8] {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        return format!("tok:{role}:{hex}");
     }
     if let Some(ip) = peer_ip {
         return format!("ip:{ip}");
-    }
-    if provided_bearer.is_some() {
-        return "bearer:query".to_string();
     }
     "anonymous-stateless".to_string()
 }
@@ -784,7 +818,7 @@ async fn handle_mcp(
         if !state.server_mode || admin_bypass_rate_limit {
             return None;
         }
-        let client_key = http_client_rate_limit_key(provided_bearer, None, peer_ip, false, false);
+        let client_key = http_client_rate_limit_key(provided_bearer, peer_ip, false);
         (!state.client_rate_limiter.check(&client_key)).then(|| {
             jsonrpc_error(
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -862,25 +896,10 @@ async fn handle_mcp(
         );
     }
 
-    // The client-supplied session id is only a trustworthy rate-limit key once
-    // it names an established session. `initialize` always mints a fresh
-    // session, so its inbound id is never trusted — this is what closes the
-    // rotate-the-header bypass (see `http_client_rate_limit_key`).
-    let trust_session_id = req.method != "initialize"
-        && session_id
-            .as_deref()
-            .map(|sid| state.sessions.contains_key(sid))
-            .unwrap_or(false);
-
     // Per-session rate limiting (server mode only).
     if state.server_mode {
-        let client_key = http_client_rate_limit_key(
-            provided_bearer,
-            session_id.as_deref(),
-            peer_ip,
-            trust_session_id,
-            admin_bypass_rate_limit,
-        );
+        let client_key =
+            http_client_rate_limit_key(provided_bearer, peer_ip, admin_bypass_rate_limit);
 
         if !admin_bypass_rate_limit && !state.client_rate_limiter.check(&client_key) {
             return jsonrpc_http_error(
@@ -1207,12 +1226,18 @@ async fn handle_mcp(
             // cancel flag is shared with the blocking dispatch so a timeout
             // doesn't just abandon the await — cancellable walks (impact,
             // dead_code, flow_trace, vector search) observe the flag and stop.
-            let timeout = Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS);
+            let timeout = state.tool_timeout;
+            #[cfg(test)]
+            let test_dispatch_delay = state.test_dispatch_delay;
             let tool_name = name.clone();
             let dispatch_cancel = std::sync::Arc::clone(&cancel_flag);
             let work = tokio::time::timeout(
                 timeout,
                 tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(delay) = test_dispatch_delay {
+                        std::thread::sleep(delay);
+                    }
                     let _delivery = tools::scoped_tool_delivery(
                         nestweaver_schema::ToolDeliveryProfile::BoundedMcp,
                     );
@@ -1328,22 +1353,26 @@ async fn handle_mcp(
                     "result": tools::wrap_tool_error(&format!("dispatch panicked: {e}")),
                 }),
                 Err(_elapsed) => {
-                    // Trip the shared flag so the still-running blocking walk
-                    // stops cooperatively instead of burning a blocking thread
-                    // to completion after the response has already been sent.
-                    // `Relaxed` on both sides: this is a lone standalone
-                    // cancellation bool that publishes no other state, so it
-                    // needs no release/acquire pairing — matching the BFS
-                    // readers (store/traverse.rs, engine/dead_code.rs,
-                    // mcp/tools.rs) that load it `Relaxed`.
-                    cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(tool = %name, timeout_secs = DEFAULT_TOOL_TIMEOUT_SECS, "MCP tool dispatch timed out");
+                    // nw-883: a mutating tool is NOT cancellable (the flag is not
+                    // honoured mid-write and the retained worker keeps the write
+                    // gate), so it will still commit after this response. Do not
+                    // trip the flag for it, and do not claim it failed.
+                    if !mutation {
+                        // Trip the shared flag so the still-running blocking walk
+                        // stops cooperatively instead of burning a blocking thread
+                        // to completion after the response has already been sent.
+                        // `Relaxed` on both sides: this is a lone standalone
+                        // cancellation bool that publishes no other state, so it
+                        // needs no release/acquire pairing — matching the BFS
+                        // readers (store/traverse.rs, engine/dead_code.rs,
+                        // mcp/tools.rs) that load it `Relaxed`.
+                        cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    tracing::warn!(tool = %name, mutation, timeout_secs = DEFAULT_TOOL_TIMEOUT_SECS, "MCP tool dispatch timed out");
                     json!({
                         "jsonrpc": "2.0",
                         "id": id,
-                        "result": tools::wrap_tool_error(&format!(
-                            "{name} query exceeded {DEFAULT_TOOL_TIMEOUT_SECS}s timeout"
-                        )),
+                        "result": tools::wrap_tool_error(&tool_timeout_message(&name, mutation)),
                     })
                 }
             }
@@ -1693,30 +1722,31 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_key_ignores_client_session_id_for_pre_session_requests() {
-        // Pre-session (initialize): a rotating, untrusted session id must not
-        // change the key — it resolves to the stable bearer identity instead,
-        // so the caller cannot mint a fresh full bucket per request.
-        let k1 = http_client_rate_limit_key(Some("tok"), Some("rotating-1"), None, false, false);
-        let k2 = http_client_rate_limit_key(Some("tok"), Some("rotating-2"), None, false, false);
-        assert_eq!(k1, k2);
-        assert_eq!(k1, "bearer:query");
-
-        // With a peer IP available the pre-session key is the IP — still stable
-        // across rotated session ids.
-        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
-        let k3 = http_client_rate_limit_key(None, Some("rotating-1"), Some(ip), false, false);
-        let k4 = http_client_rate_limit_key(None, Some("rotating-2"), Some(ip), false, false);
-        assert_eq!(k3, k4);
-        assert_eq!(k3, "ip:203.0.113.7");
-
-        // An established (trusted) session still keys per session, as before.
-        let k5 = http_client_rate_limit_key(Some("tok"), Some("sess-x"), None, true, false);
-        assert_eq!(k5, "session:sess-x");
-
-        // Admin always bypasses to its own bucket regardless of the session id.
-        let k6 = http_client_rate_limit_key(Some("tok"), Some("sess-x"), None, true, true);
-        assert_eq!(k6, "bearer:admin");
+    fn rate_limit_key_is_the_token_principal_not_the_address_or_session() {
+        // nw-907: same token+role -> same bucket regardless of peer IP.
+        let ip1: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let ip2: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        let a = http_client_rate_limit_key(Some("tok-a"), Some(ip1), false);
+        assert_eq!(
+            a,
+            http_client_rate_limit_key(Some("tok-a"), Some(ip2), false)
+        );
+        assert_eq!(a, http_client_rate_limit_key(Some("tok-a"), None, false));
+        // Different token or role -> different bucket.
+        assert_ne!(a, http_client_rate_limit_key(Some("tok-b"), None, false));
+        assert_ne!(a, http_client_rate_limit_key(Some("tok-a"), None, true));
+        // The raw token and the peer address never appear in the key.
+        assert!(!a.contains("tok-a") && !a.contains("203.0.113.7"), "{a}");
+        assert!(a.starts_with("tok:query:"), "{a}");
+        // Without a bearer the peer IP (else one shared bucket) is the identity.
+        assert_eq!(
+            http_client_rate_limit_key(None, Some(ip1), false),
+            "ip:203.0.113.7"
+        );
+        assert_eq!(
+            http_client_rate_limit_key(None, None, false),
+            "anonymous-stateless"
+        );
     }
 
     #[tokio::test]
@@ -1991,8 +2021,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mutating_tool_timeout_message_does_not_claim_failure() {
+        // nw-883: a mutation that outlives the timeout keeps running and may
+        // commit; the message must say so rather than report a plain failure.
+        let m = tool_timeout_message("brain_add_source", true);
+        assert!(
+            m.contains("NOT cancelled") && m.contains("may still complete"),
+            "{m}"
+        );
+        assert!(!m.contains("query exceeded"), "{m}");
+        let q = tool_timeout_message("impact", false);
+        assert!(q.contains("query exceeded"), "{q}");
+    }
+
+    async fn call_tool_with_short_timeout(tool: &str, args: Value) -> String {
+        // nw-883: drive the real `Err(_elapsed)` arm: the dispatch thread sleeps
+        // past the (shortened) per-state deadline.
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let mut state = McpHttpState::with_auth(
+            false,
+            store,
+            None,
+            PathBuf::from("/tmp/test.lbug"),
+            None,
+            false,
+            "query-token".to_string(),
+            Some("admin-token".to_string()),
+        );
+        state.tool_timeout = Duration::from_millis(50);
+        state.test_dispatch_delay = Some(Duration::from_millis(600));
+        let app = router(Arc::new(state));
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool, "arguments": args},
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true, "{json}");
+        json["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
     #[tokio::test]
-    async fn bearer_auth_rate_limit_is_keyed_by_session_when_present() {
+    async fn mutating_tool_timeout_reports_still_running_through_the_http_arm() {
+        let text =
+            call_tool_with_short_timeout("brain_remove_source", serde_json::json!({"target": "x"}))
+                .await;
+        assert!(text.contains("NOT cancelled"), "{text}");
+        assert!(text.contains("may still complete"), "{text}");
+        assert!(!text.contains("query exceeded"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_timeout_still_reports_a_plain_timeout_through_the_http_arm() {
+        let text = call_tool_with_short_timeout("brain_status", serde_json::json!({})).await;
+        assert!(text.contains("query exceeded"), "{text}");
+        assert!(!text.contains("NOT cancelled"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn established_sessions_share_the_principal_rate_limit_budget() {
+        // nw-907: two real sessions of the SAME bearer draw from one principal
+        // bucket (capacity 1), so the second session's request is throttled.
+        // Previously each session minted its own bucket, multiplying the budget.
         let app = test_server_auth_app_with_limiter(1);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2000,6 +2104,7 @@ mod tests {
             "method": "tools/list",
         });
 
+        let mut statuses = Vec::new();
         for sid in ["session-a", "session-b"] {
             let req = Request::builder()
                 .method("POST")
@@ -2009,19 +2114,14 @@ mod tests {
                 .header("mcp-session-id", sid)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap();
-
-            let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "session {sid} should not inherit another session's bearer bucket"
-            );
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let json: Value = serde_json::from_slice(&bytes).unwrap();
-            assert!(json["result"]["tools"].is_array(), "{json}");
+            statuses.push(app.clone().oneshot(req).await.unwrap().status());
         }
+        assert_eq!(statuses[0], StatusCode::OK);
+        assert_eq!(
+            statuses[1],
+            StatusCode::TOO_MANY_REQUESTS,
+            "a second minted session must not get a fresh bucket for the same token"
+        );
     }
 
     #[tokio::test]

@@ -170,10 +170,18 @@ pub async fn device_flow_authenticate(
     eprintln!();
     eprintln!("And enter the code:  {}", auth.user_code);
     eprintln!();
-    if open::that(&auth.verification_uri_complete).is_ok() {
+    // nw-884: the URI comes from the (possibly untrusted) server. Only open an
+    // http(s) URL whose host is the server we connected to; otherwise just
+    // print it (already shown above) and let the user decide.
+    let complete = auth.verification_uri_complete.trim();
+    if should_auto_open(complete, &base) {
+        if open::that(complete).is_ok() {
+            eprintln!("(opened your browser to {complete})");
+        }
+    } else {
         eprintln!(
-            "(opened your browser to {})",
-            auth.verification_uri_complete
+            "(not opening the browser automatically: the verification URL is not an \
+             http(s) URL on the server you connected to)"
         );
     }
     eprintln!("Waiting for approval...");
@@ -304,9 +312,48 @@ pub async fn connect_upstream(
     Ok(config)
 }
 
+/// Whether the device-flow verification URI may be handed to the OS opener:
+/// an `http`/`https` URL with a non-empty host that is the same host as the
+/// server base URL we connected to.
+fn should_auto_open(verification_uri: &str, connected_base: &str) -> bool {
+    let (Ok(uri), Ok(base)) = (
+        reqwest::Url::parse(verification_uri.trim()),
+        reqwest::Url::parse(connected_base),
+    ) else {
+        return false;
+    };
+    matches!(uri.scheme(), "http" | "https")
+        && uri.host_str().is_some_and(|h| {
+            !h.is_empty() && base.host_str().is_some_and(|b| b.eq_ignore_ascii_case(h))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_open_requires_http_and_the_connected_host() {
+        // nw-884
+        let base = "https://nw.example:9379";
+        assert!(should_auto_open(
+            "https://nw.example:9379/admin/device-approve?user_code=AB",
+            base
+        ));
+        assert!(should_auto_open("  http://NW.example/x  ", base));
+        // Host mismatch: a hostile server pointing the browser elsewhere.
+        assert!(!should_auto_open(
+            "https://evil.test/admin/device-approve",
+            base
+        ));
+        // Non-http(s) schemes and degenerate URLs.
+        assert!(!should_auto_open("javascript://nw.example/x", base));
+        assert!(!should_auto_open("file:///etc/passwd", base));
+        assert!(!should_auto_open("http://", base));
+        assert!(!should_auto_open("http:///x", base));
+        assert!(!should_auto_open("", base));
+        assert!(!should_auto_open("https://nw.example/x", "not a url"));
+    }
 
     #[test]
     fn device_http_base_derives_http_port_and_scheme() {
