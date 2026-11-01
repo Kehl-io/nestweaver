@@ -425,6 +425,12 @@ pub struct AdminState {
     /// Webhook per-repo branch map, shared with the webhook handler via RwLock.
     pub webhook_repo_branches:
         Option<Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>>,
+    /// Webhook map from canonical repo id to the RAW configured clone URL
+    /// (nw-909), shared with the webhook handler. A webhook enqueues the
+    /// configured URL, never the payload's, so clone credentials and URL form
+    /// match the config.
+    pub webhook_repo_urls:
+        Option<Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>>,
     /// Write gate shared with the daemon to prevent races between admin
     /// repo deletion and worker indexing. `None` in tests or non-server mode.
     ///

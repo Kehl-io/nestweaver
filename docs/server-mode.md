@@ -575,6 +575,12 @@ url = "https://github.com/acme/shared-vault"
 type = "vault"           # index as markdown vault, not code
 ```
 
+
+### How config changes are applied
+
+- **Persistence.** Admin add/remove rewrite the instance config atomically (temp file, fsync, rename) under an in-process lock, so concurrent admin calls all persist and readers never see a partial file. A symlinked config is followed and stays a symlink. Because the write is a rename, the config's directory must be writable, and a single-file bind mount of the config cannot be updated (mount the directory instead). Only the file mode is preserved (not owner, ACLs or xattrs). The lock is per process: a CLI `instance adopt` run while the daemon is mutating the config can still lose one of the two edits.
+- **Reload and restart.** Newly declared repos are queued; a changed `branch` re-queues the repo; jobs (including dead letters) for repos no longer declared are cancelled, at reload and at startup. A dead-lettered repo stays quarantined across reload and restart until retried via `/admin/api/dead-letter/{id}/retry`; a corrected `branch` is recorded for that retry. A change to `type` takes effect only after a restart.
+
 ### Vault repos
 
 A repo declared with `type = "vault"` is indexed as a **markdown vault** rather than source code: the server parses every `.md` file into `Note` / `Section` / `Heading` nodes (plus a `Vault` node and `Tag` links) instead of code symbols. This is the same model `nestweaver` uses for an Obsidian-style knowledge vault, applied to a cloned repo. Use it for design-doc repos, runbooks, ADR archives, or any markdown knowledge base you want queryable alongside code.
@@ -641,6 +647,8 @@ Webhooks provide near-instant re-indexing when code is pushed. The server also r
 4. Trigger on **Push events**
 
 Gitea signs the payload with its own `X-Gitea-Signature` header, carrying a raw hex HMAC-SHA256 of the body — without the `sha256=` prefix that GitHub's `X-Hub-Signature-256` uses. The server accepts a request that bears *either* a valid GitHub *or* a valid Gitea signature (it tries both), using the same `--webhook-secret` / `--webhook-secret-old` rotation pair. The repo URL is read from `repository.clone_url`, just like GitHub.
+
+A webhook is matched to a configured repo by its normalized `host/path` across ssh, scp-like and https spellings (scheme, userinfo, `.git`, trailing slash and case are ignored): the `https://` clone URL a forge sends reaches a repo configured as `ssh://git@host/org/repo` or `git@host:org/repo`. A non-default port is part of the identity, so `ssh://git@host:2222/org/repo` does not match an `https://host/org/repo` payload. Only configured repos match (payloads with backslashes, percent-escapes, dot-segments or an ambiguous host are ignored), and the job is queued with the configured URL and branch, never the payload's.
 
 ### Webhook configuration
 
@@ -1255,9 +1263,9 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 |----------|--------|-------------|
 | `/admin/api/repos` | GET | List all indexed repos with status |
 | `/admin/api/repos` | POST | Add a new repo to the index |
-| `/admin/api/repos/{id}` | DELETE | Remove a repo from the index |
+| `/admin/api/repos/{id}` | DELETE | Remove a repo from the index and config. `{id}` is the graph uid, its config `name`, or its canonical URL (as shown in the dead-letter listing), which also works for a repo that never finished indexing. `{id}` may also name an indexed repo by name or URL (graph data is removed too). Unknown ids return 404; an id matching several repos returns 409 with the candidates |
 | `/admin/api/repos/{id}/reindex` | POST | Force reindex of a specific repo |
-| `/admin/api/reload` | POST | Reload server configuration |
+| `/admin/api/reload` | POST | Reload server configuration. Newly declared repos are queued; jobs, including dead letters, for repos removed from config are cancelled; a changed `branch` re-queues the repo; dead-lettered repos stay quarantined until retried explicitly (a type change needs a restart) |
 | `/admin/api/queue` | GET | View the indexing job queue |
 | `/admin/api/drain` | POST | Pause job processing |
 | `/admin/api/resume` | POST | Resume job processing |

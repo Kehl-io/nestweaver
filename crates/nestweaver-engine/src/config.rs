@@ -1456,6 +1456,41 @@ pub struct ExpectedBrainAdoption {
     pub changed: bool,
 }
 
+/// In-process lock serializing every read-modify-write of the instance config
+/// file made by this crate (nw-900). Without it, two concurrent admin adds both
+/// read the same snapshot and the later write silently drops the earlier entry.
+///
+/// Known limit: this is NOT a cross-process lock. A separate process (for
+/// example the CLI `instance adopt`) editing the same file can still race a
+/// running daemon's admin add; the atomic replace guarantees the file is never
+/// torn, but not that both edits survive.
+static CONFIG_FILE_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_config_file_mutation() -> std::sync::MutexGuard<'static, ()> {
+    // A panic while holding the lock cannot leave the file half-written (all
+    // writes are atomic replaces), so a poisoned lock is safe to reuse.
+    CONFIG_FILE_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Atomically replace the config file with `contents` (nw-900): readers see
+/// either the old or the new file, never a truncated one.
+///
+/// A symlinked `path` is resolved first so the link is preserved and its
+/// target is the file replaced. Replacement is rename-based, so the containing
+/// directory must be writable; a single-file bind mount cannot be renamed over
+/// (EBUSY); and only the file mode is carried over (not owner/ACL/xattrs/
+/// hardlinks). There is deliberately no in-place fallback: it would give up
+/// the no-torn-read guarantee.
+fn write_config_file_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let real = std::fs::canonicalize(path)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(&real, |file| {
+        file.write_all(contents.as_bytes())
+    })
+}
+
 /// Explicitly bind an instance config to `brain_uuid` while preserving TOML
 /// comments and formatting. The complete edited config is validated before a
 /// crash-safe same-directory replacement; a dry run performs every check but
@@ -1465,8 +1500,7 @@ pub fn adopt_expected_brain_uuid(
     brain_uuid: &str,
     dry_run: bool,
 ) -> Result<ExpectedBrainAdoption, anyhow::Error> {
-    use std::io::Write;
-
+    let _config_lock = lock_config_file_mutation();
     let parsed = uuid::Uuid::parse_str(brain_uuid)
         .map_err(|error| anyhow::anyhow!("invalid brain UUID '{brain_uuid}': {error}"))?;
     if parsed.is_nil() {
@@ -1485,9 +1519,7 @@ pub fn adopt_expected_brain_uuid(
         .map_err(|error| anyhow::anyhow!("adopted config would be invalid: {error}"))?;
     let changed = source != rendered;
     if changed && !dry_run {
-        nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| {
-            file.write_all(rendered.as_bytes())
-        })?;
+        write_config_file_atomic(path, &rendered)?;
     }
     Ok(ExpectedBrainAdoption {
         previous,
@@ -1532,6 +1564,7 @@ pub fn append_repo_to_config_file(
     url: &str,
     branch: Option<&str>,
 ) -> Result<bool, anyhow::Error> {
+    let _config_lock = lock_config_file_mutation();
     let mut contents = std::fs::read_to_string(path)?;
     let cfg = InstanceConfig::from_toml_str(&contents)?;
     let target = crate::jobs::canonical_repo_id(url);
@@ -1562,7 +1595,7 @@ pub fn append_repo_to_config_file(
         contents.push_str(&toml_basic_string(branch)?);
         contents.push('\n');
     }
-    std::fs::write(path, contents)?;
+    write_config_file_atomic(path, &contents)?;
     Ok(true)
 }
 
@@ -1585,6 +1618,7 @@ pub fn remove_repo_from_config_file(
     path: &std::path::Path,
     url: &str,
 ) -> Result<bool, anyhow::Error> {
+    let _config_lock = lock_config_file_mutation();
     let contents = std::fs::read_to_string(path)?;
     let target = crate::jobs::canonical_repo_id(url);
     let lines: Vec<&str> = contents.lines().collect();
@@ -1626,7 +1660,7 @@ pub fn remove_repo_from_config_file(
         if contents.ends_with('\n') {
             next.push('\n');
         }
-        std::fs::write(path, next)?;
+        write_config_file_atomic(path, &next)?;
     }
     Ok(removed)
 }
@@ -2998,6 +3032,83 @@ path_deboost = []
                 .count(),
             1
         );
+    }
+
+    /// nw-900: a symlinked instance.toml stays a symlink; its target is updated.
+    #[cfg(unix)]
+    #[test]
+    fn append_follows_symlinked_config_and_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        let link = dir.path().join("instance.toml");
+        std::fs::write(&target, MINIMAL_TOML).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            append_repo_to_config_file(&link, "https://github.com/example/linked", None).unwrap()
+        );
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the atomic replace"
+        );
+        let cfg = InstanceConfig::from_file(&target).unwrap();
+        assert!(
+            cfg.repos
+                .iter()
+                .any(|r| r.url == "https://github.com/example/linked")
+        );
+    }
+
+    /// nw-900: concurrent appends must all persist (no lost updates) and a
+    /// concurrent reader must never observe a torn/truncated file.
+    #[test]
+    fn concurrent_appends_all_persist_and_reads_are_never_torn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        let path = std::sync::Arc::new(path);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    InstanceConfig::from_file(&path).expect("reader saw a torn config file");
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    append_repo_to_config_file(
+                        &path,
+                        &format!("https://github.com/example/concurrent-{i}"),
+                        None,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        for w in writers {
+            assert!(w.join().unwrap());
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        reader.join().unwrap();
+
+        let cfg = InstanceConfig::from_file(&path).unwrap();
+        for i in 0..8 {
+            let want = format!("https://github.com/example/concurrent-{i}");
+            assert!(
+                cfg.repos.iter().any(|r| r.url == want),
+                "lost update: {want} missing"
+            );
+        }
     }
 
     #[test]

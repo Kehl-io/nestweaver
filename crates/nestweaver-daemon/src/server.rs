@@ -16421,6 +16421,9 @@ pub async fn run_server(
         let mut webhook_repo_branches: Option<
             std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
         > = None;
+        let mut webhook_repo_urls: Option<
+            std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+        > = None;
 
         // Single shared job queue for webhook handler, worker pool, and
         // poll scheduler.  Opening the same SQLite file from multiple
@@ -16473,7 +16476,9 @@ pub async fn run_server(
                         continue;
                     }
                     let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&repo_cfg.url);
-                    if let Err(e) = queue.upsert(
+                    // nw-913: the same declared-repo enqueue config reload uses —
+                    // a dead-lettered repo stays quarantined across a restart.
+                    if let Err(e) = queue.enqueue_declared_repo(
                         &canonical_id,
                         &repo_cfg.url,
                         nestweaver_engine::jobs::JobTrigger::Unindexed,
@@ -16486,6 +16491,16 @@ pub async fn run_server(
                         );
                     }
                 }
+            }
+            // nw-912: jobs (including dead letters) for repos that are no
+            // longer declared must not survive a restart either.
+            let declared: std::collections::HashSet<String> = cfg
+                .repos
+                .iter()
+                .map(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url))
+                .collect();
+            if let Err(e) = queue.cancel_repos_not_in(&declared) {
+                tracing::warn!(error = %e, "startup: failed to cancel jobs for undeclared repos");
             }
         }
 
@@ -16519,10 +16534,29 @@ pub async fn run_server(
                         .collect()
                 })
                 .unwrap_or_default();
+            // canonical id → RAW configured clone URL, so a matched webhook
+            // enqueues the configured URL rather than the payload's (nw-909).
+            let repo_urls: std::collections::HashMap<String, String> = state
+                .instance_cfg
+                .as_ref()
+                .map(|cfg| {
+                    cfg.repos
+                        .iter()
+                        .map(|r| {
+                            (
+                                nestweaver_engine::jobs::canonical_repo_id(&r.url),
+                                r.url.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let shared_allowed = std::sync::Arc::new(std::sync::RwLock::new(allowed_repos));
             let shared_branches = std::sync::Arc::new(std::sync::RwLock::new(repo_branches));
+            let shared_urls = std::sync::Arc::new(std::sync::RwLock::new(repo_urls));
             webhook_allowed_repos = Some(std::sync::Arc::clone(&shared_allowed));
             webhook_repo_branches = Some(std::sync::Arc::clone(&shared_branches));
+            webhook_repo_urls = Some(std::sync::Arc::clone(&shared_urls));
             let webhook_state = std::sync::Arc::new(crate::webhook::WebhookState {
                 config: crate::webhook::WebhookConfig {
                     secret: secret.clone(),
@@ -16531,6 +16565,7 @@ pub async fn run_server(
                 job_queue: std::sync::Arc::clone(&shared_job_queue),
                 allowed_repos: shared_allowed,
                 repo_branches: shared_branches,
+                repo_urls: shared_urls,
             });
             mcp_router = mcp_router.route(
                 "/webhook",
@@ -16570,6 +16605,7 @@ pub async fn run_server(
                 scheduler_tx: Some(scheduler_tx.clone()),
                 webhook_allowed_repos: webhook_allowed_repos.clone(),
                 webhook_repo_branches: webhook_repo_branches.clone(),
+                webhook_repo_urls: webhook_repo_urls.clone(),
                 write_gate: Some(state.write_gate.clone()),
                 // Share the daemon's single job-queue connection. Opening a
                 // second connection from admin routes races the worker's WAL

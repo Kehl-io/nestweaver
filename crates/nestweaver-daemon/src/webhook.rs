@@ -41,6 +41,11 @@ pub struct WebhookState {
     /// so the worker indexes the correct ref instead of defaulting to HEAD.
     /// Wrapped in Arc<RwLock> so `/admin/api/reload` can update it without restart.
     pub repo_branches: Arc<RwLock<HashMap<String, String>>>,
+    /// Raw configured clone URL per repo (canonical_id → url, nw-909). A matched
+    /// webhook enqueues THIS url (never the payload's), so the worker clones
+    /// with the configured transport/credentials. Refreshed with
+    /// `allowed_repos` on `/admin/api/reload` and repo add/remove.
+    pub repo_urls: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// POST /webhook — receives push events from GitHub/GitLab/Gitea.
@@ -110,14 +115,32 @@ pub async fn handle_webhook(
         return (StatusCode::BAD_REQUEST, "rejected repo URL");
     }
 
-    // 2b. Check whether this repo is in the allowed set.
-    let repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);
+    // 2b. Check whether this repo is in the allowed set. A forge reports the
+    // https clone URL even when the repo is configured over ssh (nw-909), so
+    // fall back to comparing normalized host/path identities; the payload URL
+    // is only ever COMPARED against configured entries. On a match the job is
+    // keyed and cloned by the CONFIGURED repo (its canonical id and raw
+    // configured URL), never by the payload's URL.
+    let mut repo_id = nestweaver_engine::jobs::canonical_repo_id(&url);
+    let mut url = url;
     if let Ok(allowed_guard) = state.allowed_repos.read()
         && let Some(ref allowed) = *allowed_guard
-        && !allowed.contains(&repo_id)
     {
-        tracing::info!(%url, "webhook ignored: repo not in allowed set");
-        return (StatusCode::OK, "ignored");
+        let urls = state.repo_urls.read().ok();
+        match resolve_configured_repo(allowed, urls.as_deref(), &url) {
+            Some(configured_id) => {
+                if let Some(raw) = urls.as_deref().and_then(|m| m.get(&configured_id)) {
+                    url = raw.clone();
+                } else {
+                    url = configured_id.clone();
+                }
+                repo_id = configured_id;
+            }
+            None => {
+                tracing::info!(%url, "webhook ignored: repo not in allowed set");
+                return (StatusCode::OK, "ignored");
+            }
+        }
     }
 
     // 3. Enqueue job with the configured branch (if any).
@@ -138,6 +161,95 @@ pub async fn handle_webhook(
 
     tracing::info!(%repo_id, %url, "webhook enqueued job");
     (StatusCode::OK, "accepted")
+}
+
+/// Find the configured repo id (an element of `allowed`) that `url` names.
+///
+/// An exact [`canonical_repo_id`](nestweaver_engine::jobs::canonical_repo_id)
+/// match wins. Otherwise the payload URL's [`webhook_identity_key`] is compared
+/// with `normalized_repo_key` of each configured repo's RAW URL (`urls`, falling
+/// back to the id itself). With several equivalent configured spellings the
+/// smallest id is chosen so the result is deterministic.
+fn resolve_configured_repo(
+    allowed: &HashSet<String>,
+    urls: Option<&HashMap<String, String>>,
+    url: &str,
+) -> Option<String> {
+    let exact = nestweaver_engine::jobs::canonical_repo_id(url);
+    if allowed.contains(&exact) {
+        return Some(exact);
+    }
+    let identity = webhook_identity_key(url)?;
+    allowed
+        .iter()
+        .filter(|id| {
+            let configured = urls.and_then(|m| m.get(*id)).unwrap_or(id);
+            nestweaver_schema::repo_url::normalized_repo_key(configured) == identity
+        })
+        .min()
+        .cloned()
+}
+
+/// Identity key of a payload-supplied clone URL, or `None` to fail closed.
+///
+/// The key is `nestweaver_schema::repo_url::normalized_repo_key` (the single
+/// normalizer: scheme, userinfo, `.git`, trailing `/` and case folded; a
+/// non-default port stays part of the identity), computed from a parse that
+/// agrees with the SSRF validator's `url::Url`. Anything where a naive reader
+/// and `url::Url` could disagree about the host or path is rejected: a
+/// backslash, ANY percent-escape, dot-segments, or an authority that differs
+/// from the parsed `[userinfo@]host[:port]` (IDN, `host\@evil`, ...). scp-like
+/// `user@host:path` is accepted only with no `/` before the first `:`.
+fn webhook_identity_key(raw: &str) -> Option<String> {
+    if raw.contains('\\') || raw.contains('%') {
+        return None;
+    }
+    let has_dot_segment = |path: &str| {
+        path.split('/')
+            .any(|segment| segment == "." || segment == "..")
+    };
+    if let Some((_, rest)) = raw.split_once("://") {
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (raw_authority, tail) = rest.split_at(end);
+        let raw_path = tail.split(['?', '#']).next().unwrap_or("");
+        if has_dot_segment(raw_path) {
+            return None;
+        }
+        let parsed = url::Url::parse(raw).ok()?;
+        let host = parsed.host_str()?;
+        let mut authority = String::new();
+        if !parsed.username().is_empty() {
+            authority.push_str(parsed.username());
+            if let Some(password) = parsed.password() {
+                authority.push(':');
+                authority.push_str(password);
+            }
+            authority.push('@');
+        }
+        authority.push_str(host);
+        if let Some(port) = parsed.port() {
+            authority.push(':');
+            authority.push_str(&port.to_string());
+        }
+        if !authority.eq_ignore_ascii_case(raw_authority) {
+            return None;
+        }
+        return Some(nestweaver_schema::repo_url::normalized_repo_key(
+            parsed.as_str(),
+        ));
+    }
+    // scp-like `user@host:path`.
+    let (before, path) = raw.split_once(':')?;
+    let (user, host) = before.split_once('@')?;
+    if before.contains('/')
+        || user.is_empty()
+        || host.is_empty()
+        || host.contains('@')
+        || has_dot_segment(path)
+    {
+        return None;
+    }
+    Some(nestweaver_schema::repo_url::normalized_repo_key(raw))
 }
 
 /// Verify the HMAC-SHA256 signature from the `X-Hub-Signature-256` header.
@@ -424,6 +536,7 @@ mod tests {
             job_queue: Arc::new(Mutex::new(queue)),
             allowed_repos: Arc::new(RwLock::new(None)),
             repo_branches: Arc::new(RwLock::new(HashMap::new())),
+            repo_urls: Arc::new(RwLock::new(HashMap::new())),
         });
 
         // A validly-signed payload whose clone_url targets the cloud metadata IP
@@ -437,5 +550,207 @@ mod tests {
             .await
             .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `configured` are RAW configured URLs; allowed/urls/branches are keyed by
+    /// canonical id exactly as the daemon builds them.
+    fn state_with_configured(
+        secret: &str,
+        configured: &[(&str, Option<&str>)],
+    ) -> (Arc<WebhookState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue = JobQueue::open(&tmp.path().join("jobs.sqlite")).expect("open job queue");
+        let id = |u: &str| nestweaver_engine::jobs::canonical_repo_id(u);
+        let state = Arc::new(WebhookState {
+            config: WebhookConfig {
+                secret: secret.to_string(),
+                secret_old: None,
+            },
+            job_queue: Arc::new(Mutex::new(queue)),
+            allowed_repos: Arc::new(RwLock::new(Some(
+                configured.iter().map(|(u, _)| id(u)).collect(),
+            ))),
+            repo_branches: Arc::new(RwLock::new(
+                configured
+                    .iter()
+                    .filter_map(|(u, b)| b.map(|b| (id(u), b.to_string())))
+                    .collect(),
+            )),
+            repo_urls: Arc::new(RwLock::new(
+                configured
+                    .iter()
+                    .map(|(u, _)| (id(u), u.to_string()))
+                    .collect(),
+            )),
+        });
+        (state, tmp)
+    }
+
+    async fn post_clone_url(state: &Arc<WebhookState>, secret: &str, clone_url: &str) -> String {
+        use axum::response::IntoResponse;
+        let body = serde_json::json!({"repository": {"clone_url": clone_url}}).to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-hub-signature-256",
+            sign(body.as_bytes(), secret).parse().unwrap(),
+        );
+        let resp = handle_webhook(State(state.clone()), headers, Bytes::from(body))
+            .await
+            .into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        // 400 is the SSRF gate rejecting the payload: still "not accepted".
+        assert!(
+            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
+            "{clone_url}: {status} {text}"
+        );
+        text
+    }
+
+    /// nw-909: a forge's clone URL in any ssh/scp/https spelling must reach the
+    /// configured repo, and the job must carry the RAW configured URL (here
+    /// with its `.git` suffix) and the configured branch.
+    #[tokio::test]
+    async fn webhook_matches_equivalent_spellings_and_enqueues_configured_url() {
+        let configured = "ssh://git@github.com/Org/repo.git";
+        let (state, _tmp) = state_with_configured("s", &[(configured, Some("release"))]);
+        for payload in [
+            "https://github.com/Org/repo.git",
+            "https://GitHub.com/Org/repo.git/",
+            "https://github.com/org/repo",
+            "ssh://git@github.com/Org/repo",
+            "https://u:p@github.com/Org/repo",
+        ] {
+            assert_eq!(
+                post_clone_url(&state, "s", payload).await,
+                "accepted",
+                "{payload}"
+            );
+        }
+        let queue = state.job_queue.lock().unwrap();
+        let id = nestweaver_engine::jobs::canonical_repo_id(configured);
+        let job = queue
+            .job_for_repo(&id)
+            .unwrap()
+            .expect("job keyed by configured id");
+        assert_eq!(
+            job.repo_url, configured,
+            "raw configured URL, not payload/stripped id"
+        );
+        assert_eq!(job.branch.as_deref(), Some("release"));
+        assert_eq!(queue.queue_depth().unwrap().pending, 1, "one deduped job");
+    }
+
+    /// scp-like `user@host:path` never survives the SSRF gate (it is not a
+    /// URL), but the matcher still handles it, and only in its strict form.
+    #[test]
+    fn identity_key_handles_scp_form_strictly() {
+        let https = webhook_identity_key("https://github.com/Org/repo.git/").unwrap();
+        assert_eq!(
+            webhook_identity_key("git@github.com:Org/repo.git"),
+            Some(https.clone())
+        );
+        assert_eq!(
+            webhook_identity_key("ssh://git@github.com/Org/repo"),
+            Some(https.clone())
+        );
+        assert_eq!(
+            webhook_identity_key("https://GITHUB.com/org/repo"),
+            Some(https)
+        );
+        for bad in [
+            "git@github.com/x:Org/repo",
+            "@github.com:Org/repo",
+            "git@:Org/repo",
+            "git@github.com:Org/../repo",
+            "github.com:Org/repo",
+            "/srv/git/repo",
+        ] {
+            assert_eq!(webhook_identity_key(bad), None, "{bad}");
+        }
+    }
+
+    /// An https-configured repo is matched by scp/ssh/https payloads too.
+    #[tokio::test]
+    async fn webhook_matches_https_configured_repo_from_scp_and_ssh() {
+        let (state, _tmp) = state_with_configured("s", &[("https://github.com/Org/repo", None)]);
+        for payload in [
+            "ssh://git@github.com/Org/repo",
+            "https://github.com/Org/repo.git/",
+        ] {
+            assert_eq!(
+                post_clone_url(&state, "s", payload).await,
+                "accepted",
+                "{payload}"
+            );
+        }
+    }
+
+    /// nw-909 counterweight: identity matching must not widen the allowlist or
+    /// be fooled by URL-parser differentials. Every payload here must be
+    /// ignored (or rejected) and enqueue nothing.
+    #[tokio::test]
+    async fn webhook_identity_match_fails_closed() {
+        let (state, _tmp) = state_with_configured("s", &[("https://github.com/Org/repo", None)]);
+        for url in [
+            // different repos / hosts
+            "https://github.com/Org/other.git",
+            "https://gitlab.com/Org/repo.git",
+            "https://github.com/evil/repo.git",
+            // parser differentials
+            "https://evil.example\\@github.com/Org/repo",
+            "https://evil.example%5c@github.com/Org/repo",
+            "https://evil.example%5C@github.com/Org/repo",
+            "https://github.com/Org/repo/../other",
+            "https://github.com/Org/repo/./",
+            "https://github.com/Org/%2e%2e/repo",
+            "https://github.com/Org/%72epo",
+            "https://github.com@evil.example/Org/repo",
+            // host oddities fail closed
+            "https://github.com./Org/repo",
+            "https://g\u{ef}thub.com/Org/repo",
+            "https://github.com:8443/Org/repo",
+            // scp oddities
+            "git@github.com/x:Org/repo",
+            "@github.com:Org/repo",
+        ] {
+            let out = post_clone_url(&state, "s", url).await;
+            assert_ne!(out, "accepted", "{url}");
+        }
+        // A non-default port is part of identity: an ssh repo on :2222 is a
+        // different identity from the https one.
+        assert_ne!(
+            post_clone_url(&state, "s", "ssh://git@github.com:2222/Org/repo").await,
+            "accepted"
+        );
+        assert_eq!(
+            state
+                .job_queue
+                .lock()
+                .unwrap()
+                .queue_depth()
+                .unwrap()
+                .pending,
+            0
+        );
+    }
+
+    /// A configured ssh repo on a non-default port does NOT match the https
+    /// clone URL (documented limit), and an IDN host never matches ASCII.
+    #[tokio::test]
+    async fn webhook_non_default_port_is_part_of_identity() {
+        let (state, _tmp) =
+            state_with_configured("s", &[("ssh://git@host.example:2222/org/repo", None)]);
+        assert_ne!(
+            post_clone_url(&state, "s", "https://host.example/org/repo.git").await,
+            "accepted"
+        );
+        assert_eq!(
+            post_clone_url(&state, "s", "ssh://git@host.example:2222/org/repo").await,
+            "accepted"
+        );
     }
 }

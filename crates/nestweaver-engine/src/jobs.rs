@@ -451,6 +451,95 @@ impl JobQueue {
         Ok(changed)
     }
 
+    /// The job row for `repo_id`, if any (nw-913: reload consults status and
+    /// the last-configured branch before deciding whether to re-enqueue).
+    pub fn job_for_repo(&self, repo_id: &str) -> Result<Option<IndexJob>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, repo_id, repo_url, trigger, priority, status,
+                    attempt, max_attempts, error_msg, branch,
+                    created_at, updated_at, started_at, completed_at, claimed_by
+             FROM index_jobs WHERE repo_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![repo_id], row_to_job)?;
+        rows.next().transpose()
+    }
+
+    /// Record a new configured branch WITHOUT changing the job's status or
+    /// attempt budget (nw-913: a dead-lettered repo keeps its quarantine, but
+    /// an explicit retry must use the corrected branch).
+    pub fn set_branch(&self, repo_id: &str, branch: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE index_jobs SET branch = ?2, updated_at = strftime('%s','now')
+             WHERE repo_id = ?1",
+            params![repo_id, branch],
+        )?;
+        Ok(())
+    }
+
+    /// Forget the recorded branch (config dropped its `branch` key), leaving
+    /// status and attempt budget untouched. `upsert` cannot clear a branch.
+    pub fn clear_branch(&self, repo_id: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE index_jobs SET branch = NULL, updated_at = strftime('%s','now')
+             WHERE repo_id = ?1",
+            params![repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue a repo declared in the instance config, honouring dead-letter
+    /// quarantine (nw-913). The ONE place startup and config reload go through:
+    /// a dead-lettered repo is NOT reset to pending (only the explicit
+    /// dead-letter retry does that); a configured branch is still recorded so
+    /// that retry uses it. Returns `true` when the repo was enqueued, `false`
+    /// when it was left quarantined.
+    pub fn enqueue_declared_repo(
+        &self,
+        repo_id: &str,
+        repo_url: &str,
+        trigger: JobTrigger,
+        branch: Option<&str>,
+    ) -> Result<bool, rusqlite::Error> {
+        if let Some(job) = self.job_for_repo(repo_id)?
+            && job.status == JobStatus::DeadLetter
+        {
+            match branch {
+                Some(b) if job.branch.as_deref() != Some(b) => self.set_branch(repo_id, b)?,
+                None if job.branch.is_some() => self.clear_branch(repo_id)?,
+                _ => {}
+            }
+            return Ok(false);
+        }
+        self.upsert(repo_id, repo_url, trigger, branch)?;
+        Ok(true)
+    }
+
+    /// Cancel every pending/running/failed/dead_letter job whose `repo_id` is
+    /// not in `keep` (nw-912: repos removed from config must stop being
+    /// indexed, and a dead letter for an undeclared repo must not stay
+    /// retryable). Rows are preserved as `cancelled` (see
+    /// [`Self::cancel_repo`]); succeeded and already-cancelled rows are left
+    /// alone. Returns the cancelled repo ids.
+    pub fn cancel_repos_not_in(
+        &self,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT repo_id FROM index_jobs
+             WHERE status IN ('pending', 'running', 'failed', 'dead_letter')",
+        )?;
+        let active: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        let mut cancelled = Vec::new();
+        for repo_id in active {
+            if !keep.contains(&repo_id) && self.cancel_repo(&repo_id)? > 0 {
+                cancelled.push(repo_id);
+            }
+        }
+        Ok(cancelled)
+    }
+
     /// Check if a specific job is still valid (not cancelled, and still
     /// belongs to the expected repo). The caller must pass the repo_id from
     /// the originally-claimed job to guard against ID reuse.
@@ -1508,6 +1597,81 @@ mod tests {
         assert!(q.job_is_active(job.id, "repo-1").unwrap());
         // Wrong repo_id (simulates ID reuse) → not active
         assert!(!q.job_is_active(job.id, "repo-2").unwrap());
+    }
+
+    /// nw-912: cancel active and dead-lettered jobs for repos outside the kept
+    /// set only; a declared dead letter stays quarantined.
+    #[test]
+    fn cancel_repos_not_in_cancels_only_unkept_active_jobs() {
+        let q = queue();
+        for id in ["keep", "keep-dead", "drop-pending", "drop-dead"] {
+            q.upsert(
+                id,
+                &format!("https://example.com/{id}"),
+                JobTrigger::Poll,
+                None,
+            )
+            .unwrap();
+        }
+        for id in ["keep-dead", "drop-dead"] {
+            let job = q.job_for_repo(id).unwrap().unwrap();
+            q.conn
+                .execute(
+                    "UPDATE index_jobs SET status='dead_letter' WHERE id=?1",
+                    params![job.id],
+                )
+                .unwrap();
+        }
+        let keep: std::collections::HashSet<String> =
+            ["keep".to_string(), "keep-dead".to_string()].into();
+        let mut cancelled = q.cancel_repos_not_in(&keep).unwrap();
+        cancelled.sort();
+        assert_eq!(
+            cancelled,
+            vec!["drop-dead".to_string(), "drop-pending".to_string()]
+        );
+        let status = |id: &str| q.job_for_repo(id).unwrap().unwrap().status;
+        assert_eq!(status("keep"), JobStatus::Pending);
+        assert_eq!(status("keep-dead"), JobStatus::DeadLetter);
+        assert_eq!(status("drop-pending"), JobStatus::Cancelled);
+        assert_eq!(status("drop-dead"), JobStatus::Cancelled);
+    }
+
+    /// nw-913: the shared declared-repo enqueue leaves a dead letter
+    /// quarantined (status and attempt untouched) but tracks branch edits.
+    #[test]
+    fn enqueue_declared_repo_keeps_dead_letter_quarantined() {
+        let q = queue();
+        q.upsert("r", "https://example.com/r", JobTrigger::Poll, Some("old"))
+            .unwrap();
+        let job = q.claim_next(0).unwrap().unwrap();
+        q.fail(job.id, job.claimed_by.as_deref(), "boom", true)
+            .unwrap();
+        let attempt = q.job_for_repo("r").unwrap().unwrap().attempt;
+
+        let queued = q
+            .enqueue_declared_repo(
+                "r",
+                "https://example.com/r",
+                JobTrigger::Unindexed,
+                Some("new"),
+            )
+            .unwrap();
+        assert!(!queued);
+        let job = q.job_for_repo("r").unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::DeadLetter);
+        assert_eq!(job.attempt, attempt);
+        assert_eq!(job.branch.as_deref(), Some("new"));
+
+        q.enqueue_declared_repo("r", "https://example.com/r", JobTrigger::Unindexed, None)
+            .unwrap();
+        assert_eq!(q.job_for_repo("r").unwrap().unwrap().branch, None);
+
+        // A non-quarantined repo is enqueued normally.
+        assert!(
+            q.enqueue_declared_repo("s", "https://example.com/s", JobTrigger::Unindexed, None)
+                .unwrap()
+        );
     }
 
     #[test]
