@@ -164,6 +164,7 @@ fn merge_upstream(grpc_addr: String, token: &str) -> UpstreamHandle {
         mode: RoutingMode::Merge,
         repos: vec![],
         timeout: "15s".to_string(),
+        fallback_timeout: None,
         ca_cert: None,
     };
     UpstreamHandle::from_config(&cfg).expect("build upstream handle")

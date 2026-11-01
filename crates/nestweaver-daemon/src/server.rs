@@ -18497,6 +18497,7 @@ impl PollInFlight {
 /// execution (not just its queueing), so at most `permits` probes run at once.
 /// `probe` receives the shared cancel flag and must stop promptly when it is
 /// set; a probe that starts after cancellation returns an error immediately.
+#[allow(clippy::too_many_arguments)]
 fn spawn_poll_probe<F>(
     set: &mut tokio::task::JoinSet<PollProbeOutcome>,
     permits: Arc<tokio::sync::Semaphore>,
