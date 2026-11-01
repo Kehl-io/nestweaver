@@ -68,6 +68,12 @@ min_poll = "45s"
 max_poll = "8h"
 ```
 
+Durations accept only the units `ms`, `s`, `m` and `h` (for example `45s`, `5m`,
+`8h`) — no `d`/`w`, fractions or bare numbers. An unparseable duration logs a
+warning and the default is used. `workers` must be between 1 and 1024, and
+`min_poll`/`max_poll` must each be greater than zero with `min_poll <= max_poll`;
+otherwise config load (startup and reload) fails with an error.
+
 ### Embedding backend and readiness
 
 The daemon uses `[embedding]` from the instance config. Local device selection
@@ -673,7 +679,8 @@ not say:
 | unhealthy / not configured | `min_poll` (default 45s) |
 
 So configuring `min_poll = "45s"` does **not** give you 45-second polling while
-webhooks are working; you will see ~5 minutes as the floor, jittered.
+webhooks are working; you will see ~5 minutes as the floor, jittered. If the
+floor exceeds `max_poll`, `max_poll` wins.
 
 ```toml
 [server.indexing]

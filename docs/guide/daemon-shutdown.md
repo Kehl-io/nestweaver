@@ -87,22 +87,16 @@ Check the daemon log for what it is waiting on.
 ```
 
 The command **re-probes the socket** immediately before printing, and says so
-honestly when the answer is bad. In a stuck-flag index drain (`active_writes ==
-0` with `indexing_active` set but no worker job actually in flight — the flag
-cannot clear once the pool is drained with a non-empty queue) the daemon
-broadcasts at the ceiling — 660s — which closes every listener, while this
-command's grace runs to 690s. In that window the daemon is alive but
-unreachable, and the message says:
+honestly when the answer is bad. A stuck `indexing_active` flag
+(`active_writes == 0`, no worker job in flight) no longer holds the drain
+(nw-830). If the socket still does not answer, the message reports only that
+observation and does not name a cause:
 
 ```
 It is still running, but its socket did not answer just now, so reads may be
-DOWN. The likeliest cause is a stuck-flag index drain: with nothing in the
-write queue and the worker pool idle, the daemon broadcasts at the drain
-ceiling, which closes every listener (a genuinely running index job keeps
-them up, like a write — the broadcast is only for a flag that outlived its
-work). This probe cannot tell that apart from a socket already cleaned up,
-a refused connection during exit, or a local file-descriptor limit — check
-the daemon log before concluding.
+DOWN. The daemon may be mid-exit, its socket may already have been cleaned up,
+or this process may be at its file-descriptor limit; this probe cannot tell
+that apart — check the daemon log before concluding.
 ```
 
 Exit status is non-zero in both cases: the operator asked for the daemon to stop
@@ -128,7 +122,7 @@ short version above for why that refusal is what makes the drain terminate.
 
 | Knob | Default | What it is |
 |---|---|---|
-| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | Drain ceiling. With a write in flight — or a genuinely running index job (the drain reads the worker pool's own in-flight counter) — this is a **reporting** threshold, not a deadline. With only a stuck `indexing_active` flag (no job in flight) it **is** a deadline (see CLAUDE.md for why). |
+| `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | Drain ceiling. With a write in flight — or a genuinely running index job (the drain reads the worker pool's own in-flight counter) — this is a **reporting** threshold, not a deadline. With only a stuck `indexing_active` flag (no job in flight, no write) the drain does not wait at all and exits promptly (nw-830). |
 | `NESTWEAVER_STOP_GRACE_SECS` | ceiling + 30 (690) | How long `daemon stop` waits before reporting and standing down. **Not** a kill deadline. Deliberately shorter than the launchd `ExitTimeOut` below, so the CLI reports before launchd kills rather than after. |
 | `daemon stop --force` | 10s, fixed | SIGTERM, brief wait for a clean exit, then SIGKILL. Ignores the two variables above — an operator using `--force` should not have to wait 11 minutes first. |
 

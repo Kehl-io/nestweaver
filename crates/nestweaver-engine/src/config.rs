@@ -1012,6 +1012,58 @@ impl Default for IndexingConfig {
     }
 }
 
+/// Upper bound for `[server.indexing] workers`. Far above any useful pool and
+/// far below `tokio::sync::Semaphore::MAX_PERMITS`, which a larger value would
+/// panic the worker task on (nw-910).
+pub const MAX_INDEXING_WORKERS: usize = 1024;
+
+impl IndexingConfig {
+    /// Reject values that would wedge or panic the index worker and the poll
+    /// scheduler (nw-910, nw-880). Called from [`InstanceConfig::from_toml_str`]
+    /// so both startup and reload fail with a clear error instead.
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if !(1..=MAX_INDEXING_WORKERS).contains(&self.workers) {
+            anyhow::bail!(
+                "[server.indexing] workers must be between 1 and {MAX_INDEXING_WORKERS}, got {}",
+                self.workers
+            );
+        }
+        // An unparseable duration keeps the long-standing behaviour: warn and
+        // fall back to the default the daemon uses (`unwrap_or` in server.rs
+        // takes the same defaults). Only a value that would break the
+        // scheduler hard-fails: an explicit zero, or min_poll > max_poll
+        // (compared after substituting defaults, so the comparison is real).
+        let resolve = |key: &str,
+                       value: &str,
+                       default: String|
+         -> Result<std::time::Duration, anyhow::Error> {
+            match parse_duration(value) {
+                Some(d) if d.is_zero() => {
+                    anyhow::bail!("[server.indexing] {key} must be greater than zero")
+                }
+                Some(d) => Ok(d),
+                None => {
+                    tracing::warn!(
+                        "server.indexing.{key} = {value:?} is not a valid duration \
+                         (accepted units: ms, s, m, h); using default {default}"
+                    );
+                    Ok(parse_duration(&default).expect("default durations parse"))
+                }
+            }
+        };
+        let min = resolve("min_poll", &self.min_poll, default_min_poll())?;
+        let max = resolve("max_poll", &self.max_poll, default_max_poll())?;
+        if min > max {
+            anyhow::bail!(
+                "[server.indexing] min_poll ({}) must not exceed max_poll ({})",
+                self.min_poll,
+                self.max_poll
+            );
+        }
+        Ok(())
+    }
+}
+
 pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
     if s.is_empty() {
@@ -1038,8 +1090,8 @@ pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
     match unit {
         "ms" => Some(std::time::Duration::from_millis(num)),
         "s" => Some(std::time::Duration::from_secs(num)),
-        "m" => Some(std::time::Duration::from_secs(num * 60)),
-        "h" => Some(std::time::Duration::from_secs(num * 3600)),
+        "m" => num.checked_mul(60).map(std::time::Duration::from_secs),
+        "h" => num.checked_mul(3600).map(std::time::Duration::from_secs),
         _ => None,
     }
 }
@@ -1247,6 +1299,7 @@ impl InstanceConfig {
             }
             config.expected_brain_uuid = Some(parsed.to_string());
         }
+        config.server.indexing.validate()?;
         crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
         crate::index_limits::NoteLimits::new(config.indexing.max_note_bytes)?;
         if let Some(limit) = config.limits.default_result_limit
@@ -3195,6 +3248,51 @@ url = "https://github.com/example/keep-me"
         let off = format!("{MINIMAL_TOML}\n\n[indexing]\nwith_trigrams = false\n");
         let cfg = InstanceConfig::from_toml_str(&off).expect("should parse");
         assert!(!cfg.indexing.with_trigrams);
+    }
+
+    /// nw-910 / nw-880: bad `[server.indexing]` values fail config load with a
+    /// clear error rather than wedging or panicking the worker / scheduler.
+    #[test]
+    fn server_indexing_config_rejects_unsafe_values() {
+        let load = |body: &str| {
+            InstanceConfig::from_toml_str(&format!("{MINIMAL_TOML}\n\n[server.indexing]\n{body}\n"))
+        };
+        assert!(load("workers = 4").is_ok());
+        for bad in [
+            "workers = 0",
+            "workers = 9223372036854775807",
+            "workers = 1025",
+            "min_poll = \"0s\"",
+            "max_poll = \"0s\"",
+            "max_poll = \"30s\"", // below the default min_poll of 45s
+            "min_poll = \"10m\"\nmax_poll = \"5m\"",
+            "min_poll = \"9h\"\nmax_poll = \"bogus\"", // vs default max 8h
+        ] {
+            let err = load(bad).expect_err(bad).to_string();
+            assert!(err.contains("[server.indexing]"), "{bad}: {err}");
+        }
+        assert!(load("min_poll = \"1m\"\nmax_poll = \"1m\"").is_ok());
+        assert!(load("workers = 1024").is_ok());
+        // Unparseable durations warn and use the default; they do not fail load
+        // (and an overflowing hour count is unparseable, not a panic).
+        for odd in [
+            "max_poll = \"1d\"",
+            "min_poll = \"45\"",
+            "max_poll = \"18446744073709551615h\"",
+        ] {
+            let cfg = load(odd).unwrap_or_else(|e| panic!("{odd}: {e}"));
+            cfg.server.indexing.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn parse_duration_overflow_is_none() {
+        assert_eq!(parse_duration("18446744073709551615h"), None);
+        assert_eq!(parse_duration("18446744073709551615m"), None);
+        assert_eq!(
+            parse_duration("2h"),
+            Some(std::time::Duration::from_secs(7200))
+        );
     }
 
     #[test]

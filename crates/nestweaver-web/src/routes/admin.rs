@@ -839,15 +839,32 @@ pub async fn drain(
 }
 
 /// POST /admin/api/resume — resume normal processing.
+///
+/// nw-881: refused with 503 once shutdown has started, like every other admin
+/// mutation. `begin_shutdown_drain` sets `drained` to stop new claims; an
+/// un-drain here would let the worker claim and run queued jobs inside the
+/// drain and extend it indefinitely.
 pub async fn resume(
     _auth: AdminAuth,
     State(state): State<Arc<AdminState>>,
-) -> Json<MessageResponse> {
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    const REFUSAL: &str = "daemon is shutting down and is not resuming workers; \
+                           retry against the daemon that starts next";
+    if state.shutdown_started.load(Ordering::SeqCst) {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, REFUSAL.to_string()));
+    }
     state.drained.store(false, Ordering::SeqCst);
+    // Shutdown can begin between the check and the store; its `drained = true`
+    // would then be overwritten. Re-assert it (the worker also gates on
+    // `shutdown_started`, so this is belt and braces).
+    if state.shutdown_started.load(Ordering::SeqCst) {
+        state.drained.store(true, Ordering::SeqCst);
+        return Err((StatusCode::SERVICE_UNAVAILABLE, REFUSAL.to_string()));
+    }
     tracing::info!("admin API: workers resumed");
-    Json(MessageResponse {
+    Ok(Json(MessageResponse {
         message: "workers resumed".to_string(),
-    })
+    }))
 }
 
 /// GET /admin/api/drain/status — current drain state.
@@ -1817,6 +1834,44 @@ mod tests {
         let error = json["error"].as_str().unwrap();
         assert!(error.contains("unknown admin API route"), "{json}");
         assert!(!error.contains("server mode"), "{json}");
+    }
+
+    /// nw-881: `resume` must not un-drain the worker once shutdown has begun.
+    #[tokio::test]
+    async fn resume_is_refused_once_shutdown_starts() {
+        let state = test_admin_state();
+        state.drained.store(true, Ordering::SeqCst);
+        let app = Router::new()
+            .route("/admin/api/resume", post(resume))
+            .with_state(Arc::clone(&state));
+        let call = |app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/resume")
+                    .header("Authorization", "Bearer test-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        // Before shutdown, resume still works.
+        assert_eq!(call(app.clone()).await.status(), StatusCode::OK);
+        assert!(!state.drained.load(Ordering::SeqCst));
+
+        state.drained.store(true, Ordering::SeqCst);
+        state.shutdown_started.store(true, Ordering::SeqCst);
+        assert_eq!(
+            call(app).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "resume must be refused once shutdown has started"
+        );
+        assert!(
+            state.drained.load(Ordering::SeqCst),
+            "a refused resume must leave the pool drained"
+        );
     }
 
     #[test]

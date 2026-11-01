@@ -10967,27 +10967,19 @@ const STOP_WAIT_NOTICE_SECS: u64 = 60;
 ///
 /// `serving_reads` is OBSERVED, not assumed — the caller re-probes the socket
 /// immediately before printing. The first version of this message asserted
-/// "still serving reads" unconditionally, which is false in the stuck-flag
-/// index drain: with `active_writes == 0`, `indexing_active` set, and the
-/// worker pool reporting ZERO jobs in flight (the flag cannot clear once the
-/// pool is drained with a non-empty queue), the drain breaks and BROADCASTS at
-/// the ceiling, closing every listener at 660s, while this command's grace is
-/// 690s — so at report time the daemon could have had no listeners for thirty
-/// seconds. A GENUINELY RUNNING index job is not this case: like an in-flight
-/// write, it keeps the listeners up past the ceiling, so reads stay served.
-/// That is exactly the overclaim class this change exists to remove, so it
-/// must not be reintroduced by the command announcing the fix.
+/// "still serving reads" unconditionally. A drain no longer closes listeners
+/// at the ceiling for a stuck `indexing_active` flag (nw-830: a drain with no
+/// write and no job in flight exits promptly), so the negative branch does not
+/// name a cause; it reports the observation only.
 ///
 /// THE NEGATIVE BRANCH REPORTS THE OBSERVATION, NOT A CAUSE. All the caller
-/// knows is that one `connect()` did not answer. The stuck-flag ceiling
-/// broadcast is the *likely* explanation and is named as such, but it is not
-/// the only one: ECONNREFUSED while the process is mid-exit, `EMFILE`/`ENFILE`
-/// in this CLI process, a socket already swept by `daemon gc`, or a full listen
-/// backlog all produce the same failed connect — including 690s into a WRITE
-/// drain, where "no in-flight write" would be flatly false. Stating a
-/// fabricated diagnosis confidently is the same defect as the overclaim this
-/// branch exists to fix, merely inverted, so the wording stays hedged and the
-/// write-specific sentence is omitted rather than negated.
+/// knows is that one `connect()` did not answer. ECONNREFUSED while the process
+/// is mid-exit, `EMFILE`/`ENFILE` in this CLI process, a socket already swept
+/// by `daemon gc`, or a full listen backlog all produce the same failed
+/// connect — including during a WRITE drain, where "no in-flight write" would
+/// be flatly false. Stating a fabricated diagnosis confidently is the same
+/// defect as the overclaim this branch exists to fix, merely inverted, so the
+/// wording stays hedged.
 fn stop_still_draining_message(pid: i32, waited_secs: u64, serving_reads: bool) -> String {
     let state_line = if serving_reads {
         "It is still running and still answering on its socket — reads are still served, \
@@ -10995,13 +10987,9 @@ fn stop_still_draining_message(pid: i32, waited_secs: u64, serving_reads: bool) 
          aborted (`spawn_blocking` is not cancellable) has to finish."
     } else {
         "It is still running, but its socket did not answer just now, so reads may be \
-         DOWN. The likeliest cause is a stuck-flag index drain: with nothing in the \
-         write queue and the worker pool idle, the daemon broadcasts at the drain \
-         ceiling, which closes every listener (a genuinely running index job keeps \
-         them up, like a write — the broadcast is only for a flag that outlived its \
-         work). This probe cannot tell that apart from a socket already cleaned up, \
-         a refused connection during exit, or a local file-descriptor limit — check \
-         the daemon log before concluding."
+         DOWN. The daemon may be mid-exit, its socket may already have been cleaned up, \
+         or this process may be at its file-descriptor limit; this probe cannot tell \
+         that apart — check the daemon log before concluding."
     };
     format!(
         "Daemon (PID {pid}) is STILL DRAINING after {waited_secs}s and was NOT stopped.\n\
@@ -28833,16 +28821,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
 
                         // OBSERVE whether the socket answers; do NOT infer why.
-                        // A stuck-flag index drain (`indexing_active` set with
-                        // the worker pool reporting zero jobs in flight)
-                        // broadcasts at the ceiling, which closes every
-                        // listener 30s before this grace expires, so "still
-                        // serving reads" cannot be asserted — but a failed
-                        // connect does not prove that particular cause
-                        // either (ECONNREFUSED mid-exit, EMFILE in this process,
-                        // a socket swept by `daemon gc`, a full listen backlog).
-                        // The message therefore reports the observation and
-                        // hedges the cause. A socket owned by a different PID is
+                        // A failed connect has several possible causes
+                        // (ECONNREFUSED mid-exit, EMFILE in this process, a
+                        // socket swept by `daemon gc`, a full listen backlog),
+                        // so "still serving reads" cannot be asserted and no
+                        // cause is named: the message reports the observation
+                        // and hedges. A socket owned by a different PID is
                         // likewise not this daemon's read service.
                         let serving_reads = daemon_socket_reported_pid(&socket) == Some(pid);
                         eprintln!(
@@ -39074,20 +39058,11 @@ mod stop_grace_tests {
         );
     }
 
-    /// The stuck-flag index drain is the case the first version of this message
-    /// got wrong. With `active_writes == 0`, `indexing_active` set, and the
-    /// worker pool reporting zero jobs in flight, the drain breaks and
-    /// BROADCASTS at the ceiling — which closes every listener at 660s, while
-    /// this command's grace runs to 690s. So there is a real window in which
-    /// the daemon is alive, unreachable, and the command was announcing "still
-    /// serving reads" about it. (A genuinely running index job keeps the
-    /// listeners up past the ceiling, so the broadcast case is provably a
-    /// stuck flag.)
-    ///
-    /// The caller re-probes the socket and passes what it observed. Both
-    /// branches are asserted here because the honest branch is the whole point:
-    /// a message that could only ever say the reassuring thing would not be
-    /// reporting, it would be guessing.
+    /// The first version of this message announced "still serving reads"
+    /// unconditionally. The caller re-probes the socket and passes what it
+    /// observed. Both branches are asserted here because the honest branch is
+    /// the whole point: a message that could only ever say the reassuring thing
+    /// would not be reporting, it would be guessing.
     ///
     /// It must not overcorrect either. A failed `connect()` is one observation
     /// with several possible causes, so this test pins that the message reports
@@ -39116,9 +39091,13 @@ mod stop_grace_tests {
         // `daemon gc`, or a full backlog — including during a WRITE drain,
         // where a confident "no in-flight write" would be flatly wrong.
         assert!(
-            msg.contains("likeliest cause") && msg.contains("cannot tell that apart"),
-            "the message must present the index-only drain as the likely cause, \
-             not as an established fact: {msg}"
+            msg.contains("cannot tell that apart"),
+            "the message must hedge the cause, not state one: {msg}"
+        );
+        assert!(
+            !msg.contains("stuck-flag") && !msg.contains("likeliest cause"),
+            "a stuck flag no longer holds the drain (nw-830), so it must not \
+             be named as a cause: {msg}"
         );
         assert!(
             !msg.contains("no in-flight write"),

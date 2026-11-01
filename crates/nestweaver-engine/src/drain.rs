@@ -37,14 +37,15 @@ pub struct DrainSignals {
     /// is unbounded.
     pub active_writes: Arc<AtomicU32>,
     /// The worker pool's `indexing_active` flag. A flag, not a proof of work:
-    /// it cannot clear once the pool is drained with a non-empty queue.
+    /// it cannot clear once the pool is drained with a non-empty queue, so the
+    /// drain only reports it and never waits on it.
     pub indexing_active: Arc<AtomicBool>,
     /// The worker pool's OWN count of spawned index jobs still running —
     /// incremented when a job is claimed, decremented only when its task
     /// finishes (commit included). Unlike the flag, this is a proof of work:
     /// it is how the drain tells a genuinely running index job (unbounded
-    /// wait, like a write) from a stuck `indexing_active` flag (bounded by
-    /// the ceiling).
+    /// wait, like a write) from a stuck `indexing_active` flag (reported, never
+    /// waited on).
     pub indexing_in_flight: Arc<AtomicU32>,
     /// The channel the drain broadcasts on when the wait ends. Every listener
     /// accepts until this fires, so the broadcast is what ends read service.
@@ -89,9 +90,10 @@ const DRAIN_OVER_CEILING_REPORT_FLOOR_SECS: u64 = 60;
 ///
 /// The unbounded wait applies to work that is GENUINELY in flight: writes,
 /// and index jobs the worker pool's own in-flight counter says are running.
-/// `indexing_active` on its own — the flag set with no job in flight — stays
-/// bounded by the ceiling: see the comment on that branch for why waiting on
-/// a stuck flag forever would be a hang rather than a safeguard.
+/// `indexing_active` on its own — the flag set with no job in flight — is not
+/// waited on at all (nw-830): the pool is drained, so the flag cannot clear
+/// while jobs are only queued, and the drain exits promptly instead of
+/// burning the ceiling on it.
 ///
 /// What the in-flight counter can and cannot detect: it proves a job's task
 /// has not finished, not that the job is making progress. A job that is
@@ -115,7 +117,7 @@ pub async fn run_drain(signals: DrainSignals, ceiling: u64) {
     let mut next_over_ceiling_report = ceiling_at;
 
     loop {
-        let writes = signals.active_writes.load(Ordering::Acquire);
+        let writes = signals.active_writes.load(Ordering::SeqCst);
         // Index jobs bump `indexing_active`, not `active_writes`, so the
         // drain must wait on both — otherwise a shutdown could proceed
         // while the worker is mid-write.
@@ -125,57 +127,34 @@ pub async fn run_drain(signals: DrainSignals, ceiling: u64) {
         // exists: it is incremented on claim and decremented only when the
         // job's task finishes, so it cannot outlive the work the way the
         // flag can.
-        let in_flight = signals.indexing_in_flight.load(Ordering::Relaxed);
-        if writes == 0 && !indexing && in_flight == 0 {
-            tracing::info!("no active writes or indexing — shutting down");
+        let in_flight = signals.indexing_in_flight.load(Ordering::SeqCst);
+        if writes == 0 && in_flight == 0 {
+            // nw-830: nothing is genuinely running — no write, and the worker
+            // pool's own counter reports no job in flight — so there is
+            // nothing to wait for. `indexing_active` alone is a flag, not
+            // proof of work: with the pool drained it cannot clear while
+            // jobs are merely queued (or the worker is idle in breaker
+            // backoff), and it used to hold the drain to the full ceiling.
+            // Queued jobs are left for the next start (their rows are
+            // `pending`; nothing is claimed after `drained`/`shutdown_started`).
+            if indexing {
+                tracing::warn!(
+                    indexing_active = indexing,
+                    indexing_in_flight = in_flight,
+                    "no active writes and no index job running — `indexing_active` \
+                     is set but the worker pool reports zero jobs in flight, so the \
+                     flag is stale (work is queued that the drained pool will not \
+                     claim; it is left for the next start). Shutting down"
+                );
+            } else {
+                tracing::info!("no active writes or indexing — shutting down");
+            }
             break;
         }
 
         let elapsed = start.elapsed();
 
-        if writes == 0 && in_flight == 0 {
-            // Stuck-flag wait: BOUNDED, deliberately.
-            //
-            // Only work that is genuinely in flight earns an unbounded wait —
-            // it holds the DB write lock on a `spawn_blocking` thread nothing
-            // can cancel, and abandoning it is the operator's call. This
-            // branch is the opposite case: the flag is set but the worker
-            // pool reports ZERO jobs in flight, so there is no running work
-            // to wait for, and waiting on the flag forever is a hang, not a
-            // safeguard.
-            //
-            // `indexing_active` is cleared in exactly two places in the worker
-            // loop, and with `drained` set (which the daemon's Shutdown handler
-            // does before this runs) BOTH are unreachable while the job queue
-            // is non-empty: the idle branch is skipped because the drained
-            // check `continue`s before a job is ever claimed, and the post-job
-            // branch clears only when pending + running + in-flight all reach
-            // zero. A server-mode daemon told to shut down with work still
-            // queued — the "continuous webhook enqueue" case the Shutdown
-            // handler already calls out — would never exit at all.
-            //
-            // The broadcast below is precisely what unblocks it: the worker
-            // loop observes shutdown and breaks. That is the pre-existing,
-            // working behaviour for this path, so it is kept intact — and the
-            // message says what it costs (read service ends here) rather than
-            // letting the daemon do it quietly.
-            if elapsed >= ceiling_at {
-                tracing::warn!(
-                    indexing_active = indexing,
-                    indexing_in_flight = in_flight,
-                    waited_secs = elapsed.as_secs(),
-                    "drain ceiling ({ceiling}s) reached with no in-flight writes \
-                     and no index job actually running — `indexing_active` is \
-                     set but the worker pool reports zero jobs in flight, so \
-                     the flag is stale (work is queued that the drained pool \
-                     will not claim). Signalling shutdown so the worker loop \
-                     breaks; anything still queued is left for the next start. \
-                     NOTE: this closes every listener, so reads stop being \
-                     served now"
-                );
-                break;
-            }
-        } else if elapsed >= next_over_ceiling_report {
+        if elapsed >= next_over_ceiling_report {
             next_over_ceiling_report = elapsed + repeat_every;
             let pid = std::process::id();
             if writes > 0 {
@@ -288,6 +267,95 @@ mod tests {
         }
         git(&["add", "."]);
         git(&["commit", "-m", "init"]);
+    }
+
+    /// nw-830: `indexing_active` set with NO job in flight and no write (the
+    /// worker idle in breaker backoff, or jobs only queued behind a drained
+    /// pool) must not hold the drain to the ceiling.
+    #[tokio::test]
+    async fn drain_exits_promptly_when_only_the_indexing_flag_is_stuck() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let signals = DrainSignals {
+            active_writes: Arc::new(AtomicU32::new(0)),
+            indexing_active: Arc::new(AtomicBool::new(true)),
+            indexing_in_flight: Arc::new(AtomicU32::new(0)),
+            shutdown_tx,
+        };
+        // A one-hour ceiling: only a prompt exit passes.
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_drain(signals, 3600))
+            .await
+            .expect("a drain with nothing genuinely running must not wait on the flag");
+        assert!(
+            *shutdown_rx.borrow(),
+            "the drain must still broadcast shutdown"
+        );
+    }
+
+    /// nw-830 trigger: a daemon whose pool is drained (SIGTERM) with an index
+    /// job still QUEUED and `indexing_active` stuck on — the worker idle in
+    /// breaker backoff, never claiming — must exit promptly, not at the
+    /// ceiling. Uses the real worker (drained, so it claims nothing) and the
+    /// real queue; the breaker itself is not injectable, but a deferred job is
+    /// exactly a `pending` row the drained worker will not claim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_with_queued_job_and_idle_drained_worker_exits_promptly() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("lib.rs", "pub fn f() {}")]);
+        let queue = crate::jobs::JobQueue::open(&tmp.path().join("jobs.db")).unwrap();
+        queue
+            .upsert(
+                "queued-repo",
+                &format!("file://{}", src.display()),
+                crate::jobs::JobTrigger::Unindexed,
+                None,
+            )
+            .unwrap();
+        let queue = Arc::new(Mutex::new(queue));
+        let workspace = Arc::new(
+            crate::bare_clone::BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap(),
+        );
+        let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
+        let status = crate::worker::IndexingStatus::new();
+        // The flag a previous (backed-off) cycle left set.
+        status.active.store(true, Ordering::SeqCst);
+        let drained = Arc::new(AtomicBool::new(true));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut worker_shutdown = shutdown_tx.subscribe();
+        let signals = DrainSignals {
+            active_writes: Arc::new(AtomicU32::new(0)),
+            indexing_active: Arc::clone(&status.active),
+            indexing_in_flight: Arc::clone(&status.in_flight),
+            shutdown_tx,
+        };
+        let pool = crate::worker::WorkerPool::new(1);
+        let (wq, ws, wst) = (Arc::clone(&queue), status.clone(), Arc::clone(&store));
+        let worker = tokio::spawn(async move {
+            pool.run_with_drain(
+                wq,
+                workspace,
+                wst,
+                crate::worker::fixed_instance_id("test"),
+                &mut worker_shutdown,
+                Some(ws),
+                Some(drained),
+                None,
+            )
+            .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), run_drain(signals, 3600))
+            .await
+            .expect("nothing is running, so the drain must not wait for the ceiling");
+        assert!(*shutdown_rx.borrow());
+        tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+            .await
+            .expect("the worker exits on the broadcast")
+            .unwrap();
+        let depth = queue.lock().unwrap().queue_depth().unwrap();
+        assert_eq!(
+            depth.pending, 1,
+            "the queued job is left for the next start"
+        );
     }
 
     /// A GENUINELY RUNNING index job past the drain ceiling must not cost read

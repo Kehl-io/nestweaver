@@ -99,6 +99,10 @@ impl Default for IndexingStatus {
 pub struct WorkerPool {
     concurrency: usize,
     semaphore: Arc<Semaphore>,
+    /// nw-881: the daemon's `shutdown_started` flag. Unlike `drained` (which
+    /// `POST /admin/api/resume` can clear), it never goes back to `false`, so
+    /// once set the worker claims nothing new.
+    shutdown_started: Option<Arc<AtomicBool>>,
     /// Per-repo index strategy, keyed by [`canonical_repo_id`] of the repo URL.
     /// Repos absent from the map (or mapped to [`RepoType::Code`]) are indexed
     /// as code; entries mapped to [`RepoType::Vault`] are indexed as markdown.
@@ -120,9 +124,14 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     pub fn new(concurrency: usize) -> Self {
+        // nw-910: config validation rejects out-of-range values; this clamp is
+        // the backstop for direct callers. 0 permits would wedge the loop and
+        // more than `Semaphore::MAX_PERMITS` would panic it.
+        let concurrency = concurrency.clamp(1, crate::config::MAX_INDEXING_WORKERS);
         Self {
             concurrency,
             semaphore: Arc::new(Semaphore::new(concurrency)),
+            shutdown_started: None,
             repo_types: Arc::new(HashMap::new()),
             index_limits: crate::index_limits::IndexLimits::default(),
             note_limits: crate::index_limits::NoteLimits::default(),
@@ -134,6 +143,13 @@ impl WorkerPool {
             )),
             reindex_tracker: Arc::new(Mutex::new(crate::scheduler::ReindexTracker::new())),
         }
+    }
+
+    /// Attach the daemon's one-way `shutdown_started` flag (nw-881): once it is
+    /// set the worker stops claiming new jobs regardless of `drained`.
+    pub fn with_shutdown_started(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.shutdown_started = Some(flag);
+        self
     }
 
     /// Attach per-repo index strategies resolved from the instance config.
@@ -289,13 +305,45 @@ impl WorkerPool {
                 break;
             }
 
-            // If drained, sleep instead of claiming new jobs.
-            if let Some(ref flag) = drained
-                && flag.load(Ordering::Relaxed)
-            {
+            // If drained (or shutting down), sleep instead of claiming new
+            // jobs. `shutdown_started` is one-way, so a `resume` racing a
+            // shutdown cannot re-arm the worker (nw-881).
+            if claims_blocked(drained.as_ref(), self.shutdown_started.as_ref()) {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                     _ = shutdown.changed() => {}
+                }
+                continue;
+            }
+
+            // nw-911: take the concurrency permit BEFORE claiming, so a job is
+            // only `running` (attempt consumed, lease ticking) when it can
+            // actually execute. Waiting on the permit also yields to shutdown.
+            let permit = tokio::select! {
+                permit = self.semaphore.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break, // semaphore closed — never happens, but never spin
+                },
+                changed = shutdown.changed() => {
+                    if changed.is_err() {
+                        break; // sender dropped — never spin
+                    }
+                    continue;
+                }
+            };
+            // Increment first, check second (mirrors the admin mutation
+            // admission): the drain reads this counter after shutdown starts,
+            // so either it sees our provisional increment and waits, or we see
+            // `shutdown_started`/`drained` below and back off. The increment is
+            // undone on every path that does not go on to spawn the job, and
+            // never counts toward the idle check further down.
+            if let Some(ref st) = status {
+                st.in_flight.fetch_add(1, Ordering::SeqCst);
+            }
+            // The permit wait may have been long; re-check before claiming.
+            if claims_blocked(drained.as_ref(), self.shutdown_started.as_ref()) {
+                if let Some(ref st) = status {
+                    st.in_flight.fetch_sub(1, Ordering::SeqCst);
                 }
                 continue;
             }
@@ -311,7 +359,16 @@ impl WorkerPool {
                     st.queue_depth
                         .store((depth.pending + depth.running) as u32, Ordering::Relaxed);
                 }
-                q.claim_next(2) // 2s debounce
+                let claimed = q.claim_next(2); // 2s debounce
+                // No job claimed: release the provisional increment before
+                // anything reads `in_flight` again. A claimed job keeps it
+                // (the task decrements on completion).
+                if !matches!(claimed, Ok(Some(_)))
+                    && let Some(ref st) = status
+                {
+                    st.in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+                claimed
             };
 
             let job = match job {
@@ -350,13 +407,6 @@ impl WorkerPool {
                 *st.current_repo.write().await = job.repo_id.clone();
             }
 
-            // Track in-flight tasks so queue depth reflects running work.
-            if let Some(ref st) = status {
-                st.in_flight.fetch_add(1, Ordering::Relaxed);
-            }
-
-            // Acquire a semaphore permit to bound concurrency.
-            let permit = self.semaphore.clone().acquire_owned().await.unwrap();
             let queue = queue.clone();
             let workspace = workspace.clone();
             let store = store.clone();
@@ -535,7 +585,7 @@ impl WorkerPool {
 
                 // Update queue depth and in-flight count after job completion.
                 if let Some(ref st) = status_clone {
-                    let remaining_in_flight = st.in_flight.fetch_sub(1, Ordering::Relaxed) - 1;
+                    let remaining_in_flight = st.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
                     let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                     if let Ok(depth) = q.queue_depth() {
                         let total = (depth.pending + depth.running) as u32;
@@ -566,6 +616,16 @@ impl WorkerPool {
             let _ = task.await;
         }
     }
+}
+
+/// True when the worker must not claim new jobs: the admin `drained` flag is
+/// set, or shutdown has started (nw-881).
+fn claims_blocked(
+    drained: Option<&Arc<AtomicBool>>,
+    shutdown_started: Option<&Arc<AtomicBool>>,
+) -> bool {
+    drained.is_some_and(|flag| flag.load(Ordering::SeqCst))
+        || shutdown_started.is_some_and(|flag| flag.load(Ordering::SeqCst))
 }
 
 #[derive(Debug)]
@@ -2618,6 +2678,170 @@ mod tests {
             count > 0,
             "worker should have indexed the repo and created symbols"
         );
+    }
+
+    /// nw-910: a pool size outside the semaphore's usable range must not
+    /// wedge (0 permits) or panic (> MAX_PERMITS) the worker.
+    #[test]
+    fn pool_concurrency_is_clamped_to_a_usable_range() {
+        assert_eq!(WorkerPool::new(0).concurrency(), 1);
+        assert_eq!(
+            WorkerPool::new(usize::MAX).concurrency(),
+            crate::config::MAX_INDEXING_WORKERS
+        );
+        assert_eq!(WorkerPool::new(3).concurrency(), 3);
+    }
+
+    /// Spin up a worker over `jobs` (repo_id -> source dir) and return handles.
+    #[allow(clippy::type_complexity)]
+    fn spawn_test_worker(
+        tmp: &TempDir,
+        concurrency: usize,
+        repos: &[&str],
+        configure: impl FnOnce(WorkerPool) -> WorkerPool,
+        drained: Option<Arc<AtomicBool>>,
+        write_gate: Option<crate::write_gate::WriteGate>,
+    ) -> (
+        Arc<Mutex<JobQueue>>,
+        IndexingStatus,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let queue = JobQueue::open(&tmp.path().join("jobs.db")).unwrap();
+        for repo in repos {
+            let src = tmp.path().join(format!("source-{repo}"));
+            create_source_repo(&src, &[("lib.rs", "pub fn f() -> i32 { 1 }")]);
+            queue
+                .upsert(
+                    repo,
+                    &format!("file://{}", src.display()),
+                    JobTrigger::Unindexed,
+                    None,
+                )
+                .unwrap();
+        }
+        let queue = Arc::new(Mutex::new(queue));
+        let workspace = Arc::new(BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap());
+        let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
+        let status = IndexingStatus::new();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let pool = configure(WorkerPool::new(concurrency));
+        let (q, st) = (queue.clone(), status.clone());
+        let handle = tokio::spawn(async move {
+            pool.run_with_drain(
+                q,
+                workspace,
+                store,
+                fixed_instance_id("test"),
+                &mut shutdown_rx,
+                Some(st),
+                drained,
+                write_gate,
+            )
+            .await;
+        });
+        (queue, status, shutdown_tx, handle)
+    }
+
+    /// nw-881: `drained` can be cleared by `POST /admin/api/resume`; once
+    /// `shutdown_started` is set the worker must still claim nothing.
+    ///
+    /// Not vacuous: `claim_next(2)` debounces by 2s and the idle loop polls
+    /// every 1s, so a job is first claimable a few seconds in. The control run
+    /// (same setup, `shutdown_started = false`) proves the job IS claimed in
+    /// that time; the gated run then watches for longer than that.
+    #[tokio::test]
+    async fn worker_claims_nothing_once_shutdown_started_even_if_not_drained() {
+        // Positive control: not shutting down -> the job gets claimed.
+        {
+            let tmp = TempDir::new().unwrap();
+            let (queue, status, shutdown_tx, handle) = spawn_test_worker(
+                &tmp,
+                1,
+                &["control-repo"],
+                |pool| pool.with_shutdown_started(Arc::new(AtomicBool::new(false))),
+                Some(Arc::new(AtomicBool::new(false))),
+                None,
+            );
+            let claimed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    let depth = queue.lock().unwrap().queue_depth().unwrap();
+                    if depth.pending == 0 || depth.running > 0 {
+                        break;
+                    }
+                    if status.in_flight.load(Ordering::SeqCst) > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            assert!(
+                claimed.is_ok(),
+                "control: an unblocked worker must claim the job"
+            );
+            shutdown_tx.send(true).unwrap();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), handle).await;
+        }
+
+        // Gated: shutdown started, `drained` "resumed" to false.
+        let tmp = TempDir::new().unwrap();
+        let (queue, status, shutdown_tx, handle) = spawn_test_worker(
+            &tmp,
+            1,
+            &["late-repo"],
+            |pool| pool.with_shutdown_started(Arc::new(AtomicBool::new(true))),
+            Some(Arc::new(AtomicBool::new(false))), // "resumed"
+            None,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(6_000)).await;
+        let depth = queue.lock().unwrap().queue_depth().unwrap();
+        assert_eq!(depth.pending, 1, "the queued job must stay unclaimed");
+        assert_eq!(depth.running, 0);
+        assert_eq!(status.in_flight.load(Ordering::SeqCst), 0);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    /// nw-911: with one permit and two queued jobs, only ONE may be claimed
+    /// (`running`); the other must stay `pending` — not `running` with its
+    /// lease ticking and an attempt consumed while it waits for a permit.
+    #[tokio::test]
+    async fn worker_does_not_claim_a_job_it_has_no_permit_for() {
+        let tmp = TempDir::new().unwrap();
+        let gate = crate::write_gate::WriteGate::new();
+        // Hold the gate so the first job's commit blocks, keeping its permit.
+        let held = gate.lock("test_holds_gate").await;
+        let (queue, status, shutdown_tx, handle) = spawn_test_worker(
+            &tmp,
+            1,
+            &["repo-a", "repo-b"],
+            |pool| pool,
+            None,
+            Some(gate.clone()),
+        );
+        let blocked = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while gate.waiting() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(blocked.is_ok(), "first job must reach its commit and block");
+        // Give the loop ample time to (wrongly) claim the second job.
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        let depth = queue.lock().unwrap().queue_depth().unwrap();
+        assert_eq!(depth.running, 1, "only the job holding a permit is running");
+        assert_eq!(depth.pending, 1, "the second job must remain pending");
+        assert_eq!(status.in_flight.load(Ordering::Relaxed), 1);
+
+        // Releasing the gate lets both finish; shutdown is not blocked on a
+        // permit wait either.
+        drop(held);
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("worker must exit")
+            .unwrap();
     }
 
     #[tokio::test]

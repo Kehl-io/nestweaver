@@ -2865,8 +2865,8 @@ pub struct DaemonState {
     /// yet finished). Shared into the worker's `IndexingStatus` so the WORKER
     /// — not the `indexing_active` flag — is the authority on whether a job
     /// genuinely exists; the shutdown drain reads it to tell a running job
-    /// (unbounded wait, reads stay served) from a stuck flag (bounded by the
-    /// drain ceiling).
+    /// (unbounded wait, reads stay served) from a stuck flag (reported, not
+    /// waited on — nw-830).
     pub indexing_in_flight: Arc<AtomicU32>,
     /// Brain-status documents served by this daemon process. A daemon-side
     /// witness counter: a client that adopted this daemon after its pidfile
@@ -3430,8 +3430,9 @@ fn stop_active_watcher(state: &DaemonState) {
 /// indexing behaviour can be tested against a real worker-pool index, which
 /// this crate's tests cannot drive (they link the engine without its
 /// `cfg(test)` `file://` clone allowance). The doc comment on `run_drain`
-/// covers why the ceiling is a reporting threshold for in-flight writes and a
-/// real deadline for a stuck `indexing_active` flag.
+/// covers why the ceiling is a reporting threshold for in-flight writes and
+/// running jobs, while a stuck `indexing_active` flag is reported, not waited
+/// on (nw-830).
 async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
     nestweaver_engine::drain::run_drain(
         nestweaver_engine::drain::DrainSignals {
@@ -17061,6 +17062,7 @@ pub async fn run_server(
                 Arc::new(move || worker_state.effective_data_instance_id());
             let mut worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
+            let worker_shutdown_started = Arc::clone(&state.shutdown_started);
             let worker_write_gate = state.write_gate.clone();
             let worker_count = state
                 .instance_cfg
@@ -17122,6 +17124,7 @@ pub async fn run_server(
                         }
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
+                    .with_shutdown_started(worker_shutdown_started)
                     .with_repo_types(worker_repo_types)
                     .with_index_limits(worker_index_limits)
                     .with_note_limits(worker_note_limits)
@@ -31892,11 +31895,11 @@ external_model = "unavailable-test-model"
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_sets_drained_before_draining() {
         let state = test_state_with_writer();
-        // Stand in for an in-flight index: the drain wait loop waits on
-        // `!indexing_active`, so with this set it never completes during the
-        // test — proving `drained` is set by the handler itself, not by the
-        // loop's completion.
-        state.indexing_active.store(true, Ordering::Relaxed);
+        // Stand in for a genuinely running index job: the drain loop waits on
+        // the worker's in-flight counter (not the `indexing_active` flag, nw-830),
+        // so with this set it never completes during the test — proving
+        // `drained` is set by the handler itself, not by the loop's completion.
+        state.indexing_in_flight.store(1, Ordering::Relaxed);
         assert!(
             !state.drained.load(Ordering::Relaxed),
             "precondition: drained starts clear"
@@ -31914,6 +31917,8 @@ external_model = "unavailable-test-model"
             "shutdown must set drained immediately (before the drain wait loop) \
              so the worker pool stops claiming new jobs the moment shutdown begins"
         );
+        // Release the hold so the spawned drain can finish.
+        state.indexing_in_flight.store(0, Ordering::Relaxed);
     }
 
     /// A `tracing` writer that accumulates formatted events in memory so a
@@ -32791,16 +32796,13 @@ external_model = "unavailable-test-model"
         );
     }
 
-    /// The unbounded wait is for in-flight WRITES only. `indexing_active` on its
-    /// own must stay bounded by the ceiling, because it cannot clear by itself
-    /// once the worker is drained with a non-empty queue: the worker's idle
-    /// branch is skipped (drained `continue`s before claiming) and its post-job
-    /// branch clears only when pending + running + in-flight all hit zero. A
-    /// server-mode daemon shut down with work still queued would otherwise never
-    /// exit — and would log "still waiting on 0 in-flight write(s)", asserting
-    /// an in-flight write it does not have.
+    /// nw-830: `indexing_active` on its own (no in-flight write, no job in
+    /// flight on the worker pool's counter) must not hold the drain at all. The
+    /// flag cannot clear once the worker is drained with a non-empty queue (or
+    /// idles in breaker backoff), so waiting on it only burned the full ceiling
+    /// — 660s by default, longer than a supervisor's stop timeout.
     #[tokio::test]
-    async fn drain_with_only_indexing_active_stays_bounded_by_the_ceiling() {
+    async fn drain_with_only_indexing_active_exits_promptly() {
         let state = test_state_with_writer();
         state.drained.store(true, Ordering::Relaxed);
         state.indexing_active.store(true, Ordering::Relaxed);
@@ -32814,28 +32816,19 @@ external_model = "unavailable-test-model"
             .finish();
         let _log_guard = tracing::subscriber::set_default(subscriber);
 
+        // A one-hour ceiling: only a prompt exit passes the 10s timeout.
         tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            run_shutdown_drain(Arc::clone(&state), 1),
+            std::time::Duration::from_secs(10),
+            run_shutdown_drain(Arc::clone(&state), 3600),
         )
         .await
-        .expect(
-            "an indexing-only drain MUST stay bounded: `indexing_active` cannot \
-             clear once the worker is drained with a non-empty queue, so waiting \
-             on it forever turns a bounded shutdown into a permanent hang",
-        );
+        .expect("a drain with no genuinely running work must not wait on the flag");
 
         assert!(
             *shutdown_rx.borrow(),
-            "the bounded path must broadcast — that broadcast is what lets the \
-             worker loop observe shutdown and exit"
+            "the drain must broadcast so the worker loop observes shutdown"
         );
-
         let text = logs.text();
-        assert!(
-            text.contains("drain ceiling (1s) reached with no in-flight writes"),
-            "the indexing-only ceiling must report itself accurately: {text}"
-        );
         assert!(
             !text.contains("still waiting on 0 in-flight write(s)"),
             "the drain must never assert an in-flight write it does not have: {text}"
@@ -32849,8 +32842,10 @@ external_model = "unavailable-test-model"
     #[tokio::test]
     async fn duplicate_shutdown_does_not_start_a_second_drain() {
         let state = test_state_with_writer();
-        // Keeps the first drain loop alive for the whole test.
-        state.indexing_active.store(true, Ordering::Relaxed);
+        // Keeps the first drain loop genuinely running for the whole test: a
+        // job in flight on the worker pool's counter (the flag alone no longer
+        // holds a drain, nw-830).
+        state.indexing_in_flight.store(1, Ordering::Relaxed);
 
         let logs = CapturedLogs::new();
         let subscriber = tracing_subscriber::fmt()
