@@ -5,7 +5,7 @@
 //! result sets are asymmetric (spec validation finding #8).
 
 use crate::dedup::{
-    Confidence, MergedResult, Provenance, SymbolIdentity, assign_confidence, extract_identity,
+    Confidence, MergedResult, Provenance, SymbolIdentity, assign_confidence, identify_tiers,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -25,14 +25,19 @@ const SERVER_WEIGHT: f64 = 1.0;
 /// (Elasticsearch #101232 — score ties must not fall back to hash-map order).
 ///
 /// Every component is instance-invariant: `repo_url` is the normalized repo key
-/// (`extract_identity`), and `scope_hash` is a fixed-key `DefaultHasher` digest,
+/// (`extract_identity`), uid-derived entity keys carry no instance, and
+/// `scope_hash` is a fixed-key `DefaultHasher` digest,
 /// so this key is identical across processes and runs.
 fn identity_tiebreaker(id: &SymbolIdentity) -> String {
     // \u{1f} (unit separator) can't appear in the components, so this is an
     // injective encoding — distinct identities never collide.
     format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-        id.repo_url, id.file_path, id.symbol_name, id.scope_hash
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        id.entity.as_ref().map_or("", |e| e.key.as_str()),
+        id.repo_url,
+        id.file_path,
+        id.symbol_name,
+        id.scope_hash
     )
 }
 
@@ -69,7 +74,8 @@ fn finalize_ordering(
 /// result set sizes. This ensures local results are not drowned by a
 /// server returning 5x more results.
 ///
-/// Deduplication uses [`extract_identity`] (scope-hash identity tuple).
+/// Deduplication keys on the row's uid when present, else the
+/// [`crate::dedup::extract_identity`] scope-hash tuple (see `identify_tiers`).
 /// When both sources have the same symbol, local wins on content and
 /// scores are accumulated.
 pub fn rrf_merge(
@@ -88,13 +94,14 @@ pub fn rrf_merge_weighted(
 ) -> Vec<MergedResult> {
     let mut scored: HashMap<SymbolIdentity, MergedResult> = HashMap::new();
     let mut unkeyed: Vec<MergedResult> = Vec::new();
+    let (local_ids, server_ids, _) = identify_tiers(&local_results, &server_results);
 
     // Score local results with weighted RRF. First source to key an identity
     // owns its content; a repeated identity accumulates its RRF contribution.
-    for (rank, val) in local_results.into_iter().enumerate() {
+    for (rank, (val, identity)) in local_results.into_iter().zip(local_ids).enumerate() {
         let rrf_score = local_weight / (rank as f64 + k + 1.0);
         let confidence = infer_confidence(&val);
-        match extract_identity(&val) {
+        match identity {
             Some(id) => match scored.get_mut(&id) {
                 Some(existing) => existing.score += rrf_score,
                 None => {
@@ -121,10 +128,10 @@ pub fn rrf_merge_weighted(
     }
 
     // Score server results with baseline weight, accumulating into local.
-    for (rank, val) in server_results.into_iter().enumerate() {
+    for (rank, (val, identity)) in server_results.into_iter().zip(server_ids).enumerate() {
         let rrf_score = SERVER_WEIGHT / (rank as f64 + k + 1.0);
         let confidence = infer_confidence(&val);
-        match extract_identity(&val) {
+        match identity {
             Some(id) => match scored.get_mut(&id) {
                 Some(existing) => {
                     // Duplicate: local wins on content, accumulate score.
@@ -172,11 +179,12 @@ pub fn rrf_merge_with_modified(
 ) -> Vec<MergedResult> {
     let mut scored: HashMap<SymbolIdentity, MergedResult> = HashMap::new();
     let mut unkeyed: Vec<MergedResult> = Vec::new();
+    let (local_ids, server_ids, _) = identify_tiers(&local_results, &server_results);
 
-    for (rank, val) in local_results.into_iter().enumerate() {
+    for (rank, (val, identity)) in local_results.into_iter().zip(local_ids).enumerate() {
         let rrf_score = LOCAL_WEIGHT / (rank as f64 + RRF_K + 1.0);
         let confidence = assign_confidence(&val, Provenance::Local, locally_modified_files);
-        match extract_identity(&val) {
+        match identity {
             Some(id) => match scored.get_mut(&id) {
                 Some(existing) => existing.score += rrf_score,
                 None => {
@@ -202,10 +210,10 @@ pub fn rrf_merge_with_modified(
         }
     }
 
-    for (rank, val) in server_results.into_iter().enumerate() {
+    for (rank, (val, identity)) in server_results.into_iter().zip(server_ids).enumerate() {
         let rrf_score = SERVER_WEIGHT / (rank as f64 + RRF_K + 1.0);
         let confidence = assign_confidence(&val, Provenance::Server, locally_modified_files);
-        match extract_identity(&val) {
+        match identity {
             Some(id) => match scored.get_mut(&id) {
                 Some(existing) => {
                     if existing.provenance == Provenance::Local {

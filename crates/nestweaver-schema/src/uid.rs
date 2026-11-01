@@ -215,6 +215,174 @@ pub enum SearchEntityUidKind {
     Symbol,
 }
 
+/// A canonical graph UID split into its parts, with the instance component
+/// parsed out (and therefore droppable by a caller that compares across
+/// instances). Borrowed from the input; every hash/line has already passed
+/// the module's validators.
+///
+/// Purely additive: it mints nothing and changes no persisted UID. It is the
+/// ONE parser for these grammars -- [`normalize_search_entity_uid`] and the
+/// federation merge both call it instead of re-implementing the grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanonicalEntityUid<'a> {
+    /// `note:vlt:<instance>:<vault>:<note>`
+    Note {
+        instance: &'a str,
+        vault: &'a str,
+        note: &'a str,
+    },
+    /// `tag:vlt:<instance>:<vault>:<name>`
+    Tag {
+        instance: &'a str,
+        vault: &'a str,
+        name: &'a str,
+    },
+    /// `head:note:vlt:<instance>:<vault>:<note>:<slug>:<line>`
+    Heading {
+        instance: &'a str,
+        vault: &'a str,
+        note: &'a str,
+        slug: &'a str,
+        line: &'a str,
+    },
+    /// `sec:note:vlt:<instance>:<vault>:<note>:<line>:<content6>`
+    Section {
+        instance: &'a str,
+        vault: &'a str,
+        note: &'a str,
+        line: &'a str,
+        content: &'a str,
+    },
+    /// `vlt:<instance>:<vault>`
+    Vault { instance: &'a str, vault: &'a str },
+    /// `sym:repo:<instance>:<repo>:<file>:<name>:<line>`
+    Symbol {
+        instance: &'a str,
+        repo: &'a str,
+        file: &'a str,
+        name: &'a str,
+        line: &'a str,
+    },
+    /// `repo:<instance>:<repo>`
+    Repo { instance: &'a str, repo: &'a str },
+    /// `file:repo:<instance>:<repo>:<file>`
+    File {
+        instance: &'a str,
+        repo: &'a str,
+        file: &'a str,
+    },
+    /// `svc:repo:<instance>:<repo>:<name>`
+    Service {
+        instance: &'a str,
+        repo: &'a str,
+        name: &'a str,
+    },
+}
+
+/// Parse a canonical entity UID (see [`CanonicalEntityUid`]). Instances follow
+/// the graph UID rule: nonempty, no whitespace (a colon changes the component
+/// count and is rejected). Hashes are 12 lowercase hex, lines canonical u32,
+/// section content hashes 6 lowercase hex. Anything else is `None`.
+pub fn parse_canonical_entity_uid(uid: &str) -> Option<CanonicalEntityUid<'_>> {
+    let parts: Vec<&str> = uid.split(':').collect();
+    let h = is_lowercase_12_hex;
+    let content_ok = |c: &str| {
+        c.len() == 6
+            && c.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    match parts.as_slice() {
+        ["note", "vlt", instance, vault, note]
+            if valid_uid_instance(instance) && h(vault) && h(note) =>
+        {
+            Some(CanonicalEntityUid::Note {
+                instance,
+                vault,
+                note,
+            })
+        }
+        ["tag", "vlt", instance, vault, name]
+            if valid_uid_instance(instance) && h(vault) && h(name) =>
+        {
+            Some(CanonicalEntityUid::Tag {
+                instance,
+                vault,
+                name,
+            })
+        }
+        ["head", "note", "vlt", instance, vault, note, slug, line]
+            if valid_uid_instance(instance)
+                && h(vault)
+                && h(note)
+                && h(slug)
+                && is_canonical_u32(line) =>
+        {
+            Some(CanonicalEntityUid::Heading {
+                instance,
+                vault,
+                note,
+                slug,
+                line,
+            })
+        }
+        ["sec", "note", "vlt", instance, vault, note, line, content]
+            if valid_uid_instance(instance)
+                && h(vault)
+                && h(note)
+                && is_canonical_u32(line)
+                && content_ok(content) =>
+        {
+            Some(CanonicalEntityUid::Section {
+                instance,
+                vault,
+                note,
+                line,
+                content,
+            })
+        }
+        ["vlt", instance, vault] if valid_uid_instance(instance) && h(vault) => {
+            Some(CanonicalEntityUid::Vault { instance, vault })
+        }
+        ["sym", "repo", instance, repo, file, name, line]
+            if valid_uid_instance(instance)
+                && h(repo)
+                && h(file)
+                && h(name)
+                && is_canonical_u32(line) =>
+        {
+            Some(CanonicalEntityUid::Symbol {
+                instance,
+                repo,
+                file,
+                name,
+                line,
+            })
+        }
+        ["repo", instance, repo] if valid_uid_instance(instance) && h(repo) => {
+            Some(CanonicalEntityUid::Repo { instance, repo })
+        }
+        ["file", "repo", instance, repo, file]
+            if valid_uid_instance(instance) && h(repo) && h(file) =>
+        {
+            Some(CanonicalEntityUid::File {
+                instance,
+                repo,
+                file,
+            })
+        }
+        ["svc", "repo", instance, repo, name]
+            if valid_uid_instance(instance) && h(repo) && h(name) =>
+        {
+            Some(CanonicalEntityUid::Service {
+                instance,
+                repo,
+                name,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Parse a canonical search-entity UID and remove only its instance component.
 ///
 /// Accepted constructor grammars are:
@@ -226,46 +394,26 @@ pub enum SearchEntityUidKind {
 /// necessarily changes the exact component count and is therefore rejected.
 /// The normalized value retains the domain plus all ownership/content
 /// components so unrelated repositories, vaults, notes, tags, and symbols
-/// remain distinct.
+/// remain distinct. Thin caller of [`parse_canonical_entity_uid`].
 pub fn normalize_search_entity_uid(uid: &str) -> Option<(SearchEntityUidKind, String)> {
-    let parts: Vec<&str> = uid.split(':').collect();
-    match parts.as_slice() {
-        [
-            domain @ ("note" | "tag"),
-            "vlt",
-            instance,
-            vault_hash,
-            entity_hash,
-        ] if valid_uid_instance(instance)
-            && is_lowercase_12_hex(vault_hash)
-            && is_lowercase_12_hex(entity_hash) =>
-        {
-            let kind = if *domain == "note" {
-                SearchEntityUidKind::Note
-            } else {
-                SearchEntityUidKind::Tag
-            };
-            Some((kind, format!("{domain}:vlt:{vault_hash}:{entity_hash}")))
+    match parse_canonical_entity_uid(uid)? {
+        CanonicalEntityUid::Note { vault, note, .. } => Some((
+            SearchEntityUidKind::Note,
+            format!("note:vlt:{vault}:{note}"),
+        )),
+        CanonicalEntityUid::Tag { vault, name, .. } => {
+            Some((SearchEntityUidKind::Tag, format!("tag:vlt:{vault}:{name}")))
         }
-        [
-            "sym",
-            "repo",
-            instance,
-            repo_hash,
-            file_hash,
-            name_hash,
+        CanonicalEntityUid::Symbol {
+            repo,
+            file,
+            name,
             line,
-        ] if valid_uid_instance(instance)
-            && is_lowercase_12_hex(repo_hash)
-            && is_lowercase_12_hex(file_hash)
-            && is_lowercase_12_hex(name_hash)
-            && is_canonical_u32(line) =>
-        {
-            Some((
-                SearchEntityUidKind::Symbol,
-                format!("sym:repo:{repo_hash}:{file_hash}:{name_hash}:{line}"),
-            ))
-        }
+            ..
+        } => Some((
+            SearchEntityUidKind::Symbol,
+            format!("sym:repo:{repo}:{file}:{name}:{line}"),
+        )),
         _ => None,
     }
 }
@@ -1091,5 +1239,87 @@ mod tests {
         let h = scope_hash("Foo::bar", "bar");
         assert_eq!(h, truncated_hash("Foo::bar"));
         assert_ne!(h, truncated_hash("bar"));
+    }
+
+    /// One accept row per family, plus the shared reject shapes. The parser is
+    /// the single grammar owner for federation as well as search normalization.
+    #[test]
+    fn parse_canonical_entity_uid_covers_every_family() {
+        let vault = vault_uid("inst", "/root");
+        let note = note_uid(&vault, "a.md");
+        let repo = repo_uid("inst", "https://example.com/acme/api.git");
+        let sym = symbol_uid(&repo, "src/lib.rs", "f", 7);
+        let table: Vec<(String, &str)> = vec![
+            (note.clone(), "Note"),
+            (tag_uid(&vault, "zebra"), "Tag"),
+            (heading_uid(&note, "intro", 4), "Heading"),
+            (section_uid(&note, 4, "abc123"), "Section"),
+            (vault.clone(), "Vault"),
+            (sym.clone(), "Symbol"),
+            (repo.clone(), "Repo"),
+            (file_uid(&repo, "src/lib.rs"), "File"),
+            (service_uid(&repo, "svc"), "Service"),
+        ];
+        for (uid, family) in &table {
+            let parsed = parse_canonical_entity_uid(uid)
+                .unwrap_or_else(|| panic!("{family} uid must parse: {uid}"));
+            assert!(format!("{parsed:?}").starts_with(family), "{parsed:?}");
+            // Uppercase hex, whitespace instance and an extra component are rejected.
+            let upper = uid.replace(
+                &truncated_hash("a.md"),
+                &truncated_hash("a.md").to_uppercase(),
+            );
+            if &upper != uid {
+                assert!(parse_canonical_entity_uid(&upper).is_none(), "{upper}");
+            }
+            assert!(parse_canonical_entity_uid(&format!("{uid}:x")).is_none());
+            assert!(parse_canonical_entity_uid(&uid.replacen("inst", "in st", 1)).is_none());
+        }
+        // Non-canonical lines.
+        assert!(parse_canonical_entity_uid(&sym.replace(":7", ":07")).is_none());
+        assert!(
+            parse_canonical_entity_uid(&heading_uid(&note, "intro", 4).replace(":4", ":04"))
+                .is_none()
+        );
+        assert!(parse_canonical_entity_uid(&section_uid(&note, 4, "abc12")).is_none());
+        assert!(parse_canonical_entity_uid("proj:inst:abcdef012345").is_none());
+        assert!(parse_canonical_entity_uid("contract:http:GET:/a").is_none());
+    }
+
+    /// `normalize_search_entity_uid` is now a thin caller of the parser; its
+    /// output must stay byte-identical (instance stripped, nothing else).
+    #[test]
+    fn normalize_search_entity_uid_output_is_pinned() {
+        let vault = vault_uid("inst", "/root");
+        let note = note_uid(&vault, "a.md");
+        let (vh, nh) = (truncated_hash("/root"), truncated_hash("a.md"));
+        assert_eq!(
+            normalize_search_entity_uid(&note),
+            Some((SearchEntityUidKind::Note, format!("note:vlt:{vh}:{nh}")))
+        );
+        let th = truncated_hash("zebra");
+        assert_eq!(
+            normalize_search_entity_uid(&tag_uid(&vault, "Zebra")),
+            Some((SearchEntityUidKind::Tag, format!("tag:vlt:{vh}:{th}")))
+        );
+        let repo = repo_uid("inst", "https://example.com/acme/api.git");
+        let (rh, fh, sh) = (
+            truncated_hash(&normalized_repo_key("https://example.com/acme/api.git")),
+            truncated_hash("src/lib.rs"),
+            truncated_hash("f"),
+        );
+        assert_eq!(
+            normalize_search_entity_uid(&symbol_uid(&repo, "src/lib.rs", "f", 7)),
+            Some((
+                SearchEntityUidKind::Symbol,
+                format!("sym:repo:{rh}:{fh}:{sh}:7")
+            ))
+        );
+        // Families outside note/tag/sym stay unrecognised for search.
+        assert_eq!(
+            normalize_search_entity_uid(&heading_uid(&note, "x", 1)),
+            None
+        );
+        assert_eq!(normalize_search_entity_uid(&repo), None);
     }
 }

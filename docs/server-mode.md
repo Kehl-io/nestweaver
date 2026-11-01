@@ -847,8 +847,9 @@ alongside the returned rows:
 - `truncated` is true whenever the total is a lower bound or fewer rows were
   returned than the exact total.
 - Every row, including `response_format: "concise"`, carries its canonical
-  domain-qualified `uid`. Hybrid deduplication uses that identity rather than
-  presentation fields such as title or location.
+  domain-qualified `uid`. Hybrid deduplication keys on that uid rather than on
+  presentation fields such as title or location; the only use of a note's title
+  is as a merge guard inside a corroborated cross-tier vault pair (see below).
 - `semantic_applied` is always `false` and `degraded_components` always empty.
   `brain_search` is keyword/BM25-only and never requests a semantic leg, so
   neither can it be degraded. Both are reported rather than omitted so a
@@ -876,6 +877,41 @@ incomplete or any row is unkeyed, the merged total is a conservative lower
 bound derived from trustworthy source totals and proven distinct UIDs, never
 from the raw merged-row length. Source totals are not summed because local and
 server data can overlap.
+
+The structured `brain_context` / `code_context` / `project_context` merge
+follows the same rule for `total`: it is the exact union only when both tiers
+sent every row they counted (not truncated, `total` equal to the rows sent)
+and every row carries a unique canonical `uid`; otherwise it is the largest
+tier total or the deduplicated merged-row count, whichever is greater (a lower
+bound), never the sum. A seed resolved on both tiers counts once in
+`seeds_expanded`.
+
+Cross-tier identity for vault notes: a vault's `uid` hashes the vault's local
+root path, so the same vault indexed at two paths mints two vault hashes, and
+the uid alone cannot say whether two vault hashes are one vault. Within a tier
+the vault hash is kept. Across tiers a (local vault, server vault) pair is
+reconciled only on corroborating evidence: at least two distinct notes that
+agree on vault-relative path and lowercased title, or one `sec:` row that
+agrees on relative path, start line and content hash (only `sec:` carries a
+content hash; `head:` slugs are heading text and `tag:` is a name hash, so
+neither is evidence). The pairing must also be one-to-one. Inside a reconciled
+pair, notes still need an equal lowercased title to merge, and headings and
+tags merge by their vault-relative key (a tag by its name hash, not by path).
+Everything else stays vault-qualified: a duplicate row is possible, a false
+merge is not, with one limit. Corroboration is evidence, not proof: two
+genuinely different vaults on different tiers that share two same-path,
+same-title notes (for example two vaults from one template) or one section
+content hash will be reconciled and their same-path, same-title notes will
+merge. When either tier holds a vault that is neither shared nor reconciled,
+the merged `brain_search` total is reported as a `gte` lower bound, never
+`eq`. A path-independent vault fingerprint would need a persisted-uid
+migration and is not part of this behaviour.
+
+A row whose `uid` is not a recognised canonical shape (for example `proj:` or
+`contract:` rows) is keyed by its raw uid string, never by title, and never
+counts as proof of a distinct set. On the structured merge the lower-bound
+`total` carries no relation marker; `truncated` is the only signal that it is
+not the exact union.
 
 ### Staleness detection
 

@@ -5,11 +5,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use nestweaver_schema::uid::{
-    SearchEntityUidKind, normalize_search_entity_uid, normalize_search_symbol_canonical_id,
-};
+use nestweaver_schema::uid::normalize_search_symbol_canonical_id;
 use serde_json::Value;
 
+use crate::dedup::{
+    EntityKey, entity_key_for_uid, has_unique_canonical_identities, identify_tiers,
+    reconcile_vault_pairs,
+};
 use crate::merge::rrf_merge;
 
 #[derive(Clone, Copy)]
@@ -56,19 +58,28 @@ fn search_count_metadata(value: &Value, result_count: usize) -> SearchCountMetad
 /// never used as a federation proof identity. Older or malformed responses
 /// remain visible but unkeyed and cannot prove union cardinality.
 fn brain_search_logical_uid(value: &Value) -> Option<String> {
+    brain_search_entity(value).map(|entity| entity.key)
+}
+
+/// The [`EntityKey`] of a `brain_search` row (schema-parsed uid, presentation
+/// kind agreeing with the uid family). nw-901: a tag row carries kind `"tag"`,
+/// not `"note"`, so it was previously never keyed. nw-902: the vault hash is
+/// reconciled across tiers by `dedup::reconcile_vault_pairs`.
+fn brain_search_entity(value: &Value) -> Option<EntityKey> {
     let uid = value.get("uid").and_then(Value::as_str)?;
     let kind = value.get("kind").and_then(Value::as_str)?;
-    let (uid_kind, normalized) = normalize_search_entity_uid(uid)?;
-    match uid_kind {
-        SearchEntityUidKind::Note | SearchEntityUidKind::Tag => {
-            (kind == "note").then_some(normalized)
-        }
-        SearchEntityUidKind::Symbol => {
+    let title = value.get("title").and_then(Value::as_str);
+    let entity = entity_key_for_uid(uid, None, title)?;
+    match entity.family {
+        "note" | "tag" => (kind == entity.family).then_some(entity),
+        "sym" => {
             kind.strip_prefix("Symbol/")
                 .filter(|symbol_kind| !symbol_kind.is_empty())?;
             let canonical_id = value.get("canonical_id").and_then(Value::as_str)?;
-            normalize_search_symbol_canonical_id(uid, canonical_id)
+            let key = normalize_search_symbol_canonical_id(uid, canonical_id)?;
+            Some(entity.with_key(key))
         }
+        _ => None,
     }
 }
 
@@ -93,21 +104,31 @@ struct RankedSearchResult {
 fn merge_brain_search_items(
     local_items: Vec<Value>,
     server_items: Vec<Value>,
-) -> (Vec<Value>, u64) {
+) -> (Vec<Value>, u64, bool) {
     const RRF_K: f64 = 60.0;
     const LOCAL_WEIGHT: f64 = 1.5;
     const SERVER_WEIGHT: f64 = 1.0;
 
+    let mut local_entities: Vec<Option<EntityKey>> =
+        local_items.iter().map(brain_search_entity).collect();
+    let mut server_entities: Vec<Option<EntityKey>> =
+        server_items.iter().map(brain_search_entity).collect();
+    let vault_unproven = {
+        let mut local_keys: Vec<&mut EntityKey> = local_entities.iter_mut().flatten().collect();
+        let mut server_keys: Vec<&mut EntityKey> = server_entities.iter_mut().flatten().collect();
+        reconcile_vault_pairs(&mut local_keys, &mut server_keys)
+    };
+
     let mut keyed: HashMap<String, RankedSearchResult> = HashMap::new();
     let mut unkeyed = Vec::new();
 
-    for (source, items, weight) in [
-        ("local", local_items, LOCAL_WEIGHT),
-        ("server", server_items, SERVER_WEIGHT),
+    for (source, items, entities, weight) in [
+        ("local", local_items, local_entities, LOCAL_WEIGHT),
+        ("server", server_items, server_entities, SERVER_WEIGHT),
     ] {
-        for (rank, value) in items.into_iter().enumerate() {
+        for (rank, (value, entity)) in items.into_iter().zip(entities).enumerate() {
             let score = weight / (rank as f64 + RRF_K + 1.0);
-            if let Some(uid) = brain_search_logical_uid(&value) {
+            if let Some(uid) = entity.map(|e| e.key) {
                 if let Some(existing) = keyed.get_mut(&uid) {
                     existing.score += score;
                 } else {
@@ -141,7 +162,36 @@ fn merge_brain_search_items(
     (
         ranked.into_iter().map(|result| result.value).collect(),
         proven_identity_count,
+        vault_unproven,
     )
+}
+
+/// The one rule for a merged total over overlapping tiers, shared by the
+/// `brain_search` envelope and the structured `brain_context` /
+/// `code_context` / `project_context` envelope. Tier totals are NEVER summed
+/// (the tiers overlap): the total is the exact union count only when both
+/// tiers are `complete` (exact, untruncated, uniquely identified rows), and
+/// otherwise a conservative lower bound -- the largest tier lower bound, the
+/// proven union size, or 1 when anything was returned.
+fn combine_totals(
+    complete: bool,
+    union_count: u64,
+    local_lower_bound: Option<u64>,
+    server_lower_bound: Option<u64>,
+    returned: u64,
+) -> (u64, &'static str) {
+    if complete {
+        (union_count, "eq")
+    } else {
+        (
+            local_lower_bound
+                .unwrap_or(0)
+                .max(server_lower_bound.unwrap_or(0))
+                .max(union_count)
+                .max(u64::from(returned > 0)),
+            "gte",
+        )
+    }
 }
 
 fn union_expansion_terms(local: &Value, server: &Value) -> Vec<String> {
@@ -371,11 +421,15 @@ pub fn merge_json_results(local: &Value, server: &Value) -> Value {
     let local_identities_complete = has_proven_unique_search_identities(&local_items);
     let server_identities_complete = has_proven_unique_search_identities(&server_items);
 
-    let (values, proven_identity_count) = if is_brain_search {
+    let (values, proven_identity_count, vault_unproven) = if is_brain_search {
         merge_brain_search_items(local_items, server_items)
     } else {
         let merged = rrf_merge(local_items, server_items);
-        (merged.into_iter().map(|mr| mr.value).collect(), 0_u64)
+        (
+            merged.into_iter().map(|mr| mr.value).collect(),
+            0_u64,
+            false,
+        )
     };
     let returned = values.len() as u64;
 
@@ -384,20 +438,15 @@ pub fn merge_json_results(local: &Value, server: &Value) -> Value {
         let complete = local_count.complete
             && server_count.complete
             && local_identities_complete
-            && server_identities_complete;
-        let (total, relation) = if complete {
-            (proven_identity_count, "eq")
-        } else {
-            (
-                local_count
-                    .lower_bound
-                    .unwrap_or(0)
-                    .max(server_count.lower_bound.unwrap_or(0))
-                    .max(proven_identity_count)
-                    .max(u64::from(returned > 0)),
-                "gte",
-            )
-        };
+            && server_identities_complete
+            && !vault_unproven;
+        let (total, relation) = combine_totals(
+            complete,
+            proven_identity_count,
+            local_count.lower_bound,
+            server_count.lower_bound,
+            returned,
+        );
         response["query"] = local
             .get("query")
             .or_else(|| server.get("query"))
@@ -561,8 +610,37 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        // nw-903: one entity resolved as a seed on BOTH tiers is one seed. A
+        // server seed is dropped only when its canonical key is among the LOCAL
+        // seeds (never against other server seeds, so distinct server-side
+        // overloads that share a key all survive); rows without a canonical
+        // key are always kept. `shared_seeds` counts each matched local key
+        // once and corrects the summed `seeds_expanded` below.
+        let mut shared_seeds = 0_u64;
         if let Some(server_seeds) = server.get("seeds").and_then(|v| v.as_array()) {
-            seeds.extend(server_seeds.iter().cloned());
+            let (seed_ids, server_seed_ids, _) = identify_tiers(&seeds, server_seeds);
+            let local_keys: HashSet<String> = seed_ids
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.entity)
+                .filter(|e| e.canonical)
+                .map(|e| e.key)
+                .collect();
+            let mut matched: HashSet<String> = HashSet::new();
+            for (seed, id) in server_seeds.iter().zip(server_seed_ids) {
+                let key = id
+                    .and_then(|id| id.entity)
+                    .filter(|e| e.canonical)
+                    .map(|e| e.key);
+                match key {
+                    Some(key) if local_keys.contains(&key) => {
+                        if matched.insert(key) {
+                            shared_seeds += 1;
+                        }
+                    }
+                    _ => seeds.push(seed.clone()),
+                }
+            }
         }
 
         let mut unresolved = local
@@ -594,14 +672,28 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
             result["expansion_terms"] = Value::Array(expansion);
         }
         // Additive accounting: the merged `connected` array draws from BOTH tiers,
-        // so these counts must be the SUM, not the local-only value — otherwise an
+        // so these counts are the SUM, not the local-only value — otherwise an
         // agent that reads tokens_used/token_budget to decide whether to fetch more
         // context reasons against a number that doesn't match the payload it got.
+        // The one correction is `seeds_expanded`: a seed both tiers expanded is
+        // one seed. It is applied only when BOTH tiers explicitly report
+        // `seeds_truncated: false` (a cut tier may not have expanded a listed
+        // seed, so subtracting could undercount); otherwise the plain sum stays.
         for key in ["seeds_expanded", "tokens_used", "token_budget"] {
             let l = local.get(key).and_then(|v| v.as_u64());
             let s = server.get(key).and_then(|v| v.as_u64());
             match (l, s) {
-                (Some(a), Some(b)) => result[key] = Value::from(a.saturating_add(b)),
+                (Some(a), Some(b)) => {
+                    let sum = a.saturating_add(b);
+                    let both_uncut = [local, server].iter().all(|tier| {
+                        tier.get("seeds_truncated").and_then(Value::as_bool) == Some(false)
+                    });
+                    result[key] = Value::from(if key == "seeds_expanded" && both_uncut {
+                        sum.saturating_sub(shared_seeds)
+                    } else {
+                        sum
+                    });
+                }
                 (Some(a), None) => result[key] = Value::from(a),
                 (None, Some(b)) => result[key] = Value::from(b),
                 (None, None) => {}
@@ -695,6 +787,9 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
         let dropped_owners = result["connected"]
             .as_array_mut()
             .map_or(0, recap_module_owners);
+        // The deduplicated union size (owner cap applied, row cap NOT yet) --
+        // what the exact-total rule below counts.
+        let union_len = result["connected"].as_array().map_or(0, Vec::len) as u64;
         let local_owners = local.get("module_owners_omitted").and_then(Value::as_u64);
         let server_owners = server.get("module_owners_omitted").and_then(Value::as_u64);
         if local_owners.is_some() || server_owners.is_some() || dropped_owners > 0 {
@@ -808,26 +903,50 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
         // nw-320. This envelope is rebuilt key by key, so a field not re-added
         // here is silently dropped — which is exactly how a federated
         // `code_context` would have lost the pre-cap total the tool now
-        // reports. `total` SUMS across tiers (each tier counts its own
-        // matches) rather than being recomputed from the merged array, because
-        // recomputing it from what survived is the defect itself.
+        // reports.
+        //
+        // nw-903: `total` follows the `brain_search` no-sum rule
+        // ([`combine_totals`]). The tiers overlap (a repo indexed on both), so
+        // summing double-counted every shared entity and tripped a false
+        // `truncated_by: "limit"`. It is the exact union count only when both
+        // tiers were complete (their `total` equals the rows they sent, not
+        // truncated, every row uniquely identified by a canonical uid);
+        // otherwise a lower bound. Owners the merge's owner cap dropped are
+        // counted in `module_owners_omitted`, never in `total`, as on a single
+        // tier.
         if local.get("total").is_some() || server.get("total").is_some() {
+            let rows = |tier: &Value| {
+                tier.get("connected")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            };
             let tier_total = |tier: &Value| {
                 tier.get("total")
                     .and_then(Value::as_u64)
-                    .or_else(|| {
-                        tier.get("connected")
-                            .and_then(|c| c.as_array())
-                            .map(|a| a.len() as u64)
-                    })
-                    .unwrap_or(0)
+                    .unwrap_or(rows(tier).len() as u64)
             };
-            // nw-113: owners the merge's owner cap dropped are counted in
-            // `module_owners_omitted`, never in `total`, as on a single tier.
-            let total = tier_total(local)
-                .saturating_add(tier_total(server))
-                .saturating_sub(dropped_owners as u64);
+            let tier_complete = |tier: &Value| {
+                let rows = rows(tier);
+                tier_total(tier) == rows.len() as u64
+                    && !tier
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    && has_unique_canonical_identities(&rows)
+            };
             let connected_len = result["connected"].as_array().map_or(0, Vec::len) as u64;
+            let vault_unproven = identify_tiers(&rows(local), &rows(server)).2;
+            // No `_relation` marker is emitted on this envelope (it has no such
+            // field): `truncated` is the only signal that `total` is a lower
+            // bound rather than the exact union.
+            let (total, _relation) = combine_totals(
+                tier_complete(local) && tier_complete(server) && !vault_unproven,
+                union_len,
+                Some(tier_total(local)),
+                Some(tier_total(server)),
+                connected_len,
+            );
             result["total"] = Value::from(total.max(connected_len));
             if total > connected_len {
                 result["truncated"] = Value::from(true);
@@ -1418,6 +1537,274 @@ mod tests {
         assert_eq!(items.len(), 1);
     }
 
+    // ── nw-898 / nw-901 / nw-902 / nw-903 regressions ───────────────
+
+    fn vault_row_uids(instance: &str, root: &str, rel: &str) -> (String, String) {
+        let vault = nestweaver_schema::uid::vault_uid(instance, root);
+        (vault.clone(), nestweaver_schema::uid::note_uid(&vault, rel))
+    }
+
+    fn search_response(results: Vec<Value>) -> Value {
+        complete_search_response("zebra", results)
+    }
+
+    /// nw-901: a tag present on both tiers is ONE row and the total stays
+    /// an exact union (tag rows carry kind "tag", which used to be unkeyed).
+    #[test]
+    fn brain_search_tag_rows_dedup_and_keep_eq() {
+        let tag = |instance: &str, root: &str| {
+            let vault = nestweaver_schema::uid::vault_uid(instance, root);
+            json!({
+                "uid": nestweaver_schema::uid::tag_uid(&vault, "zebra"),
+                "kind": "tag", "title": "zebra", "location": null,
+            })
+        };
+        // Same vault hash on both tiers (the nw-901 repro); the instance differs.
+        let local = search_response(vec![tag("local", "/shared/vault")]);
+        let server = search_response(vec![tag("srv", "/shared/vault")]);
+        let merged = merge_json_results(&local, &server);
+        assert_eq!(merged["results"].as_array().unwrap().len(), 1, "{merged}");
+        assert_eq!(merged["total_matches"], 1, "{merged}");
+        assert_eq!(merged["total_matches_relation"], "eq", "{merged}");
+        assert_eq!(merged["truncated"], false, "{merged}");
+    }
+
+    /// nw-902: the same vault indexed at two different root paths reconciles:
+    /// notes dedup and the exact total is the distinct count, not 2x.
+    #[test]
+    fn brain_search_notes_reconcile_across_vault_root_paths() {
+        let note = |instance: &str, root: &str, rel: &str, title: &str| {
+            let (_, uid) = vault_row_uids(instance, root, rel);
+            json!({"uid": uid, "kind": "note", "title": title, "location": rel})
+        };
+        let local = search_response(vec![
+            note("local", "/laptop/vault", "a.md", "Alpha"),
+            note("local", "/laptop/vault", "b.md", "Beta"),
+        ]);
+        let server = search_response(vec![
+            note("srv", "/srv/clone", "a.md", "Alpha"),
+            note("srv", "/srv/clone", "b.md", "Beta"),
+            note("srv", "/srv/clone", "c.md", "Gamma"),
+        ]);
+        let merged = merge_json_results(&local, &server);
+        assert_eq!(merged["results"].as_array().unwrap().len(), 3, "{merged}");
+        assert_eq!(merged["total_matches"], 3, "{merged}");
+        assert_eq!(merged["total_matches_relation"], "eq", "{merged}");
+    }
+
+    /// nw-902 false-merge guard: the same README.md/"README" in two DIFFERENT
+    /// vaults (a single agreeing note, no section match) is two rows and the
+    /// total is only a lower bound, never an exact count.
+    #[test]
+    fn brain_search_single_agreeing_note_is_not_merged_or_called_exact() {
+        let note = |instance: &str, root: &str| {
+            let (_, uid) = vault_row_uids(instance, root, "README.md");
+            json!({"uid": uid, "kind": "note", "title": "README", "location": "README.md"})
+        };
+        let merged = merge_json_results(
+            &search_response(vec![note("local", "/laptop/a")]),
+            &search_response(vec![note("srv", "/srv/b")]),
+        );
+        assert_eq!(merged["results"].as_array().unwrap().len(), 2, "{merged}");
+        assert_eq!(merged["total_matches_relation"], "gte", "{merged}");
+        assert_eq!(merged["truncated"], true, "{merged}");
+    }
+
+    /// nw-902 limit: a tier holding two vaults with the same relative path
+    /// keeps them distinct and is NOT reconciled across tiers (a duplicate,
+    /// never a dropped note).
+    #[test]
+    fn brain_search_same_path_in_two_vaults_of_one_tier_stays_distinct() {
+        let note = |instance: &str, root: &str| {
+            let (_, uid) = vault_row_uids(instance, root, "README.md");
+            json!({"uid": uid, "kind": "note", "title": "README", "location": "README.md"})
+        };
+        let local = search_response(vec![
+            note("local", "/laptop/vault-a"),
+            note("local", "/laptop/vault-b"),
+        ]);
+        let server = search_response(vec![note("srv", "/srv/clone")]);
+        let merged = merge_json_results(&local, &server);
+        assert_eq!(merged["results"].as_array().unwrap().len(), 3, "{merged}");
+        assert_eq!(merged["total_matches_relation"], "gte", "{merged}");
+    }
+
+    fn vault_entities(instance: &str, root: &str) -> Vec<Value> {
+        let vault = nestweaver_schema::uid::vault_uid(instance, root);
+        let note = nestweaver_schema::uid::note_uid(&vault, "zebra.md");
+        let other = nestweaver_schema::uid::note_uid(&vault, "other.md");
+        vec![
+            json!({"uid": note, "kind": "note", "title": "Shared Zebra Note"}),
+            json!({
+                "uid": nestweaver_schema::uid::heading_uid(&note, "shared-zebra-note", 1),
+                "kind": "heading", "title": "Shared Zebra Note",
+            }),
+            json!({
+                "uid": nestweaver_schema::uid::section_uid(&note, 3, "abc123"),
+                "kind": "section", "title": "Shared Zebra Note",
+            }),
+            json!({
+                "uid": nestweaver_schema::uid::section_uid(&other, 3, "def456"),
+                "kind": "section", "title": "Shared Zebra Note",
+            }),
+        ]
+    }
+
+    /// nw-898 + nw-902: four distinct entities that share a title (and have no
+    /// location) are all kept, and the same four on the other tier (different
+    /// instance and vault root) coalesce to exactly four rows.
+    #[test]
+    fn context_merge_keeps_distinct_entities_and_dedups_across_tiers() {
+        let local = json!({"seeds": [], "connected": vault_entities("local", "/laptop/v")});
+        let server = json!({"seeds": [], "connected": vault_entities("srv", "/srv/c")});
+        let merged = merge_structured_results(&local, &server);
+        let connected = merged["connected"].as_array().unwrap();
+        assert_eq!(connected.len(), 4, "{merged}");
+        assert!(
+            connected.iter().all(|r| r["_provenance"] == "both"),
+            "{merged}"
+        );
+
+        // One tier alone loses nothing either.
+        let alone = merge_structured_results(&local, &json!({"seeds": [], "connected": []}));
+        assert_eq!(alone["connected"].as_array().unwrap().len(), 4, "{alone}");
+    }
+
+    fn sym(instance: &str, name: &str, line: u32) -> Value {
+        let repo = nestweaver_schema::uid::repo_uid(instance, "https://example.com/acme/api.git");
+        json!({
+            "uid": nestweaver_schema::uid::symbol_uid(&repo, "src/lib.rs", name, line),
+            "name": name,
+        })
+    }
+
+    /// nw-903 (repro): one symbol on both tiers, each tier complete -> the
+    /// merged total is the union (1), not the sum (2); no false truncation.
+    #[test]
+    fn context_total_of_overlapping_complete_tiers_is_the_union() {
+        let local = json!({
+            "seeds": [], "connected": [sym("local", "f", 3)], "total": 1,
+            "limit": 500, "truncated": false, "truncated_by": null,
+            "seeds_expanded": 1,
+        });
+        let server = json!({
+            "seeds": [], "connected": [sym("srv", "f", 3)], "total": 1,
+            "limit": 500, "truncated": false, "truncated_by": null,
+            "seeds_expanded": 1,
+        });
+        let merged = merge_structured_results(&local, &server);
+        assert_eq!(merged["connected"].as_array().unwrap().len(), 1, "{merged}");
+        assert_eq!(merged["total"], 1, "{merged}");
+        assert_eq!(merged["truncated"], false, "{merged}");
+        assert!(merged["truncated_by"].is_null(), "{merged}");
+    }
+
+    /// nw-903: when a tier was itself truncated its total is only a lower
+    /// bound, so the merge reports the larger bound (never the sum) and stays
+    /// truncated.
+    #[test]
+    fn context_total_with_a_truncated_tier_is_a_lower_bound_not_a_sum() {
+        let local = json!({
+            "seeds": [], "connected": [sym("local", "f", 3)], "total": 40,
+            "truncated": true, "truncated_by": "limit",
+        });
+        let server = json!({
+            "seeds": [], "connected": [sym("srv", "f", 3)], "total": 30,
+            "truncated": false, "truncated_by": null,
+        });
+        let merged = merge_structured_results(&local, &server);
+        assert_eq!(merged["total"], 40, "{merged}");
+        assert_eq!(merged["truncated"], true, "{merged}");
+    }
+
+    /// nw-903: rows that cannot be proven unique (raw, non-canonical uids)
+    /// never yield an exact union. The tier is complete by its own counts, so
+    /// an exact merge would report total 1 / not truncated; the lower-bound
+    /// path is distinguishable because the tier total exceeds its rows.
+    #[test]
+    fn context_total_of_unproven_rows_is_a_lower_bound() {
+        let local = json!({
+            "seeds": [], "connected": [{"name": "a", "uid": "sym:x"}], "total": 5,
+            "truncated": true,
+        });
+        let server = json!({"seeds": [], "connected": [{"name": "b", "uid": "sym:y"}], "total": 1});
+        let merged = merge_structured_results(&local, &server);
+        assert_eq!(merged["total"], 5, "{merged}");
+        assert_eq!(merged["truncated"], true, "{merged}");
+        // Even when both tiers look complete, raw-uid rows never prove an
+        // exact total: the (identical) rows merge to 1, total stays 1 as a
+        // lower bound and nothing is flagged truncated.
+        let same = json!({"seeds": [], "connected": [{"name": "a", "uid": "sym:x"}], "total": 1});
+        let merged = merge_structured_results(&same, &same);
+        assert_eq!(merged["connected"].as_array().unwrap().len(), 1, "{merged}");
+        assert_eq!(merged["total"], 1, "{merged}");
+    }
+
+    /// nw-903 regression: a really truncated tier (total 900, 500 rows) stays a
+    /// truncated lower bound >= 900 next to a small complete tier.
+    #[test]
+    fn context_real_truncation_stays_flagged_in_the_merge() {
+        let rows: Vec<Value> = (0..500)
+            .map(|i| sym("local", &format!("f{i}"), i + 1))
+            .collect();
+        let local = json!({
+            "seeds": [], "connected": rows, "total": 900,
+            "truncated": true, "truncated_by": "limit", "limit": 500,
+        });
+        let server = json!({
+            "seeds": [], "connected": [sym("srv", "g", 1)], "total": 1,
+            "truncated": false, "truncated_by": null,
+        });
+        let merged = merge_structured_results(&local, &server);
+        assert!(merged["total"].as_u64().unwrap() >= 900, "{merged}");
+        assert_eq!(merged["truncated"], true, "{merged}");
+    }
+
+    /// nw-903: the same seed resolved on both tiers is one seed and counted once
+    /// in `seeds_expanded` (both tiers report `seeds_truncated: false`);
+    /// `tokens_used` stays additive (work done per tier).
+    #[test]
+    fn shared_seed_is_counted_once_in_seeds_expanded() {
+        let local = json!({
+            "seeds": [sym("local", "f", 3)], "connected": [], "seeds_truncated": false,
+            "seeds_expanded": 1, "tokens_used": 10,
+        });
+        let server = json!({
+            "seeds": [sym("srv", "f", 3)], "connected": [], "seeds_truncated": false,
+            "seeds_expanded": 1, "tokens_used": 12,
+        });
+        let merged = merge_structured_results(&local, &server);
+        assert_eq!(merged["seeds"].as_array().unwrap().len(), 1, "{merged}");
+        assert_eq!(merged["seeds_expanded"], 1, "{merged}");
+        assert_eq!(merged["tokens_used"], 22, "{merged}");
+
+        // A tier that cut its seeds (or does not say) keeps the plain sum.
+        let mut cut = server.clone();
+        cut["seeds_truncated"] = json!(true);
+        let merged = merge_structured_results(&local, &cut);
+        assert_eq!(merged["seeds_expanded"], 2, "{merged}");
+        let mut unknown = server.clone();
+        unknown.as_object_mut().unwrap().remove("seeds_truncated");
+        let merged = merge_structured_results(&local, &unknown);
+        assert_eq!(merged["seeds_expanded"], 2, "{merged}");
+    }
+
+    /// nw-903: only a server seed matching a LOCAL seed is dropped; two
+    /// distinct server seeds that share a key (same-scope overloads) survive.
+    #[test]
+    fn server_seeds_sharing_a_key_are_not_dropped_against_each_other() {
+        let local =
+            json!({"seeds": [], "connected": [], "seeds_truncated": false, "seeds_expanded": 0});
+        let a = sym("srv", "f", 3);
+        let b = sym("srv", "f", 3);
+        let server = json!({
+            "seeds": [a, b], "connected": [], "seeds_truncated": false, "seeds_expanded": 2,
+        });
+        let merged = merge_structured_results(&local, &server);
+        assert_eq!(merged["seeds"].as_array().unwrap().len(), 2, "{merged}");
+        assert_eq!(merged["seeds_expanded"], 2, "{merged}");
+    }
+
     // ── Merge helpers test ────────────────────────────────────────
 
     /// nw-557 F2: an all-miss `read_symbols` sent upstream because local was
@@ -1533,7 +1920,8 @@ mod tests {
     fn tag_search_row(instance: &str, root_path: &str, tag: &str) -> Value {
         json!({
             "uid": tag_uid(&vault_uid(instance, root_path), tag),
-            "kind": "note",
+            // nw-901: real tag rows carry kind "tag" (daemon `kind: "tag"`).
+            "kind": "tag",
             "title": tag
         })
     }
