@@ -228,15 +228,15 @@ class IsolatedDaemon:
                            capture_output=True, check=True, timeout=30)
 
     @staticmethod
-    def assert_daemon_status(result, *, indexed=True):
+    def assert_daemon_status(result, *, indexed=True, expected_repos=1):
         payload = json.loads(result.stdout)
         if (payload.get("runtime_telemetry") != "available"
                 or not isinstance(payload.get("indexing_active"), bool)
-                or (indexed and payload.get("repo_count") != 1)
+                or (indexed and payload.get("repo_count") != expected_repos)
                 or "daemon_runtime" in payload.get("degraded_components", [])):
             raise AssertionError(f"expected indexed fixture and live daemon telemetry: {payload}")
 
-    def wait_for_indexed_status(self, timeout=25):
+    def wait_for_indexed_status(self, timeout=25, *, expected_repos=1):
         deadline = time.monotonic() + min(timeout, self.timeout)
         last = None
         while True:
@@ -254,7 +254,7 @@ class IsolatedDaemon:
                     or not isinstance(observation.get("busy"), bool)):
                 raise AssertionError(f"expected explicit daemon observation: {last}")
             if not observation["stale"] and not observation["busy"]:
-                self.assert_daemon_status(result)
+                self.assert_daemon_status(result, expected_repos=expected_repos)
                 self.record(kind="indexed_status_current", observation=observation)
                 return result
             time.sleep(min(0.1, remaining))

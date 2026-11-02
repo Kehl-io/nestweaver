@@ -5,6 +5,7 @@ pub mod connect;
 pub mod hybrid;
 pub mod progress;
 pub mod repo_identity;
+pub mod runtime_status;
 
 // These modules moved to the `nestweaver-federation` crate (nw-017 Phase B,
 // 5a). Re-export them at their old paths so `nestweaver_client::discovery`,
@@ -1554,6 +1555,30 @@ impl DaemonClient {
             .await
             .context("brain_status RPC failed")?;
         Ok(resp.into_inner())
+    }
+
+    /// Read the daemon's immutable configuration provenance without graph counts.
+    pub async fn effective_config(&mut self) -> Result<nestweaver_proto::EffectiveConfig> {
+        self.inner
+            .get_effective_config(nestweaver_proto::BrainStatusRequest {})
+            .await
+            .context("get_effective_config RPC failed")
+            .map(tonic::Response::into_inner)
+    }
+
+    /// Read live runtime diagnostics even when typed graph counts are stale.
+    /// Uses the already-connected daemon and never invents current graph counts.
+    pub async fn brain_runtime_status(&mut self) -> Result<runtime_status::RuntimeStatus> {
+        let response = self
+            .inner
+            .brain_status_json(nestweaver_proto::JsonRequest {
+                args_json: "{}".to_string(),
+            })
+            .await
+            .context("brain_status_json runtime RPC failed")?;
+        let value = serde_json::from_str(&response.into_inner().result_json)
+            .context("decode brain_status_json runtime response")?;
+        runtime_status::RuntimeStatus::from_status_json(&value)
     }
 
     /// List Contract nodes through the daemon, optionally resolving an exact

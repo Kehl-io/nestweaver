@@ -9,6 +9,9 @@
 #[path = "helpers/catalogue_contract.rs"]
 mod catalogue_contract;
 
+#[path = "helpers/status_observation.rs"]
+mod status_observation;
+
 use assert_cmd::Command;
 use nestweaver_engine::{load_filemeta_sidecar, save_filemeta_sidecar, sidecar_path};
 use predicates::prelude::PredicateBooleanExt;
@@ -2034,6 +2037,21 @@ fn brain_status_json_via_daemon(db_path: &Path) -> (serde_json::Value, String) {
     let value = serde_json::from_str(&stdout)
         .unwrap_or_else(|error| panic!("brain status stdout is not JSON: {error}\n{stdout}"));
     (value, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+fn current_brain_status_json_via_daemon(db_path: &Path) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let (value, _) = brain_status_json_via_daemon(db_path);
+        if status_observation::is_current(&value) {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon status did not provide a current observation: {value}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// After `rm -f daemon.pid` under a live daemon, an ordinary read must still
@@ -5270,13 +5288,25 @@ fn daemon_mcp_and_cli_add_source_share_default_instance() {
     );
 
     // Exactly one vault row, under the CLI's "default" instance.
-    let status_output = mcp_tool_call_in_mode(
-        &db_path,
-        "brain_status",
-        serde_json::json!({}),
-        McpMode::Daemon,
-    );
-    let status = mcp_call_response(&status_output);
+    let status_deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let status = loop {
+        let output = mcp_tool_call_in_mode(
+            &db_path,
+            "brain_status",
+            serde_json::json!({}),
+            McpMode::Daemon,
+        );
+        let status = mcp_call_response(&output);
+        assert_eq!(status["result"]["isError"], false, "{status}");
+        if status_observation::is_current(&status["result"]["structuredContent"]) {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < status_deadline,
+            "MCP status did not provide a current observation: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
     let vaults = status["result"]["structuredContent"]["vaults"]
         .as_array()
         .unwrap_or_else(|| panic!("brain_status should list vaults; got: {status}"));
@@ -7907,12 +7937,7 @@ fn suggest_links_names_a_repo_whose_manifest_the_daemon_refused() {
         "{remedy}"
     );
 
-    let status = daemon_cmd()
-        .args(["brain", "status", "--json", "--db"])
-        .arg(&db_path)
-        .output()
-        .unwrap();
-    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let status = current_brain_status_json_via_daemon(&db_path);
     assert_eq!(
         status["manifest_failures"].as_array().map(Vec::len),
         Some(1),

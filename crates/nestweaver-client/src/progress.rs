@@ -123,7 +123,37 @@ fn format_rate(per_hour: f64) -> String {
 /// `write_queue_depth` with an empty holder is still reported, because
 /// "somebody is blocked but status cannot name what on" is exactly the silence
 /// this module exists to break.
-fn format_write_lock_clause(status: &BrainStatusResponse) -> Option<String> {
+#[derive(Clone, Copy)]
+struct WriteStatus<'a> {
+    write_holder: &'a str,
+    write_holder_seconds: i64,
+    write_queue_depth: i32,
+    embedding_status: Option<&'a EmbeddingStatus>,
+}
+
+impl<'a> From<&'a BrainStatusResponse> for WriteStatus<'a> {
+    fn from(status: &'a BrainStatusResponse) -> Self {
+        Self {
+            write_holder: &status.write_holder,
+            write_holder_seconds: status.write_holder_seconds,
+            write_queue_depth: status.write_queue_depth,
+            embedding_status: status.embedding_status.as_ref(),
+        }
+    }
+}
+
+impl<'a> From<&'a crate::runtime_status::RuntimeStatus> for WriteStatus<'a> {
+    fn from(status: &'a crate::runtime_status::RuntimeStatus) -> Self {
+        Self {
+            write_holder: &status.write_holder,
+            write_holder_seconds: status.write_holder_seconds,
+            write_queue_depth: status.write_queue_depth,
+            embedding_status: status.embedding_status.as_ref(),
+        }
+    }
+}
+
+fn format_write_lock_clause(status: WriteStatus<'_>) -> Option<String> {
     let queued = status.write_queue_depth.max(0);
     if status.write_holder.is_empty() && queued == 0 {
         return None;
@@ -138,10 +168,7 @@ fn format_write_lock_clause(status: &BrainStatusResponse) -> Option<String> {
     };
     // Only an embed's own progress may be attributed to an embed.
     if status.write_holder == "embed"
-        && let Some(progress) = status
-            .embedding_status
-            .as_ref()
-            .and_then(format_embed_progress)
+        && let Some(progress) = status.embedding_status.and_then(format_embed_progress)
     {
         clause.push_str(&format!(" ({progress})"));
     }
@@ -151,6 +178,10 @@ fn format_write_lock_clause(status: &BrainStatusResponse) -> Option<String> {
 /// One line telling a blocked caller what is in front of it, or `None` when
 /// nothing is.
 pub fn format_write_holder(status: &BrainStatusResponse) -> Option<String> {
+    format_write_holder_view(status.into())
+}
+
+fn format_write_holder_view(status: WriteStatus<'_>) -> Option<String> {
     let clause = format_write_lock_clause(status)?;
     let mut line = format!("waiting for the daemon write lock; {clause}");
     // `write_queue_depth` counts every waiter including this one, so only
@@ -171,6 +202,10 @@ pub fn format_write_holder(status: &BrainStatusResponse) -> Option<String> {
 /// assert "waiting" (which would be false for the holder), report what status
 /// actually knows.
 pub fn format_write_lock_contention(status: &BrainStatusResponse) -> Option<String> {
+    format_write_lock_contention_view(status.into())
+}
+
+fn format_write_lock_contention_view(status: WriteStatus<'_>) -> Option<String> {
     let clause = format_write_lock_clause(status)?;
     let queued = status.write_queue_depth.max(0);
     if queued == 0 {
@@ -272,7 +307,7 @@ async fn poll_loop(
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        match client.brain_status().await {
+        match client.brain_runtime_status().await {
             Ok(status) => {
                 let line = match kind {
                     // Our own RPC name in `write_holder` is ambiguous: either
@@ -281,15 +316,15 @@ async fn poll_loop(
                     // true either way rather than going silent on a blocked
                     // client (which is the bug this module exists to fix).
                     NoticeKind::Waiting { own_rpc } if status.write_holder == own_rpc => {
-                        format_write_lock_contention(&status)
+                        format_write_lock_contention_view((&status).into())
                     }
-                    NoticeKind::Waiting { .. } => format_write_holder(&status),
+                    NoticeKind::Waiting { .. } => format_write_holder_view((&status).into()),
                     NoticeKind::EmbedProgress => status
                         .embedding_status
                         .as_ref()
                         .and_then(format_embed_progress)
                         .map(|p| format!("embedding: {p}"))
-                        .or_else(|| format_write_holder(&status)),
+                        .or_else(|| format_write_holder_view((&status).into())),
                 };
                 if let Some(line) = line {
                     if first {
@@ -310,6 +345,32 @@ async fn poll_loop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stale_graph_json_keeps_the_same_live_write_and_embed_messages() {
+        let runtime = crate::runtime_status::RuntimeStatus::from_status_json(&serde_json::json!({
+            "runtime_telemetry":"available", "repo_count":null,
+            "status_observation":{"stale":true,"busy":true},
+            "write_holder":"embed", "write_holder_seconds":95, "write_queue_depth":3,
+            "embedding_status":{"pass_active":true,"pass_processed":14,"pass_total":20}
+        }))
+        .unwrap();
+        let typed = BrainStatusResponse {
+            write_holder: runtime.write_holder.clone(),
+            write_holder_seconds: runtime.write_holder_seconds,
+            write_queue_depth: runtime.write_queue_depth,
+            embedding_status: runtime.embedding_status.clone(),
+            ..Default::default()
+        };
+        let line = format_write_holder_view((&runtime).into()).unwrap();
+        assert_eq!(Some(line.clone()), format_write_holder(&typed));
+        assert!(line.contains("14 / 20 (70%)"), "{line}");
+        assert!(line.contains("2 other write command(s)"), "{line}");
+        assert_eq!(
+            format_write_lock_contention_view((&runtime).into()),
+            format_write_lock_contention(&typed)
+        );
+    }
+
     use super::*;
 
     fn active_pass(processed: u64, total: u64, started_secs_ago: i64) -> EmbeddingStatus {

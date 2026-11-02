@@ -1137,6 +1137,8 @@ service NestWeaverDaemon {
   // observation is stale or a writer is active. Use BrainStatusJson for
   // explicitly last-observed counts with as-of/age/stale and live runtime metadata.
   rpc BrainStatus(BrainStatusRequest) returns (BrainStatusResponse);
+  // Native-free, process-authoritative provenance; same status authorization.
+  rpc GetEffectiveConfig(BrainStatusRequest) returns (EffectiveConfig);
   rpc BrainStatusJson(JsonRequest) returns (JsonResponse);
   rpc RepoStates(RepoStatesRequest) returns (RepoStatesResponse);
   rpc HubNodes(HubNodesRequest) returns (HubNodesResponse);

@@ -60,11 +60,10 @@ fn stale(state: &DaemonState, observation: &Observation) -> bool {
         || needs_refresh(state, observation)
 }
 
-fn key(
+pub(super) fn runtime_status_scope(
     state: &DaemonState,
     extensions: &tonic::Extensions,
-    args: serde_json::Value,
-) -> Result<Key, Status> {
+) -> Result<(bool, nestweaver_engine::authz::VisibleRepos), Status> {
     use nestweaver_engine::authz::{Identity, VisibleRepos};
     let identity = extensions.get::<Identity>().unwrap_or(&Identity::Anonymous);
     let enabled = state.permission_source.is_enabled();
@@ -83,6 +82,17 @@ fn key(
     } else {
         VisibleRepos::All
     };
+    Ok((enabled, visible))
+}
+
+fn key(
+    state: &DaemonState,
+    extensions: &tonic::Extensions,
+    args: serde_json::Value,
+) -> Result<Key, Status> {
+    use nestweaver_engine::authz::Identity;
+    let identity = extensions.get::<Identity>().unwrap_or(&Identity::Anonymous);
+    let (enabled, visible) = runtime_status_scope(state, extensions)?;
     let args = nestweaver_mcp::tools::admit_tool_arguments("brain_status", args, Some(&visible))
         .map_err(|error| dispatch_err_to_status("brain_status", error))?;
     let mut principal = Sha256::new();
@@ -128,16 +138,7 @@ impl DaemonService {
         extensions: &tonic::Extensions,
         current_only: bool,
     ) -> Result<serde_json::Value, Status> {
-        let _activity = ConnectionGuard::read(&self.state);
-        let started = Instant::now();
-        let tool = "brain_status";
-        nestweaver_web::routes::metrics::GRPC_REQUESTS
-            .with_label_values(&[tool])
-            .inc();
-        let timeout = self.state.safeguards.effective_timeout(tool, None);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let _disconnect = arm_disconnect_cancel(cancel.clone());
-        let handler = async {
+        self.guarded_runtime_read("brain_status", async {
             let args = match args {
                 StatusArguments::Json(raw) => serde_json::from_str(raw).map_err(|error| {
                     Status::invalid_argument(format!("invalid JSON arguments: {error}"))
@@ -145,7 +146,23 @@ impl DaemonService {
                 StatusArguments::Value(args) => args,
             };
             self.status_snapshot(args, extensions, current_only).await
-        };
+        })
+        .await
+    }
+
+    async fn guarded_runtime_read<T>(
+        &self,
+        tool: &str,
+        handler: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        let _activity = ConnectionGuard::read(&self.state);
+        let started = Instant::now();
+        nestweaver_web::routes::metrics::GRPC_REQUESTS
+            .with_label_values(&[tool])
+            .inc();
+        let timeout = self.state.safeguards.effective_timeout(tool, None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _disconnect = arm_disconnect_cancel(cancel.clone());
         let response = if self.state.server_mode {
             with_safeguard_cancellable(tool, &self.state.safeguards, None, cancel, handler).await
         } else {
@@ -164,6 +181,23 @@ impl DaemonService {
                 .inc();
         }
         response
+    }
+
+    pub(super) async fn runtime_effective_config(
+        &self,
+        extensions: &tonic::Extensions,
+    ) -> Result<EffectiveConfig, Status> {
+        self.guarded_runtime_read("get_effective_config", async {
+            let (_, visible) = runtime_status_scope(&self.state, extensions)?;
+            nestweaver_mcp::tools::admit_tool_arguments(
+                "brain_status",
+                serde_json::json!({}),
+                Some(&visible),
+            )
+            .map_err(|error| dispatch_err_to_status("brain_status", error))?;
+            Ok(effective_config_proto(&self.state.effective_config))
+        })
+        .await
     }
 
     pub(super) fn http_brain_status_provider(

@@ -4257,7 +4257,7 @@ async fn hybrid_lookup_modes_preserve_rpc_shapes_and_partial_symbol_results() {
         let value = hybrid
             .query(
                 "read_symbols",
-                &json!({"targets":["localfn","main::serverfn"],"include_neighbors":false}),
+                &json!({"targets":["localfn","main::serverfn"],"include_neighbors":0}),
             )
             .await
             .unwrap();
@@ -4283,7 +4283,7 @@ async fn hybrid_lookup_modes_preserve_rpc_shapes_and_partial_symbol_results() {
         let found = hybrid
             .query(
                 "read_symbols",
-                &json!({"targets":["localfn"],"include_neighbors":false}),
+                &json!({"targets":["localfn"],"include_neighbors":0}),
             )
             .await
             .unwrap();

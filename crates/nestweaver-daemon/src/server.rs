@@ -10751,6 +10751,15 @@ impl NestWeaverDaemon for DaemonService {
         }))
     }
 
+    async fn get_effective_config(
+        &self,
+        request: Request<BrainStatusRequest>,
+    ) -> Result<Response<EffectiveConfig>, Status> {
+        self.runtime_effective_config(request.extensions())
+            .await
+            .map(Response::new)
+    }
+
     async fn brain_status(
         &self,
         r: Request<BrainStatusRequest>,
@@ -13210,6 +13219,7 @@ fn watcher_is_attached(state: &DaemonState) -> bool {
 /// without classifying it here or as mutating, forcing a deliberate
 /// (fail-closed) read/write decision.
 const READ_ONLY_ALLOWED_METHODS: &[&str] = &[
+    "GetEffectiveConfig",
     "AffectedTests",
     "BlastRadius",
     "BrainBrokenLinks",
@@ -13378,6 +13388,7 @@ fn declared_rpc_repo_scope(method: &str) -> Option<RpcRepoScope> {
         // dispatch while per-repo authorization is enabled.
         "BrainStatus"
         | "BrainStatusJson"
+        | "GetEffectiveConfig"
         | "DetectImplicitProjectsJson"
         | "BrainGuide"
         | "Clusters"
@@ -19362,6 +19373,44 @@ credential_method = "gh"
     }
 
     #[tokio::test]
+    async fn effective_config_runtime_preserves_defaults_and_status_authorization() {
+        use nestweaver_engine::authz::Identity;
+        let mut state = test_state_with_writer();
+        let defaults = DaemonService::new(state.clone())
+            .get_effective_config(Request::new(BrainStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            defaults.source,
+            Some(effective_config::Source::CompiledDefaults(_))
+        ));
+        Arc::get_mut(&mut state).unwrap().permission_source =
+            Arc::new(nestweaver_engine::authz::StaticConfigPermissionSource::new(
+                std::collections::HashMap::from([(
+                    "restricted".to_string(),
+                    vec!["github.com/visible/*".to_string()],
+                )]),
+            ));
+        let service = DaemonService::new(state);
+        for identity in [Identity::Anonymous, Identity::Token("restricted".into())] {
+            let mut request = Request::new(BrainStatusRequest {});
+            request.extensions_mut().insert(identity);
+            assert_eq!(
+                service
+                    .get_effective_config(request)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        let mut request = Request::new(BrainStatusRequest {});
+        request.extensions_mut().insert(Identity::Admin);
+        assert!(service.get_effective_config(request).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn brain_status_json_cold_idle_dirty_marker_keeps_diagnostics_available() {
         let state = test_state_with_writer();
         seed_vault_note_heading_embeddings(&state, "status:dirty", "status", "/missing/dirty");
@@ -19408,7 +19457,26 @@ credential_method = "gh"
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn brain_status_json_stays_truthful_under_real_native_admission_and_recovers() {
-        let state = test_state_with_writer();
+        let mut state = test_state_with_writer();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("process-config.toml");
+        std::fs::write(&config_path, "# process configuration provenance fixture\n").unwrap();
+        let canonical_config = std::fs::canonicalize(&config_path).unwrap();
+        let runtime_instance = lifecycle::instance_id_from_db_path(&state.db_path);
+        Arc::get_mut(&mut state).unwrap().effective_config =
+            EffectiveConfigProvenance::Configured(canonical_config.clone());
+        // The real binding file can disappear after process startup. It is
+        // never the authority for the already-running process's provenance.
+        let binding_path = lifecycle::effective_config_binding_path(&runtime_instance);
+        std::fs::create_dir_all(binding_path.parent().unwrap()).unwrap();
+        let binding = lifecycle::EffectiveConfigBinding::new(
+            std::process::id(),
+            lifecycle::EffectiveConfigBindingSource::Configured {
+                path: canonical_config.to_str().unwrap().to_string(),
+            },
+        );
+        std::fs::write(&binding_path, serde_json::to_vec(&binding).unwrap()).unwrap();
+        std::fs::remove_file(&binding_path).unwrap();
         seed_vault_note_heading_embeddings(&state, "status:before", "status", "/missing/status");
         let service = DaemonService::new(state.clone());
         service.prewarm_status_observations().await;
@@ -19495,6 +19563,13 @@ credential_method = "gh"
         )
         .await;
         let observed_elapsed = observed_started.elapsed();
+        let provenance_started = Instant::now();
+        let provenance = tokio::time::timeout(
+            Duration::from_millis(500),
+            service.get_effective_config(Request::new(BrainStatusRequest {})),
+        )
+        .await;
+        let provenance_elapsed = provenance_started.elapsed();
         let typed = tokio::time::timeout(
             Duration::from_millis(500),
             service.brain_status(Request::new(BrainStatusRequest {})),
@@ -19545,6 +19620,11 @@ credential_method = "gh"
         );
         let observed: serde_json::Value =
             serde_json::from_str(&observed.unwrap().unwrap().into_inner().result_json).unwrap();
+        assert!(provenance_elapsed < Duration::from_millis(500));
+        assert!(matches!(provenance.unwrap().unwrap().into_inner().source,
+            Some(effective_config::Source::ConfiguredPath(path))
+                if path == canonical_config.to_str().unwrap()));
+        assert!(!binding_path.exists());
         assert_eq!(observed["notes"], 1);
         assert_eq!(
             observed["vault_count"], 1,
@@ -36066,7 +36146,12 @@ external_model = "unavailable-test-model"
         let calls = Arc::new(AtomicU32::new(0));
         let mut guard = ReadOnlyGuard::new(false, true, CountingService(calls.clone()));
 
-        for method in ["ExportGraph", "IndexRepo", "UnknownFutureRpc"] {
+        for method in [
+            "ExportGraph",
+            "GetEffectiveConfig",
+            "IndexRepo",
+            "UnknownFutureRpc",
+        ] {
             let mut req = http::Request::builder()
                 .uri(format!("/nestweaver.daemon.v1.NestWeaverDaemon/{method}"))
                 .body(tonic::body::Body::default())
@@ -37224,11 +37309,19 @@ mod watcher_e2e_tests {
         // batch-lease fix this permanently reported `watch_code` here.
         let idle_status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let status = client
+                // Counts must be current; a publication can legitimately
+                // make typed status retryable until its observation refreshes.
+                let status = match client
                     .brain_status(nestweaver_proto::BrainStatusRequest {})
                     .await
-                    .expect("brain status while watcher is idle")
-                    .into_inner();
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(error) if error.code() == tonic::Code::Unavailable => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(error) => panic!("brain status while watcher is idle: {error}"),
+                };
                 if status.repo_count > 0 && status.write_holder.is_empty() {
                     break status;
                 }

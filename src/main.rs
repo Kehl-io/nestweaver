@@ -6155,6 +6155,18 @@ fn format_effective_config(config: Option<&nestweaver_proto::EffectiveConfig>) -
     }
 }
 
+fn format_watcher_status(watcher: &nestweaver_proto::WatcherStatus) -> String {
+    format!(
+        "Watcher: {} {} (session {}, controller {:?}, started {}, age {}s)",
+        watcher.kind,
+        watcher.target,
+        watcher.id,
+        watcher.controller_pid,
+        watcher.started_unix_seconds,
+        watcher.age_seconds
+    )
+}
+
 fn format_daemon_status_response(
     response: Result<&nestweaver_proto::BrainStatusResponse, &str>,
 ) -> String {
@@ -6173,15 +6185,7 @@ fn format_daemon_status_response(
                 }
             ));
             if let Some(watcher) = &status.watcher {
-                lines.push(format!(
-                    "Watcher: {} {} (session {}, controller {:?}, started {}, age {}s)",
-                    watcher.kind,
-                    watcher.target,
-                    watcher.id,
-                    watcher.controller_pid,
-                    watcher.started_unix_seconds,
-                    watcher.age_seconds
-                ));
+                lines.push(format_watcher_status(watcher));
             }
             lines.push("Embedding:".to_string());
             if let Some(embedding) = status.embedding_status.as_ref() {
@@ -6281,17 +6285,122 @@ fn format_daemon_not_running_status(summary: &str) -> String {
     )
 }
 
+enum DaemonDiagnosticStatus {
+    Current(Box<nestweaver_proto::BrainStatusResponse>),
+    Runtime {
+        status: Box<nestweaver_client::runtime_status::RuntimeStatus>,
+        config: Option<nestweaver_proto::EffectiveConfig>,
+        config_error: Option<String>,
+    },
+}
+
+fn daemon_rpc_error_has_code(error: &anyhow::Error, code: tonic::Code) -> bool {
+    error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == code)
+}
+
+fn format_live_daemon_status(
+    status: &nestweaver_client::runtime_status::RuntimeStatus,
+    config: Option<&nestweaver_proto::EffectiveConfig>,
+    config_error: Option<&str>,
+) -> String {
+    let config = match config_error {
+        Some(error) => format!("unknown (provenance query failed: {error})"),
+        None => format_effective_config(config),
+    };
+    let mut lines = vec![
+        format!("Config: {config}"),
+        "Runtime diagnostics: live; current graph observation unavailable".to_string(),
+        format!(
+            "Supervision: {}",
+            if status.supervision.is_empty() {
+                "unknown/unverifiable"
+            } else {
+                &status.supervision
+            }
+        ),
+    ];
+    if let Some(watcher) = &status.watcher {
+        lines.push(format_watcher_status(watcher));
+    }
+    lines.push("Embedding:".to_string());
+    lines.push(
+        status
+            .embedding_status
+            .as_ref()
+            .map(format_embedding_status)
+            .unwrap_or_else(|| "  State:            unknown (older daemon)".to_string()),
+    );
+    lines.push("Search index:".to_string());
+    lines.push(
+        status
+            .search_status
+            .as_ref()
+            .map(format_search_status)
+            .unwrap_or_else(|| "  State:            unknown (older daemon)".to_string()),
+    );
+    if let Some(line) = status
+        .code_links
+        .as_ref()
+        .and_then(format_code_links_status)
+    {
+        lines.push(line);
+    }
+    if let Some(line) = status
+        .cross_repo_links
+        .as_ref()
+        .and_then(format_cross_repo_links_status)
+    {
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 fn print_daemon_embedding_status(db_path: &Path) {
     let result = tokio::runtime::Runtime::new()
         .map_err(anyhow::Error::from)
         .and_then(|runtime| {
             runtime.block_on(async {
                 let mut client = nestweaver_client::DaemonClient::connect_existing(db_path).await?;
-                client.brain_status().await
+                match client.brain_status().await {
+                    Ok(status) => Ok(DaemonDiagnosticStatus::Current(Box::new(status))),
+                    Err(error) if daemon_rpc_error_has_code(&error, tonic::Code::Unavailable) => {
+                        let status = client.brain_runtime_status().await?;
+                        let (config, config_error) = match client.effective_config().await {
+                            Ok(config) => (Some(config), None),
+                            Err(error)
+                                if daemon_rpc_error_has_code(
+                                    &error,
+                                    tonic::Code::Unimplemented,
+                                ) =>
+                            {
+                                (None, None)
+                            }
+                            Err(error) => (None, Some(format!("{error:#}"))),
+                        };
+                        Ok(DaemonDiagnosticStatus::Runtime {
+                            status: Box::new(status),
+                            config,
+                            config_error,
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
             })
         });
     match result {
-        Ok(status) => println!("{}", format_daemon_status_response(Ok(&status))),
+        Ok(DaemonDiagnosticStatus::Current(status)) => {
+            println!("{}", format_daemon_status_response(Ok(&status)))
+        }
+        Ok(DaemonDiagnosticStatus::Runtime {
+            status,
+            config,
+            config_error,
+        }) => println!(
+            "{}",
+            format_live_daemon_status(&status, config.as_ref(), config_error.as_deref())
+        ),
         Err(error) => {
             let error = format!("{error:#}");
             println!("{}", format_daemon_status_response(Err(&error)));
@@ -6316,6 +6425,65 @@ mod daemon_status_renderer_tests {
             fallback_used: false,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn busy_live_diagnostics_keep_authoritative_config_without_graph_counts() {
+        let status = nestweaver_client::runtime_status::RuntimeStatus::from_status_json(
+            &serde_json::json!({
+                "runtime_telemetry":"available", "repo_count":null,
+                "write_holder":"embed", "write_holder_seconds":95,"write_queue_depth":2,
+                "embedding_status":{"state":"embedding","model_id":"actual-model"},
+                "code_links":{"pending":true,"reason":"current debt"}
+            }),
+        )
+        .unwrap();
+        let config = nestweaver_proto::EffectiveConfig {
+            source: Some(Source::ConfiguredPath("/canonical/live.toml".into())),
+        };
+        let text = format_live_daemon_status(&status, Some(&config), None);
+        assert!(
+            text.starts_with("Config: /canonical/live.toml\nRuntime diagnostics: live"),
+            "{text}"
+        );
+        assert!(
+            text.contains("current graph observation unavailable"),
+            "{text}"
+        );
+        assert!(text.contains("actual-model"), "{text}");
+        assert!(text.contains("current debt"), "{text}");
+        let legacy = format_live_daemon_status(&status, None, None);
+        assert!(legacy.contains("Config: unknown"), "{legacy}");
+        assert!(!legacy.contains("daemon is not running"), "{legacy}");
+        let denied = format_live_daemon_status(&status, None, Some("permission denied"));
+        assert!(
+            denied.contains("Config: unknown (provenance query failed: permission denied)"),
+            "{denied}"
+        );
+        assert!(denied.contains("actual-model"), "{denied}");
+        assert!(
+            !denied.contains("unreachable") && !denied.contains("booting"),
+            "{denied}"
+        );
+    }
+
+    #[test]
+    fn only_current_status_unavailable_selects_live_fallback() {
+        for code in [
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Unimplemented,
+        ] {
+            assert!(!daemon_rpc_error_has_code(
+                &anyhow::Error::new(tonic::Status::new(code, "fixture")),
+                tonic::Code::Unavailable
+            ));
+        }
+        assert!(daemon_rpc_error_has_code(
+            &anyhow::Error::new(tonic::Status::unavailable("busy")),
+            tonic::Code::Unavailable
+        ));
     }
 
     #[test]

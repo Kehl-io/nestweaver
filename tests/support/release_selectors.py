@@ -373,7 +373,7 @@ def during_index(fixture):
     # The unchanged full table must pass ONCE after all writer requests finish.
     # Persistent debt, malformed failures and selector regressions are never retried.
     cases(fixture)
-    state = json.loads(fixture.run("brain", "status", "--db", fixture.db, "--json").stdout)
+    state = json.loads(fixture.wait_for_indexed_status(expected_repos=2).stdout)
     assert state["index_compatibility"]["incomplete_repos"] == [], state
     assert not state["index_publication"]["dirty"], state
     assert fixture.child.poll() is None and int(fixture.pidfile.read_text()) == owned_pid

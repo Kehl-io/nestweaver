@@ -105,6 +105,23 @@ class FixtureSafetyTests(unittest.TestCase):
         self.assertTrue(all(0 < call.kwargs["timeout"] <= 3
                             for call in fixture.run.call_args_list))
 
+    def test_indexed_status_waits_for_expected_two_repositories(self):
+        fixture = self.make_fixture()
+        fixture.run = Mock(side_effect=[self.status_result(stale=True, repos=1),
+                                        self.status_result(repos=2)])
+        with patch("isolated_daemon.time.sleep"):
+            result = fixture.wait_for_indexed_status(expected_repos=2)
+        self.assertEqual(json.loads(result.stdout)["repo_count"], 2)
+        self.assertEqual(fixture.run.call_count, 2)
+
+    def test_indexed_status_rejects_current_wrong_expected_repository_count(self):
+        fixture = self.make_fixture()
+        fixture.run = Mock(return_value=self.status_result(repos=1))
+        with patch("isolated_daemon.time.sleep") as sleep, self.assertRaises(AssertionError):
+            fixture.wait_for_indexed_status(expected_repos=2)
+        self.assertEqual(fixture.run.call_count, 1)
+        sleep.assert_not_called()
+
     def test_indexed_status_wait_is_bounded_and_preserves_last_observation(self):
         fixture = self.make_fixture()
         fixture.run = Mock(return_value=self.status_result(stale=True, repos=0))

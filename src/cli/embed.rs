@@ -220,7 +220,7 @@ where
             Ok(mut client) => {
                 if model_id.is_some() {
                     let status = rt
-                        .block_on(client.brain_status())
+                        .block_on(client.brain_runtime_status())
                         .context("read the daemon's selected embedding model")?;
                     let selected = status.embedding_status.as_ref()
                         .map(|embedding| embedding.model_id.as_str())
@@ -247,7 +247,7 @@ where
                                 let status = if plan.scoped == 0 {
                                     None
                                 } else {
-                                    rt.block_on(client.brain_status())
+                                    rt.block_on(client.brain_runtime_status())
                                         .context("read embedding runtime readiness before skipping embed")?
                                         .embedding_status
                                 };
