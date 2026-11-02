@@ -55,6 +55,16 @@ pub fn net_git_command(
     cmd
 }
 
+/// Build a network-capable command with the same origin guard, IP pins and
+/// configured credentials for fetches and reads that may lazily fetch blobs.
+pub(crate) fn guarded_git_command(
+    url: &str,
+    credential_method: Option<&str>,
+) -> Result<std::process::Command> {
+    let guard = guard_clone_url(url)?;
+    Ok(net_git_command(&guard, credential_method))
+}
+
 /// Append the remedy to a git stderr that looks like missing credentials, so a
 /// private repo without auth points the operator at `[git] credential_method`
 /// (nw-828) instead of a bare "terminal prompts disabled".
@@ -250,8 +260,7 @@ impl BareClone {
     /// defense); non-remote schemes (file://, git://) are rejected here (see
     /// `guard_clone_url`).
     fn fetch_command(&self, operands: Vec<String>) -> Result<Command> {
-        let guard = guard_clone_url(&self.url)?;
-        let mut cmd = net_git_command(&guard, self.credential_method.as_deref());
+        let mut cmd = guarded_git_command(&self.url, self.credential_method.as_deref())?;
         cmd.arg("-C").arg(&self.path).args(operands);
         Ok(cmd)
     }

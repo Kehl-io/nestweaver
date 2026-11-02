@@ -1567,23 +1567,16 @@ struct CatFileBatch {
 impl CatFileBatch {
     /// Spawn `git -C <bare_path> cat-file --batch` with piped stdin/stdout, plus
     /// a dedicated reader thread that owns stdout and parses framed responses.
-    fn spawn(bare_path: &Path, max_source_file_bytes: u64) -> Result<Self> {
+    fn spawn(mut cmd: Command, max_source_file_bytes: u64) -> Result<Self> {
         // The pooled batch process is long-lived with an interactive stdin/stdout
         // protocol, so it can't go through `run_git_with_timeout` (which nulls
         // stdin and drains stdout to EOF). Its read deadline is enforced per
         // request via `CAT_FILE_READ_TIMEOUT`. Still isolate it from the host's
-        // system/global git config and credential helpers, like every other call.
-        let mut cmd = Command::new("git");
-        cmd.args([
-            "-C",
-            &bare_path.display().to_string(),
-            "cat-file",
-            "--batch",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-        apply_git_isolation(&mut cmd);
+        // system/global git config. The caller supplies the command so server
+        // reads retain the same credentials and SSRF pins as ordinary fetches.
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = cmd
             .spawn()
             .context("failed to spawn git cat-file --batch")?;
@@ -1764,6 +1757,9 @@ pub struct GitBareReader {
     /// `[git] credential_method` for the network fetches this reader makes
     /// (the blob prefetch, nw-832). `None` keeps the credential-less isolation.
     credential_method: Option<String>,
+    /// Explicit server read policy; ordinary cached/local readers do not need
+    /// an origin or DNS lookup just to read an already-present object.
+    guarded_remote_reads: bool,
     /// Lazily-spawned pooled `cat-file --batch` process. `None` until the first
     /// read; reset to `None` if the process dies so the next read re-spawns.
     batch: Mutex<Option<CatFileBatch>>,
@@ -1779,6 +1775,7 @@ impl GitBareReader {
             limits: IndexLimits::default(),
             policy: FilesystemReader::new(bare_path),
             credential_method: None,
+            guarded_remote_reads: false,
             batch: Mutex::new(None),
         }
     }
@@ -1792,6 +1789,7 @@ impl GitBareReader {
             limits,
             policy: FilesystemReader::new(bare_path),
             credential_method: None,
+            guarded_remote_reads: false,
             batch: Mutex::new(None),
         }
     }
@@ -1804,11 +1802,34 @@ impl GitBareReader {
         self
     }
 
-    /// Authenticate the blob prefetch like the clone and fetch do
-    /// (`[git] credential_method`, nw-828/nw-832).
+    /// Apply the server's guarded Git policy to prefetches and lazy reads.
+    /// Calling this, including with `None`, opts reads into origin validation
+    /// and the same IP pins and credential isolation as clone/fetch. Plain local
+    /// readers retain their cached/no-origin behavior.
     pub fn with_credential_method(mut self, method: Option<String>) -> Self {
         self.credential_method = method;
+        self.guarded_remote_reads = true;
         self
+    }
+
+    fn read_command(&self, operands: &[&str]) -> Result<Command> {
+        let mut cmd = if self.guarded_remote_reads && !self.local_objects_only {
+            let origin = crate::bare_clone::read_origin_url(&self.bare_path)?;
+            crate::bare_clone::guarded_git_command(&origin, self.credential_method.as_deref())?
+        } else {
+            let mut cmd = Command::new("git");
+            apply_git_isolation(&mut cmd);
+            if self.local_objects_only {
+                // Git versions predating --no-lazy-fetch ignore this env var.
+                // An empty transport allowlist also keeps repair offline on
+                // those versions, while cached object reads still work.
+                cmd.env("GIT_NO_LAZY_FETCH", "1")
+                    .env("GIT_ALLOW_PROTOCOL", "");
+            }
+            cmd
+        };
+        cmd.arg("-C").arg(&self.bare_path).args(operands);
+        Ok(cmd)
     }
 
     /// Attach `[[repos]] exclude` globs (nw-908), matched exactly as
@@ -1857,19 +1878,8 @@ impl GitBareReader {
     /// `git ls-tree -z <sha> -- <rel>`: the tree entry for one path (empty
     /// stdout when the path is absent from the commit).
     fn ls_tree_entry(&self, rel_path: &Path) -> Result<std::process::Output> {
-        let mut cmd = Command::new("git");
-        if self.local_objects_only {
-            cmd.env("GIT_NO_LAZY_FETCH", "1");
-        }
-        cmd.args([
-            "-C",
-            &self.bare_path.display().to_string(),
-            "ls-tree",
-            "-z",
-            &self.sha,
-            "--",
-        ])
-        .arg(rel_path);
+        let mut cmd = self.read_command(&["ls-tree", "-z", &self.sha, "--"])?;
+        cmd.arg(rel_path);
         run_git_with_timeout(cmd, git_net_timeout())
             .with_context(|| format!("git ls-tree {} -- {}", self.sha, rel_path.display()))
     }
@@ -1884,10 +1894,10 @@ impl GitBareReader {
     /// `file://` remote). Asking for the whole set once turns N fetches into
     /// ceil(N / [`PREFETCH_CHUNK`]).
     ///
-    /// Requires git >= 2.29 (`--no-write-fetch-head`) and, for the
-    /// missing-object probe to stay off the network, >= 2.44
-    /// (`GIT_NO_LAZY_FETCH`); on an older git the call errors and the index
-    /// falls back to per-blob fetches. Only the blobs the caller names are
+    /// Requires git >= 2.29 (`--no-write-fetch-head`). Metadata probes disable
+    /// every transport as well as requesting no lazy fetch, so older Git
+    /// versions that ignore `GIT_NO_LAZY_FETCH` cannot fetch during a probe.
+    /// Only the blobs the caller names are
     /// fetched: files the indexer reads for other reasons (build manifests,
     /// OpenAPI specs, anything `wants` rejects) still lazy-fetch individually,
     /// and a file a later `.brainignore` drops may have been fetched needlessly.
@@ -1898,18 +1908,16 @@ impl GitBareReader {
     /// `local_objects_only` reader (repair must not touch the network).
     ///
     /// The fetch is guarded exactly like `BareClone::fetch_branch`: the origin
-    /// URL goes through the SSRF guard and the connect IP is pinned. git's own
-    /// lazy fetch has no such guard.
+    /// URL goes through the SSRF guard and the connect IP is pinned. Server
+    /// lazy reads use the same guard through their prepared command.
     pub fn prefetch_blobs(&self, wanted: &[PathBuf]) -> Result<usize> {
         if self.local_objects_only || wanted.is_empty() {
             return Ok(0);
         }
         let git = |args: &[&str]| -> Result<std::process::Output> {
-            let mut cmd = Command::new("git");
-            cmd.arg("-C")
-                .arg(&self.bare_path)
-                .env("GIT_NO_LAZY_FETCH", "1")
-                .args(args);
+            let mut cmd = self.read_command(args)?;
+            cmd.env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_ALLOW_PROTOCOL", "");
             run_git_with_timeout(cmd, git_net_timeout())
         };
 
@@ -2039,7 +2047,10 @@ impl GitBareReader {
 
         // Lazily spawn the pooled batch process on the first read.
         if guard.is_none() {
-            match CatFileBatch::spawn(&self.bare_path, self.limits.max_source_file_bytes()) {
+            match self
+                .read_command(&["cat-file", "--batch"])
+                .and_then(|cmd| CatFileBatch::spawn(cmd, self.limits.max_source_file_bytes()))
+            {
                 Ok(batch) => *guard = Some(batch),
                 Err(err) => {
                     tracing::warn!(
@@ -2100,17 +2111,7 @@ impl GitBareReader {
         // emitting its bytes, so an oversized blob is never materialized here (the
         // batch reader's cap would otherwise be bypassed whenever this fallback
         // fires — spawn failure, mid-stream death, or timeout).
-        let mut size_cmd = Command::new("git");
-        if self.local_objects_only {
-            size_cmd.env("GIT_NO_LAZY_FETCH", "1");
-        }
-        size_cmd.args([
-            "-C",
-            &self.bare_path.display().to_string(),
-            "cat-file",
-            "-s",
-            &spec,
-        ]);
+        let size_cmd = self.read_command(&["cat-file", "-s", &spec])?;
         let size_output = run_git_with_timeout(size_cmd, git_net_timeout())
             .with_context(|| format!("failed to preflight object size for {spec}"))?;
         if !size_output.status.success() {
@@ -2137,11 +2138,7 @@ impl GitBareReader {
             }
             .into());
         }
-        let mut cmd = Command::new("git");
-        if self.local_objects_only {
-            cmd.env("GIT_NO_LAZY_FETCH", "1");
-        }
-        cmd.args(["-C", &self.bare_path.display().to_string(), "show", &spec]);
+        let cmd = self.read_command(&["show", &spec])?;
         let output = run_git_with_timeout(cmd, git_net_timeout())
             .with_context(|| format!("failed to run git show {spec}"))?;
         if !output.status.success() {
@@ -2323,18 +2320,7 @@ impl ContentReader for GitBareReader {
         // we can skip symlink (120000) and gitlink/submodule (160000) entries,
         // mirroring `FilesystemReader`'s `follow_links(false)`; otherwise a
         // symlink's target-path text would be indexed as file content.
-        let mut cmd = Command::new("git");
-        if self.local_objects_only {
-            cmd.env("GIT_NO_LAZY_FETCH", "1");
-        }
-        cmd.args([
-            "-C",
-            &self.bare_path.display().to_string(),
-            "ls-tree",
-            "-r",
-            "-z",
-            &self.sha,
-        ]);
+        let cmd = self.read_command(&["ls-tree", "-r", "-z", &self.sha])?;
         let output = if self.local_objects_only {
             crate::git_cmd::run_git_with_timeout_and_output_limit(
                 cmd,
@@ -3336,6 +3322,207 @@ mod tests {
         assert_ne!(
             excluded.eligibility_fingerprint(),
             unskipped.eligibility_fingerprint()
+        );
+    }
+
+    /// Configured server credentials must reach the actual pooled child and
+    /// both one-shot reads, including when blobs really are absent locally.
+    #[cfg(unix)]
+    #[test]
+    fn server_reader_gh_credentials_reach_missing_blob_reads() {
+        server_reader_credential_case("gh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_reader_env_credentials_reach_missing_blob_reads() {
+        server_reader_credential_case("env");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_reader_unsafe_origin_is_refused_before_credentials() {
+        server_reader_credential_case("unsafe-origin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_reader_local_objects_only_never_authenticates_or_fetches() {
+        server_reader_credential_case("local-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_reader_without_https_credentials_does_not_inherit_a_helper() {
+        server_reader_credential_case("none");
+        server_reader_credential_case("ssh");
+    }
+
+    /// Process-local PATH/env avoid races with the rest of the Rust suite.
+    /// The shim gates only body reads using real Git's credential protocol,
+    /// then execs real Git so the batch process retains its PID and pipes.
+    #[cfg(unix)]
+    fn server_reader_credential_case(case: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let child_case = std::env::var("NW_READER_CREDENTIAL_CHILD").ok();
+        if child_case
+            .as_deref()
+            .is_some_and(|selected| selected != case)
+        {
+            return;
+        }
+        if child_case.as_deref() != Some(case) {
+            let dir = tempfile::tempdir().unwrap();
+            let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .map(|p| p.join("git"))
+                .find(|p| p.is_file())
+                .unwrap()
+                .canonicalize()
+                .unwrap();
+            let shim = dir.path().join("git");
+            std::fs::write(&shim, r#"#!/bin/sh
+set -eu
+mode=other
+previous=
+for arg in "$@"; do
+    if test "$previous" = cat-file; then
+        case "$arg" in --batch) mode=batch;; -s) mode=size;; esac
+    fi
+    test "$arg" != show || mode=show
+    previous=$arg
+done
+if test "$mode" != other && test "${GIT_NO_LAZY_FETCH:-}" != 1; then
+    answer=$(printf 'protocol=https\nhost=github.com\n\n' | "$NW_REAL_GIT" credential fill 2>/dev/null) || exit 93
+    case "$answer" in *password=synthetic-reader-token*) ;; *) exit 94;; esac
+    printf '%s\n' "$mode" >> "$NW_READ_GATE_LOG"
+fi
+exec "$NW_REAL_GIT" "$@"
+"#).unwrap();
+            let gh = dir.path().join("gh");
+            std::fs::write(
+                &gh,
+                r#"#!/bin/sh
+host=
+while IFS== read -r key value; do
+    test "$key" != host || host=$value
+done
+if test "$host" = github.com; then
+    printf '%s\n' username=fixture password=synthetic-reader-token
+fi
+"#,
+            )
+            .unwrap();
+            for path in [&shim, &gh] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let path = std::env::join_paths(
+                std::iter::once(dir.path().to_path_buf())
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap();
+            let git_version = Command::new(&real_git).arg("--version").output().unwrap();
+            let git_diagnostic = format!(
+                "{} ({})",
+                real_git.display(),
+                String::from_utf8_lossy(&git_version.stdout).trim()
+            );
+            let test_name = std::thread::current().name().unwrap().to_string();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env("NW_READER_CREDENTIAL_CHILD", case)
+                .env("NW_REAL_GIT", real_git)
+                .env("NW_READ_GATE_LOG", dir.path().join("gates.log"))
+                .env("PATH", path)
+                .env("GH_TOKEN", "synthetic-reader-token")
+                .env("GH_CONFIG_DIR", dir.path().join("gh-config"))
+                .env_remove("GITHUB_TOKEN")
+                .env_remove("GH_HOST")
+                .env_remove("GIT_ASKPASS")
+                .env_remove("GIT_NO_LAZY_FETCH")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "credential case {case}, git {git_diagnostic}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (_tmp, bare, sha) = blobless_bare_repo(2);
+        assert_eq!(
+            missing_blobs(&bare, &sha),
+            2,
+            "fixture must begin genuinely blobless"
+        );
+        let gate_log = PathBuf::from(std::env::var_os("NW_READ_GATE_LOG").unwrap());
+        let method = match case {
+            "none" => None,
+            "unsafe-origin" | "local-only" => Some("gh".to_string()),
+            _ => Some(case.to_string()),
+        };
+        let reader = GitBareReader::new(&bare, &sha).with_credential_method(method);
+        if case == "unsafe-origin" {
+            super::test_util::git(
+                &bare,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://127.0.0.1:9/private.git",
+                ],
+            );
+            let error = reader.read_file(Path::new("f0.rs")).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("private/loopback"),
+                "guard must explain refusal: {error:#}"
+            );
+            assert!(
+                !gate_log.exists(),
+                "unsafe origin must not reach a credential helper"
+            );
+            assert_eq!(missing_blobs(&bare, &sha), 2);
+            return;
+        }
+        if case == "local-only" {
+            let reader = reader.local_objects_only();
+            assert!(reader.read_file(Path::new("f0.rs")).is_err());
+            assert!(
+                !gate_log.exists(),
+                "local-only reads must never authenticate"
+            );
+            assert_eq!(
+                missing_blobs(&bare, &sha),
+                2,
+                "local-only reads cannot fetch"
+            );
+            return;
+        }
+        if case == "none" || case == "ssh" {
+            assert!(reader.read_file(Path::new("f0.rs")).is_err());
+            assert!(!gate_log.exists(), "no HTTPS helper may be inherited");
+            assert_eq!(missing_blobs(&bare, &sha), 2);
+            return;
+        }
+        assert_eq!(
+            reader.read_file(Path::new("f0.rs")).unwrap(),
+            "pub fn f0() {}\n"
+        );
+        assert!(
+            reader.batch.lock().unwrap().is_some(),
+            "successful read must use the live pooled child"
+        );
+        assert_eq!(missing_blobs(&bare, &sha), 1);
+        assert_eq!(
+            reader
+                .read_file_via_show(Path::new("f1.rs"), decode_git_blob)
+                .unwrap(),
+            "pub fn f1() {}\n"
+        );
+        assert_eq!(missing_blobs(&bare, &sha), 0);
+        assert_eq!(
+            std::fs::read_to_string(gate_log).unwrap(),
+            "batch\nsize\nshow\n"
         );
     }
 
