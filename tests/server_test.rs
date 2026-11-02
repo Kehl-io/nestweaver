@@ -4211,11 +4211,103 @@ async fn daemon_mcp_boundary_single_node_without_upstream() {
 
 /// Exercise the public query router against two real authenticated daemons;
 /// response composition must keep lookup envelopes in every configured mode.
-// The legacy index_repo bootstrap above requires the internal CI artifact.
-// Standard-artifact local acceptance uses owned isolated-daemon fixtures.
-#[cfg(feature = "ci-direct-tests")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hybrid_lookup_modes_preserve_rpc_shapes_and_partial_symbol_results() {
+    // This case runs against the ordinary shipping binary, including locally.
+    fn shipping_command(db_path: &std::path::Path) -> StdCommand {
+        let mut command = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+        command
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .current_dir(db_path.parent().unwrap());
+        command
+    }
+    struct BootstrapStop {
+        db_path: std::path::PathBuf,
+        armed: bool,
+    }
+    impl Drop for BootstrapStop {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = shipping_command(&self.db_path)
+                    .args(["daemon", "--db"])
+                    .arg(&self.db_path)
+                    .arg("stop")
+                    .output();
+            }
+        }
+    }
+    fn index_and_provision_source(repo_dir: &std::path::Path, db_path: &std::path::Path) {
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let mut cleanup = BootstrapStop {
+            db_path: db_path.to_path_buf(),
+            armed: true,
+        };
+        let indexed = shipping_command(db_path)
+            .args(["index", "--repo"])
+            .arg(repo_dir)
+            .arg("--db")
+            .arg(db_path)
+            .output();
+        let listed = shipping_command(db_path)
+            .args(["list-repos", "--json", "--db"])
+            .arg(db_path)
+            .output();
+        // Always stop before asserting or parsing, including failed CLI calls.
+        let stopped = shipping_command(db_path)
+            .args(["daemon", "--db"])
+            .arg(db_path)
+            .arg("stop")
+            .output();
+        if stopped.as_ref().is_ok_and(|output| output.status.success()) {
+            cleanup.armed = false;
+        }
+        let indexed = indexed.expect("ordinary index command must execute");
+        let listed = listed.expect("ordinary repo-list command must execute");
+        let stopped = stopped.expect("ordinary stop command must execute");
+        assert!(indexed.status.success(), "index failed: {indexed:?}");
+        assert!(listed.status.success(), "list-repos failed: {listed:?}");
+        assert!(
+            stopped.status.success(),
+            "bootstrap stop failed: {stopped:?}"
+        );
+        let repos: Vec<nestweaver_schema::Repo> = serde_json::from_slice(&listed.stdout).unwrap();
+        assert_eq!(repos.len(), 1, "one actual indexed fixture repo");
+        let repo = &repos[0];
+        assert!(!repo.url.is_empty() && !repo.indexed_sha.is_empty());
+        let workspace = nestweaver_engine::bare_clone::bare_clone_root(db_path, None);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let clone = workspace.join(format!(
+            "{}.git",
+            nestweaver_engine::pull::clone_dir_name_from_url(&repo.url)
+        ));
+        let cloned = StdCommand::new("git")
+            .current_dir(db_path.parent().unwrap())
+            .args(["clone", "--bare", "--"])
+            .arg(repo_dir)
+            .arg(&clone)
+            .output()
+            .unwrap();
+        assert!(
+            cloned.status.success(),
+            "real bare clone failed: {cloned:?}"
+        );
+        let commit = StdCommand::new("git")
+            .current_dir(db_path.parent().unwrap())
+            .arg("--git-dir")
+            .arg(&clone)
+            .args([
+                "cat-file",
+                "-e",
+                &format!("{}^{{commit}}", repo.indexed_sha),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "clone must contain indexed commit: {commit:?}"
+        );
+    }
     let dir = tempfile::tempdir().unwrap();
     let local_repo = dir.path().join("local-repo");
     let remote_repo = dir.path().join("remote-repo");
@@ -4229,12 +4321,12 @@ async fn hybrid_lookup_modes_preserve_rpc_shapes_and_partial_symbol_results() {
         &remote_repo,
         &[("main.js", "function serverfn() { return 2; }")],
     );
-    index_repo(&local_repo, &local_db);
-    index_repo(&remote_repo, &remote_db);
+    index_and_provision_source(&local_repo, &local_db);
+    index_and_provision_source(&remote_repo, &remote_db);
     let _local_server =
-        helpers::server_guard::ServerGuard::start_with_auth(&local_db, HYBRID_TOKEN);
+        helpers::server_guard::ServerGuard::start_with_auth_graceful(&local_db, HYBRID_TOKEN);
     let remote_server =
-        helpers::server_guard::ServerGuard::start_with_auth(&remote_db, HYBRID_TOKEN);
+        helpers::server_guard::ServerGuard::start_with_auth_graceful(&remote_db, HYBRID_TOKEN);
     for mode in [
         RoutingMode::Fallback,
         RoutingMode::Merge,
@@ -4268,6 +4360,13 @@ async fn hybrid_lookup_modes_preserve_rpc_shapes_and_partial_symbol_results() {
         assert!(
             symbols.iter().any(|row| row["name"] == "serverfn"),
             "{mode:?}: {value}"
+        );
+        assert!(
+            symbols.iter().all(|row| row["body_available"] == true
+                && row["body"].as_str().is_some_and(|body| row["name"]
+                    .as_str()
+                    .is_some_and(|name| body.contains(name)))),
+            "each hit must read genuine indexed source: {mode:?}: {value}"
         );
         if mode != RoutingMode::Primary {
             assert_eq!(symbols.len(), 2, "{mode:?}: {value}");
@@ -4332,4 +4431,5 @@ async fn hybrid_lookup_modes_preserve_rpc_shapes_and_partial_symbol_results() {
             assert!(missing.get("results").is_none(), "{missing}");
         }
     }
+    eprintln!("hybrid_lookup_modes: all original assertions passed; draining owned query servers");
 }
