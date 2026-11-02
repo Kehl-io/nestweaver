@@ -228,18 +228,41 @@ class IsolatedDaemon:
                            capture_output=True, check=True, timeout=30)
 
     @staticmethod
-    def assert_daemon_status(result):
+    def assert_daemon_status(result, *, indexed=True):
         payload = json.loads(result.stdout)
         if (payload.get("runtime_telemetry") != "available"
                 or not isinstance(payload.get("indexing_active"), bool)
-                or payload.get("repo_count") != 1
+                or (indexed and payload.get("repo_count") != 1)
                 or "daemon_runtime" in payload.get("degraded_components", [])):
             raise AssertionError(f"expected indexed fixture and live daemon telemetry: {payload}")
+
+    def wait_for_indexed_status(self, timeout=25):
+        deadline = time.monotonic() + min(timeout, self.timeout)
+        last = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.record(kind="indexed_status_timeout", last_status=last)
+                raise TimeoutError(f"indexed status did not become current: {last}")
+            result = self.run("brain", "status", "--db", self.db, "--json",
+                              timeout=min(3, remaining))
+            self.assert_daemon_status(result, indexed=False)
+            last = json.loads(result.stdout)
+            observation = last.get("status_observation")
+            if (not isinstance(observation, dict)
+                    or not isinstance(observation.get("stale"), bool)
+                    or not isinstance(observation.get("busy"), bool)):
+                raise AssertionError(f"expected explicit daemon observation: {last}")
+            if not observation["stale"] and not observation["busy"]:
+                self.assert_daemon_status(result)
+                self.record(kind="indexed_status_current", observation=observation)
+                return result
+            time.sleep(min(0.1, remaining))
 
     def bootstrap(self):
         self.create_repository()
         self.run("index", "--repo", self.repo, "--db", self.db)
-        self.assert_daemon_status(self.run("brain", "status", "--db", self.db, "--json"))
+        self.wait_for_indexed_status()
         result = self.run("impact", "releaseTarget", "--db", self.db, "--json")
         payload = json.loads(result.stdout)
         if payload.get("status") in ("not_found", "ambiguous", "error"):
