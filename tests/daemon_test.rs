@@ -6,6 +6,27 @@
 //! Run with:
 //!   cargo test --test daemon_test -- --test-threads=1
 
+#[test]
+fn daemon_brain_status_text_with_user_upstream_has_a_live_reactor() {
+    let output = std::process::Command::new("python3")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/release_brain_status_upstream.py"),
+        )
+        .arg("--binary")
+        .arg(env!("CARGO_BIN_EXE_nestweaver"))
+        .output()
+        .expect("ordinary text-status fixture must execute");
+    assert!(
+        output.status.success(),
+        "ordinary text status failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[path = "helpers/catalogue_contract.rs"]
 mod catalogue_contract;
 

@@ -810,13 +810,18 @@ pub(crate) fn run_brain(
                         for ucfg in &upstream_configs {
                             let name = ucfg.name.as_deref().unwrap_or("upstream");
                             let mode = format!("{:?}", ucfg.mode).to_lowercase();
-                            match nestweaver_client::upstream::UpstreamHandle::from_config(ucfg) {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()?;
+                            // Lazy tonic channels spawn their transport task during
+                            // construction, before the first RPC is polled.
+                            let handle = {
+                                let _entered = rt.enter();
+                                nestweaver_client::upstream::UpstreamHandle::from_config(ucfg)
+                            };
+                            match handle {
                                 Ok(handle) => {
                                     // Try a quick HealthCheck to determine reachability.
-                                    let rt = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                        .unwrap();
                                     let health_result = rt.block_on(async {
                                         let mut client = handle.client();
                                         let mut req = tonic::Request::new(
