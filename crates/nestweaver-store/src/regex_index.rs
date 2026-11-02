@@ -76,6 +76,42 @@ impl RegexShardMetadata {
     }
 }
 
+/// Internal candidate identity. A note title and its frontmatter share a
+/// public UID but are distinct documents in the regex shard.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RegexDocumentIdentity {
+    pub kind: String,
+    pub uid: String,
+}
+
+impl RegexDocumentIdentity {
+    pub fn new(kind: &str, uid: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    fn query(&self, fields: Fields) -> Box<dyn Query> {
+        Box::new(BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(fields.uid, &self.uid),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(fields.kind, &self.kind),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RegexShardDocument<'a> {
     pub uid: &'a str,
@@ -547,7 +583,7 @@ impl RegexIndex {
         previous: &RegexShardMetadata,
         metadata: RegexShardMetadata,
         upserts: &[RegexShardDocument<'_>],
-        deletes: &[String],
+        deletes: &[RegexDocumentIdentity],
     ) -> Result<(), StoreError> {
         let prepared = self.prepare_update_scope(previous, metadata, upserts, deletes)?;
         if self.publish_prepared(prepared)? {
@@ -562,7 +598,7 @@ impl RegexIndex {
         previous: &RegexShardMetadata,
         metadata: RegexShardMetadata,
         upserts: &[RegexShardDocument<'_>],
-        deletes: &[String],
+        deletes: &[RegexDocumentIdentity],
     ) -> Result<PreparedRegexScope, StoreError> {
         if metadata.schema_version != REGEX_INDEX_SCHEMA_VERSION
             || metadata.tokenizer_fingerprint != REGEX_TOKENIZER_FINGERPRINT
@@ -628,12 +664,16 @@ impl RegexIndex {
         let mut writer = index
             .writer(50_000_000)
             .map_err(|error| StoreError::Query(format!("open regex shard writer: {error}")))?;
-        for uid in deletes
-            .iter()
-            .map(String::as_str)
-            .chain(upserts.iter().map(|document| document.uid))
-        {
-            writer.delete_term(Term::from_field_text(fields.uid, uid));
+        for identity in deletes.iter().cloned().chain(
+            upserts
+                .iter()
+                .map(|document| RegexDocumentIdentity::new(document.kind, document.uid)),
+        ) {
+            writer
+                .delete_query(identity.query(fields))
+                .map_err(|error| {
+                    StoreError::Query(format!("delete regex candidate {}: {error}", identity.uid))
+                })?;
         }
         writer.delete_term(Term::from_field_text(
             fields.uid,
@@ -845,7 +885,7 @@ impl RegexIndex {
     pub fn document_hashes(
         &self,
         scope_uid: &str,
-    ) -> Result<Option<std::collections::HashMap<String, String>>, StoreError> {
+    ) -> Result<Option<std::collections::HashMap<RegexDocumentIdentity, String>>, StoreError> {
         let Some((index, fields, metadata)) = self.open_current(scope_uid)? else {
             return Ok(None);
         };
@@ -870,8 +910,14 @@ impl RegexIndex {
                 continue;
             }
             let uid = extract_text(&document, fields.uid);
+            let kind = extract_text(&document, fields.kind);
             let text_hash = extract_text(&document, fields.text_hash);
-            if uid.is_empty() || text_hash.is_empty() || hashes.insert(uid, text_hash).is_some() {
+            let identity = RegexDocumentIdentity::new(&kind, &uid);
+            if uid.is_empty()
+                || kind.is_empty()
+                || text_hash.is_empty()
+                || hashes.insert(identity, text_hash).is_some()
+            {
                 return Err(StoreError::Query(format!(
                     "regex shard {scope_uid} has malformed or duplicate document identity"
                 )));
@@ -892,7 +938,7 @@ impl RegexIndex {
         &self,
         scope_uid: &str,
         changed: &[RegexShardDocument<'_>],
-        deleted: &[String],
+        deleted: &[RegexDocumentIdentity],
     ) -> Result<(usize, usize), StoreError> {
         let Some((index, fields, _)) = self.open_current(scope_uid)? else {
             return Ok((changed.iter().map(|doc| doc.trigrams.len()).sum(), 0));
@@ -903,21 +949,20 @@ impl RegexIndex {
             .try_into()
             .map_err(|e| StoreError::Query(format!("read changed postings: {e}")))?;
         let searcher = reader.searcher();
-        let desired: std::collections::HashMap<_, _> =
-            changed.iter().map(|doc| (doc.uid, doc.trigrams)).collect();
+        let desired: std::collections::HashMap<_, _> = changed
+            .iter()
+            .map(|doc| (RegexDocumentIdentity::new(doc.kind, doc.uid), doc.trigrams))
+            .collect();
         let mut added = changed.iter().map(|doc| doc.trigrams.len()).sum::<usize>();
         let mut removed = 0;
-        for uid in changed
+        for identity in changed
             .iter()
-            .map(|doc| doc.uid)
-            .chain(deleted.iter().map(String::as_str))
+            .map(|doc| RegexDocumentIdentity::new(doc.kind, doc.uid))
+            .chain(deleted.iter().cloned())
         {
-            let query = TermQuery::new(
-                Term::from_field_text(fields.uid, uid),
-                IndexRecordOption::Basic,
-            );
+            let query = identity.query(fields);
             let hits = searcher
-                .search(&query, &TopDocs::with_limit(2).order_by_score())
+                .search(query.as_ref(), &TopDocs::with_limit(2).order_by_score())
                 .map_err(|e| StoreError::Query(format!("find changed posting document: {e}")))?;
             if hits.len() > 1 {
                 return Err(StoreError::Query(
@@ -932,7 +977,10 @@ impl RegexIndex {
                     .get_all(fields.trigram)
                     .filter_map(|value| value.as_str())
                 {
-                    if desired.get(uid).is_some_and(|set| set.contains(trigram)) {
+                    if desired
+                        .get(&identity)
+                        .is_some_and(|set| set.contains(trigram))
+                    {
                         added -= 1;
                     } else {
                         removed += 1;
@@ -953,8 +1001,10 @@ impl RegexIndex {
         desired: &[RegexShardDocument<'_>],
     ) -> Result<(usize, usize), StoreError> {
         let desired_count: usize = desired.iter().map(|doc| doc.trigrams.len()).sum();
-        let desired: std::collections::HashMap<_, _> =
-            desired.iter().map(|doc| (doc.uid, doc.trigrams)).collect();
+        let desired: std::collections::HashMap<_, _> = desired
+            .iter()
+            .map(|doc| (RegexDocumentIdentity::new(doc.kind, doc.uid), doc.trigrams))
+            .collect();
         let Some((index, fields, _)) = self.open_current(scope_uid)? else {
             let root = self.scope_root(scope_uid);
             if root
@@ -1002,14 +1052,14 @@ impl RegexIndex {
                                     .map_err(|e| {
                                         StoreError::Query(format!("decode regex posting UID: {e}"))
                                     })?;
-                                entry.insert(extract_text(&document, fields.uid))
+                                entry.insert(RegexDocumentIdentity::new(
+                                    &extract_text(&document, fields.kind),
+                                    &extract_text(&document, fields.uid),
+                                ))
                             }
                         };
                         previous += 1;
-                        if desired
-                            .get(uid.as_str())
-                            .is_some_and(|set| set.contains(term))
-                        {
+                        if desired.get(&*uid).is_some_and(|set| set.contains(term)) {
                             shared += 1;
                         }
                     }
@@ -1794,7 +1844,7 @@ mod tests {
                 &initial,
                 updated.clone(),
                 &[second],
-                &["sym:one".to_string()],
+                &[RegexDocumentIdentity::new("Symbol", "sym:one")],
             )
             .unwrap();
         assert_eq!(
@@ -1807,7 +1857,10 @@ mod tests {
         );
         assert_eq!(
             index.document_hashes("repo:test").unwrap().unwrap(),
-            std::collections::HashMap::from([("sym:one".to_string(), "hash-one".to_string())]),
+            std::collections::HashMap::from([(
+                RegexDocumentIdentity::new("Symbol", "sym:one"),
+                "hash-one".to_string()
+            )]),
             "preparation must not mutate the served generation"
         );
         index.garbage_collect().unwrap();
@@ -1824,7 +1877,10 @@ mod tests {
         assert_eq!(pointer.metadata, updated);
         assert_eq!(
             index.document_hashes("repo:test").unwrap().unwrap(),
-            std::collections::HashMap::from([("sym:two".to_string(), "hash-two".to_string())])
+            std::collections::HashMap::from([(
+                RegexDocumentIdentity::new("Symbol", "sym:two"),
+                "hash-two".to_string()
+            )])
         );
         assert_eq!(
             index

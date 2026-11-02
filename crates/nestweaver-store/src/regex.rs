@@ -28,8 +28,8 @@ use nestweaver_schema::{Heading, Section};
 use crate::db::GraphStore;
 use crate::error::{CancelReason, StoreError};
 use crate::regex_index::{
-    REGEX_INDEX_SCHEMA_VERSION, REGEX_TOKENIZER_FINGERPRINT, RegexIndex, RegexShardDocument,
-    RegexShardMetadata,
+    REGEX_INDEX_SCHEMA_VERSION, REGEX_TOKENIZER_FINGERPRINT, RegexDocumentIdentity, RegexIndex,
+    RegexShardDocument, RegexShardMetadata,
 };
 use crate::tantivy_index::SEARCH_PRESENTATION_LIMIT_MAX;
 
@@ -1191,23 +1191,28 @@ impl GraphStore {
                 .unwrap_or_default();
             let desired_documents: HashMap<_, _> = candidates
                 .iter()
-                .map(|candidate| (candidate.uid.clone(), candidate_document_hash(candidate)))
+                .map(|candidate| {
+                    (
+                        RegexDocumentIdentity::new(&candidate.kind, &candidate.uid),
+                        candidate_document_hash(candidate),
+                    )
+                })
                 .collect();
             stats.nodes_added += desired_documents
                 .keys()
-                .filter(|uid| !prior_documents.contains_key(uid.as_str()))
+                .filter(|uid| !prior_documents.contains_key(*uid))
                 .count();
             stats.nodes_changed += desired_documents
                 .iter()
                 .filter(|(uid, hash)| {
                     prior_documents
-                        .get(uid.as_str())
+                        .get(*uid)
                         .is_some_and(|prior| prior != *hash)
                 })
                 .count();
             stats.nodes_deleted += prior_documents
                 .keys()
-                .filter(|uid| !desired_documents.contains_key(uid.as_str()))
+                .filter(|uid| !desired_documents.contains_key(*uid))
                 .count();
             let metadata = RegexShardMetadata {
                 schema_version: REGEX_INDEX_SCHEMA_VERSION,
@@ -1232,8 +1237,10 @@ impl GraphStore {
                 .iter()
                 .filter(|candidate| {
                     !can_update
-                        || prior_documents.get(&candidate.uid)
-                            != desired_documents.get(&candidate.uid)
+                        || prior_documents
+                            .get(&RegexDocumentIdentity::new(&candidate.kind, &candidate.uid))
+                            != desired_documents
+                                .get(&RegexDocumentIdentity::new(&candidate.kind, &candidate.uid))
                 })
                 .collect();
             stats.trigram_sets_built += changed_candidates.len();
@@ -1249,14 +1256,14 @@ impl GraphStore {
                     kind: &candidate.kind,
                     path: candidate_path(candidate),
                     text_hash: desired_documents
-                        .get(&candidate.uid)
+                        .get(&RegexDocumentIdentity::new(&candidate.kind, &candidate.uid))
                         .expect("candidate document hash"),
                     trigrams,
                 })
                 .collect();
             let deleted_uids: Vec<_> = prior_documents
                 .keys()
-                .filter(|uid| !desired_documents.contains_key(uid.as_str()))
+                .filter(|uid| !desired_documents.contains_key(*uid))
                 .cloned()
                 .collect();
             stats.postings_scanned += documents.len() + deleted_uids.len();
@@ -3780,6 +3787,178 @@ mod tests {
             !result.scanned_fallback,
             "the new ready selector survived stale retirement"
         );
+    }
+
+    #[test]
+    fn frontmatter_manifest_keeps_variants_and_incremental_work() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(&temp.path().join("brain.lbug")).unwrap();
+        let scope = "vlt:frontmatter-manifest";
+        for (uid, title, marker) in [
+            ("note:frontmatter:one", "TitleNeedleOne", "MetaNeedleOne"),
+            ("note:frontmatter:two", "TitleNeedleTwo", "MetaNeedleTwo"),
+        ] {
+            store
+                .insert_note(&Note {
+                    uid: uid.to_string(),
+                    vault_uid: scope.to_string(),
+                    file_path: format!("notes/{marker}.md"),
+                    title: title.to_string(),
+                    note_kind: NoteKind::General,
+                    word_count: 0,
+                    content_hash: marker.to_string(),
+                    frontmatter: Some(format!(r#"{{"status":"active","marker":"{marker}"}}"#)),
+                    frontmatter_raw: Some(format!("status: active\nmarker: {marker}\n")),
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+        }
+        let (candidates, stop) = store
+            .collect_candidates_for_scopes(
+                &HashSet::from([scope.to_string()]),
+                None,
+                None,
+                Instant::now(),
+                u64::MAX,
+                CandidateLimits {
+                    cancel: None,
+                    max_candidates: usize::MAX,
+                    prefilter: None,
+                    rejected: None,
+                },
+            )
+            .unwrap();
+        assert!(stop.is_none());
+        assert_eq!(candidates.len(), 4, "two real title/frontmatter pairs");
+        for uid in ["note:frontmatter:one", "note:frontmatter:two"] {
+            let variants: HashSet<_> = candidates
+                .iter()
+                .filter(|candidate| candidate.uid == uid)
+                .map(|candidate| candidate.kind.as_str())
+                .collect();
+            assert_eq!(variants, HashSet::from(["Note", "Frontmatter"]));
+        }
+        store.refresh_trigram_index(false).unwrap();
+        let index = RegexIndex::new(store.regex_sidecar_root().unwrap());
+        let metadata = index.metadata(scope).unwrap().unwrap();
+        assert_eq!(metadata.candidate_count, 4);
+        let manifest = index.document_hashes(scope);
+        let manifest_error = manifest.as_ref().err().map(ToString::to_string);
+
+        // A real frontmatter-only edit must update one internal document while
+        // Note and Frontmatter results continue to expose the original Note UID.
+        {
+            let conn = store.conn().unwrap();
+            let mut statement = conn
+                .prepare("MATCH (n:Note {uid: $uid}) SET n.frontmatter_raw = $raw")
+                .unwrap();
+            conn.execute(
+                &mut statement,
+                vec![
+                    ("uid", Value::String("note:frontmatter:one".to_string())),
+                    (
+                        "raw",
+                        Value::String("status: active\nmarker: MetaNeedleAfter\n".to_string()),
+                    ),
+                ],
+            )
+            .unwrap();
+        }
+        store.mark_regex_scope_dirty(scope, false).unwrap();
+        let second = store.refresh_trigram_index(false).unwrap();
+        eprintln!(
+            "frontmatter manifest error={manifest_error:?}; candidates={}; second refresh={second:?}",
+            metadata.candidate_count,
+        );
+        assert_eq!(
+            second.trigram_sets_built, 1,
+            "one frontmatter edit must not fall back to full replacement; initial manifest: {manifest_error:?}"
+        );
+        assert_eq!(second.postings_scanned, 1);
+        assert_eq!(
+            (
+                second.nodes_added,
+                second.nodes_changed,
+                second.nodes_deleted
+            ),
+            (0, 1, 0)
+        );
+        assert_eq!(manifest.unwrap().unwrap().len(), metadata.candidate_count);
+        for (pattern, kind, uid) in [
+            ("TitleNeedleOne", "Note", "note:frontmatter:one"),
+            ("MetaNeedleAfter", "Frontmatter", "note:frontmatter:one"),
+            ("TitleNeedleTwo", "Note", "note:frontmatter:two"),
+            ("MetaNeedleTwo", "Frontmatter", "note:frontmatter:two"),
+        ] {
+            let result = store
+                .regex_search(pattern, None, Some(&[kind.to_string()]), None, None)
+                .unwrap();
+            assert!(!result.scanned_fallback && !result.truncated);
+            assert_eq!(result.results.len(), 1);
+            assert_eq!(result.results[0].uid, uid);
+            assert_eq!(result.results[0].kind, kind);
+        }
+        let old = store
+            .regex_search(
+                "MetaNeedleOne",
+                None,
+                Some(&["Frontmatter".to_string()]),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!old.scanned_fallback && !old.truncated);
+        assert!(
+            old.results.is_empty(),
+            "the old raw frontmatter must be removed"
+        );
+
+        // Removing one variant must retain the title with the same public UID.
+        store
+            .conn()
+            .unwrap()
+            .query(
+                "MATCH (n:Note {uid: 'note:frontmatter:one'}) SET n.frontmatter_raw = NULL, n.frontmatter = NULL",
+            )
+            .unwrap();
+        store.mark_regex_scope_dirty(scope, false).unwrap();
+        let third = store.refresh_trigram_index(false).unwrap();
+        assert_eq!(third.trigram_sets_built, 0);
+        assert_eq!(third.postings_scanned, 1);
+        assert_eq!(
+            (third.nodes_added, third.nodes_changed, third.nodes_deleted),
+            (0, 0, 1)
+        );
+        assert_eq!(index.metadata(scope).unwrap().unwrap().candidate_count, 3);
+        assert_eq!(index.document_hashes(scope).unwrap().unwrap().len(), 3);
+        for (pattern, kind, uid) in [
+            ("TitleNeedleOne", "Note", "note:frontmatter:one"),
+            ("TitleNeedleTwo", "Note", "note:frontmatter:two"),
+            ("MetaNeedleTwo", "Frontmatter", "note:frontmatter:two"),
+        ] {
+            let result = store
+                .regex_search(pattern, None, Some(&[kind.to_string()]), None, None)
+                .unwrap();
+            assert!(!result.scanned_fallback && !result.truncated);
+            assert_eq!(result.results.len(), 1);
+            assert_eq!(result.results[0].uid, uid);
+            assert_eq!(result.results[0].kind, kind);
+        }
+        let removed = store
+            .regex_search(
+                "MetaNeedleAfter",
+                None,
+                Some(&["Frontmatter".to_string()]),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!removed.scanned_fallback && !removed.truncated);
+        assert!(removed.results.is_empty());
     }
 
     #[test]
