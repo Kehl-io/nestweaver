@@ -221,6 +221,7 @@ pub enum ArtifactKind {
     InstanceConfig,
     Ranking,
     RepoManifest,
+    MarkdownDerivation,
     Bm25,
     Regex,
     Embeddings,

@@ -932,6 +932,10 @@ pub struct McpServerConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamEntry {
+    /// Explicit local-vault UID to upstream-vault UID federation identity mapping.
+    #[serde(default)]
+    pub vault_mappings: std::collections::HashMap<String, String>,
+
     #[serde(default)]
     pub name: Option<String>,
     pub url: String,
@@ -1466,14 +1470,8 @@ pub struct ExpectedBrainAdoption {
     pub changed: bool,
 }
 
-/// In-process lock serializing every read-modify-write of the instance config
-/// file made by this crate (nw-900). Without it, two concurrent admin adds both
-/// read the same snapshot and the later write silently drops the earlier entry.
-///
-/// Known limit: this is NOT a cross-process lock. A separate process (for
-/// example the CLI `instance adopt`) editing the same file can still race a
-/// running daemon's admin add; the atomic replace guarantees the file is never
-/// torn, but not that both edits survive.
+/// Serialize config read/modify/replace in-process and across cooperating
+/// processes. The sidecar inode is stable across atomic config replacements.
 static CONFIG_FILE_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lock_config_file_mutation() -> std::sync::MutexGuard<'static, ()> {
@@ -1482,6 +1480,44 @@ fn lock_config_file_mutation() -> std::sync::MutexGuard<'static, ()> {
     CONFIG_FILE_MUTATION_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_config_path(path: &std::path::Path) -> Result<std::fs::File, anyhow::Error> {
+    let real = std::fs::canonicalize(path)?;
+    let lock_path = real.with_file_name(format!(
+        "{}.lock",
+        real.file_name().unwrap().to_string_lossy()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(&lock_path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "config lock is not a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.nlink() == 1,
+            "config lock must have one link and belong to the current user"
+        );
+    }
+    file.try_lock().map_err(|e| {
+        anyhow::anyhow!(
+            "config is being edited by another process ({}): {e}",
+            lock_path.display()
+        )
+    })?;
+    Ok(file)
 }
 
 /// Atomically replace the config file with `contents` (nw-900): readers see
@@ -1510,12 +1546,18 @@ pub fn adopt_expected_brain_uuid(
     brain_uuid: &str,
     dry_run: bool,
 ) -> Result<ExpectedBrainAdoption, anyhow::Error> {
-    let _config_lock = lock_config_file_mutation();
     let parsed = uuid::Uuid::parse_str(brain_uuid)
         .map_err(|error| anyhow::anyhow!("invalid brain UUID '{brain_uuid}': {error}"))?;
     if parsed.is_nil() {
         anyhow::bail!("invalid brain UUID: nil UUID is not a data identity");
     }
+    // Preview reads one snapshot and has no writer-side filesystem effects.
+    let _config_lock = (!dry_run).then(lock_config_file_mutation);
+    let _path_lock = if dry_run {
+        None
+    } else {
+        Some(lock_config_path(path)?)
+    };
     let adopted = parsed.to_string();
     let source = std::fs::read_to_string(path)?;
     let mut document = source.parse::<toml_edit::DocumentMut>()?;
@@ -1575,6 +1617,7 @@ pub fn append_repo_to_config_file(
     branch: Option<&str>,
 ) -> Result<bool, anyhow::Error> {
     let _config_lock = lock_config_file_mutation();
+    let _path_lock = lock_config_path(path)?;
     let mut contents = std::fs::read_to_string(path)?;
     let cfg = InstanceConfig::from_toml_str(&contents)?;
     let target = crate::jobs::canonical_repo_id(url);
@@ -1629,6 +1672,7 @@ pub fn remove_repo_from_config_file(
     url: &str,
 ) -> Result<bool, anyhow::Error> {
     let _config_lock = lock_config_file_mutation();
+    let _path_lock = lock_config_path(path)?;
     let contents = std::fs::read_to_string(path)?;
     let target = crate::jobs::canonical_repo_id(url);
     let lines: Vec<&str> = contents.lines().collect();
@@ -3595,5 +3639,97 @@ url = "https://github.com/example/keep-me"
                 .parse::<u32>()
                 .ok()
         })
+    }
+    #[test]
+    fn config_writer_refuses_a_competing_file_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        let held = lock_config_path(&path).unwrap();
+        let error =
+            append_repo_to_config_file(&path, "https://example.com/org/new", None).unwrap_err();
+        assert!(error.to_string().contains("another process"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), MINIMAL_TOML);
+        drop(held);
+        assert!(append_repo_to_config_file(&path, "https://example.com/org/new", None).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_lock_refuses_symlink_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        let victim = dir.path().join("victim");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("instance.toml.lock")).unwrap();
+        assert!(lock_config_path(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+    }
+    #[test]
+    fn identity_preview_has_no_filesystem_side_effects_even_for_invalid_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        let entries = || {
+            let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            entries.sort();
+            entries
+        };
+        let before = entries();
+        assert!(adopt_expected_brain_uuid(&path, "not-a-uuid", true).is_err());
+        assert_eq!(entries(), before);
+        assert!(adopt_expected_brain_uuid(&path, "not-a-uuid", false).is_err());
+        assert_eq!(entries(), before);
+        adopt_expected_brain_uuid(&path, "4f8a9ef0-d161-453d-a4e8-f12609ac3f07", true).unwrap();
+        assert_eq!(entries(), before);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), MINIMAL_TOML);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_preview_is_read_only_without_directory_write_permission() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        const CHILD_PATH: &str = "NW_READ_ONLY_PREVIEW_FIXTURE";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = std::path::PathBuf::from(path);
+            assert!(
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path.with_extension("probe"))
+                    .is_err(),
+                "fixture must actually deny directory writes, including root test runners"
+            );
+            adopt_expected_brain_uuid(&path, "4f8a9ef0-d161-453d-a4e8-f12609ac3f07", true).unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("config::tests::identity_preview_is_read_only_without_directory_write_permission")
+            .env(CHILD_PATH, &path);
+        if unsafe { libc::geteuid() } == 0 {
+            command.gid(65534).uid(65534);
+        }
+        let output = command.output();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child must execute the permission test: {:?}",
+            output
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), MINIMAL_TOML);
     }
 }

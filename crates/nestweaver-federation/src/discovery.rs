@@ -53,6 +53,8 @@ pub struct UpstreamConfig {
     /// it for an off-site server (nw-834).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_timeout: Option<String>,
+    #[serde(default)]
+    pub vault_mappings: crate::dedup::VaultMappings,
 }
 
 fn default_timeout() -> String {
@@ -105,6 +107,8 @@ struct UpstreamSection {
     ca_cert: Option<String>,
     #[serde(default)]
     fallback_timeout: Option<String>,
+    #[serde(default)]
+    vault_mappings: crate::dedup::VaultMappings,
 }
 
 /// Parsed content of `~/.config/nestweaver/upstreams.toml`.
@@ -143,6 +147,7 @@ pub fn discover_upstreams(start_dir: &Path) -> Vec<UpstreamConfig> {
             timeout: default_timeout(),
             ca_cert,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         }];
     }
 
@@ -287,6 +292,7 @@ fn find_server_toml(start_dir: &Path) -> Option<UpstreamConfig> {
                 timeout: parsed.upstream.timeout,
                 ca_cert: parsed.upstream.ca_cert,
                 fallback_timeout: parsed.upstream.fallback_timeout,
+                vault_mappings: parsed.upstream.vault_mappings,
             };
             expand_config_token(&mut cfg);
             return Some(cfg);
@@ -329,6 +335,8 @@ struct InstanceUpstreamEntry {
     ca_cert: Option<String>,
     #[serde(default)]
     fallback_timeout: Option<String>,
+    #[serde(default)]
+    vault_mappings: crate::dedup::VaultMappings,
 }
 
 fn default_mode_string() -> String {
@@ -351,6 +359,7 @@ impl InstanceUpstreamEntry {
             timeout: self.timeout,
             ca_cert: self.ca_cert,
             fallback_timeout: self.fallback_timeout,
+            vault_mappings: self.vault_mappings,
         }
     }
 }
@@ -398,6 +407,33 @@ mod tests {
     /// world-readable.
     #[cfg(unix)]
     #[test]
+    fn explicit_vault_mappings_survive_all_file_config_shapes() {
+        let mapping = "vault_mappings = { 'vlt:local:aaaaaaaaaaaa' = 'vlt:server:bbbbbbbbbbbb' }";
+        let instance: InstanceUpstreamsOnly = toml::from_str(&format!(
+            "[[upstream]]\nurl = 'http://localhost:9378'\n{mapping}\n"
+        ))
+        .unwrap();
+        let config = instance
+            .upstream
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_upstream_config();
+        assert_eq!(
+            config.vault_mappings["vlt:local:aaaaaaaaaaaa"],
+            "vlt:server:bbbbbbbbbbbb"
+        );
+        let server: ServerToml = toml::from_str(&format!(
+            "[upstream]\nurl = 'http://localhost:9378'\n{mapping}\n"
+        ))
+        .unwrap();
+        assert_eq!(server.upstream.vault_mappings, config.vault_mappings);
+        let serialized = toml::to_string(&config).unwrap();
+        let user: UpstreamConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(user.vault_mappings, config.vault_mappings);
+    }
+
+    #[test]
     fn upstreams_toml_written_0600() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -411,6 +447,7 @@ mod tests {
             timeout: "1s".to_string(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
 
         let path = save_upstream_in(dir.path(), &config).unwrap();

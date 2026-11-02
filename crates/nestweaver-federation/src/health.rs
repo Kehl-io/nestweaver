@@ -133,9 +133,24 @@ pub struct MaintenanceProbe {
 /// ceiling (the richer upstream answer is the point). On a cold start (no
 /// EWMA samples yet) we use `mode_ceiling`.
 pub fn effective_timeout(mode: RoutingMode, handle: &UpstreamHandle) -> Duration {
-    let mode_ceiling = mode_ceiling(mode, handle);
+    deadline_from_latency(mode_ceiling(mode, handle), handle.latency_ewma_ms())
+}
 
-    match handle.latency_ewma_ms() {
+/// Per-tool budgets prevent a cheap search or metadata call from shrinking
+/// the first-call allowance for a different, heavier tool.
+pub fn effective_timeout_for_tool(
+    mode: RoutingMode,
+    handle: &UpstreamHandle,
+    tool: &str,
+) -> Duration {
+    deadline_from_latency(
+        mode_ceiling(mode, handle),
+        handle.tool_latency_ewma_ms(tool),
+    )
+}
+
+fn deadline_from_latency(mode_ceiling: Duration, ewma: Option<f64>) -> Duration {
+    match ewma {
         // Cold start — no observed latency yet. Use the mode ceiling.
         None => mode_ceiling,
         Some(ewma_ms) => {
@@ -174,8 +189,50 @@ pub fn handle_query_timeout(
     deadline: Duration,
     reason: &str,
 ) {
+    handle_timeout_for_tool(mode, upstream, all, guard, None, deadline, reason);
+}
+
+/// Learn a timeout only for the queried tool, retaining global ejection policy.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_query_timeout_for_tool(
+    mode: RoutingMode,
+    upstream: &UpstreamHandle,
+    all: &[UpstreamHandle],
+    guard: &Mutex<()>,
+    tool: &str,
+    deadline: Duration,
+    reason: &str,
+) {
+    handle_timeout_for_tool(mode, upstream, all, guard, Some(tool), deadline, reason);
+}
+
+/// Safe diagnostic context; callers supply measured query elapsed time after
+/// cold connection establishment, never credentials or request arguments.
+pub fn log_tool_timeout(
+    upstream: &UpstreamHandle,
+    tool: &str,
+    budget: Duration,
+    elapsed: Duration,
+) {
+    tracing::debug!(source = %upstream.name, tool, budget_ms = budget.as_millis() as u64,
+        elapsed_ms = elapsed.as_millis() as u64, "upstream tool query timed out");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_timeout_for_tool(
+    mode: RoutingMode,
+    upstream: &UpstreamHandle,
+    all: &[UpstreamHandle],
+    guard: &Mutex<()>,
+    tool: Option<&str>,
+    deadline: Duration,
+    reason: &str,
+) {
     let at_ceiling = deadline >= mode_ceiling(mode, upstream);
-    let streak = upstream.record_timeout(deadline, at_ceiling);
+    let streak = match tool {
+        Some(tool) => upstream.record_tool_timeout(tool, deadline, at_ceiling),
+        None => upstream.record_timeout(deadline, at_ceiling),
+    };
     if streak >= CEILING_TIMEOUTS_TO_EJECT {
         upstream.reset_timeout_streak();
         eject_with_cap(upstream, all, guard, reason);
@@ -288,11 +345,25 @@ async fn server_sha_is_in_local_history(
 /// the checkout) a differing SHA stays stale, the conservative direction:
 /// consult the server.
 pub async fn local_is_behind(local_url: &str, local_sha: &str, server_sha: &str) -> bool {
+    local_is_behind_with_checkout_path(local_url, None, local_sha, server_sha).await
+}
+
+/// The optional path comes exclusively from the LOCAL daemon. Never supply
+/// a remote RepoState's filesystem path here.
+pub async fn local_is_behind_with_checkout_path(
+    local_url: &str,
+    checkout_path: Option<&str>,
+    local_sha: &str,
+    server_sha: &str,
+) -> bool {
     let unknown = |sha: &str| sha.is_empty() || sha == "local";
     if unknown(server_sha) || unknown(local_sha) || local_sha == server_sha {
         return false;
     }
-    match local_checkout_path(local_url) {
+    match checkout_path
+        .and_then(local_checkout_path)
+        .or_else(|| local_checkout_path(local_url))
+    {
         Some(path) => !server_sha_is_in_local_history(path, server_sha, local_sha).await,
         None => true,
     }
@@ -308,6 +379,15 @@ pub async fn local_is_behind(local_url: &str, local_sha: &str, server_sha: &str)
 /// rather than blocking).
 pub async fn compute_stale_repos(
     local_states: &HashMap<String, String>,
+    probes: &[MaintenanceProbe],
+) -> Vec<String> {
+    compute_stale_repos_with_checkout_paths(local_states, &HashMap::new(), probes).await
+}
+
+/// Compare by repository identity while inspecting only locally advertised paths.
+pub async fn compute_stale_repos_with_checkout_paths(
+    local_states: &HashMap<String, String>,
+    local_checkout_paths: &HashMap<String, String>,
     probes: &[MaintenanceProbe],
 ) -> Vec<String> {
     let mut stale = Vec::new();
@@ -331,7 +411,13 @@ pub async fn compute_stale_repos(
             for server_repo in resp.into_inner().repos {
                 if let Some((local_url, local_sha)) =
                     local_entry_for_server_repo(local_states, &server_repo.repo_url)
-                    && local_is_behind(local_url, local_sha, &server_repo.indexed_sha).await
+                    && local_is_behind_with_checkout_path(
+                        local_url,
+                        local_checkout_paths.get(local_url).map(String::as_str),
+                        local_sha,
+                        &server_repo.indexed_sha,
+                    )
+                    .await
                 {
                     stale.push(server_repo.repo_url.clone());
                 }
@@ -349,6 +435,126 @@ pub async fn compute_stale_repos(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn fast_tool_does_not_shrink_an_unseen_heavy_tools_budget() {
+        let handle = handle_with(RoutingMode::Merge, "2s");
+        handle.record_tool_latency("search_symbols", Duration::from_millis(2));
+        assert_eq!(
+            effective_timeout_for_tool(RoutingMode::Merge, &handle, "search_symbols"),
+            Duration::from_millis(50)
+        );
+        for tool in [
+            "brain_search",
+            "symbol_lookup",
+            "brain_impact",
+            "flow_trace_continue",
+        ] {
+            let budget = effective_timeout_for_tool(RoutingMode::Merge, &handle, tool);
+            assert_eq!(
+                budget,
+                Duration::from_secs(2),
+                "{tool} must start at configured ceiling"
+            );
+            // The old shared estimate would time out this real awaited work.
+            assert!(
+                tokio::time::timeout(budget, tokio::time::sleep(Duration::from_millis(75)))
+                    .await
+                    .is_ok()
+            );
+        }
+        handle.record_tool_latency("brain_search", Duration::from_millis(400));
+        assert_eq!(
+            effective_timeout_for_tool(RoutingMode::Merge, &handle, "brain_search"),
+            Duration::from_millis(700)
+        );
+        assert_eq!(
+            effective_timeout_for_tool(RoutingMode::Merge, &handle, "symbol_lookup"),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            effective_timeout_for_tool(RoutingMode::Fallback, &handle, "unseen"),
+            handle.fallback_cap()
+        );
+        assert_eq!(
+            effective_timeout_for_tool(RoutingMode::Merge, &handle, "search_symbols"),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_learning_is_tool_local_bounded_and_any_success_resets_global_streak() {
+        let all = vec![handle_with(RoutingMode::Merge, "2s")];
+        let handle = &all[0];
+        let guard = Mutex::new(());
+        handle.record_tool_latency("search_symbols", Duration::from_millis(2));
+        handle.record_tool_latency("brain_search", Duration::from_millis(10));
+        for _ in 0..4 {
+            let deadline = effective_timeout_for_tool(RoutingMode::Merge, handle, "brain_search");
+            handle_query_timeout_for_tool(
+                RoutingMode::Merge,
+                handle,
+                &all,
+                &guard,
+                "brain_search",
+                deadline,
+                "test",
+            );
+            let widened = effective_timeout_for_tool(RoutingMode::Merge, handle, "brain_search");
+            assert!(widened > deadline && widened <= Duration::from_secs(2));
+            assert_eq!(
+                effective_timeout_for_tool(RoutingMode::Merge, handle, "search_symbols"),
+                Duration::from_millis(50)
+            );
+            assert_eq!(
+                effective_timeout_for_tool(RoutingMode::Merge, handle, "symbol_lookup"),
+                Duration::from_secs(2)
+            );
+            assert!(handle.is_healthy());
+        }
+        let ceiling = Duration::from_secs(2);
+        handle_query_timeout_for_tool(
+            RoutingMode::Merge,
+            handle,
+            &all,
+            &guard,
+            "brain_search",
+            ceiling,
+            "test",
+        );
+        assert!(handle.is_healthy());
+        handle.record_tool_latency("search_symbols", Duration::from_millis(2));
+        handle_query_timeout_for_tool(
+            RoutingMode::Merge,
+            handle,
+            &all,
+            &guard,
+            "brain_search",
+            ceiling,
+            "test",
+        );
+        assert!(
+            handle.is_healthy(),
+            "any successful tool clears the global streak"
+        );
+        handle_query_timeout_for_tool(
+            RoutingMode::Merge,
+            handle,
+            &all,
+            &guard,
+            "symbol_lookup",
+            ceiling,
+            "test",
+        );
+        assert!(
+            !handle.is_healthy(),
+            "global consecutive ceiling failures still eject across tools"
+        );
+        assert_eq!(
+            effective_timeout_for_tool(RoutingMode::Merge, handle, "brain_search"),
+            ceiling
+        );
+    }
+
     // ── Mode-aware adaptive timeout (`effective_timeout`) ─────────────────
 
     fn handle_with(mode: RoutingMode, timeout: &str) -> UpstreamHandle {
@@ -362,6 +568,7 @@ mod tests {
             timeout: timeout.to_string(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         UpstreamHandle::from_config(&cfg).unwrap()
     }
@@ -499,6 +706,7 @@ mod tests {
             timeout: "1s".to_string(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let all = vec![
             UpstreamHandle::from_config(&cfg("a")).unwrap(),
@@ -534,6 +742,7 @@ mod tests {
             timeout: "1s".to_string(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let all = vec![
             UpstreamHandle::from_config(&cfg("a")).unwrap(),
@@ -565,6 +774,7 @@ mod tests {
                 timeout: timeout.to_string(),
                 ca_cert: None,
                 fallback_timeout: cap.map(String::from),
+                vault_mappings: Default::default(),
             })
             .unwrap()
         };
@@ -682,6 +892,39 @@ mod tests {
         assert!(!local_is_behind(&url, &newer, &newer).await);
         // Server SHA the checkout has never seen -> consult the server.
         assert!(local_is_behind(&url, &newer, &"f".repeat(40)).await);
+    }
+
+    #[tokio::test]
+    async fn remote_identity_uses_only_the_local_daemons_checkout_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        git(path, &["init", "-q"]);
+        git(path, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base = git(path, &["rev-parse", "HEAD"]);
+        git(path, &["commit", "-q", "--allow-empty", "-m", "local"]);
+        let local = git(path, &["rev-parse", "HEAD"]);
+        let url = "https://github.com/acme/api";
+        let checkout = path.to_str();
+        assert!(!local_is_behind_with_checkout_path(url, checkout, &local, &base).await);
+        assert!(local_is_behind_with_checkout_path(url, checkout, &base, &local).await);
+        assert!(!local_is_behind_with_checkout_path(url, checkout, &local, &local).await);
+        assert!(
+            local_is_behind_with_checkout_path(url, None, &local, &base).await,
+            "old peers without a local path remain conservative"
+        );
+        git(path, &["checkout", "-q", "--detach", &base]);
+        git(path, &["commit", "-q", "--allow-empty", "-m", "remote"]);
+        let remote = git(path, &["rev-parse", "HEAD"]);
+        assert!(
+            local_is_behind_with_checkout_path(url, checkout, &local, &remote).await,
+            "diverged histories consult upstream"
+        );
+        assert!(!local_is_behind_with_checkout_path(url, checkout, "local", &remote).await);
+        assert!(
+            local_is_behind_with_checkout_path(url, Some("https://untrusted/path"), &local, &base)
+                .await,
+            "remote-form paths are never filesystem paths"
+        );
     }
 
     #[tokio::test]

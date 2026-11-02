@@ -112,6 +112,7 @@ export function SceneBreadcrumbs() {
             title={notFound ? `Not found: ${selectedNodeId}` : selectedNodeId ?? undefined}
           >
             {notFound ? "Not found" : compactNodeLabel(selectedNodeId, graphLabel)}
+            {preview?.type === "symbol" && preview.sourceState === "unsupported" && <span className="ml-1 text-[var(--color-text-muted)]"> · remote source unsupported</span>}
           </span>
         </>
       )}

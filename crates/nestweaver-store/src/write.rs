@@ -10,6 +10,65 @@ use serde_json;
 use crate::db::GraphStore;
 use crate::error::StoreError;
 
+/// Two scalar-PK statements tied to one caller-owned connection. No old
+/// edge rows are cached between reads, and each result is drained before reuse.
+pub struct CrossDomainEdgeReader<'connection, 'database> {
+    conn: &'connection crate::db::StoreConnection<'database>,
+    statements: [crate::db::StoreStatement<'connection>; 2],
+}
+
+#[cfg(test)]
+thread_local! {
+    static SIDECAR_READ_PREPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl CrossDomainEdgeReader<'_, '_> {
+    pub fn read(
+        &mut self,
+        note_uid: &str,
+    ) -> Result<Vec<(String, String, f32, String)>, StoreError> {
+        let mut edges = Vec::new();
+        for statement in &mut self.statements {
+            let rows = self
+                .conn
+                .execute(
+                    statement,
+                    vec![("uid", lbug::Value::String(note_uid.into()))],
+                )
+                .map_err(|e| StoreError::Query(format!("read sidecars: {e}")))?;
+            for row in rows {
+                let text = |at: usize| match row.get(at) {
+                    Some(lbug::Value::String(value)) => Ok(value.clone()),
+                    _ => Err(StoreError::Query("invalid sidecar string".into())),
+                };
+                let confidence = match row.get(2) {
+                    Some(lbug::Value::Float(value)) => *value,
+                    Some(lbug::Value::Double(value)) => *value as f32,
+                    _ => return Err(StoreError::Query("invalid sidecar confidence".into())),
+                };
+                edges.push((text(0)?, text(1)?, confidence, text(3)?));
+            }
+        }
+        Ok(edges)
+    }
+}
+
+/// Atomic server-reader publication metadata. Cleanup is restricted to the
+/// repository identity and bare-root vault identified by this replacement.
+#[derive(Debug, Clone)]
+pub struct RepoStrategyReplacement {
+    pub repo: Repo,
+    pub bare_root: String,
+    pub policy: String,
+    pub to_vault: bool,
+    pub remove_opposite: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_STRATEGY_AFTER_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// nw-655. What a regex scope acknowledgement established.
 ///
 /// A publication whose scope was advanced by a concurrent writer is NOT an
@@ -881,12 +940,16 @@ fn insert_references_code_rows_on(
                 ])
             })
             .collect();
+        let bound_rows = lbug::Value::List(row_type.clone(), rows);
+        #[cfg(test)]
+        references_code_plan_tests::capture_actual_plan(
+            conn,
+            &format!("UNWIND $rows AS r {tail}"),
+            &bound_rows,
+        )?;
         count_parameterized_write();
-        conn.execute(
-            &mut stmt,
-            vec![("rows", lbug::Value::List(row_type.clone(), rows))],
-        )
-        .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+        conn.execute(&mut stmt, vec![("rows", bound_rows)])
+            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
         statements += 1;
     }
     Ok(statements)
@@ -1771,6 +1834,76 @@ impl GraphStore {
         finish_regex_ack(self, &conn, result)
     }
 
+    fn validate_strategy_replacement(
+        &self,
+        strategy: &RepoStrategyReplacement,
+        target_repo: &str,
+        target_vault: Option<&Vault>,
+    ) -> Result<(), StoreError> {
+        let repo = &strategy.repo;
+        let expected_vault = vault_uid(&repo.instance_id, &strategy.bare_root);
+        if repo.uid != repo_uid(&repo.instance_id, &repo.url)
+            || target_repo != repo.uid
+            || strategy.to_vault != target_vault.is_some()
+            || strategy.policy.starts_with("vault:") != strategy.to_vault
+            || target_vault.is_some_and(|vault| {
+                vault.uid != expected_vault
+                    || vault.root_path != strategy.bare_root
+                    || nestweaver_schema::repo_url::normalized_repo_key(&vault.name)
+                        != nestweaver_schema::repo_url::normalized_repo_key(&repo.url)
+                    || vault.instance_id != repo.instance_id
+            })
+        {
+            return Err(StoreError::Query(
+                "strategy replacement identity mismatch".into(),
+            ));
+        }
+        // Both opposite cleanup and destination replacement may delete this
+        // root's incumbent vault. Validate its owner before either transaction.
+        if strategy.to_vault || strategy.remove_opposite {
+            match self.lookup_vault(&expected_vault) {
+                Ok(vault) => {
+                    if nestweaver_schema::repo_url::normalized_repo_key(&vault.name)
+                        != nestweaver_schema::repo_url::normalized_repo_key(&repo.url)
+                        || vault.instance_id != repo.instance_id
+                        || vault.root_path != strategy.bare_root
+                    {
+                        return Err(StoreError::Query(
+                            "incumbent vault belongs to another repository".into(),
+                        ));
+                    }
+                }
+                Err(StoreError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn clean_strategy_replacement_on(
+        conn: &crate::db::StoreConnection<'_>,
+        strategy: &RepoStrategyReplacement,
+    ) -> Result<(), StoreError> {
+        if strategy.remove_opposite {
+            if strategy.to_vault {
+                Self::bulk_delete_repo_files_and_symbols_on(conn, &strategy.repo.uid)?;
+                Self::clear_repo_derived_nodes_on(conn, &strategy.repo.uid)?;
+            } else {
+                Self::delete_vault_cascade_on(
+                    conn,
+                    &vault_uid(&strategy.repo.instance_id, &strategy.bare_root),
+                )?;
+            }
+            #[cfg(test)]
+            if FAIL_STRATEGY_AFTER_CLEANUP.with(|fail| fail.replace(false)) {
+                return Err(StoreError::Query(
+                    "injected failure after strategy cleanup".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Atomically delete old repo data and insert the replacement in a single
     /// transaction. This prevents concurrent readers from seeing an empty repo
     /// between the delete and the insert (the concurrency bug where the
@@ -1792,6 +1925,32 @@ impl GraphStore {
         service_symbol_edges: &[(&str, &str)],
         resolved_edges: &[ResolvedEdge],
     ) -> Result<(usize, usize, Vec<String>), StoreError> {
+        self.bulk_reindex_write_with_strategy(
+            repo_uid,
+            files,
+            symbols,
+            repo_file_edges,
+            file_symbol_edges,
+            services,
+            service_symbol_edges,
+            resolved_edges,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_reindex_write_with_strategy(
+        &self,
+        repo_uid: &str,
+        files: &[File],
+        symbols: &[Symbol],
+        repo_file_edges: &[(&str, &str)],
+        file_symbol_edges: &[(&str, &str)],
+        services: &[Service],
+        service_symbol_edges: &[(&str, &str)],
+        resolved_edges: &[ResolvedEdge],
+        strategy: Option<&RepoStrategyReplacement>,
+    ) -> Result<(usize, usize, Vec<String>), StoreError> {
         Self::validate_bulk_reindex_input(
             repo_uid,
             files,
@@ -1801,7 +1960,18 @@ impl GraphStore {
             services,
             service_symbol_edges,
         )?;
+        if let Some(strategy) = strategy {
+            self.validate_strategy_replacement(strategy, repo_uid, None)?;
+        }
+        let repo_exists = strategy
+            .map(|strategy| self.lookup_repo(&strategy.repo.uid))
+            .transpose()?
+            .flatten()
+            .is_some();
         let conn = self.begin_transaction()?;
+        if let Some(strategy) = strategy {
+            Self::clean_strategy_replacement_on(&conn, strategy)?;
+        }
 
         // Delete old data within the transaction.
         let (file_count, symbol_count, deleted_symbol_uids) =
@@ -1822,6 +1992,14 @@ impl GraphStore {
 
         Self::mark_regex_scope_dirty_on(&conn, repo_uid, false)?;
 
+        if let Some(strategy) = strategy {
+            if repo_exists {
+                Self::update_repo_sha_on(&conn, &strategy.repo.uid, &strategy.repo.indexed_sha)?;
+            } else {
+                Self::insert_repo_on(&conn, &strategy.repo)?;
+            }
+            Self::set_repo_index_policy_on(&conn, &strategy.repo.uid, &strategy.policy)?;
+        }
         self.commit_transaction(&conn)?;
         Ok((file_count, symbol_count, deleted_symbol_uids))
     }
@@ -2013,6 +2191,46 @@ impl GraphStore {
         wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
         wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
     ) -> Result<usize, StoreError> {
+        self.bulk_vault_reindex_write_with_strategy(
+            vault,
+            vault_existed,
+            notes,
+            headings,
+            sections,
+            vault_note_edges,
+            note_heading_edges,
+            note_section_edges,
+            heading_section_edges,
+            heading_parent_edges,
+            tags,
+            note_tag_edges,
+            section_tag_edges,
+            wikilink_to_note_edges,
+            wikilink_to_heading_edges,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_vault_reindex_write_with_strategy(
+        &self,
+        vault: &Vault,
+        vault_existed: bool,
+        notes: &[Note],
+        headings: &[Heading],
+        sections: &[Section],
+        vault_note_edges: &[(&str, &str)],
+        note_heading_edges: &[(&str, &str)],
+        note_section_edges: &[(&str, &str)],
+        heading_section_edges: &[(&str, &str)],
+        heading_parent_edges: &[(&str, &str)],
+        tags: &[Tag],
+        note_tag_edges: &[(&str, &str)],
+        section_tag_edges: &[(&str, &str)],
+        wikilink_to_note_edges: &[(&str, &str, f32, &str, &str)],
+        wikilink_to_heading_edges: &[(&str, &str, f32, &str, &str)],
+        strategy: Option<&RepoStrategyReplacement>,
+    ) -> Result<usize, StoreError> {
         refuse_control_chars_in_source_name("vault", &vault.name)?;
         Self::validate_bulk_vault_reindex_input(
             vault,
@@ -2050,7 +2268,18 @@ impl GraphStore {
             .iter()
             .map(|(project, note)| (project.as_str(), note.as_str()))
             .collect::<Vec<_>>();
+        if let Some(strategy) = strategy {
+            self.validate_strategy_replacement(strategy, &strategy.repo.uid, Some(vault))?;
+        }
+        let repo_exists = strategy
+            .map(|strategy| self.lookup_repo(&strategy.repo.uid))
+            .transpose()?
+            .flatten()
+            .is_some();
         let conn = self.begin_transaction()?;
+        if let Some(strategy) = strategy {
+            Self::clean_strategy_replacement_on(&conn, strategy)?;
+        }
 
         // Delete old vault data within the transaction (if it existed).
         let deleted = if vault_existed {
@@ -2092,6 +2321,14 @@ impl GraphStore {
 
         Self::mark_regex_scope_dirty_on(&conn, &vault.uid, false)?;
 
+        if let Some(strategy) = strategy {
+            if repo_exists {
+                Self::update_repo_sha_on(&conn, &strategy.repo.uid, &strategy.repo.indexed_sha)?;
+            } else {
+                Self::insert_repo_on(&conn, &strategy.repo)?;
+            }
+            Self::set_repo_index_policy_on(&conn, &strategy.repo.uid, &strategy.policy)?;
+        }
         self.commit_transaction(&conn)?;
         Ok(deleted)
     }
@@ -2448,52 +2685,67 @@ impl GraphStore {
         Self::batch_insert_notes_on(&conn, notes)
     }
 
-    /// Insert notes using an externally-provided connection (for transaction batching).
+    // Shared serialization for strict CREATE and incremental retained-row SET.
+    fn notes_fields(note: &Note) -> Vec<(&'static str, lbug::Value)> {
+        vec![
+            ("uid", lbug::Value::String(note.uid.clone())),
+            ("vid", lbug::Value::String(note.vault_uid.clone())),
+            ("fp", lbug::Value::String(note.file_path.clone())),
+            ("title", lbug::Value::String(note.title.clone())),
+            ("nk", lbug::Value::String(note.note_kind.to_string())),
+            ("wc", lbug::Value::Int64(note.word_count as i64)),
+            ("hash", lbug::Value::String(note.content_hash.clone())),
+            (
+                "fm",
+                lbug::Value::String(note.frontmatter.clone().unwrap_or_default()),
+            ),
+            (
+                "fmr",
+                lbug::Value::String(note.frontmatter_raw.clone().unwrap_or_default()),
+            ),
+            (
+                "ca",
+                lbug::Value::String(note.created_at.clone().unwrap_or_default()),
+            ),
+            (
+                "ma",
+                lbug::Value::String(note.modified_at.clone().unwrap_or_default()),
+            ),
+            (
+                "pr",
+                lbug::Value::Double(note.pagerank_score.unwrap_or(0.0)),
+            ),
+        ]
+    }
+
+    fn notes_statement(retain: bool) -> String {
+        let fields = "uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, note_kind: $nk, word_count: $wc, content_hash: $hash, frontmatter: $fm, frontmatter_raw: $fmr, created_at: $ca, modified_at: $ma, pagerank_score: $pr";
+        if retain {
+            let updates = fields
+                .split(',')
+                .filter_map(|field| {
+                    let (property, parameter) =
+                        field.trim().split_once(':').expect("static field mapping");
+                    (property != "uid").then(|| format!("n.{property} = {}", parameter.trim()))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("MATCH (n:Note {{uid: $uid}}) SET {updates}")
+        } else {
+            format!("CREATE (:Note {{{fields}}})")
+        }
+    }
+
     pub fn batch_insert_notes_on(
         conn: &crate::db::StoreConnection<'_>,
         notes: &[Note],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
-            .prepare(
-                "CREATE (:Note {uid: $uid, vault_uid: $vid, file_path: $fp, title: $title, \
-                 note_kind: $nk, word_count: $wc, content_hash: $hash, frontmatter: $fm, \
-                 frontmatter_raw: $fmr, created_at: $ca, modified_at: $ma, pagerank_score: $pr})",
-            )
+            .prepare(&Self::notes_statement(false))
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
         for note in notes {
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("uid", lbug::Value::String(note.uid.clone())),
-                    ("vid", lbug::Value::String(note.vault_uid.clone())),
-                    ("fp", lbug::Value::String(note.file_path.clone())),
-                    ("title", lbug::Value::String(note.title.clone())),
-                    ("nk", lbug::Value::String(note.note_kind.to_string())),
-                    ("wc", lbug::Value::Int64(note.word_count as i64)),
-                    ("hash", lbug::Value::String(note.content_hash.clone())),
-                    (
-                        "fm",
-                        lbug::Value::String(note.frontmatter.clone().unwrap_or_default()),
-                    ),
-                    (
-                        "fmr",
-                        lbug::Value::String(note.frontmatter_raw.clone().unwrap_or_default()),
-                    ),
-                    (
-                        "ca",
-                        lbug::Value::String(note.created_at.clone().unwrap_or_default()),
-                    ),
-                    (
-                        "ma",
-                        lbug::Value::String(note.modified_at.clone().unwrap_or_default()),
-                    ),
-                    (
-                        "pr",
-                        lbug::Value::Double(note.pagerank_score.unwrap_or(0.0)),
-                    ),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            conn.execute(&mut stmt, Self::notes_fields(note))
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
         }
         Ok(())
     }
@@ -2659,37 +2911,52 @@ impl GraphStore {
         Self::batch_insert_sections_on(&conn, sections)
     }
 
-    /// Insert sections using an externally-provided connection (for transaction batching).
+    // Shared serialization for strict CREATE and incremental retained-row SET.
+    fn sections_fields(s: &Section) -> Vec<(&'static str, lbug::Value)> {
+        vec![
+            ("uid", lbug::Value::String(s.uid.clone())),
+            ("nid", lbug::Value::String(s.note_uid.clone())),
+            (
+                "hid",
+                lbug::Value::String(s.heading_uid.clone().unwrap_or_default()),
+            ),
+            ("sl", lbug::Value::Int64(s.start_line as i64)),
+            ("el", lbug::Value::Int64(s.end_line as i64)),
+            ("th", lbug::Value::String(s.text_hash.clone())),
+            ("tc", lbug::Value::String(s.text_content.clone())),
+            ("wc", lbug::Value::Int64(s.word_count as i64)),
+            ("pr", lbug::Value::Double(s.pagerank_score.unwrap_or(0.0))),
+        ]
+    }
+
+    fn sections_statement(retain: bool) -> String {
+        let fields = "uid: $uid, note_uid: $nid, heading_uid: $hid, start_line: $sl, end_line: $el, text_hash: $th, text_content: $tc, word_count: $wc, pagerank_score: $pr";
+        if retain {
+            let updates = fields
+                .split(',')
+                .filter_map(|field| {
+                    let (property, parameter) =
+                        field.trim().split_once(':').expect("static field mapping");
+                    (property != "uid").then(|| format!("n.{property} = {}", parameter.trim()))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("MATCH (n:Section {{uid: $uid}}) SET {updates}")
+        } else {
+            format!("CREATE (:Section {{{fields}}})")
+        }
+    }
+
     pub fn batch_insert_sections_on(
         conn: &crate::db::StoreConnection<'_>,
         sections: &[Section],
     ) -> Result<(), StoreError> {
         let mut stmt = conn
-            .prepare(
-                "CREATE (:Section {uid: $uid, note_uid: $nid, heading_uid: $hid, \
-                 start_line: $sl, end_line: $el, text_hash: $th, text_content: $tc, \
-                 word_count: $wc, pagerank_score: $pr})",
-            )
+            .prepare(&Self::sections_statement(false))
             .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
         for s in sections {
-            conn.execute(
-                &mut stmt,
-                vec![
-                    ("uid", lbug::Value::String(s.uid.clone())),
-                    ("nid", lbug::Value::String(s.note_uid.clone())),
-                    (
-                        "hid",
-                        lbug::Value::String(s.heading_uid.clone().unwrap_or_default()),
-                    ),
-                    ("sl", lbug::Value::Int64(s.start_line as i64)),
-                    ("el", lbug::Value::Int64(s.end_line as i64)),
-                    ("th", lbug::Value::String(s.text_hash.clone())),
-                    ("tc", lbug::Value::String(s.text_content.clone())),
-                    ("wc", lbug::Value::Int64(s.word_count as i64)),
-                    ("pr", lbug::Value::Double(s.pagerank_score.unwrap_or(0.0))),
-                ],
-            )
-            .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
+            conn.execute(&mut stmt, Self::sections_fields(s))
+                .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
         }
         Ok(())
     }
@@ -3428,6 +3695,36 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Retention must preserve strict CREATE's refusal to steal another owner's UID.
+    fn retained_owner_on(
+        conn: &crate::db::StoreConnection<'_>,
+        label: &str,
+        property: &str,
+        uid: &str,
+        expected: &str,
+    ) -> Result<bool, StoreError> {
+        let mut statement = conn
+            .prepare(&format!(
+                "MATCH (n:{label} {{uid: $uid}}) RETURN n.{property}"
+            ))
+            .map_err(|e| StoreError::Query(format!("prepare retained ownership: {e}")))?;
+        let mut rows = conn
+            .execute(
+                &mut statement,
+                vec![("uid", lbug::Value::String(uid.to_string()))],
+            )
+            .map_err(|e| StoreError::Query(format!("read retained ownership: {e}")))?;
+        match rows.next() {
+            None => Ok(false),
+            Some(row) if matches!(row.first(), Some(lbug::Value::String(owner)) if owner == expected) => {
+                Ok(true)
+            }
+            Some(_) => Err(StoreError::Query(format!(
+                "refusing to retain {label} {uid} owned by another {property}"
+            ))),
+        }
+    }
+
     /// Apply a complete incremental vault refresh in one transaction.
     ///
     /// Every incumbent replacement/removal, every replacement node and edge,
@@ -3544,14 +3841,122 @@ impl GraphStore {
                     )?;
                 }
             }
-            for note_uid in delete_note_uids {
-                Self::delete_note_cascade_on(&conn, note_uid)?;
+            let _incoming_notes = unique_uid_set("Note", notes.iter().map(|n| n.uid.as_str()))?;
+            let _incoming_sections =
+                unique_uid_set("Section", sections.iter().map(|s| s.uid.as_str()))?;
+            let mut retained_notes = std::collections::HashSet::new();
+            let mut retained_sections = std::collections::HashSet::new();
+            for note in notes {
+                if !delete_note_uids.contains(&note.uid) {
+                    continue; // Fresh inputs retain strict CREATE collision behavior.
+                }
+                if Self::retained_owner_on(&conn, "Note", "vault_uid", &note.uid, &note.vault_uid)?
+                {
+                    retained_notes.insert(note.uid.as_str());
+                    exec_params(
+                        &conn,
+                        &Self::notes_statement(true),
+                        Self::notes_fields(note),
+                    )?;
+                    // Recreate ordinary membership; retain the Note and its code references.
+                    for relation in ["VAULT_HAS_NOTE", "PROJECT_INCLUDES_NOTE"] {
+                        exec_params(
+                            &conn,
+                            &format!("MATCH ()-[r:{relation}]->(n:Note {{uid: $uid}}) DELETE r"),
+                            vec![("uid", lbug::Value::String(note.uid.clone()))],
+                        )?;
+                    }
+                    exec_params(
+                        &conn,
+                        "MATCH (n:Note {uid: $uid})-[r:NOTE_TAGGED_WITH]->() DELETE r",
+                        vec![("uid", lbug::Value::String(note.uid.clone()))],
+                    )?;
+                }
             }
+            for section in sections {
+                if retained_notes.contains(section.note_uid.as_str())
+                    && Self::retained_owner_on(
+                        &conn,
+                        "Section",
+                        "note_uid",
+                        &section.uid,
+                        &section.note_uid,
+                    )?
+                {
+                    retained_sections.insert(section.uid.as_str());
+                    exec_params(
+                        &conn,
+                        &Self::sections_statement(true),
+                        Self::sections_fields(section),
+                    )?;
+                    for relation in [
+                        "SECTION_TAGGED_WITH",
+                        "WIKILINK_TO_NOTE",
+                        "WIKILINK_TO_HEADING",
+                    ] {
+                        exec_params(
+                            &conn,
+                            &format!("MATCH (s:Section {{uid: $uid}})-[r:{relation}]->() DELETE r"),
+                            vec![("uid", lbug::Value::String(section.uid.clone()))],
+                        )?;
+                    }
+                }
+            }
+            for note_uid in delete_note_uids {
+                if !retained_notes.contains(note_uid.as_str()) {
+                    Self::delete_note_cascade_on(&conn, note_uid)?;
+                    continue;
+                }
+                // Property and edge passes include orphaned/corrupt ownership fragments.
+                for query in [
+                    "MATCH (s:Section) WHERE s.note_uid = $uid AND NOT s.uid IN $keep DETACH DELETE s",
+                    "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_SECTION]->(s:Section) WHERE NOT s.uid IN $keep DETACH DELETE s",
+                ] {
+                    exec_params(
+                        &conn,
+                        query,
+                        vec![
+                            ("uid", lbug::Value::String(note_uid.clone())),
+                            (
+                                "keep",
+                                lbug::Value::List(
+                                    lbug::LogicalType::String,
+                                    retained_sections
+                                        .iter()
+                                        .map(|uid| lbug::Value::String((*uid).to_string()))
+                                        .collect(),
+                                ),
+                            ),
+                        ],
+                    )?;
+                }
+                for query in [
+                    "MATCH (h:Heading) WHERE h.note_uid = $uid DETACH DELETE h",
+                    "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_HEADING]->(h:Heading) DETACH DELETE h",
+                    "MATCH (n:Note {uid: $uid})-[r:NOTE_HAS_SECTION]->() DELETE r",
+                ] {
+                    exec_params(
+                        &conn,
+                        query,
+                        vec![("uid", lbug::Value::String(note_uid.clone()))],
+                    )?;
+                }
+            }
+            let fresh_notes: Vec<_> = notes
+                .iter()
+                .filter(|n| !retained_notes.contains(n.uid.as_str()))
+                .cloned()
+                .collect();
+            let fresh_sections: Vec<_> = sections
+                .iter()
+                .filter(|s| !retained_sections.contains(s.uid.as_str()))
+                .cloned()
+                .collect();
             Self::bulk_vault_write_on(
                 &conn,
-                notes,
+                &fresh_notes,
                 headings,
-                sections,
+                &fresh_sections,
                 vault_note_edges,
                 note_heading_edges,
                 note_section_edges,
@@ -4171,7 +4576,7 @@ impl GraphStore {
     ) -> Result<usize, StoreError> {
         insert_references_code_rows_on(
             conn,
-            "MATCH (a:Note {uid: r.src}), (b:Symbol {uid: r.dst}) \
+            "MATCH (a:Note {uid: r.src}) WITH a, r MATCH (b:Symbol {uid: r.dst}) \
              CREATE (a)-[:REFERENCES_CODE_NOTE_TO_SYMBOL \
              {confidence: r.conf, source: r.origin}]->(b)",
             edges,
@@ -4186,11 +4591,70 @@ impl GraphStore {
     ) -> Result<usize, StoreError> {
         insert_references_code_rows_on(
             conn,
-            "MATCH (a:Section {uid: r.src}), (b:Symbol {uid: r.dst}) \
+            "MATCH (a:Section {uid: r.src}) WITH a, r MATCH (b:Symbol {uid: r.dst}) \
              CREATE (a)-[:REFERENCES_CODE_SECTION_TO_SYMBOL \
              {confidence: r.conf, source: r.origin}]->(b)",
             edges,
         )
+    }
+
+    /// Delete one changed relationship via a scalar primary-key lookup.
+    pub fn delete_cross_domain_edge_on(
+        conn: &crate::db::StoreConnection<'_>,
+        from_note: bool,
+        from: &str,
+        to: &str,
+        confidence: f32,
+        source: &str,
+    ) -> Result<usize, StoreError> {
+        let query = if from_note {
+            "MATCH (a:Note {uid: $src})-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol {uid: $dst}) WHERE r.confidence = $confidence AND r.source = $source DELETE r"
+        } else {
+            "MATCH (a:Section {uid: $src})-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol {uid: $dst}) WHERE r.confidence = $confidence AND r.source = $source DELETE r"
+        };
+        exec_params(
+            conn,
+            query,
+            vec![
+                ("src", lbug::Value::String(from.into())),
+                ("dst", lbug::Value::String(to.into())),
+                ("confidence", lbug::Value::Float(confidence)),
+                ("source", lbug::Value::String(source.into())),
+            ],
+        )?;
+        Ok(1)
+    }
+
+    /// Read one note's current sidecars on the replacing transaction. A scalar
+    /// primary-key binding prevents the UNWIND/whole-graph cross product.
+    pub fn cross_domain_edges_for_note_on(
+        conn: &crate::db::StoreConnection<'_>,
+        note_uid: &str,
+    ) -> Result<Vec<(String, String, f32, String)>, StoreError> {
+        Self::cross_domain_edge_reader_on(conn)?.read(note_uid)
+    }
+
+    /// Prepare once on the caller's transaction; each read retains only one
+    /// note's old edges and continues to observe writes on that connection.
+    pub fn cross_domain_edge_reader_on<'connection, 'database>(
+        conn: &'connection crate::db::StoreConnection<'database>,
+    ) -> Result<CrossDomainEdgeReader<'connection, 'database>, StoreError> {
+        let prepare = |query| {
+            let statement = conn
+                .prepare(query)
+                .map_err(|e| StoreError::Query(format!("prepare sidecar read: {e}")))?;
+            #[cfg(test)]
+            SIDECAR_READ_PREPARES.with(|count| count.set(count.get() + 1));
+            Ok::<_, StoreError>(statement)
+        };
+        let [note_query, section_query] = [
+            "MATCH (n:Note {uid: $uid})-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol) RETURN n.uid, b.uid, r.confidence, r.source",
+            "MATCH (n:Note {uid: $uid})-[:NOTE_HAS_SECTION]->(s:Section)-[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) RETURN s.uid, b.uid, r.confidence, r.source",
+        ];
+        Ok(CrossDomainEdgeReader {
+            conn,
+            statements: [prepare(note_query)?, prepare(section_query)?],
+        })
     }
 
     /// Delete every REFERENCES_CODE edge originating from each note in
@@ -12919,6 +13383,624 @@ mod regex_scope_invalidation_tests {
             store.pending_regex_scope_count().unwrap(),
             1,
             "four payload entries, one repo, one queued scope"
+        );
+    }
+}
+
+#[cfg(test)]
+mod strategy_replacement_tests {
+    use super::*;
+
+    #[test]
+    fn strategy_replacement_rolls_back_opposite_cleanup_and_policy_in_both_directions() {
+        for to_vault in [true, false] {
+            let store = GraphStore::in_memory().unwrap();
+            let repo = Repo {
+                uid: repo_uid("test", "https://example.com/org/transition"),
+                url: "https://example.com/org/transition".into(),
+                indexed_sha: "old-sha".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            };
+            let root = "/bare/transition";
+            let vault = Vault {
+                uid: vault_uid("test", root),
+                name: repo.url.clone(),
+                root_path: root.into(),
+                instance_id: "test".into(),
+            };
+            store.insert_repo(&repo).unwrap();
+            store
+                .set_repo_index_policy(&repo.uid, "old-policy")
+                .unwrap();
+            if to_vault {
+                let file = File {
+                    uid: format!("file:{}:old", repo.uid),
+                    path: "old.rs".into(),
+                    repo_uid: repo.uid.clone(),
+                    content_hash: "old-file".into(),
+                };
+                let mut symbol = super::copy_from_tests::plain_symbol(1);
+                symbol.repo_uid = repo.uid.clone();
+                symbol.file_path = file.path.clone();
+                store
+                    .bulk_index_write(
+                        std::slice::from_ref(&file),
+                        std::slice::from_ref(&symbol),
+                        &[(&repo.uid, &file.uid)],
+                        &[(&file.uid, &symbol.uid)],
+                        &[],
+                        &[],
+                    )
+                    .unwrap();
+            } else {
+                store.insert_vault(&vault).unwrap();
+                let note = Note {
+                    uid: format!("note:{}:old", vault.uid),
+                    vault_uid: vault.uid.clone(),
+                    file_path: "old.md".into(),
+                    title: "Old note".into(),
+                    note_kind: nestweaver_schema::NoteKind::General,
+                    word_count: 2,
+                    content_hash: "old-note".into(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                };
+                store.insert_note(&note).unwrap();
+                store.insert_vault_note_edge(&vault.uid, &note.uid).unwrap();
+            }
+            let before_repo = format!("{:?}", store.repo_deletion_snapshot(&repo.uid).unwrap());
+            let before_vault = format!("{:?}", store.vault_deletion_snapshot(&vault.uid).unwrap());
+            let before_files = format!("{:?}", store.list_files_by_repo(&repo.uid).unwrap());
+            let before_notes = format!("{:?}", store.list_notes(None).unwrap());
+            let before_symbols = store.count_symbols().unwrap();
+            let mut replacement = RepoStrategyReplacement {
+                repo: repo.clone(),
+                bare_root: root.into(),
+                policy: if to_vault {
+                    "vault:new-policy".into()
+                } else {
+                    "new-policy".into()
+                },
+                to_vault,
+                remove_opposite: true,
+            };
+            replacement.repo.indexed_sha = "new-sha".into();
+            FAIL_STRATEGY_AFTER_CLEANUP.with(|fail| fail.set(true));
+            let result = if to_vault {
+                store
+                    .bulk_vault_reindex_write_with_strategy(
+                        &vault,
+                        false,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        Some(&replacement),
+                    )
+                    .map(|_| ())
+            } else {
+                store
+                    .bulk_reindex_write_with_strategy(
+                        &repo.uid,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        Some(&replacement),
+                    )
+                    .map(|_| ())
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("after strategy cleanup")
+            );
+            assert_eq!(
+                format!("{:?}", store.repo_deletion_snapshot(&repo.uid).unwrap()),
+                before_repo
+            );
+            assert_eq!(
+                format!("{:?}", store.vault_deletion_snapshot(&vault.uid).unwrap()),
+                before_vault
+            );
+            assert_eq!(
+                format!("{:?}", store.list_files_by_repo(&repo.uid).unwrap()),
+                before_files
+            );
+            assert_eq!(
+                format!("{:?}", store.list_notes(None).unwrap()),
+                before_notes
+            );
+            assert_eq!(store.count_symbols().unwrap(), before_symbols);
+            assert_eq!(
+                store.lookup_repo(&repo.uid).unwrap().unwrap().indexed_sha,
+                "old-sha"
+            );
+            assert_eq!(
+                store.get_repo_index_policy(&repo.uid).unwrap().as_deref(),
+                Some("old-policy")
+            );
+        }
+    }
+
+    #[test]
+    fn strategy_descriptor_cannot_delete_an_unrelated_vault() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo = Repo {
+            uid: repo_uid("test", "https://example.com/org/code"),
+            url: "https://example.com/org/code".into(),
+            indexed_sha: "sha".into(),
+            staleness_commits_behind: 0,
+            instance_id: "test".into(),
+            name: None,
+            root_path: None,
+        };
+        store.insert_repo(&repo).unwrap();
+        let vault = Vault {
+            uid: vault_uid("test", "/bare/other"),
+            name: "https://example.com/org/other".into(),
+            root_path: "/bare/other".into(),
+            instance_id: "test".into(),
+        };
+        store.insert_vault(&vault).unwrap();
+        let replacement = RepoStrategyReplacement {
+            repo: repo.clone(),
+            bare_root: vault.root_path.clone(),
+            policy: "policy".into(),
+            to_vault: false,
+            remove_opposite: true,
+        };
+        let error = store
+            .bulk_reindex_write_with_strategy(
+                &repo.uid,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                Some(&replacement),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("another repository"));
+        assert!(store.lookup_vault(&vault.uid).is_ok());
+    }
+    #[test]
+    fn strategy_descriptor_cannot_replace_an_unrelated_destination_vault() {
+        let store = GraphStore::in_memory().unwrap();
+        let repo = Repo {
+            uid: repo_uid("test", "https://example.com/org/destination"),
+            url: "https://example.com/org/destination".into(),
+            indexed_sha: "old-sha".into(),
+            staleness_commits_behind: 0,
+            instance_id: "test".into(),
+            name: None,
+            root_path: None,
+        };
+        store.insert_repo(&repo).unwrap();
+        store
+            .set_repo_index_policy(&repo.uid, "old-policy")
+            .unwrap();
+        let incumbent = Vault {
+            uid: vault_uid("test", "/bare/shared-root"),
+            name: "https://example.com/org/incumbent".into(),
+            root_path: "/bare/shared-root".into(),
+            instance_id: "test".into(),
+        };
+        store.insert_vault(&incumbent).unwrap();
+        let note = Note {
+            uid: "note:incumbent-owner".into(),
+            vault_uid: incumbent.uid.clone(),
+            file_path: "retained.md".into(),
+            title: "Retain incumbent content".into(),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 3,
+            content_hash: "incumbent-content-hash".into(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: None,
+            pagerank_score: None,
+            embedding: None,
+        };
+        store.insert_note(&note).unwrap();
+        store
+            .insert_vault_note_edge(&incumbent.uid, &note.uid)
+            .unwrap();
+        let target = Vault {
+            name: repo.url.clone(),
+            ..incumbent.clone()
+        };
+        for remove_opposite in [true, false] {
+            let mut replacement = RepoStrategyReplacement {
+                repo: repo.clone(),
+                bare_root: incumbent.root_path.clone(),
+                policy: "vault:new-policy".into(),
+                to_vault: true,
+                remove_opposite,
+            };
+            replacement.repo.indexed_sha = "new-sha".into();
+            let error = store
+                .bulk_vault_reindex_write_with_strategy(
+                    &target,
+                    true,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    Some(&replacement),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("another repository"));
+            assert_eq!(
+                store.lookup_vault(&incumbent.uid).unwrap().name,
+                incumbent.name
+            );
+            let retained = store.list_notes(Some(&incumbent.uid)).unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].uid, note.uid);
+            assert_eq!(retained[0].title, note.title);
+            assert_eq!(retained[0].content_hash, note.content_hash);
+            assert_eq!(
+                store.lookup_repo(&repo.uid).unwrap().unwrap().indexed_sha,
+                "old-sha"
+            );
+            assert_eq!(
+                store.get_repo_index_policy(&repo.uid).unwrap().as_deref(),
+                Some("old-policy")
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod references_code_plan_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static PLANS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    // Called only by the real insertion path, with its exact query and bound
+    // rows. Disabled for ordinary tests and all timed iterations.
+    pub(super) fn capture_actual_plan(
+        conn: &crate::db::StoreConnection<'_>,
+        query: &str,
+        rows: &lbug::Value,
+    ) -> Result<(), StoreError> {
+        if !PLANS.with(|plans| plans.borrow().is_some()) {
+            return Ok(());
+        }
+        let mut statement = conn.prepare(&format!("EXPLAIN {query}")).map_err(|error| {
+            StoreError::Query(format!("prepare actual sidecar EXPLAIN: {error}"))
+        })?;
+        let result = conn
+            .execute(&mut statement, vec![("rows", rows.clone())])
+            .map_err(|error| StoreError::Query(format!("actual sidecar EXPLAIN: {error}")))?;
+        let plan = result.to_string();
+        PLANS.with(|plans| plans.borrow_mut().as_mut().unwrap().push(plan));
+        Ok(())
+    }
+
+    fn seed() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_repo(&Repo {
+                uid: "repo:dialect".into(),
+                url: "https://example.com/plan".into(),
+                indexed_sha: "sha".into(),
+                staleness_commits_behind: 0,
+                instance_id: "test".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        store
+            .insert_vault(&Vault {
+                uid: "vlt:plan".into(),
+                name: "plan".into(),
+                root_path: "/plan".into(),
+                instance_id: "test".into(),
+            })
+            .unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:plan".into(),
+                vault_uid: "vlt:plan".into(),
+                file_path: "plan.md".into(),
+                title: "Plan".into(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 1,
+                content_hash: "hash".into(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        store
+            .insert_section(&Section {
+                uid: "section:plan".into(),
+                note_uid: "note:plan".into(),
+                heading_uid: None,
+                start_line: 1,
+                end_line: 1,
+                text_hash: "hash".into(),
+                text_content: "Plan".into(),
+                word_count: 1,
+                pagerank_score: None,
+            })
+            .unwrap();
+        add_symbols(&store, 0..1000);
+        store
+    }
+
+    fn add_symbols(store: &GraphStore, range: std::ops::Range<usize>) {
+        let symbols: Vec<_> = range.map(super::copy_from_tests::plain_symbol).collect();
+        store
+            .bulk_index_write(&[], &symbols, &[], &[], &[], &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn sidecar_reader_reuses_two_prepares_and_observes_only_its_transaction() {
+        let store = seed();
+        let mut other = store.lookup_note("note:plan").unwrap();
+        other.uid = "note:other".into();
+        other.file_path = "other.md".into();
+        store.insert_note(&other).unwrap();
+        let mut other_section = store.lookup_section("section:plan").unwrap();
+        other_section.uid = "section:other".into();
+        other_section.note_uid = other.uid.clone();
+        store.insert_section(&other_section).unwrap();
+        let mut excluded = other.clone();
+        excluded.uid = "note:excluded".into();
+        excluded.file_path = "excluded.md".into();
+        store.insert_note(&excluded).unwrap();
+        store
+            .batch_insert_note_section_edges(&[
+                ("note:plan", "section:plan"),
+                ("note:other", "section:other"),
+            ])
+            .unwrap();
+        let seed_conn = store.begin_transaction().unwrap();
+        GraphStore::batch_insert_note_to_symbol_edges_on(
+            &seed_conn,
+            &[
+                ("note:plan", "sym:plain:0000", 0.75, "note-source"),
+                ("note:other", "sym:plain:0001", 0.25, "other-note-source"),
+                ("note:excluded", "sym:plain:0004", 0.125, "excluded-source"),
+            ],
+        )
+        .unwrap();
+        GraphStore::batch_insert_section_to_symbol_edges_on(
+            &seed_conn,
+            &[
+                ("section:plan", "sym:plain:0002", 0.5, "section-source"),
+                (
+                    "section:other",
+                    "sym:plain:0003",
+                    0.375,
+                    "other-section-source",
+                ),
+            ],
+        )
+        .unwrap();
+        store.commit_transaction(&seed_conn).unwrap();
+        drop(seed_conn);
+        let all_before = store.list_references_code_edges().unwrap();
+        let conn = store.begin_transaction().unwrap();
+        let boundary = SIDECAR_READ_PREPARES.with(std::cell::Cell::get);
+        let mut reader = GraphStore::cross_domain_edge_reader_on(&conn).unwrap();
+        let expected = vec![
+            (
+                "note:plan".to_string(),
+                "sym:plain:0000".to_string(),
+                0.75,
+                "note-source".to_string(),
+            ),
+            (
+                "section:plan".to_string(),
+                "sym:plain:0002".to_string(),
+                0.5,
+                "section-source".to_string(),
+            ),
+        ];
+        for _ in 0..16 {
+            assert_eq!(reader.read("note:plan").unwrap(), expected);
+            let other_edges = reader.read("note:other").unwrap();
+            assert_eq!(other_edges.len(), 2);
+            assert!(
+                other_edges
+                    .iter()
+                    .all(|(from, _, _, _)| from.ends_with(":other"))
+            );
+            assert!(reader.read("note:missing").unwrap().is_empty());
+        }
+        assert_eq!(
+            SIDECAR_READ_PREPARES.with(std::cell::Cell::get) - boundary,
+            2,
+            "actual prepare calls must stay constant across scalar UID reads"
+        );
+        assert_eq!(
+            GraphStore::cross_domain_edges_for_note_on(&conn, "note:plan").unwrap(),
+            expected
+        );
+        assert_eq!(
+            SIDECAR_READ_PREPARES.with(std::cell::Cell::get) - boundary,
+            4,
+            "the one-note compatibility wrapper uses the same two prepared queries"
+        );
+        // Writes after reader construction must be visible through THIS
+        // transaction, rather than an off-connection lookup or cached rows.
+        GraphStore::delete_cross_domain_edge_on(
+            &conn,
+            true,
+            "note:plan",
+            "sym:plain:0000",
+            0.75,
+            "note-source",
+        )
+        .unwrap();
+        GraphStore::batch_insert_note_to_symbol_edges_on(
+            &conn,
+            &[("note:plan", "sym:plain:0005", 0.625, "transaction-only")],
+        )
+        .unwrap();
+        let changed = reader.read("note:plan").unwrap();
+        assert_eq!(changed.len(), 2);
+        assert!(changed.iter().any(|edge| edge.1 == "sym:plain:0005"
+            && edge.2 == 0.625
+            && edge.3 == "transaction-only"));
+        assert!(!changed.iter().any(|edge| edge.1 == "sym:plain:0000"));
+        assert_eq!(reader.read("note:other").unwrap().len(), 2);
+        drop(reader);
+        // A genuine failure after those mutations must preserve the whole
+        // old graph on rollback, including the unrelated excluded source.
+        assert!(conn.query("CREATE (:Note {uid: 'note:plan'})").is_err());
+        // The failed native CREATE automatically aborts this transaction;
+        // there is no active transaction left for an explicit ROLLBACK.
+        drop(conn);
+        assert_eq!(store.list_references_code_edges().unwrap(), all_before);
+        let verify = store.begin_transaction().unwrap();
+        assert_eq!(
+            GraphStore::cross_domain_edges_for_note_on(&verify, "note:plan").unwrap(),
+            expected
+        );
+        store.rollback_transaction(&verify).unwrap();
+    }
+
+    fn insert_fixed_batch_and_rollback(store: &GraphStore) -> Duration {
+        let destinations: Vec<_> = (0..100)
+            .map(|number| format!("sym:plain:{number:04}"))
+            .collect();
+        let notes: Vec<_> = destinations
+            .iter()
+            .map(|uid| ("note:plan", uid.as_str(), 1.0, "mention"))
+            .collect();
+        let sections: Vec<_> = destinations
+            .iter()
+            .map(|uid| ("section:plan", uid.as_str(), 1.0, "mention"))
+            .collect();
+        let transaction = store.begin_transaction().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            GraphStore::batch_insert_note_to_symbol_edges_on(&transaction, &notes).unwrap(),
+            1
+        );
+        assert_eq!(
+            GraphStore::batch_insert_section_to_symbol_edges_on(&transaction, &sections).unwrap(),
+            1
+        );
+        let elapsed = started.elapsed();
+        transaction.query("ROLLBACK").unwrap();
+        elapsed
+    }
+
+    fn assert_actual_plans(store: &GraphStore, symbol_count: usize) {
+        PLANS.with(|plans| *plans.borrow_mut() = Some(Vec::new()));
+        insert_fixed_batch_and_rollback(store);
+        let plans = PLANS.with(|plans| plans.borrow_mut().take().unwrap());
+        assert_eq!(plans.len(), 2, "capture both real insert paths");
+        for (kind, plan) in ["note", "section"].into_iter().zip(plans) {
+            eprintln!("REFERENCES_CODE {kind}, symbols={symbol_count}:\n{plan}");
+            let compact: String = plan
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .flat_map(char::to_lowercase)
+                .collect();
+            assert!(
+                !compact.is_empty(),
+                "EXPLAIN must return its actual physical plan"
+            );
+            assert!(
+                !compact.contains("crossproduct"),
+                "{kind} still cross-products: {plan}"
+            );
+            assert!(
+                compact.contains("indexscan")
+                    || compact.contains("primarykey")
+                    || compact.contains("hashjoin"),
+                "{kind} must demonstrate PK lookup or hash join: {plan}"
+            );
+        }
+        assert_eq!(
+            store.count_references_code_edges().unwrap(),
+            0,
+            "all experimental writes roll back"
+        );
+    }
+
+    #[test]
+    fn references_code_actual_insert_plans_use_pk_or_hash_join_without_cross_product() {
+        assert_actual_plans(&seed(), 1000);
+    }
+
+    #[test]
+    #[ignore = "explicit 1k/50k scaling witness; run once on an otherwise quiet worker"]
+    fn references_code_insert_cost_does_not_scale_with_symbol_count() {
+        let store = seed();
+        let mut medians = Vec::new();
+        for count in [1000, 50_000] {
+            if count == 50_000 {
+                add_symbols(&store, 1000..count);
+            }
+            assert_actual_plans(&store, count);
+            insert_fixed_batch_and_rollback(&store); // warm the actual statement/index path
+            let mut measurements: Vec<_> = (0..5)
+                .map(|_| insert_fixed_batch_and_rollback(&store))
+                .collect();
+            measurements.sort();
+            let median = measurements[measurements.len() / 2];
+            eprintln!(
+                "REFERENCES_CODE fixed 100 note + 100 section edges, symbols={count}, median_us={}, samples_us={:?}",
+                median.as_micros(),
+                measurements
+                    .iter()
+                    .map(Duration::as_micros)
+                    .collect::<Vec<_>>()
+            );
+            medians.push(median);
+        }
+        let ratio = medians[1].as_secs_f64() / medians[0].as_secs_f64();
+        eprintln!("REFERENCES_CODE 50k/1k median insert ratio={ratio:.4}");
+        assert!(
+            ratio <= 2.0,
+            "canonical 2x scaling bound failed: {ratio:.4}"
         );
     }
 }

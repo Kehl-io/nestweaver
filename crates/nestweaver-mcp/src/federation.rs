@@ -168,6 +168,7 @@ pub fn upstream_entry_to_config(entry: &nestweaver_engine::UpstreamEntry) -> Ups
         timeout: entry.timeout.clone(),
         ca_cert: entry.ca_cert.clone(),
         fallback_timeout: entry.fallback_timeout.clone(),
+        vault_mappings: entry.vault_mappings.clone(),
     }
 }
 
@@ -363,13 +364,18 @@ async fn refresh_stale_verdict(
     probes: &[MaintenanceProbe],
     fed: &FederationState,
 ) {
-    let Some(local_states) = local_repo_states(store).await else {
+    let Some((local_states, local_checkout_paths)) = local_repo_states(store).await else {
         // Store read failed — keep the previous verdict rather than blanking
         // it (staleness degrades to possibly-outdated, never to a lie of
         // freshness caused by a transient read error).
         return;
     };
-    let stale = nestweaver_federation::health::compute_stale_repos(&local_states, probes).await;
+    let stale = nestweaver_federation::health::compute_stale_repos_with_checkout_paths(
+        &local_states,
+        &local_checkout_paths,
+        probes,
+    )
+    .await;
     fed.set_stale_repos(stale);
 }
 
@@ -377,7 +383,9 @@ async fn refresh_stale_verdict(
 /// the store — the same fields the gRPC `RepoStates` handler serves, without
 /// the loopback RPC. Store reads are blocking, so this hops to the blocking
 /// pool like every other store access on the async path.
-async fn local_repo_states(store: &Arc<GraphStore>) -> Option<HashMap<String, String>> {
+type LocalRepoStates = (HashMap<String, String>, HashMap<String, String>);
+
+async fn local_repo_states(store: &Arc<GraphStore>) -> Option<LocalRepoStates> {
     let store = Arc::clone(store);
     let result = tokio::task::spawn_blocking(move || {
         store
@@ -385,8 +393,13 @@ async fn local_repo_states(store: &Arc<GraphStore>) -> Option<HashMap<String, St
             .map(|repos| {
                 repos
                     .into_iter()
-                    .map(|r| (r.url, r.indexed_sha))
-                    .collect::<HashMap<String, String>>()
+                    .map(|r| {
+                        (
+                            (r.url.clone(), r.indexed_sha),
+                            (r.url, r.root_path.unwrap_or_default()),
+                        )
+                    })
+                    .unzip::<_, _, HashMap<String, String>, HashMap<String, String>>()
             })
             .map_err(|e| e.to_string())
     })
@@ -542,6 +555,7 @@ timeout = "2s"
             timeout: "200ms".to_string(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         FederationState {
             upstreams: vec![UpstreamHandle::from_config(&cfg).expect("handle")],

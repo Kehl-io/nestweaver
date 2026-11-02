@@ -46,6 +46,7 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
 
   return (
     <div className="flex min-w-0 h-full flex-col overflow-x-hidden overflow-y-auto p-4">
+      {detail._federation && <p role="status" className="mb-3 text-xs text-[var(--color-text-muted)]">Upstream result · freshness unknown · read only. Source files and local navigation are unavailable.</p>}
       {/* Top: Identity */}
       <div className="mb-4">
         <div className="mb-1 flex min-w-0 items-start gap-2">
@@ -63,14 +64,14 @@ export function SymbolDetail({ uid }: SymbolDetailProps) {
           </pre>
         )}
         <div className="flex gap-4 text-xs text-[var(--color-text-muted)]">
-          <span>PageRank: {symbol.pagerank_score.toFixed(4)}</span>
+          <span>PageRank: {(symbol.pagerank_score ?? 0).toFixed(4)}</span>
           <span>
             Refs: {refCount}
           </span>
         </div>
         <NodeActionBar
           node={{ uid: symbol.uid, kind: symbol.kind, label: symbol.name }}
-          ids={["open", "explore", "impact", "trace", "path", "related", "ask", "copyLink"]}
+          ids={detail._federation ? ["impact", "copyLink"] : ["open", "explore", "impact", "trace", "path", "related", "ask", "copyLink"]}
           compact
           className="mt-3"
         />

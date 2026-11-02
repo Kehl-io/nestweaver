@@ -39,6 +39,25 @@ nestweaver daemon --db ./brain.lbug run \
 | `--acme-production` | Use the Let's Encrypt **production** directory. The default is **staging** (untrusted certs, high rate limits), so issuance can be debugged without a rate-limit ban. Pass this only once the staging flow works end to end |
 | `--port-file <path>` | Write the actual bound port to this file — the way to read an ephemeral `--bind …:0` port programmatically |
 
+For a snapshot replica, keep using the original `--db` path for `daemon status`,
+`daemon stop` and `ui`. The daemon manages its private materialized copy; its
+endpoint identity remains bound to the selected path.
+Reads such as `brain status` and `brain search` can use that anchor while the
+verified replica is running. With no live local endpoint, an absent anchor
+uses configured upstreams or reports a missing database; it never starts a
+daemon that creates an empty store.
+
+Snapshots can include verified Markdown derivation proof and its captured
+graph generation when all vaults have complete current filesystem coverage.
+Such replicas can serve `brain orphans`, `brain topic-clusters`,
+`brain tag-graph` and `brain doc-stats` without mounting the producer's paths,
+provided the configured note-size and ignore policy matches. Managed bare
+providers are not certified by this portable proof. Older or uncertified
+snapshots remain searchable; derived reads report that an upstream refresh is
+required. A declared but invalid proof or generation rejects verification.
+Readers must support the `markdown-derivation-proof-v1` capability to import
+snapshots carrying it; older readers reject these snapshots.
+
 A `--bind` that is not a literal socket address (`localhost:9378`, `0:9378`,
 `myhost:9378`) is resolved once at startup, and both the gRPC and MCP HTTP
 listeners bind exactly that validated address set (MCP on port + 1). If every resolved address is loopback it
@@ -309,6 +328,16 @@ point, not corruption, and the next attempt picks it up. And auto-repair
 load stays failed until an operator acts.
 
 ### Write-path visibility
+
+During indexing, JSON `brain status` can return the last completed graph
+observation instead of waiting behind an atomic write. `status_observation`
+reports its age, generation and whether it is stale or busy; the text command
+labels those counts. Graph changes or a 30-second age limit trigger a refresh;
+configuration annotations can lag until that refresh. Authorization and
+operation-time configuration checks remain current. Owner, write queue, dirty
+publication, derivation progress and reconciliation debt remain live. The
+typed `BrainStatus` RPC returns retryable `Unavailable` when it cannot provide
+current counts; use `BrainStatusJson` for disclosed last-observed counts.
 
 `brain status` reports two different queues, and they are not
 interchangeable:
@@ -642,8 +671,8 @@ type = "vault"           # index as markdown vault, not code
 
 ### How config changes are applied
 
-- **Persistence.** Admin add/remove rewrite the instance config atomically (temp file, fsync, rename) under an in-process lock, so concurrent admin calls all persist and readers never see a partial file. A symlinked config is followed and stays a symlink. Because the write is a rename, the config's directory must be writable, and a single-file bind mount of the config cannot be updated (mount the directory instead). Only the file mode is preserved (not owner, ACLs or xattrs). The lock is per process: a CLI `instance adopt` run while the daemon is mutating the config can still lose one of the two edits.
-- **Reload and restart.** Newly declared repos are queued; a changed `branch` re-queues the repo; jobs (including dead letters) for repos no longer declared are cancelled, at reload and at startup. A dead-lettered repo stays quarantined across reload and restart until retried via `/admin/api/dead-letter/{id}/retry`; a corrected `branch` is recorded for that retry. A change to `type` takes effect only after a restart.
+- **Persistence.** Admin add/remove rewrite the instance config atomically (temp file, fsync, rename) under an in-process lock and a cross-process sidecar lock, so concurrent admin calls all persist and readers never see a partial file. A symlinked config is followed and stays a symlink. Because the write is a rename, the config's directory must be writable, and a single-file bind mount of the config cannot be updated (mount the directory instead). Only the file mode is preserved (not owner, ACLs or xattrs). Cooperating CLI and daemon writers also use a stable `<config>.lock` beside the canonical target; a competing process is refused with “config is being edited by another process” and can retry, rather than overwriting an acknowledged edit. External editors that ignore this lock are not serialized.
+- **Reload and restart.** Newly declared repos are queued; a changed `branch` re-queues the repo; jobs (including dead letters) for repos no longer declared are cancelled, at reload and at startup. A dead-lettered repo stays quarantined across reload and restart until retried via `/admin/api/dead-letter/{id}/retry`; a corrected `branch` is recorded for that retry. A changed `type`, `exclude` or `unskip` policy takes effect on reload and queues a full repair even when the indexed Git SHA is unchanged. Code/vault strategy transitions replace the old graph and publish the new repo SHA/policy in one transaction; failed replacement preserves the prior graph. Other boot settings, such as worker count, credentials and workspace root, still need a restart.
 
 ### Vault repos
 
@@ -743,7 +772,14 @@ During rotation, the server checks the new secret first, falls back to the old s
 
 ## Adaptive Polling
 
-The server automatically polls repos for changes using `git ls-remote`. Probes run concurrently, at most 8 at a time, so a hung remote costs one slot for one git timeout rather than stalling the other repos, scheduler commands or shutdown. The polling interval adapts based on repo activity:
+The server automatically polls repos for changes using `git ls-remote`. Probes
+run concurrently, at most eight at a time. Each read-only probe holds its slot
+through DNS resolution and the bounded git command. A stalled resolver can
+occupy a slot until the operating system returns, but does not retain Tokio's
+blocking pool during foreground shutdown. Cancellation prevents a late DNS
+result from starting git, and an active git probe is cancelled and reaped.
+Scheduler commands and other available probe slots remain responsive. The
+polling interval adapts based on repo activity:
 
 ```
 base     = time_since_last_commit / 2
@@ -984,26 +1020,27 @@ tier total or the deduplicated merged-row count, whichever is greater (a lower
 bound), never the sum. A seed resolved on both tiers counts once in
 `seeds_expanded`.
 
-Cross-tier identity for vault notes: a vault's `uid` hashes the vault's local
-root path, so the same vault indexed at two paths mints two vault hashes, and
-the uid alone cannot say whether two vault hashes are one vault. Within a tier
-the vault hash is kept. Across tiers a (local vault, server vault) pair is
-reconciled only on corroborating evidence: at least two distinct notes that
-agree on vault-relative path and lowercased title, or one `sec:` row that
-agrees on relative path, start line and content hash (only `sec:` carries a
-content hash; `head:` slugs are heading text and `tag:` is a name hash, so
-neither is evidence). The pairing must also be one-to-one. Inside a reconciled
-pair, notes still need an equal lowercased title to merge, and headings and
-tags merge by their vault-relative key (a tag by its name hash, not by path).
-Everything else stays vault-qualified: a duplicate row is possible, a false
-merge is not, with one limit. Corroboration is evidence, not proof: two
-genuinely different vaults on different tiers that share two same-path,
-same-title notes (for example two vaults from one template) or one section
-content hash will be reconciled and their same-path, same-title notes will
-merge. When either tier holds a vault that is neither shared nor reconciled,
-the merged `brain_search` total is reported as a `gte` lower bound, never
-`eq`. A path-independent vault fingerprint would need a persisted-uid
-migration and is not part of this behaviour.
+Cross-tier identity for vault notes: a vault UID includes the instance and a
+hash of its machine-local root path. Matching titles, relative paths or section
+content do not prove that two vaults are the same: unrelated vaults can share a
+template. To reconcile a local vault with its upstream copy, explicitly bind
+their full vault UIDs in that upstream's configuration:
+
+```toml
+[[upstream]]
+url = "grpcs://nestweaver.internal:9378"
+vault_mappings = { "vlt:laptop:aaaaaaaaaaaa" = "vlt:server:bbbbbbbbbbbb" }
+```
+
+Use the actual vault UIDs reported by each graph. Bindings must be one-to-one;
+invalid or ambiguous bindings cannot merge rows. The same setting is accepted
+in instance.toml, upstreams.toml and .nestweaver/server.toml. Inside an authorized
+pair, notes, headings, sections and tags use their canonical vault-relative
+identity. The original result UIDs are preserved. Without a binding, distinct
+vault scopes stay separate even when their root paths or contents coincide.
+Their union cardinality is uncertain: search reports a `gte` lower bound from
+the tier totals, which can be smaller than the number of returned copies. This
+configuration does not change persisted UIDs or require an identity migration.
 
 A row whose `uid` is not a recognised canonical shape (for example `proj:` or
 `contract:` rows) is keyed by its raw uid string, never by title, and never
@@ -1014,8 +1051,8 @@ not the exact union.
 ### Staleness detection
 
 The client compares local `indexed_sha` against the server's `RepoStates` in a background task, matching repos by full canonical identity (`host/owner/name`; a same-named repo in another org never matches, and a path-only local checkout pairs with a server repo by unique directory name). A repo is stale only when the local index is **behind**:
-- a path-only local checkout that is ahead of (or already contains) the server's indexed commit is not stale. This is checked with a bounded (2 s), non-blocking `git merge-base --is-ancestor`; if it cannot be checked (git missing, commit not in the checkout, timeout), a differing SHA is conservatively treated as stale
-- a local repo registered by remote URL has no checkout path the client can inspect, so a differing SHA is treated as stale even when the local copy is ahead (limitation: the daemon's `RepoState` does not yet carry a root path)
+- a local checkout that is ahead of (or already contains) the server's indexed commit is not stale. This is checked with a bounded (2 s), non-blocking `git merge-base --is-ancestor`; if it cannot be checked (git missing, commit not in the checkout, timeout), a differing SHA is conservatively treated as stale
+- repositories registered by remote URL use the checkout path advertised by the **local** daemon for ancestry checks. Paths from upstream servers are never used as local paths. Older local daemons without this field retain the conservative differing-SHA verdict
 - a non-git directory (SHA `local`) or an empty SHA is unknown, not stale
 
 When a repo is stale:
@@ -1033,18 +1070,49 @@ url = "grpcs://nestweaver.internal:9378"
 timeout = "1s"    # ceiling; the live deadline is adaptive (see below)
 ```
 
-The live per-query deadline is **adaptive and mode-aware**, not a fixed value. The client scales off a rolling EWMA of observed upstream latencies and clamps the result per routing mode:
+The live per-query deadline is **adaptive and mode-aware**, not a fixed value. The client learns a separate rolling latency estimate for each tool on each upstream and clamps its deadline per routing mode. A fast search cannot shorten the first detail, note or impact query; a tool without observations starts at the mode ceiling:
 
-- **`fallback`** keeps the deadline tight — the deadline is capped at **200ms** by default (`DEFAULT_FALLBACK_CAP` in `crates/nestweaver-federation/src/upstream.rs`, pinned by `effective_timeout_fallback_capped_at_200ms`) — so the local fast path is never blocked waiting on the server. Set `fallback_timeout` on the upstream to raise or lower that cap (it is always bounded by `timeout`): with `timeout = "1s"` and `fallback_timeout = "750ms"` fallback mode waits up to 750ms. Use this for an off-site server where TLS plus round-trip alone exceeds 200ms. `fallback_timeout` is accepted in `upstreams.toml`, `.nestweaver/server.toml` and `instance.toml` `[[upstream]]`.
+- **`fallback`** keeps the deadline tight — the deadline is capped at **200ms** by default (`DEFAULT_FALLBACK_CAP` in `crates/nestweaver-federation/src/upstream.rs`, pinned by `effective_timeout_fallback_capped_at_200ms`) for the query after connection establishment. Set `fallback_timeout` on the upstream to raise or lower that cap (it is always bounded by `timeout`): with `timeout = "1s"` and `fallback_timeout = "750ms"` fallback mode waits up to 750ms. Use this when the upstream query itself needs more than 200ms. `fallback_timeout` is accepted in `upstreams.toml`, `.nestweaver/server.toml` and `instance.toml` `[[upstream]]`.
 - **`merge`** and **`primary`** allow up to the configured `timeout` ceiling (default 1s) — the richer org-wide answer is the whole point of those modes.
 
-On a cold start (no latency samples yet) the mode ceiling is used directly.
+A cold lazy channel is established with an authenticated health check under a
+separate bounded five-second connection budget. The query deadline and latency
+sample start after that check, so TLS setup does not consume the warm query
+budget. An unreachable cold upstream can therefore add up to five seconds to
+the first request; subsequent calls use the warm query deadline. With no query
+latency samples yet, the mode ceiling is used directly. Query provenance includes
+`_meta.upstream_attempts` with the outcome and ejection state; upstream status
+includes `last_query_outcome`, `ejected` and effective `fallback_timeout_ms`.
 
-A timeout does not by itself eject the upstream. A timed-out call raises the latency estimate (so the next deadline widens instead of staying near the 50ms floor), and the upstream is passively ejected only after **two consecutive timeouts at the full mode ceiling**; any successful call resets the count. Connection failures and `Unavailable`/`DeadlineExceeded` statuses returned by the server still eject immediately; the client's own deadline always fires first (the transport backstop is `timeout` + 1s), so a plain slow response is a timeout, not a `DeadlineExceeded` status. An upstream that rejects a query with some other status (for example a `note_get` for a note the server does not hold) is healthy and is not ejected; its real gRPC status is logged.
+A timeout does not by itself eject the upstream. A timed-out call raises that tool's latency estimate (so the next deadline widens instead of staying near the 50ms floor), and the upstream is passively ejected only after **two consecutive timeouts at the full mode ceiling**; any successful call resets the count. Connection failures and `Unavailable`/`DeadlineExceeded` statuses returned by the server still eject immediately; the client's own deadline always fires first (the transport backstop is above both the query and cold-connect ceilings), so a plain slow response is a timeout, not a `DeadlineExceeded` status. An upstream that rejects a query with some other status (for example a `note_get` for a note the server does not hold) is healthy and is not ejected; its real gRPC status is logged.
 
 Tools with their own response shape (`regex_search`, `count_patterns`, `flow_trace`, and the other local-only, two-tier and combined tools) keep their tool-specific routing in every mode.
 
 ---
+
+## Federated web UI
+
+The optional web UI uses the daemon's startup `instance.toml` `[[upstream]]`
+entries for symbol and note search, read-only symbol details, note bodies and
+metadata, and the all-workspace impact lens. CLI environment or user connection
+discovery alone does not configure web federation. Restart the daemon to change
+these upstreams. Search shows source, freshness and partial-result notices.
+The impact lens keeps local
+and org-wide impact, affected tests and blast radius in separate tiers.
+
+An unavailable upstream is reported as unavailable, rather than as a missing
+symbol or note. A missing detail is reported only after the relevant sources
+have answered; ambiguous lookups remain ambiguous. Remote symbol details can
+show graph relationships, but remote file bytes, source editing and local-file
+navigation are unavailable. Remote note headings, sections, backlinks and
+wikilink navigation are not composed. Org-wide layered edges and uncommitted
+overlays are also unsupported.
+
+Workspace-scoped views use local workspace membership. Remote workspace
+membership, overview and context views are not composed across upstreams; the
+UI capability response describes these limits. Configure explicit vault
+bindings as described above when the local and remote vaults represent the
+same material.
 
 ## Impact Analysis
 
@@ -1348,7 +1416,7 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 | `/admin/api/repos` | POST | Add a new repo to the index |
 | `/admin/api/repos/{id}` | DELETE | Remove a repo from the index and config. `{id}` is the graph uid, its config `name`, or its canonical URL (as shown in the dead-letter listing), which also works for a repo that never finished indexing. `{id}` may also name an indexed repo by name or URL (graph data is removed too). Unknown ids return 404; an id matching several repos returns 409 with the candidates |
 | `/admin/api/repos/{id}/reindex` | POST | Force reindex of a specific repo |
-| `/admin/api/reload` | POST | Reload server configuration. Newly declared repos are queued; jobs, including dead letters, for repos removed from config are cancelled; a changed `branch` re-queues the repo; dead-lettered repos stay quarantined until retried explicitly (a type change needs a restart) |
+| `/admin/api/reload` | POST | Reload server configuration. Newly declared repos are queued; jobs, including dead letters, for repos removed from config are cancelled; a changed `branch` re-queues the repo; dead-lettered repos stay quarantined until retried explicitly; branch/type/exclude/unskip changes are applied through one live repo snapshot and unchanged-SHA indexes heal |
 | `/admin/api/queue` | GET | View the indexing job queue |
 | `/admin/api/drain` | POST | Pause job processing |
 | `/admin/api/resume` | POST | Resume job processing |

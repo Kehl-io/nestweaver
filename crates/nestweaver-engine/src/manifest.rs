@@ -1040,6 +1040,7 @@ pub(crate) fn begin_graph_mutation_publication_on_lease<'a>(
     reason: Option<&'static str>,
     non_code: bool,
 ) -> Result<GraphMutationPublicationGuard<'a>, anyhow::Error> {
+    lease.set_operation(&operation);
     lease.ensure_clean_for_snapshot().map_err(|error| {
         anyhow::anyhow!("{operation}: refusing to overwrite a dirty publication: {error}")
     })?;

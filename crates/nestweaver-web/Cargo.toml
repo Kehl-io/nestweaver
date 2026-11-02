@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 nestweaver-algorithms = { workspace = true }
 nestweaver-engine = { workspace = true }
+nestweaver-federation = { workspace = true }
 nestweaver-store = { workspace = true }
 nestweaver-schema = { workspace = true }
 rmp-serde = "1"

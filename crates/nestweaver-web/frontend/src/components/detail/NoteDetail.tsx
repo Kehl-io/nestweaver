@@ -74,6 +74,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
   }, [loading, destination, uid, detail, setDestination]);
 
   const handleWikilink = useCallback(async (target: string) => {
+    if (detail?._federation) { setLinkError("Remote note navigation is unsupported."); return; }
     const sequence = ++navigationSeq.current;
     setLinkError(null);
     try {
@@ -85,7 +86,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
       if (sequence !== navigationSeq.current || useStore.getState().graphEpoch !== graphEpoch || useStore.getState().activeWorkspaceId !== workspaceId || useStore.getState().selectedNodeId !== uid) return;
       setLinkError(error instanceof Error ? error.message : "Wikilink could not be resolved.");
     }
-  }, [uid, graphEpoch, workspaceId, exploreNode, setDestination]);
+  }, [uid, graphEpoch, workspaceId, exploreNode, setDestination, detail]);
 
   const visibleNoteKey = JSON.stringify([workspaceId, uid]);
   if (loading || (loadedNote.current !== visibleNoteKey && !(error && errorNote.current === visibleNoteKey))) {
@@ -126,6 +127,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
         </div>
         <div className="mb-2 min-w-0 break-all text-xs text-[var(--color-text-muted)]">
           {note.file_path}
+          {detail._federation && <span role="status"> · Upstream · freshness unknown · read only; note navigation and edits unavailable.</span>}
         </div>
         <div className="flex gap-4 text-xs text-[var(--color-text-muted)]">
           <span>{note.word_count} words</span>
@@ -134,7 +136,7 @@ export function NoteDetail({ uid }: NoteDetailProps) {
         </div>
         <NodeActionBar
           node={{ uid: note.uid, kind: "note", label: note.title }}
-          ids={["open", "explore", "related", "path", "ask", "copyLink"]}
+          ids={detail._federation ? ["copyLink"] : ["open", "explore", "related", "path", "ask", "copyLink"]}
           compact
           className="mt-3"
         />

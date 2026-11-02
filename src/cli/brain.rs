@@ -508,6 +508,27 @@ pub(crate) fn run_brain(
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
                     println!("Brain status:");
+                    if let Some(observation) = value
+                        .get("status_observation")
+                        .filter(|observation| observation.is_object())
+                    {
+                        println!(
+                            "  Counts: last observed {} ms ago (generation {}; {}{})",
+                            observation["age_ms"],
+                            observation["as_of_generation"],
+                            if observation["stale"].as_bool() == Some(true) {
+                                "stale"
+                            } else {
+                                "completed observation"
+                            },
+                            if observation["busy"].as_bool() == Some(true) {
+                                "; indexing in progress"
+                            } else {
+                                ""
+                            },
+                        );
+                    }
+
                     if let Some(compatibility) = value
                         .get("index_compatibility")
                         .or_else(|| value.pointer("/_meta/index_compatibility"))
@@ -727,6 +748,16 @@ pub(crate) fn run_brain(
                         if let Some(line) = format_index_publication_line(dirty, wedged) {
                             println!("{line}");
                         }
+                    }
+                    if let Some(owner) = value.get("index_publication_owner")
+                        && let (Some(token), Some(age)) =
+                            (owner["token"].as_u64(), owner["age_secs"].as_u64())
+                    {
+                        let operation = owner["operation"].as_str().unwrap_or("unknown");
+                        println!(
+                            "  Publication owner: {} (token {token}, held {age}s)",
+                            terminal_safe(operation)
+                        );
                     }
                     if let Some(embedding) = value.get("embedding_status") {
                         println!("Embedding:");
@@ -2486,9 +2517,50 @@ pub(crate) fn run_brain(
             prf,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            require_existing_db(&db_path)?;
+            let selected = selected_existing_database(&db_path)?;
+            let absent_anchor = selected.is_none();
+            if !use_daemon || !absent_anchor {
+                require_existing_db(&db_path)?;
+                if let Some(selected) = &selected {
+                    require_openable_db(selected)?;
+                }
+            }
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 20);
+            let finish_json =
+                |result: &serde_json::Value| -> anyhow::Result<(i32, Option<String>)> {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(result)?);
+                    } else {
+                        render_brain_search_json(result)?;
+                    }
+                    let count = result
+                        .get("results")
+                        .and_then(|v| v.as_array())
+                        .map_or(0, Vec::len);
+                    Ok((
+                        EXIT_SUCCESS,
+                        Some(format!(
+                            "{} results in {} (via daemon+hybrid)",
+                            count,
+                            format_elapsed(t0.elapsed()),
+                        )),
+                    ))
+                };
+            if use_daemon && absent_anchor {
+                // The shared funnel admits a verified live replica or an
+                // upstream-only read without ever creating the absent anchor.
+                // Keep its admitted client; do not probe then autostart below.
+                let result = try_hybrid_json_rpc_checked(
+                    true,
+                    &db_path,
+                    config.as_deref(),
+                    "brain_search",
+                    serde_json::json!({"query": raw_query, "limit": limit, "prf": prf}),
+                )?
+                .context("brain search read did not produce a daemon answer")?;
+                return finish_json(&result);
+            }
 
             // Route through the daemon's typed `Search` RPC when running. The
             // daemon owns the writer-mode Tantivy index and shares dispatch
@@ -2526,22 +2598,7 @@ pub(crate) fn run_brain(
                             });
                             match rt.block_on(hybrid.query("brain_search", &params)) {
                                 Ok(result) => {
-                                    if json {
-                                        println!("{}", serde_json::to_string_pretty(&result)?);
-                                    } else {
-                                        render_brain_search_json(&result)?;
-                                    }
-                                    let count = result
-                                        .get("results")
-                                        .and_then(|v| v.as_array())
-                                        .map(|a| a.len())
-                                        .unwrap_or(0);
-                                    let stats = format!(
-                                        "{} results in {} (via daemon+hybrid)",
-                                        count,
-                                        format_elapsed(t0.elapsed())
-                                    );
-                                    return Ok((EXIT_SUCCESS, Some(stats)));
+                                    return finish_json(&result);
                                 }
                                 Err(error) => {
                                     ensure_direct_store_fallback_allowed(
@@ -3252,9 +3309,6 @@ pub(crate) fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // nw-087: read-only command — fail `db_not_found` on a
-            // missing --db, matching the other read commands.
-            require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
@@ -3303,6 +3357,7 @@ pub(crate) fn run_brain(
                 }
             }
 
+            require_existing_db(&db_path)?;
             let store = open_store(Some(&db_path))?;
             let all_orphans = nestweaver_engine::orphan_documents(
                 &store,
@@ -3345,9 +3400,6 @@ pub(crate) fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // nw-087: read-only command — fail `db_not_found` on a
-            // missing --db, matching the other read commands.
-            require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
@@ -3380,6 +3432,7 @@ pub(crate) fn run_brain(
                 return Ok((EXIT_SUCCESS, None));
             }
 
+            require_existing_db(&db_path)?;
             let store = open_store(Some(&db_path))?;
             let all_clusters = nestweaver_engine::topic_clusters(&store, resolution)?;
             let total = all_clusters.len();
@@ -3422,9 +3475,6 @@ pub(crate) fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // nw-087: read-only command — fail `db_not_found` on a
-            // missing --db, matching the other read commands.
-            require_existing_db(&db_path)?;
             let cfg = load_instance_config_opt(config.as_deref());
             let limit = resolve_limit(limit, cfg.as_ref(), 50);
 
@@ -3479,6 +3529,7 @@ pub(crate) fn run_brain(
                 }
             }
 
+            require_existing_db(&db_path)?;
             let store = open_store(Some(&db_path))?;
             match tag {
                 Some(tag) => {
@@ -3538,9 +3589,6 @@ pub(crate) fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            // nw-087: read-only command — fail `db_not_found` on a
-            // missing --db, matching the other read commands.
-            require_existing_db(&db_path)?;
 
             if let Some(value) = try_hybrid_json_rpc_checked(
                 use_daemon,
@@ -3560,6 +3608,7 @@ pub(crate) fn run_brain(
                 return Ok((EXIT_SUCCESS, None));
             }
 
+            require_existing_db(&db_path)?;
             let store = open_store(Some(&db_path))?;
             let stats = nestweaver_engine::doc_stats(&store, top_tags_limit)?;
             if json {
@@ -3581,7 +3630,6 @@ pub(crate) fn run_brain(
             config,
         } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
-            require_existing_db(&db_path)?;
             let mut args = serde_json::json!({ "repo": repo });
             if let Some(sha) = since_sha.as_deref() {
                 args["since_sha"] = serde_json::json!(sha);
@@ -3611,6 +3659,7 @@ pub(crate) fn run_brain(
                 Err(error) => return Err(error),
                 Ok(Some(value)) => value,
                 Ok(None) => {
+                    require_existing_db(&db_path)?;
                     let store = open_store(Some(&db_path))?;
                     match nestweaver_mcp::tools::dispatch(&store, None, "brain_diff", args, None) {
                         Err(error) if error_is_unresolved_repo_filter(&error) => {

@@ -3,9 +3,10 @@
 //! Wraps a `tonic::Channel` with bearer token injection, health state,
 //! timeout, routing mode, and repo glob matching.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -274,6 +275,9 @@ impl LatencyCell {
 pub struct UpstreamHandle {
     pub name: String,
     channel: Channel,
+    connected: tokio::sync::Mutex<bool>,
+    query_outcome: AtomicU8,
+    pub vault_mappings: crate::dedup::VaultMappings,
     token: Option<String>,
     repo_globs: Vec<glob::Pattern>,
     pub mode: RoutingMode,
@@ -288,9 +292,62 @@ pub struct UpstreamHandle {
     /// sentinel meaning "no samples yet". Feeds the mode-aware adaptive
     /// timeout (see [`crate::health::effective_timeout`]).
     latency_ewma: Arc<LatencyCell>,
+    tool_latencies: Mutex<HashMap<String, Arc<LatencyCell>>>,
+}
+
+/// Connection establishment has its own bounded budget, independent of the
+/// adaptive query deadline. TLS handshakes must not consume a 50ms warm RPC budget.
+pub const COLD_CONNECT_BUDGET: Duration = Duration::from_secs(5);
+
+/// Observable outcome of the latest routed query; skipped is distinct from
+/// a completed empty answer, timeout, rejection, or transport failure.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum QueryOutcome {
+    Skipped,
+    Success,
+    Timeout,
+    Rejected,
+    Unavailable,
 }
 
 impl UpstreamHandle {
+    pub fn record_query_outcome(&self, outcome: QueryOutcome) {
+        self.query_outcome.store(outcome as u8, Ordering::Relaxed);
+    }
+
+    pub fn query_outcome(&self) -> &'static str {
+        match self.query_outcome.load(Ordering::Relaxed) {
+            1 => "success",
+            2 => "timeout",
+            3 => "rejected",
+            4 => "unavailable",
+            _ => "skipped",
+        }
+    }
+
+    /// Establish the lazy channel once under a separate connection budget.
+    /// The lock prevents concurrent cold calls from multiplying handshakes.
+    pub async fn ensure_connected(&self) -> Result<()> {
+        tokio::time::timeout(COLD_CONNECT_BUDGET, async {
+            let mut connected = self.connected.lock().await;
+            if *connected {
+                return Ok(());
+            }
+            let mut client = self.client();
+            let mut req = tonic::Request::new(nestweaver_proto::HealthCheckRequest {});
+            self.inject_auth(&mut req);
+            client
+                .health_check(req)
+                .await
+                .context("upstream cold-connect health check failed")?;
+            *connected = true;
+            Ok(())
+        })
+        .await
+        .context("upstream cold-connect timed out")?
+    }
+
     /// Create from a discovered config. Uses `connect_lazy` so the channel
     /// doesn't block during construction — the first RPC triggers the real
     /// TCP handshake.
@@ -309,7 +366,7 @@ impl UpstreamHandle {
             // so the client deadline always fires first and feeds
             // `health::handle_query_timeout` instead of racing a transport
             // `DeadlineExceeded` that would eject immediately (nw-905).
-            .timeout(per_rpc_timeout + Duration::from_secs(1));
+            .timeout(per_rpc_timeout.max(COLD_CONNECT_BUDGET) + Duration::from_secs(1));
 
         endpoint = configure_endpoint_tls(
             endpoint,
@@ -345,6 +402,9 @@ impl UpstreamHandle {
                 .clone()
                 .unwrap_or_else(|| "upstream".to_string()),
             channel,
+            connected: tokio::sync::Mutex::new(false),
+            query_outcome: AtomicU8::new(0),
+            vault_mappings: config.vault_mappings.clone(),
             token: config.token.clone(),
             repo_globs: patterns,
             mode: config.mode,
@@ -352,6 +412,7 @@ impl UpstreamHandle {
             fallback_cap,
             health: Arc::new(HealthState::new()),
             latency_ewma: Arc::new(LatencyCell::default()),
+            tool_latencies: Mutex::new(HashMap::new()),
         })
     }
 
@@ -396,6 +457,9 @@ impl UpstreamHandle {
     /// Passive mark-down (a live query failed). Ejects with escalating backoff;
     /// the background probe task restores it — this is never permanent.
     pub fn mark_unhealthy(&self) {
+        if let Ok(mut connected) = self.connected.try_lock() {
+            *connected = false;
+        }
         self.health.mark_down(now_ms());
     }
 
@@ -407,7 +471,44 @@ impl UpstreamHandle {
     /// Fold an observed *successful* RPC duration into the latency EWMA.
     /// A success also clears the ceiling-timeout streak (nw-905).
     pub fn record_latency(&self, observed: Duration) {
+        self.record_query_outcome(QueryOutcome::Success);
         record_latency_into(&self.latency_ewma, observed);
+    }
+
+    /// Latency for one tool only. An unseen tool has no learned deadline.
+    pub fn tool_latency_ewma_ms(&self, tool: &str) -> Option<f64> {
+        self.tool_latencies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tool)
+            .and_then(|cell| cell.ewma_ms())
+    }
+
+    fn tool_latency_cell(&self, tool: &str) -> Arc<LatencyCell> {
+        Arc::clone(
+            self.tool_latencies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(tool.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// Success learns only this tool's cost, but resets the upstream-wide
+    /// ceiling-timeout streak, preserving the any-success recovery policy.
+    pub fn record_tool_latency(&self, tool: &str, observed: Duration) {
+        record_latency_into(&self.tool_latency_cell(tool), observed);
+        self.reset_timeout_streak();
+        self.record_query_outcome(QueryOutcome::Success);
+    }
+
+    pub fn record_tool_timeout(&self, tool: &str, deadline: Duration, at_ceiling: bool) -> u32 {
+        learn_timeout_into(&self.tool_latency_cell(tool), deadline);
+        if at_ceiling {
+            self.latency_ewma.streak.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            0
+        }
     }
 
     /// Ceiling of the adaptive deadline in `fallback` mode (nw-834).
@@ -428,13 +529,7 @@ impl UpstreamHandle {
     /// further); a miss below the ceiling returns 0 and never counts toward
     /// ejection.
     pub fn record_timeout(&self, deadline: Duration, at_ceiling: bool) -> u32 {
-        let deadline_ms = deadline.as_secs_f64() * 1000.0;
-        let prev = self.latency_ewma_ms().unwrap_or(0.0);
-        if deadline_ms > prev {
-            self.latency_ewma
-                .ewma_bits
-                .store(deadline_ms.to_bits(), Ordering::Relaxed);
-        }
+        learn_timeout_into(&self.latency_ewma, deadline);
         if at_ceiling {
             self.latency_ewma.streak.fetch_add(1, Ordering::Relaxed) + 1
         } else {
@@ -453,6 +548,14 @@ impl UpstreamHandle {
     /// merge path). Update it with [`record_latency_into`].
     pub fn latency_ewma_ref(&self) -> Arc<LatencyCell> {
         Arc::clone(&self.latency_ewma)
+    }
+}
+
+fn learn_timeout_into(cell: &LatencyCell, deadline: Duration) {
+    let deadline_ms = deadline.as_secs_f64() * 1000.0;
+    if deadline_ms > cell.ewma_ms().unwrap_or(0.0) {
+        cell.ewma_bits
+            .store(deadline_ms.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -562,6 +665,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_connect_has_a_separate_bounded_budget_and_no_rpc_latency_sample() {
+        // A real TCP listener that never speaks HTTP/2 holds connection setup.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = UpstreamConfig {
+            name: Some("cold".into()),
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: None,
+            mode: RoutingMode::Fallback,
+            repos: vec![],
+            timeout: "30ms".into(),
+            ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
+        };
+        let handle = UpstreamHandle::from_config(&config).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), handle.ensure_connected())
+                .await
+                .is_err(),
+            "a 30ms RPC ceiling must not abort cold connection establishment"
+        );
+        let result = tokio::time::timeout(
+            COLD_CONNECT_BUDGET + Duration::from_secs(1),
+            handle.ensure_connected(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cold connection must finish within its own finite budget"
+        );
+        assert!(result.unwrap().is_err());
+        assert_eq!(
+            handle.latency_ewma_ms(),
+            None,
+            "handshake latency is not query latency"
+        );
+        assert!(
+            !*handle.connected.lock().await,
+            "a failed handshake must remain cold"
+        );
+        assert_eq!(handle.query_outcome(), "skipped");
+        handle.record_query_outcome(QueryOutcome::Timeout);
+        assert_eq!(handle.query_outcome(), "timeout");
+        handle.record_latency(Duration::from_millis(10));
+        assert_eq!(handle.query_outcome(), "success");
+    }
+
+    #[tokio::test]
     async fn handle_latency_ewma_cold_then_warm() {
         let config = UpstreamConfig {
             name: Some("lat".to_string()),
@@ -572,6 +723,7 @@ mod tests {
             timeout: "1s".to_string(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         // Cold start: no samples yet.
@@ -596,6 +748,7 @@ mod tests {
             timeout: "200ms".to_string(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         assert_eq!(handle.timeout, Duration::from_millis(200));
@@ -644,6 +797,7 @@ mod tests {
             timeout: "1s".to_string(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         assert_eq!(handle.name, "test");
@@ -664,6 +818,7 @@ mod tests {
             timeout: "1s".to_string(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         assert!(handle.matches_repo("anything/at/all"));
@@ -817,6 +972,7 @@ mod tests {
             timeout: "1s".into(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let h = UpstreamHandle::from_config(&cfg).unwrap();
         h.record_latency(Duration::from_millis(8));
@@ -845,6 +1001,7 @@ mod tests {
                 timeout: timeout.into(),
                 ca_cert: None,
                 fallback_timeout: cap.map(String::from),
+                vault_mappings: Default::default(),
             })
             .unwrap()
             .fallback_cap()

@@ -301,6 +301,7 @@ pub async fn connect_upstream(
         timeout: "1s".to_string(),
         ca_cert: ca_cert.map(|p| p.display().to_string()),
         fallback_timeout: None,
+        vault_mappings: Default::default(),
     };
 
     let saved_path = save_upstream(&config)?;

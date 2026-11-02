@@ -4168,6 +4168,17 @@ pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
         .collect()
 }
 
+/// Explicit transport-mode admission, shared with daemon status providers.
+pub fn enforce_lite_tool_allowed(name: &str, lite: bool) -> Result<(), anyhow::Error> {
+    if lite && !LITE_TOOLS.contains(&name) {
+        return Err(anyhow!(
+            "tool '{name}' is not available in lite mode; allowed: {}",
+            LITE_TOOLS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Enforce the `--tools` allowlist and `--lite` mode for a dispatch. Called by
 /// EVERY dispatch entry point (local store, daemon proxy, hybrid routing) so a
 /// restricted server cannot be reached by routing around the local path
@@ -4179,12 +4190,7 @@ pub fn enforce_tool_allowed(name: &str) -> Result<(), anyhow::Error> {
             "tool '{name}' is unavailable in direct read-only mode; remove --no-daemon to route mutations through the daemon"
         ));
     }
-    if is_lite_mode() && !LITE_TOOLS.contains(&name) {
-        return Err(anyhow!(
-            "tool '{name}' is not available in lite mode; allowed: {}",
-            LITE_TOOLS.join(", ")
-        ));
-    }
+    enforce_lite_tool_allowed(name, is_lite_mode())?;
     let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
     if let Some(ref names) = allowed
         && !names.iter().any(|a| a == name)
@@ -4334,6 +4340,36 @@ pub fn dispatch(
     dispatch_cancellable(store, tantivy, name, args, embed_model, None, None)
 }
 
+/// Native-free admission shared by dispatch and the daemon status snapshot.
+/// Callers must supply the visibility already admitted by their transport.
+pub fn admit_tool_arguments(
+    name: &str,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
+    // Enforce --tools allowlist and --lite mode.
+    enforce_tool_allowed(name)?;
+
+    // Refuse before embedding/graph preflights, response caches, and shared
+    // flights. Otherwise a scoped caller could receive global preflight details,
+    // or a follower could lose the typed authorization error when coalescing.
+    if matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    ) && let RepoScope::FailClosed(reason) = repo_scope(name)
+    {
+        return Err(RepositoryScopeRefused {
+            tool: name.to_string(),
+            reason,
+        }
+        .into());
+    }
+
+    let args = canonicalize_tool_arguments(name, args);
+    validate_tool_arguments(name, &args)?;
+    Ok(args)
+}
+
 /// Like [`dispatch`], but threads a cooperative cancellation flag into the
 /// heavy traversals (e.g. `brain_context`/`project_context` vector fan-out) so a
 /// query timeout or client disconnect can stop the work. `cancel = None` is the
@@ -4368,26 +4404,7 @@ pub fn dispatch_cancellable(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    // Enforce --tools allowlist and --lite mode.
-    enforce_tool_allowed(name)?;
-
-    // Refuse before embedding/graph preflights, response caches, and shared
-    // flights. Otherwise a scoped caller could receive global preflight details,
-    // or a follower could lose the typed authorization error when coalescing.
-    if matches!(
-        visible,
-        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
-    ) && let RepoScope::FailClosed(reason) = repo_scope(name)
-    {
-        return Err(RepositoryScopeRefused {
-            tool: name.to_string(),
-            reason,
-        }
-        .into());
-    }
-
-    let args = canonicalize_tool_arguments(name, args);
-    validate_tool_arguments(name, &args)?;
+    let args = admit_tool_arguments(name, args, visible)?;
     // Reranking consumes persisted embedding-derived similarity signals even
     // when the primary retrieval request is lexical-only. Guard before the
     // response cache so a prior successful response cannot bypass a newly
@@ -11797,6 +11814,24 @@ pub fn brain_status_repo_inventory(
         .collect()
 }
 
+/// File-backed publication disclosure; performs no native graph query.
+pub fn publication_status_json(
+    status: &nestweaver_engine::index_publication::IndexPublicationStatus,
+) -> Value {
+    json!({
+        "dirty": status.dirty,
+        "determinable": status.determinable,
+        "marker_age_s": status.marker_age_s,
+        "writer_pid": status.writer_pid,
+        "writer_alive": status.writer_alive,
+        "writer_liveness_unknown": status.writer_liveness_unknown,
+        "writer_authority_held": status.writer_authority_held,
+        "writer_reason": status.writer_reason,
+        "wedged": status.is_wedged(),
+        "marker_path": status.marker_path,
+    })
+}
+
 /// The ONE `brain_status` document builder, shared by every serving path:
 /// the daemon's gRPC surface (which overwrites the daemon-runtime fields with
 /// live values), the in-process MCP server, and the CLI's direct
@@ -11995,20 +12030,7 @@ pub fn brain_status_json(
     // The `index_publication` payload reuses the single status read taken
     // above; the matching `index_publication_wedged` warning is pushed by
     // `brain_status_warnings_for` from that same read.
-    let index_publication = publication_status.as_ref().map(|status| {
-        json!({
-            "dirty": status.dirty,
-            "determinable": status.determinable,
-            "marker_age_s": status.marker_age_s,
-            "writer_pid": status.writer_pid,
-            "writer_alive": status.writer_alive,
-            "writer_liveness_unknown": status.writer_liveness_unknown,
-            "writer_authority_held": status.writer_authority_held,
-            "writer_reason": status.writer_reason,
-            "wedged": status.is_wedged(),
-            "marker_path": status.marker_path,
-        })
-    });
+    let index_publication = publication_status.as_ref().map(publication_status_json);
 
     // Fold the per-vault failures into the same disclosure the totals use, so
     // a caller has ONE place to look for "what could not be read".
@@ -12114,6 +12136,11 @@ pub fn brain_status_json(
     // is at `json!`'s recursion limit.
     status["manifest_recovery"] = Value::Null;
     status["last_watcher_failure"] = Value::Null;
+    // No daemon observation exists on the shared/direct/standalone path.
+    status["status_observation"] = Value::Null;
+    status["index_publication_owner"] = store.index_publication_owner_snapshot()
+        .map(|(token, operation, age_secs)| json!({"token": token, "operation": operation, "age_secs": age_secs}))
+        .unwrap_or(Value::Null);
     Ok(status)
 }
 
@@ -12123,6 +12150,7 @@ pub fn brain_status_json(
 /// (daemon-bypassed) path — so a `--json 2>/dev/null` consumer can never
 /// silently receive a different schema.
 pub const DAEMON_RUNTIME_STATUS_FIELDS: &[&str] = &[
+    "status_observation",
     "embedding_status",
     "search_status",
     "indexing_active",
@@ -29046,6 +29074,7 @@ mod cache_dispatch_tests {
         let status = brain_status_json(&store, None).unwrap();
         assert_eq!(status["db"], json!(db_path.display().to_string()));
         assert_eq!(status["vault_details"], status["vaults"]);
+        assert_eq!(status.get("status_observation"), Some(&Value::Null));
         assert!(status["instance_ids"].is_array());
         for field in DAEMON_RUNTIME_STATUS_FIELDS {
             assert!(
@@ -29139,6 +29168,8 @@ mod cache_dispatch_tests {
         set_current_db_path(db_path.clone());
         let store = GraphStore::open(&db_path).unwrap();
         let mut status = brain_status_json(&store, None).unwrap();
+
+        status["status_observation"] = json!({"cached":true,"age_ms":42});
 
         mark_brain_status_daemon_bypassed(&mut status, "test bypass cause");
 

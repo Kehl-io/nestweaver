@@ -14,7 +14,10 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::dispatch::dispatch_json_rpc_authed_profile;
-use crate::health::{effective_timeout, eject_with_cap, handle_query_timeout, is_upstream_down};
+use crate::health::{
+    effective_timeout_for_tool, eject_with_cap, handle_query_timeout_for_tool, is_upstream_down,
+    log_tool_timeout,
+};
 use crate::results::inject_or_wrap_provenance;
 use crate::upstream::UpstreamHandle;
 
@@ -46,13 +49,46 @@ pub async fn two_tier_query(
 }
 
 pub async fn two_tier_query_profile(
-    mut local_result: Value,
+    local_result: Value,
     upstreams: &[UpstreamHandle],
     ejection_guard: &Mutex<()>,
     tool_name: &str,
     params: &Value,
     profile: nestweaver_schema::ToolDeliveryProfile,
 ) -> Value {
+    two_tier_query_profile_preferred(
+        local_result,
+        upstreams,
+        ejection_guard,
+        tool_name,
+        params,
+        profile,
+        None,
+    )
+    .await
+}
+
+/// Preserve entity ownership when the caller resolved a target on a specific
+/// configured peer. An unavailable owner must never fall through to another
+/// peer's clean miss. All peers still participate in health/ejection budgeting.
+pub async fn two_tier_query_profile_preferred(
+    mut local_result: Value,
+    upstreams: &[UpstreamHandle],
+    ejection_guard: &Mutex<()>,
+    tool_name: &str,
+    params: &Value,
+    profile: nestweaver_schema::ToolDeliveryProfile,
+    preferred: Option<&str>,
+) -> Value {
+    if let Some(name) = preferred
+        && !upstreams
+            .iter()
+            .any(|upstream| upstream.name == name && upstream.is_healthy())
+    {
+        let mut response = assemble_two_tier(local_result, None, name);
+        inject_or_wrap_provenance(&mut response, &["local"], &[]);
+        return response;
+    }
     // 1. If no healthy upstream is configured, return local-only with clear
     // annotation.
     if !upstreams.iter().any(|u| u.is_healthy()) {
@@ -64,7 +100,10 @@ pub async fn two_tier_query_profile(
     }
 
     // 2. Query upstream for org-wide impact.
-    let upstream = match upstreams.iter().find(|u| u.is_healthy()) {
+    let upstream = match upstreams
+        .iter()
+        .find(|u| u.is_healthy() && preferred.is_none_or(|name| u.name == name))
+    {
         Some(u) => u,
         None => {
             inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
@@ -79,12 +118,27 @@ pub async fn two_tier_query_profile(
         }
     };
 
+    if let Err(error) = upstream.ensure_connected().await {
+        upstream.record_query_outcome(crate::upstream::QueryOutcome::Unavailable);
+        if is_upstream_down(&error) {
+            eject_with_cap(
+                upstream,
+                upstreams,
+                ejection_guard,
+                "two-tier cold connect failed",
+            );
+        }
+        let mut result = assemble_two_tier(local_result, None, &upstream.name);
+        inject_or_wrap_provenance(&mut result, &["local"], &[]);
+        return result;
+    }
+
     let server_name = upstream.name.clone();
     let mut up_client = upstream.client();
     let token = upstream.auth_token().map(|t| t.to_string());
     // Route the org-wide tier through the adaptive resolver instead of the
     // static configured timeout, mirroring query_upstream/query_merge.
-    let timeout = effective_timeout(upstream.mode, upstream);
+    let timeout = effective_timeout_for_tool(upstream.mode, upstream, tool_name);
     let tool = tool_name.to_string();
 
     let server_params = params.clone();
@@ -102,10 +156,15 @@ pub async fn two_tier_query_profile(
     .await
     {
         Ok(Ok(result)) => {
-            upstream.record_latency(started.elapsed());
+            upstream.record_tool_latency(tool_name, started.elapsed());
             Some(result)
         }
         Ok(Err(e)) => {
+            upstream.record_query_outcome(if is_upstream_down(&e) {
+                crate::upstream::QueryOutcome::Unavailable
+            } else {
+                crate::upstream::QueryOutcome::Rejected
+            });
             debug!(error = %e, tool = %tool, "org-wide two-tier query failed");
             // Eject on a genuine outage so a dead server used only via blast_radius/impact
             // doesn't stay "healthy" and time out every call (this path bypasses query_upstream).
@@ -115,12 +174,14 @@ pub async fn two_tier_query_profile(
             None
         }
         Err(_) => {
-            debug!(tool = %tool, "org-wide two-tier query timed out");
-            handle_query_timeout(
+            upstream.record_query_outcome(crate::upstream::QueryOutcome::Timeout);
+            log_tool_timeout(upstream, tool_name, timeout, started.elapsed());
+            handle_query_timeout_for_tool(
                 upstream.mode,
                 upstream,
                 upstreams,
                 ejection_guard,
+                tool_name,
                 timeout,
                 "two-tier query timed out",
             );
@@ -758,6 +819,7 @@ mod tests {
             timeout: "200ms".into(),
             ca_cert: None,
             fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let upstreams = vec![UpstreamHandle::from_config(&cfg).unwrap()];
         let guard = Mutex::new(());
@@ -772,5 +834,33 @@ mod tests {
         assert!(upstreams[0].is_healthy(), "one timeout must not eject");
         assert!(out.is_object());
         drop(held);
+    }
+    #[tokio::test]
+    async fn preferred_owner_unavailable_never_queries_a_healthy_other_peer() {
+        let config = |name: &str| {
+            serde_json::from_value::<crate::discovery::UpstreamConfig>(
+                json!({"name":name,"url":"http://127.0.0.1:1","timeout":"20ms"}),
+            )
+            .unwrap()
+        };
+        let upstreams = vec![
+            UpstreamHandle::from_config(&config("A")).unwrap(),
+            UpstreamHandle::from_config(&config("B")).unwrap(),
+        ];
+        upstreams[1].mark_unhealthy();
+        let value = two_tier_query_profile_preferred(
+            json!({"status":"not_found"}),
+            &upstreams,
+            &Mutex::new(()),
+            "brain_impact",
+            &json!({}),
+            nestweaver_schema::ToolDeliveryProfile::FullCli,
+            Some("B"),
+        )
+        .await;
+        assert_eq!(value["org_wide_impact"]["source_server"], "B");
+        assert_eq!(value["org_wide_impact"]["status"], "unavailable");
+        assert_eq!(upstreams[0].query_outcome(), "skipped");
+        assert!(upstreams[0].is_healthy());
     }
 }

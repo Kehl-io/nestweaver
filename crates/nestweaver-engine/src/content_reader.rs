@@ -76,6 +76,10 @@ pub struct ExclusionInventory {
 /// reads from blobless bare clones via a pooled, persistent `git cat-file --batch`
 /// subprocess (one process per reader, reused for every file read).
 pub trait ContentReader: Send + Sync {
+    fn strategy_replacement(&self) -> Option<&nestweaver_store::write::RepoStrategyReplacement> {
+        None
+    }
+
     /// Persisted with the indexed graph so policy-only changes cannot reuse a
     /// same-SHA answer. Readers with configurable eligibility override this.
     fn eligibility_fingerprint(&self) -> String {
@@ -1747,6 +1751,7 @@ impl Drop for CatFileBatch {
 /// listing uses `git ls-tree -r --name-only <sha>`. This avoids needing a
 /// checkout — the server only needs transient access to blobs.
 pub struct GitBareReader {
+    strategy_replacement: Option<nestweaver_store::write::RepoStrategyReplacement>,
     bare_path: PathBuf,
     local_objects_only: bool,
     sha: String,
@@ -1767,6 +1772,7 @@ pub struct GitBareReader {
 impl GitBareReader {
     pub fn new(bare_path: &Path, sha: &str) -> Self {
         Self {
+            strategy_replacement: None,
             bare_path: bare_path.to_path_buf(),
             local_objects_only: false,
             sha: sha.to_string(),
@@ -1779,6 +1785,7 @@ impl GitBareReader {
 
     pub fn with_limits(bare_path: &Path, sha: &str, limits: IndexLimits) -> Self {
         Self {
+            strategy_replacement: None,
             bare_path: bare_path.to_path_buf(),
             local_objects_only: false,
             sha: sha.to_string(),
@@ -1787,6 +1794,14 @@ impl GitBareReader {
             credential_method: None,
             batch: Mutex::new(None),
         }
+    }
+
+    pub fn with_strategy_replacement(
+        mut self,
+        replacement: nestweaver_store::write::RepoStrategyReplacement,
+    ) -> Self {
+        self.strategy_replacement = Some(replacement);
+        self
     }
 
     /// Authenticate the blob prefetch like the clone and fetch do
@@ -2198,6 +2213,10 @@ fn decode_git_blob_strict(rel_path: &Path, bytes: Vec<u8>) -> Result<String> {
 }
 
 impl ContentReader for GitBareReader {
+    fn strategy_replacement(&self) -> Option<&nestweaver_store::write::RepoStrategyReplacement> {
+        self.strategy_replacement.as_ref()
+    }
+
     /// nw-652: "is there a regular file here?" answered from the TREE, the
     /// question `list_files` answers for the same gate. The trait default reads
     /// the blob, which disagreed with the tree for a manifest over

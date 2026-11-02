@@ -225,12 +225,27 @@ impl HttpRateLimiter {
     }
 }
 
+/// Daemon diagnostic hook; identity is resolved by HTTP authentication, never
+/// accepted from tool arguments. Standalone MCP keeps its ordinary dispatcher.
+pub type BrainStatusProvider = Arc<
+    dyn Fn(
+            Value,
+            nestweaver_engine::authz::Identity,
+            nestweaver_schema::ToolDeliveryProfile,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Shared state for the MCP HTTP handler.
 ///
 /// Holds references to the graph store and search index so `tools/call`
 /// can dispatch through the same path as the stdio server.
 pub struct McpHttpState {
     pub lite: bool,
+    /// Daemon-owned status RPC provider. Never selected through tool arguments.
+    pub brain_status_provider: Option<BrainStatusProvider>,
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
     pub db_path: PathBuf,
@@ -394,6 +409,7 @@ impl McpHttpState {
             #[cfg(test)]
             test_dispatch_delay: None,
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            brain_status_provider: None,
             embed_model_provider: None,
             search_index_provider: None,
             #[cfg(feature = "daemon")]
@@ -433,6 +449,7 @@ impl McpHttpState {
             #[cfg(test)]
             test_dispatch_delay: None,
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
+            brain_status_provider: None,
             embed_model_provider: None,
             search_index_provider: None,
             #[cfg(feature = "daemon")]
@@ -1153,7 +1170,26 @@ async fn handle_mcp(
             // redacting everything — a silent full redaction reads as a valid
             // empty result. Mirrors the daemon boundary; `Some(&All)` makes
             // blast_radius redaction a no-op.
-            let visible = if state.permission_source.is_enabled() {
+            let status_provider = if name == "brain_status" {
+                state.brain_status_provider.clone()
+            } else {
+                None
+            };
+            let identity = resolve_identity(
+                provided_bearer,
+                state.admin_token.as_deref(),
+                state.auth_token.as_deref(),
+            );
+            let visible = if status_provider.is_some() {
+                // Status fails closed for restricted policy; administrator
+                // resolution needs no graph catalogue. The daemon repeats its
+                // current authorization before touching a cached observation.
+                if state.permission_source.is_enabled() {
+                    state.permission_source.visible_repos(&identity, &[])
+                } else {
+                    nestweaver_engine::authz::VisibleRepos::All
+                }
+            } else if state.permission_source.is_enabled() {
                 use nestweaver_engine::authz::{AuthzRepoListing, classify_repo_listing};
                 let identity = resolve_identity(
                     provided_bearer,
@@ -1231,8 +1267,21 @@ async fn handle_mcp(
             let test_dispatch_delay = state.test_dispatch_delay;
             let tool_name = name.clone();
             let dispatch_cancel = std::sync::Arc::clone(&cancel_flag);
-            let work = tokio::time::timeout(
-                timeout,
+            let work = tokio::time::timeout(timeout, async move {
+                if let Some(provider) = status_provider {
+                    return Ok(async {
+                        tools::enforce_lite_tool_allowed(&tool_name, lite)?;
+                        let arguments =
+                            tools::admit_tool_arguments(&tool_name, arguments, Some(&visible))?;
+                        provider(
+                            arguments,
+                            identity,
+                            nestweaver_schema::ToolDeliveryProfile::BoundedMcp,
+                        )
+                        .await
+                    }
+                    .await);
+                }
                 tokio::task::spawn_blocking(move || {
                     #[cfg(test)]
                     if let Some(delay) = test_dispatch_delay {
@@ -1259,8 +1308,9 @@ async fn handle_mcp(
                         Some(&dispatch_cancel),
                         Some(&visible),
                     )
-                }),
-            );
+                })
+                .await
+            });
             let result = tokio::select! {
                 result = work => result,
                 _ = async {
@@ -2514,6 +2564,101 @@ mod admission_regression_tests {
                 serde_json::from_slice(&bytes).unwrap()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn standalone_status_keeps_explicit_null_daemon_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = McpHttpState::new(
+            true,
+            Arc::new(GraphStore::in_memory().unwrap()),
+            None,
+            dir.path().join("standalone.lbug"),
+            None,
+            true,
+        );
+        assert!(state.brain_status_provider.is_none());
+        let body = json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"brain_status","arguments":{}}
+        });
+        let (status, value) = post(router(Arc::new(state)), body.to_string(), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(value["result"]["isError"], true, "{value}");
+        let payload: Value =
+            serde_json::from_str(value["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload.get("status_observation"), Some(&Value::Null));
+        assert_eq!(payload["notes"], 0);
+    }
+
+    #[tokio::test]
+    async fn daemon_status_provider_keeps_http_auth_rate_schema_policy_and_envelope() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = calls.clone();
+        let provider: BrainStatusProvider = Arc::new(move |_args, identity, profile| {
+            let counted = counted.clone();
+            Box::pin(async move {
+                assert_eq!(profile, nestweaver_schema::ToolDeliveryProfile::BoundedMcp);
+                assert!(matches!(
+                    identity,
+                    nestweaver_engine::authz::Identity::Admin
+                        | nestweaver_engine::authz::Identity::Token(_)
+                ));
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"notes":7}))
+            })
+        });
+        let make_state = || {
+            let mut state = McpHttpState::with_auth(
+                true,
+                Arc::new(GraphStore::in_memory().unwrap()),
+                None,
+                PathBuf::from("/tmp/provider-unopened.lbug"),
+                None,
+                true,
+                "query-token".into(),
+                Some("admin-token".into()),
+            );
+            state.client_rate_limiter = Arc::new(HttpRateLimiter::new(1));
+            state.brain_status_provider = Some(provider.clone());
+            state
+        };
+        let app = router(Arc::new(make_state()));
+        let raw = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_status","arguments":{}}}).to_string();
+        let (status, _) = post(app.clone(), raw.clone(), Some("wrong-token"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (_, malformed) = post(app.clone(), json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"brain_status","arguments":[]}}).to_string(), Some("admin-token"), None).await;
+        assert!(malformed.get("error").is_some() || malformed["result"]["isError"] == true);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (status, value) = post(app.clone(), raw.clone(), Some("query-token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(value["result"]["isError"], true, "{value}");
+        let payload: Value =
+            serde_json::from_str(value["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["notes"], 7);
+        assert_eq!(payload["_meta"]["sources"], json!(["daemon"]));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let (status, _) = post(app.clone(), raw.clone(), Some("query-token"), None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let (status, _) = post(app, raw.clone(), Some("admin-token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let mut scoped = make_state();
+        scoped.permission_source =
+            Arc::new(nestweaver_engine::authz::StaticConfigPermissionSource::new(
+                std::collections::HashMap::from([(
+                    "query-token".into(),
+                    vec!["github.com/example/*".into()],
+                )]),
+            ));
+        let (_, refused) = post(router(Arc::new(scoped)), raw, Some("query-token"), None).await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "restricted policy must refuse before provider invocation"
+        );
     }
 
     #[tokio::test]

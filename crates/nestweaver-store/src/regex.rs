@@ -319,6 +319,12 @@ pub struct TrigramRefreshStats {
     pub nodes_added: usize,
     pub nodes_changed: usize,
     pub nodes_deleted: usize,
+    /// Distinct documents tokenized; incremental refreshes exclude unchanged documents.
+    #[serde(default)]
+    pub trigram_sets_built: usize,
+    /// Document posting sets inspected for the delta, including deleted documents.
+    #[serde(default)]
+    pub postings_scanned: usize,
     /// Live (UID, trigram) set additions, excluding scopes listed below.
     pub postings_added: usize,
     pub postings_deleted: usize,
@@ -347,6 +353,8 @@ type RegexAckHook = Box<dyn FnMut(&GraphStore, &str)>;
 #[cfg(test)]
 thread_local! {
     static BEFORE_REGEX_ACK: std::cell::RefCell<Option<RegexAckHook>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_REGEX_STAGE: std::cell::RefCell<Option<RegexAckHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -460,7 +468,7 @@ impl CandidateLimits<'_> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RegexGraphScopeState {
     desired_epoch: u64,
     acknowledged_epoch: u64,
@@ -959,10 +967,17 @@ impl GraphStore {
         &self,
         force_full: bool,
     ) -> Result<TrigramRefreshStats, StoreError> {
-        self.refresh_regex_v3(force_full)
+        self.refresh_trigram_index_with_write_gate(force_full, || ())
     }
 
-    fn refresh_regex_v3(&self, force_full: bool) -> Result<TrigramRefreshStats, StoreError> {
+    /// Prepare candidate collection/tokenization off the write gate. Each
+    /// scope publishes under its own lease and revalidates the captured epoch;
+    /// concurrent changes remain dirty instead of acknowledging stale content.
+    pub fn refresh_trigram_index_with_write_gate<G>(
+        &self,
+        force_full: bool,
+        mut acquire_write_guard: impl FnMut() -> G,
+    ) -> Result<TrigramRefreshStats, StoreError> {
         let started = Instant::now();
         let root = self.regex_sidecar_root().ok_or_else(|| {
             StoreError::Query("regex v3 requires an on-disk graph store".to_string())
@@ -1062,12 +1077,33 @@ impl GraphStore {
         ordered.sort();
         for scope_uid in ordered {
             if !active_scopes.contains(&scope_uid) {
+                let delta = index.posting_delta(&scope_uid, &[]);
+                let _guard = acquire_write_guard();
+                let current_states = self.read_regex_scope_states()?;
+                let current = current_states.get(&scope_uid);
+                if self.active_regex_scopes()?.contains(&scope_uid)
+                    || current != states.get(&scope_uid)
+                    || index.metadata(&scope_uid).ok().flatten().as_ref()
+                        != existing.get(&scope_uid)
+                {
+                    defer_superseded_scope(
+                        &mut stats,
+                        &scope_uid,
+                        states
+                            .get(&scope_uid)
+                            .map_or(0, |state| state.desired_epoch),
+                        current.map_or(0, |state| state.desired_epoch),
+                    );
+                    continue;
+                }
                 let epoch = match states.get(&scope_uid) {
                     Some(state) if state.tombstone => state.desired_epoch,
                     _ => self.mark_regex_scope_dirty(&scope_uid, true)?,
                 };
-                let delta = index.posting_delta(&scope_uid, &[]);
-                let retired = index.retire_scope(&scope_uid)?;
+                let Some(retired) = index.try_retire_scope(&scope_uid)? else {
+                    defer_superseded_scope(&mut stats, &scope_uid, epoch, epoch);
+                    continue;
+                };
                 record_posting_delta(&mut stats, &scope_uid, delta);
                 #[cfg(test)]
                 run_before_regex_ack_hook(self, &scope_uid);
@@ -1087,12 +1123,15 @@ impl GraphStore {
                 continue;
             }
 
-            let epoch = if force_full {
-                self.mark_regex_scope_dirty(&scope_uid, false)?
-            } else {
-                match states.get(&scope_uid).filter(|state| !state.tombstone) {
-                    Some(state) => state.desired_epoch,
-                    None => self.mark_regex_scope_dirty(&scope_uid, false)?,
+            let epoch = {
+                let _guard = acquire_write_guard();
+                if force_full {
+                    self.mark_regex_scope_dirty(&scope_uid, false)?
+                } else {
+                    match states.get(&scope_uid).filter(|state| !state.tombstone) {
+                        Some(state) => state.desired_epoch,
+                        None => self.mark_regex_scope_dirty(&scope_uid, false)?,
+                    }
                 }
             };
             let one_scope = HashSet::from([scope_uid.clone()]);
@@ -1181,11 +1220,28 @@ impl GraphStore {
                 candidate_count: candidates.len(),
                 candidate_digest: digest.clone(),
             };
-            let trigram_sets: Vec<HashSet<String>> = candidates
+            let can_update = !force_full
+                && prior_documents_result.is_ok()
+                && prior.is_some_and(|prior| {
+                    prior.schema_version == REGEX_INDEX_SCHEMA_VERSION
+                        && prior.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
+                        && prior.brain_uuid == identity.brain_uuid
+                        && prior.publication_uuid == identity.publication_uuid
+                });
+            let changed_candidates: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| {
+                    !can_update
+                        || prior_documents.get(&candidate.uid)
+                            != desired_documents.get(&candidate.uid)
+                })
+                .collect();
+            stats.trigram_sets_built += changed_candidates.len();
+            let trigram_sets: Vec<HashSet<String>> = changed_candidates
                 .iter()
                 .map(|candidate| trigrams(&candidate.text))
                 .collect();
-            let documents: Vec<RegexShardDocument<'_>> = candidates
+            let documents: Vec<RegexShardDocument<'_>> = changed_candidates
                 .iter()
                 .zip(&trigram_sets)
                 .map(|(candidate, trigrams)| RegexShardDocument {
@@ -1198,39 +1254,50 @@ impl GraphStore {
                     trigrams,
                 })
                 .collect();
-            let changed_uids: HashSet<_> = desired_documents
-                .iter()
-                .filter(|(uid, hash)| prior_documents.get(uid.as_str()) != Some(*hash))
-                .map(|(uid, _)| uid.as_str())
-                .collect();
             let deleted_uids: Vec<_> = prior_documents
                 .keys()
                 .filter(|uid| !desired_documents.contains_key(uid.as_str()))
                 .cloned()
                 .collect();
-            let changed_documents: Vec<_> = documents
-                .iter()
-                .filter(|document| changed_uids.contains(document.uid))
-                .cloned()
-                .collect();
-            let can_update = !force_full
-                && prior_documents_result.is_ok()
-                && prior.is_some_and(|prior| {
-                    prior.schema_version == REGEX_INDEX_SCHEMA_VERSION
-                        && prior.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
-                        && prior.brain_uuid == identity.brain_uuid
-                        && prior.publication_uuid == identity.publication_uuid
-                });
-            let posting_delta = index.posting_delta(&scope_uid, &documents);
-            if can_update {
-                index.update_scope(
+            stats.postings_scanned += documents.len() + deleted_uids.len();
+            let posting_delta = if can_update {
+                index.changed_posting_delta(&scope_uid, &documents, &deleted_uids)
+            } else {
+                index.posting_delta(&scope_uid, &documents)
+            };
+            #[cfg(test)]
+            if let Some(mut hook) = BEFORE_REGEX_STAGE.with(|slot| slot.borrow_mut().take()) {
+                hook(self, &scope_uid);
+            }
+            // Tantivy writer/merge/reopen work touches only a private sibling
+            // generation. The selected shard remains immutable and available.
+            let prepared = if can_update {
+                index.prepare_update_scope(
                     prior.expect("checked above"),
                     metadata,
-                    &changed_documents,
+                    &documents,
                     &deleted_uids,
-                )?;
+                )?
             } else {
-                index.replace_scope(metadata, &documents)?;
+                index.prepare_replace_scope(metadata, &documents)?
+            };
+            let _guard = acquire_write_guard();
+            let current_states = self.read_regex_scope_states()?;
+            let current = current_states.get(&scope_uid);
+            if current.is_none_or(|state| state.desired_epoch != epoch || state.tombstone)
+                || index.metadata(&scope_uid).ok().flatten().as_ref() != prior
+            {
+                defer_superseded_scope(
+                    &mut stats,
+                    &scope_uid,
+                    epoch,
+                    current.map_or(epoch, |state| state.desired_epoch),
+                );
+                continue;
+            }
+            if !index.publish_prepared(prepared)? {
+                defer_superseded_scope(&mut stats, &scope_uid, epoch, epoch);
+                continue;
             }
             #[cfg(test)]
             run_before_regex_ack_hook(self, &scope_uid);
@@ -3626,6 +3693,136 @@ mod tests {
             .unwrap();
         assert_eq!(kept.results.len(), 1);
         assert!(!kept.scanned_fallback);
+    }
+
+    #[test]
+    fn fifty_writes_complete_during_off_gate_full_and_delta_preparation() {
+        use std::sync::{Arc, Mutex, mpsc};
+        for full in [true, false] {
+            let store = Arc::new(store_with_text());
+            store.rebuild_trigram_index().unwrap();
+            store.mark_regex_scope_dirty("repo:1", false).unwrap();
+            let gate = Arc::new(Mutex::new(()));
+            let (stage_tx, stage_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let index_store = Arc::clone(&store);
+            let index_gate = Arc::clone(&gate);
+            let worker = std::thread::spawn(move || {
+                BEFORE_REGEX_STAGE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |_, _| {
+                        stage_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }))
+                });
+                let result = index_store
+                    .refresh_trigram_index_with_write_gate(full, || index_gate.lock().unwrap());
+                done_tx.send(result).unwrap();
+            });
+            stage_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let writes_started = std::time::Instant::now();
+            for number in 0..50 {
+                let _guard = gate
+                    .try_lock()
+                    .expect("staging must not hold the daemon write gate");
+                store
+                    .insert_symbol(&symbol_with_signature(
+                        &format!("sym:during:{number}"),
+                        "fn updatedDuringPreparation()",
+                    ))
+                    .unwrap();
+            }
+            assert!(writes_started.elapsed() < std::time::Duration::from_secs(30));
+            resume_tx.send(()).unwrap();
+            let stats = done_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            assert!(
+                stats.scopes_deferred.contains(&"repo:1".to_string()),
+                "a stage prepared before the writes must not acknowledge their epoch"
+            );
+            assert!(store.pending_regex_scope_count().unwrap() > 0);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn retirement_revalidates_readded_scope_and_preserves_new_selector() {
+        let store = store_with_text();
+        store.rebuild_trigram_index().unwrap();
+        let mut restored = store.lookup_symbol("sym:1").unwrap();
+        restored.signature = "fn newlyRestoredSymbol()".into();
+        store
+            .conn()
+            .unwrap()
+            .query("MATCH (s:Symbol {uid: 'sym:1'}) DETACH DELETE s")
+            .unwrap();
+        store.mark_regex_scope_dirty("repo:1", true).unwrap();
+        let mut before_retire = true;
+        let stats = store
+            .refresh_trigram_index_with_write_gate(false, || {
+                if before_retire {
+                    before_retire = false;
+                    store.insert_symbol(&restored).unwrap();
+                    store.refresh_trigram_index(false).unwrap();
+                }
+            })
+            .unwrap();
+        assert!(stats.scopes_deferred.contains(&"repo:1".to_string()));
+        let result = store
+            .regex_search("newlyRestoredSymbol", None, None, None, None)
+            .unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert!(
+            !result.scanned_fallback,
+            "the new ready selector survived stale retirement"
+        );
+    }
+
+    #[test]
+    fn refresh_work_is_proportional_to_change() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        let template = store.lookup_symbol("sym:1").unwrap();
+        let unchanged: Vec<_> = (0..2000)
+            .map(|number| {
+                let mut symbol = template.clone();
+                symbol.uid = format!("sym:unchanged:{number}");
+                symbol
+            })
+            .collect();
+        store.batch_insert_symbols(&unchanged).unwrap();
+        store
+            .mark_regex_scope_dirty(&template.repo_uid, false)
+            .unwrap();
+        let initial = store.rebuild_trigram_index().unwrap();
+        assert!(initial.trigram_sets_built >= 2001);
+        store
+            .conn()
+            .unwrap()
+            .query(
+                "MATCH (s:Symbol {uid: 'sym:1'}) SET s.signature = 'fn uniquelyChangedSignature()'",
+            )
+            .unwrap();
+        store
+            .mark_regex_scope_dirty(&template.repo_uid, false)
+            .unwrap();
+        let refreshed = store.refresh_trigram_index(false).unwrap();
+        assert_eq!(refreshed.trigram_sets_built, 1);
+        assert_eq!(refreshed.nodes_changed, 1);
+        assert_eq!(refreshed.postings_scanned, 1);
+        assert!(refreshed.postings_added > 0);
+        assert!(refreshed.posting_deltas_unavailable.is_empty());
+        assert_eq!(
+            store
+                .refresh_trigram_index(false)
+                .unwrap()
+                .trigram_sets_built,
+            0
+        );
     }
 
     #[test]

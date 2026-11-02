@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod error;
+pub mod federation;
 pub mod gaps_cache;
 pub mod hardening;
 pub mod rank_events;
@@ -191,6 +192,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Impact
         .route("/api/v1/impact/{uid}", get(routes::impact::impact))
+        .route("/api/v1/capabilities", get(federation::capabilities))
         // Repos
         .route("/api/v1/repos", get(routes::repos::list_repos))
         .route("/api/v1/services", get(routes::repos::list_services))

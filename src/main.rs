@@ -1871,6 +1871,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Configures,
     },
     EnvVar {
+        name: "NESTWEAVER_CA_CERT",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
         name: "NESTWEAVER_CRASH_REPORT_DIRS",
         role: EnvRole::Configures,
     },
@@ -3266,6 +3270,14 @@ impl RankingBounds {
             _ => shown.to_string(),
         }
     }
+}
+
+fn decode_hybrid_regex_result(
+    value: serde_json::Value,
+) -> anyhow::Result<nestweaver_store::regex::RegexSearchResult> {
+    // nw-875: a malformed transport envelope is never evidence of no matches.
+    serde_json::from_value(strip_hybrid_meta(value))
+        .context("invalid regex_search response from daemon or upstream")
 }
 
 /// Print a ranking payload as an OBJECT carrying its own staleness, rather than
@@ -14757,9 +14769,7 @@ fn daemon_status_reachable_pid(db_path: &Path, socket: &Path) -> Result<Option<i
         .map_err(|_| "endpoint health check timed out".to_string())?
         .map_err(|error| format!("endpoint health check failed: {error}"))?;
     if health.pid != peer_pid as u32
-        || health.instance_id != nestweaver_daemon::instance_id_from_db_path(db_path)
-        || nestweaver_daemon::lifecycle::database_path_fingerprint(Path::new(&health.db_path))
-            != nestweaver_daemon::lifecycle::database_path_fingerprint(db_path)
+        || nestweaver_client::verify_endpoint_binding(db_path, &health).is_err()
     {
         return Err(
             "socket peer does not verify the selected database/instance identity".to_string(),
@@ -24313,24 +24323,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 )? {
                     // Strip the hybrid `_meta` provenance so both output
                     // modes match the direct path byte-for-byte.
-                    let res: nestweaver_store::regex::RegexSearchResult =
-                        serde_json::from_value(strip_hybrid_meta(value)).unwrap_or_else(|_| {
-                            nestweaver_store::regex::RegexSearchResult {
-                                results: vec![],
-                                truncated: false,
-                                scanned_fallback: false,
-                                stale_index: false,
-                                ready_scopes: 0,
-                                dirty_scopes: 0,
-                                error_scopes: 0,
-                                posting_hits: 0,
-                                hydrated_candidates: 0,
-                                scanned_candidates: 0,
-                                truncation_reason: None,
-                                timings: Default::default(),
-                                note: None,
-                            }
-                        });
+                    let res = decode_hybrid_regex_result(value)?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&res)?);
                     } else if res.results.is_empty() {
@@ -38538,6 +38531,33 @@ credential_method = "ssh"
             strip_hybrid_meta(serde_json::json!([1, 2])),
             serde_json::json!([1, 2])
         );
+    }
+
+    #[test]
+    fn malformed_hybrid_regex_response_is_an_error_not_zero_matches() {
+        // nw-875: the old fallback fabricated an empty successful response.
+        for value in [serde_json::json!({"results": []}), serde_json::json!(null)] {
+            let error = decode_hybrid_regex_result(value).unwrap_err();
+            assert!(error.to_string().contains("invalid regex_search response"));
+        }
+    }
+
+    #[test]
+    fn hybrid_regex_decode_preserves_planner_and_truncation_evidence() {
+        let value = serde_json::json!({
+            "results": [], "truncated": true, "scanned_fallback": false,
+            "stale_index": true, "ready_scopes": 4, "dirty_scopes": 2,
+            "error_scopes": 1, "posting_hits": 17, "hydrated_candidates": 9,
+            "scanned_candidates": 3, "truncation_reason": null,
+            "timings": {"planning_ms": 1, "hydration_ms": 2, "verification_ms": 3, "total_ms": 6},
+            "note": "incomplete scan",
+            "_meta": {"sources": ["local", "server"]}
+        });
+        let result = decode_hybrid_regex_result(value).unwrap();
+        assert!(result.truncated && result.stale_index);
+        assert_eq!((result.ready_scopes, result.dirty_scopes), (4, 2));
+        assert_eq!((result.error_scopes, result.posting_hits), (1, 17));
+        assert_eq!(result.note.as_deref(), Some("incomplete scan"));
     }
 
     /// `index --repo <file>` is rejected naming the path; a missing

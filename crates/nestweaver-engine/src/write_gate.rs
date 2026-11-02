@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 /// emitted for the 13 hours of the production incident; a single line per
 /// blocked acquisition is proportionate.
 const WRITE_WAIT_LOG_AFTER: Duration = Duration::from_secs(5);
+const WRITE_WAIT_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The process-wide write lock and its holder/waiter accounting.
 ///
@@ -123,7 +124,18 @@ impl WriteGate {
                     blocked_on = blocked_on.as_ref().map(|(name, _)| name.as_str()),
                     "writer is waiting for the write lock"
                 );
-                let guard = Arc::clone(&self.mutex).lock_owned().await;
+                let waiting = Arc::clone(&self.mutex).lock_owned();
+                tokio::pin!(waiting);
+                let guard = loop {
+                    tokio::select! {
+                        guard = &mut waiting => break guard,
+                        _ = tokio::time::sleep(WRITE_WAIT_REPORT_INTERVAL) => {
+                            let holder = self.holder_snapshot();
+                            tracing::warn!(what, waited_secs = waited_since.elapsed().as_secs(),
+                                holder = ?holder, "still waiting for write gate");
+                        }
+                    }
+                };
                 Self::log_wait(what, waited_since, blocked_on);
                 drop(ticket);
                 guard
@@ -142,7 +154,28 @@ impl WriteGate {
                 let ticket = WaitTicket::new(&self.waiting);
                 let blocked_on = self.holder_snapshot();
                 let waited_since = Instant::now();
-                let guard = Arc::clone(&self.mutex).blocking_lock_owned();
+                // A diagnostic helper waits on a condvar so acquisition is
+                // still unbounded and cancellation wakes it immediately. This
+                // path also works on threads with no Tokio timer context.
+                let done = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+                let guard = std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        let mut finished = done.0.lock().unwrap_or_else(|e| e.into_inner());
+                        while !*finished {
+                            let (next, timeout) = done.1.wait_timeout(finished, WRITE_WAIT_REPORT_INTERVAL)
+                                .unwrap_or_else(|e| e.into_inner());
+                            finished = next;
+                            if timeout.timed_out() && !*finished {
+                                tracing::warn!(what, waited_secs = waited_since.elapsed().as_secs(),
+                                    holder = ?self.holder_snapshot(), "still waiting for write gate");
+                            }
+                        }
+                    });
+                    let guard = Arc::clone(&self.mutex).blocking_lock_owned();
+                    *done.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                    done.1.notify_all();
+                    guard
+                });
                 Self::log_wait(what, waited_since, blocked_on);
                 drop(ticket);
                 guard

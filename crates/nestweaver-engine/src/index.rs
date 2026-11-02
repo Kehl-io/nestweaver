@@ -1620,6 +1620,7 @@ pub(crate) fn establish_index_publication_marker_on_lease<'a>(
     operation: &str,
     io: &dyn IndexEpilogueIo,
 ) -> Result<nestweaver_store::IndexPublicationLease<'a>, DeletionReconciliationError> {
+    lease.set_operation(operation);
     let Some(db_path) = db_path else {
         lease.preflight_transient_generation().map_err(|error| {
             DeletionReconciliationError::new(
@@ -5985,8 +5986,8 @@ where
         //     unreadable — it would delete that directory's stored files, which
         //     this run never saw. The per-file branch below re-inserts every
         //     parsed file just the same and its prune skips those paths.
-        let force_reindex =
-            existing_repo.is_some() && files_unchanged == 0 && unreadable_dirs.is_empty();
+        let force_reindex = reader.strategy_replacement().is_some()
+            || existing_repo.is_some() && files_unchanged == 0 && unreadable_dirs.is_empty();
         // Snapshot before the per-file deletes below. Those deletes remove
         // the nodes of files we are about to re-insert, so a later listing
         // cannot tell a recreated file from a modification.
@@ -6126,7 +6127,7 @@ where
             // resolved edges, so concurrent readers never see an empty repo
             // or a repo whose symbols have no CALLS.
             let (deleted_files, deleted_symbols, removed_symbol_uids) = store
-                .bulk_reindex_write(
+                .bulk_reindex_write_with_strategy(
                     &r_uid,
                     &all_files,
                     &all_symbols,
@@ -6135,6 +6136,7 @@ where
                     &all_services,
                     &svc_sym_refs,
                     &publication_edges,
+                    reader.strategy_replacement(),
                 )
                 .context("bulk_reindex_write")?;
             files_deleted += deleted_files;

@@ -64,7 +64,12 @@ export function CodePreview({
       if (symbolUid !== undefined) {
         // Parents may retain old metadata while its shared query refreshes.
         // Never read a new file body using coordinates from that older query.
-        const { symbol } = await fetchSymbol(symbolUid);
+        const detail = await fetchSymbol(symbolUid);
+        if (detail._federation?.source_available === false) {
+          if (current()) setError("Remote source files are unsupported; indexed symbol metadata and impact remain available.");
+          return;
+        }
+        const { symbol } = detail;
         if (!current()) return;
         if (symbol.uid !== symbolUid || symbol.file_path !== filePath ||
           symbol.start_line !== line || !symbol.repo_uid || symbol.repo_uid !== effectiveRepo) {

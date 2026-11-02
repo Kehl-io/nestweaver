@@ -97,12 +97,21 @@ const SIDECAR_MANIFESTS: &str = "manifests.json";
 const SIDECAR_TANTIVY_DIR: &str = "tantivy";
 const SIDECAR_REGEX_DIR: &str = "regex-v3";
 const SIDECAR_EMBEDDINGS: &str = "embeddings.bin";
+const SIDECAR_DERIVATION: &str = "markdown-derivation.json";
+const SIDECAR_GENERATION: &str = "generation";
+const DERIVATION_CAPABILITY: &str = "markdown-derivation-proof-v1";
 
 /// Core files that MUST be present and checksummed in every snapshot.
 const CORE_FILES: &[&str] = &[GRAPH_FILE, MANIFEST_FILE, STAMP_FILE];
 
 /// Sidecar files that are checksummed when present.
-const SIDECAR_FILES: &[&str] = &[SIDECAR_PAGERANK, SIDECAR_MANIFESTS, SIDECAR_EMBEDDINGS];
+const SIDECAR_FILES: &[&str] = &[
+    SIDECAR_PAGERANK,
+    SIDECAR_MANIFESTS,
+    SIDECAR_EMBEDDINGS,
+    SIDECAR_DERIVATION,
+    SIDECAR_GENERATION,
+];
 
 /// Compute per-file BLAKE3 checksums for all core files and any present
 /// sidecars.  Returns a checksum-style string: one `<hash>  <filename>\n`
@@ -356,6 +365,14 @@ pub fn build_snapshot_from_store(
         authoritative_stamp.embedding_count = embedding.count;
         authoritative_stamp.brain_uuid = publication_identity.brain_uuid;
         authoritative_stamp.publication_uuid = publication_identity.publication_uuid;
+        if let Some((records, generation)) = crate::markdown_derivation::snapshot_record_pair(store)
+        {
+            std::fs::write(staging.join(SIDECAR_DERIVATION), records)?;
+            std::fs::write(staging.join(SIDECAR_GENERATION), generation)?;
+            authoritative_stamp
+                .capabilities
+                .push(DERIVATION_CAPABILITY.to_string());
+        }
         build_snapshot_files(
             &staging,
             &authoritative_stamp,
@@ -581,6 +598,9 @@ fn artifact_contract(path: &str, stamp: &Stamp) -> anyhow::Result<(ArtifactKind,
         SIDECAR_EMBEDDINGS => anyhow::bail!(
             "embedding contract requires payload inspection; use artifact_contract_for_payload"
         ),
+        SIDECAR_DERIVATION | SIDECAR_GENERATION => {
+            anyhow::bail!("snapshot derivation contract requires payload inspection")
+        }
         path if path.starts_with(&format!("{SIDECAR_TANTIVY_DIR}/")) => (
             ArtifactKind::Bm25,
             1,
@@ -606,6 +626,38 @@ fn artifact_contract_for_payload(
     source_graph_generation: u64,
     payload: Option<&[u8]>,
 ) -> anyhow::Result<(ArtifactKind, u32, String)> {
+    if path == SIDECAR_DERIVATION || path == SIDECAR_GENERATION {
+        let payload =
+            payload.ok_or_else(|| anyhow::anyhow!("snapshot derivation payload is missing"))?;
+        if path == SIDECAR_GENERATION {
+            crate::markdown_derivation::validate_snapshot_generation(
+                payload,
+                source_graph_generation,
+            )?;
+            return Ok((
+                ArtifactKind::Generation,
+                1,
+                "snapshot-graph-generation-v1".into(),
+            ));
+        }
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: stamp.brain_uuid.clone(),
+            publication_uuid: stamp.publication_uuid.clone(),
+        };
+        crate::markdown_derivation::SnapshotRecords::decode(
+            payload,
+            &identity,
+            source_graph_generation,
+        )?;
+        return Ok((
+            ArtifactKind::MarkdownDerivation,
+            crate::markdown_derivation::RECORD_SCHEMA_VERSION,
+            format!(
+                "markdown-links-v{}",
+                crate::markdown_derivation::DERIVATION_VERSION
+            ),
+        ));
+    }
     if path == SIDECAR_PAGERANK || path == SIDECAR_MANIFESTS || path == SIDECAR_EMBEDDINGS {
         let payload =
             payload.ok_or_else(|| anyhow::anyhow!("artifact contract requires its payload"))?;
@@ -678,6 +730,10 @@ fn artifact_contract_for_path(
             envelope.schema_version,
             envelope.algorithm_fingerprint()?,
         ));
+    }
+    if path == SIDECAR_DERIVATION || path == SIDECAR_GENERATION {
+        let payload = crate::markdown_derivation::bounded_snapshot_bytes(absolute)?;
+        return artifact_contract_for_payload(path, stamp, source_graph_generation, Some(&payload));
     }
     let payload =
         if path == SIDECAR_PAGERANK || path == SIDECAR_MANIFESTS {
@@ -995,6 +1051,15 @@ fn verify_snapshot_envelope(snapshot_dir: &Path) -> Result<Stamp, anyhow::Error>
             }
         }
     }
+    let declared = stamp
+        .capabilities
+        .iter()
+        .any(|value| value == DERIVATION_CAPABILITY);
+    let proof = snapshot_dir.join(SIDECAR_DERIVATION).exists();
+    let generation = snapshot_dir.join(SIDECAR_GENERATION).exists();
+    if declared != proof || proof != generation {
+        anyhow::bail!("snapshot Markdown proof capability/artifact/generation pair mismatch");
+    }
     Ok(stamp)
 }
 
@@ -1021,6 +1086,27 @@ fn verify_snapshot_artifacts(snapshot_dir: &Path, stamp: &Stamp) -> Result<(), a
         }
     }
 
+    if snapshot_dir.join(SIDECAR_DERIVATION).exists() {
+        let graph_path = snapshot_dir.join(GRAPH_FILE);
+        let graph = nestweaver_store::GraphStore::open_read_only_without_migration(&graph_path)?;
+        // The sealed generation artifact is relocated only during materialization.
+        // Validate the actual snapshot graph with its captured epoch explicitly.
+        let bundle: PublicationBundleV3 =
+            serde_json::from_slice(&std::fs::read(snapshot_dir.join(PUBLICATION_FILE))?)?;
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: stamp.brain_uuid.clone(),
+            publication_uuid: stamp.publication_uuid.clone(),
+        };
+        let bytes = crate::markdown_derivation::bounded_snapshot_bytes(
+            &snapshot_dir.join(SIDECAR_DERIVATION),
+        )?;
+        let proof = crate::markdown_derivation::SnapshotRecords::decode(
+            &bytes,
+            &identity,
+            bundle.source_graph_generation,
+        )?;
+        proof.validate_snapshot_graph(&graph)?;
+    }
     let embedding_path = snapshot_dir.join(SIDECAR_EMBEDDINGS);
     if embedding_path.exists() {
         let embeddings = nestweaver_store::EmbeddingIndex::load_binary_v2(&embedding_path)
@@ -1187,6 +1273,67 @@ pub fn materialize_snapshot(
     )
 }
 
+/// Opaque result of staged, checksum- and graph-verified materialization.
+/// A caller can bind it only to the exact destination read-only handle.
+pub struct MaterializedSnapshot {
+    db_path: PathBuf,
+    proof: Option<crate::markdown_derivation::SnapshotRecords>,
+    graph_digest: Option<(u64, String)>,
+}
+impl MaterializedSnapshot {
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+    pub fn bind(
+        self,
+        store: std::sync::Arc<nestweaver_store::GraphStore>,
+    ) -> anyhow::Result<
+        Option<std::sync::Arc<crate::markdown_derivation::ValidatedSnapshotDerivation>>,
+    > {
+        if store.is_read_write() {
+            anyhow::bail!("materialized snapshot receipt requires a read-only graph handle");
+        }
+        store.verify_backing_file()?;
+        if store.db_path().map(std::fs::canonicalize).transpose()?
+            != Some(std::fs::canonicalize(&self.db_path)?)
+        {
+            anyhow::bail!("materialized snapshot receipt belongs to another database path");
+        }
+        if let Some(expected) = &self.graph_digest {
+            if &crate::hash::blake3_file(&self.db_path)? != expected {
+                anyhow::bail!(
+                    "materialized graph changed between verified receipt and read-only open"
+                );
+            }
+            store.verify_backing_file()?;
+        }
+        self.proof
+            .map(|proof| {
+                crate::markdown_derivation::ValidatedSnapshotDerivation::bind(store, proof)
+                    .map(std::sync::Arc::new)
+                    .map_err(anyhow::Error::from)
+            })
+            .transpose()
+    }
+}
+
+pub fn materialize_snapshot_with_config_receipt(
+    snapshot_dir: &Path,
+    working_dir: &Path,
+    engine_version: &str,
+    expected_schema_hash: Option<&str>,
+    expected_embedding_model: Option<&str>,
+) -> anyhow::Result<MaterializedSnapshot> {
+    materialize_snapshot_receipt_with_hook(
+        snapshot_dir,
+        working_dir,
+        engine_version,
+        expected_schema_hash,
+        expected_embedding_model,
+        || {},
+    )
+}
+
 pub fn materialize_snapshot_with_config(
     snapshot_dir: &Path,
     working_dir: &Path,
@@ -1212,6 +1359,25 @@ fn materialize_snapshot_with_config_and_hook(
     expected_embedding_model: Option<&str>,
     after_source_verification: impl FnOnce(),
 ) -> Result<PathBuf, anyhow::Error> {
+    materialize_snapshot_receipt_with_hook(
+        snapshot_dir,
+        working_dir,
+        engine_version,
+        expected_schema_hash,
+        expected_embedding_model,
+        after_source_verification,
+    )
+    .map(|receipt| receipt.db_path)
+}
+
+fn materialize_snapshot_receipt_with_hook(
+    snapshot_dir: &Path,
+    working_dir: &Path,
+    engine_version: &str,
+    expected_schema_hash: Option<&str>,
+    expected_embedding_model: Option<&str>,
+    after_source_verification: impl FnOnce(),
+) -> anyhow::Result<MaterializedSnapshot> {
     // Compat gate first — refuse an incompatible snapshot before touching disk.
     load_snapshot_with_config(
         snapshot_dir,
@@ -1239,6 +1405,34 @@ fn materialize_snapshot_with_config_and_hook(
             expected_embedding_model,
         )?;
 
+        let (proof, graph_digest) = if verified_snapshot.join(SIDECAR_DERIVATION).exists() {
+            let bundle: PublicationBundleV3 =
+                serde_json::from_slice(&std::fs::read(verified_snapshot.join(PUBLICATION_FILE))?)?;
+            let identity = nestweaver_store::PublicationIdentity {
+                brain_uuid: bundle.brain_uuid.clone(),
+                publication_uuid: bundle.publication_uuid.clone(),
+            };
+            let bytes = crate::markdown_derivation::bounded_snapshot_bytes(
+                &verified_snapshot.join(SIDECAR_DERIVATION),
+            )?;
+            let graph = bundle
+                .artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.kind == ArtifactKind::Graph && artifact.path == GRAPH_FILE
+                })
+                .ok_or_else(|| anyhow::anyhow!("verified snapshot omits its graph descriptor"))?;
+            (
+                Some(crate::markdown_derivation::SnapshotRecords::decode(
+                    &bytes,
+                    &identity,
+                    bundle.source_graph_generation,
+                )?),
+                Some((graph.byte_size, graph.blake3.clone())),
+            )
+        } else {
+            (None, None)
+        };
         let db_path = staging.join(GRAPH_FILE);
         std::fs::rename(verified_snapshot.join(GRAPH_FILE), &db_path)
             .map_err(|e| anyhow::anyhow!("failed to stage verified snapshot graph file: {e}"))?;
@@ -1248,6 +1442,11 @@ fn materialize_snapshot_with_config_and_hook(
             (SIDECAR_PAGERANK, ".pagerank.json"),
             (SIDECAR_MANIFESTS, ".manifests.json"),
             (SIDECAR_EMBEDDINGS, ".embeddings.bin"),
+            (
+                SIDECAR_DERIVATION,
+                crate::markdown_derivation::RECORD_SUFFIX,
+            ),
+            (SIDECAR_GENERATION, ".generation"),
         ] {
             let src = verified_snapshot.join(src_name);
             if src.exists() {
@@ -1271,10 +1470,18 @@ fn materialize_snapshot_with_config_and_hook(
             std::fs::rename(&regex_src, &regex_dst)
                 .map_err(|e| anyhow::anyhow!("failed to stage verified regex-v3 index: {e}"))?;
         }
+        if let Some(proof) = &proof {
+            let graph = nestweaver_store::GraphStore::open_read_only_without_migration(&db_path)?;
+            proof.validate_graph(&graph)?;
+        }
         std::fs::remove_dir_all(&verified_snapshot)?;
         sync_directory_tree(&staging)?;
         publish_restored_directory(&staging, working_dir)?;
-        Ok(working_dir.join(GRAPH_FILE))
+        Ok(MaterializedSnapshot {
+            db_path: working_dir.join(GRAPH_FILE),
+            proof,
+            graph_digest,
+        })
     })();
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&staging);

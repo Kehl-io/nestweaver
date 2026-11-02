@@ -127,12 +127,14 @@ export function TopBar() {
     try {
       if (workspaceId === "all") {
         const symbolsPromise =
-          scope === "notes_only" ? Promise.resolve([]) : api.search(q, 10);
+          scope === "notes_only" ? Promise.resolve({results: [], _federation: undefined}) : api.searchPage(q, 10);
         const brainPromise =
-          scope === "code_only" ? Promise.resolve([]) : api.brainSearch(q, 5);
-        const [symbols, brain] = await Promise.all([symbolsPromise, brainPromise]);
+          scope === "code_only" ? Promise.resolve({results: [], _federation: undefined}) : api.brainSearchPage(q, 5);
+        const [symbolPage, brainPage] = await Promise.all([symbolsPromise, brainPromise]);
+        const symbols = symbolPage.results;
+        const brain = brainPage.results;
         if (useStore.getState().graphEpoch !== epoch || !isCurrentSearch(generation, q, workspaceId, scope)) return;
-        setSearchResults(symbols, brain);
+        setSearchResults(symbols, brain, [symbolPage._federation, brainPage._federation].filter((value) => value !== undefined));
         announceSearch(q, symbols.length + brain.length);
       } else {
         const scoped = await brainSearchInWorkspace(q, {

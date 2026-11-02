@@ -1,3 +1,4 @@
+import { searchEnvelope, type SearchEnvelope } from "./searchAvailability";
 import { fetchAfterInitialGraphBaseline } from "../sse/initialReadBarrier";
 import type {
   BacklinkRow,
@@ -58,11 +59,14 @@ function post<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
 }
 
 export const api = {
-  search(q: string, limit = 20, init?: RequestInit) {
-    return get<SymbolCandidate[]>(
+  search(q: string, limit = 20, init?: RequestInit): Promise<SymbolCandidate[]> {
+    return api.searchPage(q, limit, init).then((value) => value.results);
+  },
+  searchPage(q: string, limit = 20, init?: RequestInit): Promise<SearchEnvelope<SymbolCandidate>> {
+    return get<SymbolCandidate[] | SearchEnvelope<SymbolCandidate>>(
       `/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`,
       init,
-    );
+    ).then(searchEnvelope<SymbolCandidate>);
   },
 
   symbol(uid: string, init?: RequestInit) {
@@ -199,11 +203,14 @@ export const api = {
     );
   },
 
-  brainSearch(q: string, limit = 20, init?: RequestInit) {
-    return get<SearchHit[]>(
+  brainSearch(q: string, limit = 20, init?: RequestInit): Promise<SearchHit[]> {
+    return api.brainSearchPage(q, limit, init).then((value) => value.results);
+  },
+  brainSearchPage(q: string, limit = 20, init?: RequestInit): Promise<SearchEnvelope<SearchHit>> {
+    return get<SearchHit[] | SearchEnvelope<SearchHit>>(
       `/api/v1/brain/search?q=${encodeURIComponent(q)}&limit=${limit}`,
       init,
-    );
+    ).then(searchEnvelope<SearchHit>);
   },
 
   source(file: string, line?: number, context?: number, init?: RequestInit, repo?: string) {

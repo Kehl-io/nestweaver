@@ -92,9 +92,34 @@ pub fn rrf_merge_weighted(
     k: f64,
     local_weight: f64,
 ) -> Vec<MergedResult> {
+    rrf_merge_weighted_mapped(
+        local_results,
+        server_results,
+        k,
+        local_weight,
+        &crate::dedup::VaultMappings::new(),
+    )
+}
+
+pub fn rrf_merge_with_vault_mappings(
+    local_results: Vec<serde_json::Value>,
+    server_results: Vec<serde_json::Value>,
+    mappings: &crate::dedup::VaultMappings,
+) -> Vec<MergedResult> {
+    rrf_merge_weighted_mapped(local_results, server_results, RRF_K, LOCAL_WEIGHT, mappings)
+}
+
+fn rrf_merge_weighted_mapped(
+    local_results: Vec<serde_json::Value>,
+    server_results: Vec<serde_json::Value>,
+    k: f64,
+    local_weight: f64,
+    mappings: &crate::dedup::VaultMappings,
+) -> Vec<MergedResult> {
     let mut scored: HashMap<SymbolIdentity, MergedResult> = HashMap::new();
     let mut unkeyed: Vec<MergedResult> = Vec::new();
-    let (local_ids, server_ids, _) = identify_tiers(&local_results, &server_results);
+    let (local_ids, server_ids, _) =
+        crate::dedup::identify_tiers_with_vault_mappings(&local_results, &server_results, mappings);
 
     // Score local results with weighted RRF. First source to key an identity
     // owns its content; a repeated identity accumulates its RRF contribution.

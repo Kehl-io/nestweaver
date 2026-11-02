@@ -1,9 +1,11 @@
+import type { SearchAvailability } from "../api/searchAvailability";
 import type { StateCreator } from "zustand";
 import type { SearchHit, SymbolCandidate } from "../api/types";
 import type { PhraseIntent, PhraseResolution } from "../searchPhrases";
 import type { StoreState } from "./index";
 
 export interface SearchSlice {
+  searchAvailability: SearchAvailability[];
   searchQuery: string;
   searchResults: SymbolCandidate[];
   brainSearchResults: SearchHit[];
@@ -14,7 +16,7 @@ export interface SearchSlice {
   phraseResolving: boolean;
   phraseError: string | null;
   setSearchQuery: (q: string) => void;
-  setSearchResults: (symbols: SymbolCandidate[], brain: SearchHit[]) => void;
+  setSearchResults: (symbols: SymbolCandidate[], brain: SearchHit[], availability?: SearchAvailability[]) => void;
   setSearchOpen: (open: boolean) => void;
   setSearchLoading: (loading: boolean) => void;
   setPhraseIntent: (intent: PhraseIntent | null) => void;
@@ -30,6 +32,7 @@ export const createSearchSlice: StateCreator<
   [],
   SearchSlice
 > = (set) => ({
+  searchAvailability: [],
   searchQuery: "",
   searchResults: [],
   brainSearchResults: [],
@@ -42,11 +45,13 @@ export const createSearchSlice: StateCreator<
 
   setSearchQuery: (q) =>
     set((s) => {
+      s.searchAvailability = [];
       s.searchQuery = q;
     }),
 
-  setSearchResults: (symbols, brain) =>
+  setSearchResults: (symbols, brain, availability = []) =>
     set((s) => {
+      s.searchAvailability = availability;
       s.searchResults = symbols;
       s.brainSearchResults = brain;
     }),
@@ -89,6 +94,7 @@ export const createSearchSlice: StateCreator<
 
   clearSearch: () =>
     set((s) => {
+      s.searchAvailability = [];
       s.searchQuery = "";
       s.searchResults = [];
       s.brainSearchResults = [];

@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 ///    [--force]`, `kill -9`) are the daemon's CLI; a different consumer must
 ///    substitute its own escalation path rather than inherit these strings.
 pub struct DrainSignals {
+    /// Cached pending + running count. Diagnostics never lock or query SQLite.
+    pub queue_depth_hint: Option<Arc<AtomicU32>>,
     /// In-flight write RPCs. A write holds the DB write lock on an
     /// unabortable `spawn_blocking` thread, so while any are running the wait
     /// is unbounded.
@@ -110,6 +112,7 @@ pub async fn run_drain(signals: DrainSignals, ceiling: u64) {
     let repeat_every =
         std::time::Duration::from_secs(ceiling.max(DRAIN_OVER_CEILING_REPORT_FLOOR_SECS));
     let start = tokio::time::Instant::now();
+    let mut next_progress = std::time::Duration::ZERO;
     let mut warned_half = false;
     let mut warned_ninety = false;
     // When the next over-ceiling report is due: first at the ceiling itself,
@@ -128,6 +131,10 @@ pub async fn run_drain(signals: DrainSignals, ceiling: u64) {
         // job's task finishes, so it cannot outlive the work the way the
         // flag can.
         let in_flight = signals.indexing_in_flight.load(Ordering::SeqCst);
+        let queued = signals
+            .queue_depth_hint
+            .as_ref()
+            .map(|depth| depth.load(Ordering::Relaxed).saturating_sub(in_flight));
         if writes == 0 && in_flight == 0 {
             // nw-830: nothing is genuinely running — no write, and the worker
             // pool's own counter reports no job in flight — so there is
@@ -137,6 +144,7 @@ pub async fn run_drain(signals: DrainSignals, ceiling: u64) {
             // backoff), and it used to hold the drain to the full ceiling.
             // Queued jobs are left for the next start (their rows are
             // `pending`; nothing is claimed after `drained`/`shutdown_started`).
+            tracing::info!(queued_jobs_hint = ?queued, "drain complete; queued jobs persist for next start");
             if indexing {
                 tracing::warn!(
                     indexing_active = indexing,
@@ -153,6 +161,11 @@ pub async fn run_drain(signals: DrainSignals, ceiling: u64) {
         }
 
         let elapsed = start.elapsed();
+        if elapsed >= next_progress {
+            tracing::info!(active_writes = writes, indexing_in_flight = in_flight,
+                queued_jobs_hint = ?queued, waited_secs = elapsed.as_secs(), "drain waiting for in-flight work");
+            next_progress = elapsed + std::time::Duration::from_secs(30);
+        }
 
         if elapsed >= next_over_ceiling_report {
             next_over_ceiling_report = elapsed + repeat_every;
@@ -276,6 +289,7 @@ mod tests {
     async fn drain_exits_promptly_when_only_the_indexing_flag_is_stuck() {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let signals = DrainSignals {
+            queue_depth_hint: None,
             active_writes: Arc::new(AtomicU32::new(0)),
             indexing_active: Arc::new(AtomicBool::new(true)),
             indexing_in_flight: Arc::new(AtomicU32::new(0)),
@@ -323,6 +337,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut worker_shutdown = shutdown_tx.subscribe();
         let signals = DrainSignals {
+            queue_depth_hint: Some(Arc::clone(&status.queue_depth)),
             active_writes: Arc::new(AtomicU32::new(0)),
             indexing_active: Arc::clone(&status.active),
             indexing_in_flight: Arc::clone(&status.in_flight),
@@ -406,6 +421,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut worker_shutdown = shutdown_tx.subscribe();
         let signals = DrainSignals {
+            queue_depth_hint: None,
             active_writes: Arc::new(AtomicU32::new(0)),
             indexing_active: Arc::clone(&status.active),
             indexing_in_flight: Arc::clone(&status.in_flight),
@@ -486,5 +502,62 @@ mod tests {
             .await
             .expect("the worker must exit after the shutdown broadcast")
             .expect("worker task panicked");
+    }
+    #[tokio::test]
+    // Holding this lock throughout the drain is the regression's premise.
+    #[allow(clippy::await_holding_lock)]
+    async fn cached_queue_diagnostics_never_wait_for_a_held_sqlite_mutex() {
+        let queue = Arc::new(std::sync::Mutex::new(
+            crate::jobs::JobQueue::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let _held = queue.lock().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let signals = DrainSignals {
+            queue_depth_hint: Some(Arc::new(AtomicU32::new(7))),
+            active_writes: Arc::new(AtomicU32::new(0)),
+            indexing_active: Arc::new(AtomicBool::new(true)),
+            indexing_in_flight: Arc::new(AtomicU32::new(0)),
+            shutdown_tx,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            run_drain(signals, 3600),
+        )
+        .await
+        .unwrap();
+        assert!(*shutdown_rx.borrow());
+    }
+
+    #[tokio::test]
+    // Timers and write completion must progress while the queue stays locked.
+    #[allow(clippy::await_holding_lock)]
+    async fn cached_queue_diagnostics_keep_timers_responsive_during_real_write_drain() {
+        let queue = Arc::new(std::sync::Mutex::new(
+            crate::jobs::JobQueue::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let _held = queue.lock().unwrap();
+        let writes = Arc::new(AtomicU32::new(1));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let signals = DrainSignals {
+            queue_depth_hint: Some(Arc::new(AtomicU32::new(7))),
+            active_writes: writes.clone(),
+            indexing_active: Arc::new(AtomicBool::new(false)),
+            indexing_in_flight: Arc::new(AtomicU32::new(0)),
+            shutdown_tx,
+        };
+        let task = tokio::spawn(run_drain(signals, 0));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::time::sleep(std::time::Duration::from_millis(25)),
+        )
+        .await
+        .unwrap();
+        assert!(!*shutdown_rx.borrow());
+        writes.store(0, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*shutdown_rx.borrow());
     }
 }

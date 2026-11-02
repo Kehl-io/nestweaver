@@ -56,6 +56,8 @@ export function buildGraphFromImpact(result: ImpactLensResponse): Graph {
   graph.setAttribute("impactTarget", result.target?.uid ?? null);
   graph.setAttribute("impactStates", result.states);
   graph.setAttribute("affectedTests", result.affected_tests);
+  graph.setAttribute("orgAffectedTests", result.org_affected_tests ?? null);
+  graph.setAttribute("blastRadius", result.blast_radius ?? null);
   graph.setAttribute("sceneMetadata", result._meta);
 
   for (const node of nodes) {

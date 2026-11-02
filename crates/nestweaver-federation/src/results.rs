@@ -9,10 +9,10 @@ use nestweaver_schema::uid::normalize_search_symbol_canonical_id;
 use serde_json::Value;
 
 use crate::dedup::{
-    EntityKey, entity_key_for_uid, has_unique_canonical_identities, identify_tiers,
-    reconcile_vault_pairs,
+    EntityKey, VaultMappings, entity_key_for_uid, has_unique_canonical_identities,
+    identify_tiers_with_vault_mappings, reconcile_vault_pairs_with_mappings,
 };
-use crate::merge::rrf_merge;
+use crate::merge::rrf_merge_with_vault_mappings;
 
 #[derive(Clone, Copy)]
 struct SearchCountMetadata {
@@ -104,6 +104,7 @@ struct RankedSearchResult {
 fn merge_brain_search_items(
     local_items: Vec<Value>,
     server_items: Vec<Value>,
+    mappings: &VaultMappings,
 ) -> (Vec<Value>, u64, bool) {
     const RRF_K: f64 = 60.0;
     const LOCAL_WEIGHT: f64 = 1.5;
@@ -116,7 +117,7 @@ fn merge_brain_search_items(
     let vault_unproven = {
         let mut local_keys: Vec<&mut EntityKey> = local_entities.iter_mut().flatten().collect();
         let mut server_keys: Vec<&mut EntityKey> = server_entities.iter_mut().flatten().collect();
-        reconcile_vault_pairs(&mut local_keys, &mut server_keys)
+        reconcile_vault_pairs_with_mappings(&mut local_keys, &mut server_keys, mappings)
     };
 
     let mut keyed: HashMap<String, RankedSearchResult> = HashMap::new();
@@ -412,6 +413,15 @@ pub fn extract_result_items(value: &Value) -> Vec<Value> {
 /// Merge two JSON responses by concatenating their result arrays and
 /// deduplicating via scope-hash identity.
 pub fn merge_json_results(local: &Value, server: &Value) -> Value {
+    merge_json_results_with_vault_mappings(local, server, &VaultMappings::new())
+}
+
+/// Merge with operator-authorized vault identity bindings for this upstream.
+pub fn merge_json_results_with_vault_mappings(
+    local: &Value,
+    server: &Value,
+    mappings: &VaultMappings,
+) -> Value {
     let local_items = extract_result_items(local);
     let server_items = extract_result_items(server);
     let is_brain_search =
@@ -422,9 +432,9 @@ pub fn merge_json_results(local: &Value, server: &Value) -> Value {
     let server_identities_complete = has_proven_unique_search_identities(&server_items);
 
     let (values, proven_identity_count, vault_unproven) = if is_brain_search {
-        merge_brain_search_items(local_items, server_items)
+        merge_brain_search_items(local_items, server_items, mappings)
     } else {
-        let merged = rrf_merge(local_items, server_items);
+        let merged = rrf_merge_with_vault_mappings(local_items, server_items, mappings);
         (
             merged.into_iter().map(|mr| mr.value).collect(),
             0_u64,
@@ -442,7 +452,11 @@ pub fn merge_json_results(local: &Value, server: &Value) -> Value {
             && !vault_unproven;
         let (total, relation) = combine_totals(
             complete,
-            proven_identity_count,
+            if vault_unproven {
+                0
+            } else {
+                proven_identity_count
+            },
             local_count.lower_bound,
             server_count.lower_bound,
             returned,
@@ -492,6 +506,278 @@ pub fn merge_json_results(local: &Value, server: &Value) -> Value {
     }
 
     response
+}
+
+/// Tool-specific lookup disposition, shared by routing and composition.
+/// Missing requires an explicit miss or a valid, genuinely empty summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LookupDisposition {
+    Found,
+    Missing,
+    Ambiguous,
+    Incomplete,
+    Invalid,
+}
+
+pub fn lookup_disposition(tool: &str, value: &Value) -> LookupDisposition {
+    use LookupDisposition as D;
+    if value
+        .get("status")
+        .is_some_and(|status| !status.is_string())
+    {
+        return D::Invalid;
+    }
+    match value.get("status").and_then(Value::as_str) {
+        Some("not_found") => return D::Missing,
+        Some("ambiguous") => return D::Ambiguous,
+        Some("found" | "ok") | None => {}
+        Some(_) => return D::Invalid,
+    }
+    if !value.is_object() || value.get("error").is_some() {
+        return D::Invalid;
+    }
+    match tool {
+        "note_get" => {
+            if value
+                .get("uid")
+                .and_then(Value::as_str)
+                .is_some_and(|uid| !uid.is_empty())
+            {
+                D::Found
+            } else {
+                D::Invalid
+            }
+        }
+        "get_summary" => {
+            let Some(rows) = value.get("summaries").and_then(Value::as_array) else {
+                return D::Invalid;
+            };
+            let total = value.get("total").and_then(Value::as_u64);
+            let returned = value.get("returned").and_then(Value::as_u64);
+            if value.get("total").is_some() && total.is_none()
+                || value.get("returned").is_some() && returned != Some(rows.len() as u64)
+                || total.is_some_and(|total| total < rows.len() as u64)
+            {
+                return D::Invalid;
+            }
+            if !rows.is_empty() || total.is_some_and(|total| total > 0) {
+                D::Found
+            } else if total == Some(0) && returned == Some(0) {
+                D::Missing
+            } else {
+                D::Invalid
+            }
+        }
+        "read_symbols" => {
+            if value
+                .get("symbols")
+                .and_then(Value::as_array)
+                .is_some_and(|rows| !rows.is_empty())
+                && value
+                    .get("not_found")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            {
+                D::Found
+            } else {
+                D::Incomplete
+            }
+        }
+        _ => D::Invalid,
+    }
+}
+
+/// Compose named lookup contracts before considering generic result envelopes.
+/// Merge keeps the local singular answer/ambiguity; a clean local miss can
+/// be answered by the upstream. Primary routing selects its answer separately.
+pub fn compose_tool_results(
+    tool: &str,
+    local: &Value,
+    server: &Value,
+    mappings: &VaultMappings,
+) -> Value {
+    if matches!(tool, "note_get" | "get_summary") {
+        let local_miss = lookup_disposition(tool, local) == LookupDisposition::Missing;
+        let server_miss = lookup_disposition(tool, server) == LookupDisposition::Missing;
+        return if local_miss && !server_miss {
+            server.clone()
+        } else {
+            local.clone()
+        };
+    }
+    if tool != "read_symbols" {
+        return merge_structured_results_with_vault_mappings(local, server, mappings);
+    }
+    let rows = |value: &Value| {
+        value
+            .get("symbols")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let symbols: Vec<Value> = rrf_merge_with_vault_mappings(rows(local), rows(server), mappings)
+        .into_iter()
+        .map(|row| row.value)
+        .collect();
+    let mut out = local.clone();
+    // Keep per-target ambiguity, truncation, budget and suggestion explanations.
+    for key in ["ambiguous", "dropped", "qualifier_ignored", "did_you_mean"] {
+        let mut combined = Vec::new();
+        for tier in [local, server] {
+            if let Some(values) = tier.get(key).and_then(Value::as_array) {
+                for value in values {
+                    if !combined.contains(value) {
+                        combined.push(value.clone());
+                    }
+                }
+            }
+        }
+        out[key] = Value::Array(combined);
+    }
+    // Both tiers executed the identical target request. Their explicit
+    // not_found dispositions are authoritative, including suffix/container
+    // resolution and resolved symbols omitted by a token budget. Returned
+    // windows cannot reconstruct the resolver's grammar or dropped targets.
+    fn dispositions(value: &Value) -> Option<&Vec<Value>> {
+        value
+            .get("not_found")
+            .and_then(Value::as_array)
+            .filter(|entries| entries.iter().all(Value::is_string))
+    }
+    let local_missing = dispositions(local);
+    let server_missing = dispositions(server);
+    let mut missing = Vec::new();
+    match (local_missing, server_missing) {
+        (Some(local), Some(server)) => {
+            for target in local {
+                if server.contains(target) && !missing.contains(target) {
+                    missing.push(target.clone());
+                }
+            }
+        }
+        _ => {
+            // A synthesized typed miss may lack target dispositions. Keep
+            // explicit misses from the other tier; do not infer resolution
+            // from absent/malformed fields or from neighboring windows.
+            for entries in [local_missing, server_missing].into_iter().flatten() {
+                for target in entries {
+                    if !missing.contains(target) {
+                        missing.push(target.clone());
+                    }
+                }
+            }
+        }
+    }
+    out["symbols"] = Value::Array(symbols);
+    out["not_found"] = Value::Array(missing);
+    out["truncated"] = Value::Bool([local, server].iter().any(|tier| tier["truncated"] == true));
+    if local
+        .get("budget_exceeded_by_first_symbol")
+        .is_none_or(Value::is_null)
+        && let Some(budget) = server.get("budget_exceeded_by_first_symbol")
+    {
+        out["budget_exceeded_by_first_symbol"] = budget.clone();
+    }
+    let mut suggestions = serde_json::Map::new();
+    for tier in [server, local] {
+        if let Some(entries) = tier
+            .get("did_you_mean_by_target")
+            .and_then(Value::as_object)
+        {
+            for (target, value) in entries {
+                if out["not_found"]
+                    .as_array()
+                    .is_some_and(|missing| missing.iter().any(|v| v == target))
+                {
+                    suggestions.insert(target.clone(), value.clone());
+                }
+            }
+        }
+    }
+    if out["not_found"].as_array().is_some_and(Vec::is_empty) {
+        out["did_you_mean"] = Value::Array(Vec::new());
+    }
+    out["did_you_mean_by_target"] = Value::Object(suggestions);
+    if (!out["symbols"].as_array().is_none_or(Vec::is_empty)
+        || !out["ambiguous"].as_array().is_none_or(Vec::is_empty)
+        || !out["dropped"].as_array().is_none_or(Vec::is_empty))
+        && let Some(object) = out.as_object_mut()
+        && object.get("status").and_then(Value::as_str) == Some("not_found")
+    {
+        for key in ["status", "error", "message"] {
+            object.remove(key);
+        }
+    }
+    out
+}
+
+/// Fan-out composition retaining regex planner work and both tier explanations.
+/// Counts are summed work/scope visits, never cross-tier unique scope counts.
+pub fn compose_fanout_results(tool: &str, local: &Value, server: &Value) -> Value {
+    let mut out = concat_fanout(local, server);
+    if tool != "regex_search" {
+        return out;
+    }
+    for flag in ["scanned_fallback", "stale_index", "truncated"] {
+        out[flag] = Value::Bool(local[flag] == true || server[flag] == true);
+    }
+    let counts = [
+        "ready_scopes",
+        "dirty_scopes",
+        "error_scopes",
+        "posting_hits",
+        "hydrated_candidates",
+        "scanned_candidates",
+    ];
+    let mut tiers = serde_json::Map::new();
+    for (tier_name, value) in [("local", local), ("server", server)] {
+        let mut stats = serde_json::Map::new();
+        for key in counts.into_iter().chain([
+            "timings",
+            "note",
+            "truncation_reason",
+            "truncated",
+            "scanned_fallback",
+            "stale_index",
+        ]) {
+            if let Some(value) = value.get(key) {
+                stats.insert(key.to_owned(), value.clone());
+            }
+        }
+        tiers.insert(tier_name.to_owned(), Value::Object(stats));
+    }
+    for key in counts {
+        out[key] = Value::from(
+            local[key]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(server[key].as_u64().unwrap_or(0)),
+        );
+    }
+    for key in ["planning_ms", "hydration_ms", "verification_ms", "total_ms"] {
+        out["timings"][key] = Value::from(
+            local["timings"][key]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(server["timings"][key].as_u64().unwrap_or(0)),
+        );
+    }
+    let mut reasons =
+        vec!["Federated planner counts are tier-scope visits; timings sum tier work.".to_string()];
+    for (name, value) in [("local", local), ("server", server)] {
+        if let Some(text) = value["note"].as_str().filter(|text| !text.is_empty()) {
+            reasons.push(format!("{name}: {text}"));
+        }
+        if let Some(reason) = value["truncation_reason"].as_str() {
+            reasons.push(format!("{name} truncation: {reason}"));
+        }
+    }
+    out["note"] = Value::String(reasons.join("; "));
+    if out["truncation_reason"].is_null() {
+        out["truncation_reason"] = server["truncation_reason"].clone();
+    }
+    out["planner_work"] = serde_json::json!({"scope_counts":"tier-scope-visits", "timings":"summed-tier-work", "tiers":tiers});
+    out
 }
 
 /// Merge two FanOut tool responses (regex_search, count_patterns) by CONCATENATING their row
@@ -581,11 +867,20 @@ fn merge_cross_repo_links(local: &Value, server: &Value) -> Vec<Value> {
 }
 
 pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
+    merge_structured_results_with_vault_mappings(local, server, &VaultMappings::new())
+}
+
+/// Merge with operator-authorized vault identity bindings for this upstream.
+pub fn merge_structured_results_with_vault_mappings(
+    local: &Value,
+    server: &Value,
+    mappings: &VaultMappings,
+) -> Value {
     let local_connected = local.get("connected").and_then(|v| v.as_array());
     let server_connected = server.get("connected").and_then(|v| v.as_array());
 
     if let (Some(lc), Some(sc)) = (local_connected, server_connected) {
-        let merged_connected = rrf_merge(lc.clone(), sc.clone());
+        let merged_connected = rrf_merge_with_vault_mappings(lc.clone(), sc.clone(), mappings);
         let merged_values: Vec<Value> = merged_connected
             .into_iter()
             .map(|mr| {
@@ -618,7 +913,8 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
         // once and corrects the summed `seeds_expanded` below.
         let mut shared_seeds = 0_u64;
         if let Some(server_seeds) = server.get("seeds").and_then(|v| v.as_array()) {
-            let (seed_ids, server_seed_ids, _) = identify_tiers(&seeds, server_seeds);
+            let (seed_ids, server_seed_ids, _) =
+                identify_tiers_with_vault_mappings(&seeds, server_seeds, mappings);
             let local_keys: HashSet<String> = seed_ids
                 .into_iter()
                 .flatten()
@@ -936,19 +1232,24 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
                     && has_unique_canonical_identities(&rows)
             };
             let connected_len = result["connected"].as_array().map_or(0, Vec::len) as u64;
-            let vault_unproven = identify_tiers(&rows(local), &rows(server)).2;
+            let vault_unproven =
+                identify_tiers_with_vault_mappings(&rows(local), &rows(server), mappings).2;
             // No `_relation` marker is emitted on this envelope (it has no such
             // field): `truncated` is the only signal that `total` is a lower
             // bound rather than the exact union.
             let (total, _relation) = combine_totals(
                 tier_complete(local) && tier_complete(server) && !vault_unproven,
-                union_len,
+                if vault_unproven { 0 } else { union_len },
                 Some(tier_total(local)),
                 Some(tier_total(server)),
                 connected_len,
             );
-            result["total"] = Value::from(total.max(connected_len));
-            if total > connected_len {
+            result["total"] = Value::from(if vault_unproven {
+                total
+            } else {
+                total.max(connected_len)
+            });
+            if vault_unproven || total > connected_len {
                 result["truncated"] = Value::from(true);
             }
         }
@@ -989,7 +1290,7 @@ pub fn merge_structured_results(local: &Value, server: &Value) -> Value {
         inject_or_wrap_provenance(&mut result, &["local", "server"], &[]);
         result
     } else {
-        merge_json_results(local, server)
+        merge_json_results_with_vault_mappings(local, server, mappings)
     }
 }
 
@@ -1082,6 +1383,166 @@ mod tests {
     /// `resolver_stale_repos` as a FOURTH, differently-named field rather than
     /// overloading a third meaning onto this one — that precedent is the
     /// intended direction.
+    #[test]
+    fn lookup_composition_preserves_singular_statuses_and_partial_symbol_contract() {
+        let maps = VaultMappings::new();
+        let local = json!({"uid":"note:local","title":"Local"});
+        let remote = json!({"uid":"note:remote","title":"Remote"});
+        let ambiguous = json!({"status":"ambiguous","candidate_uids":["a","b"]});
+        let miss = json!({"status":"not_found","message":"absent"});
+        assert_eq!(
+            compose_tool_results("note_get", &local, &remote, &maps),
+            local
+        );
+        assert_eq!(
+            compose_tool_results("note_get", &ambiguous, &remote, &maps),
+            ambiguous
+        );
+        assert_eq!(
+            compose_tool_results("note_get", &miss, &ambiguous, &maps),
+            ambiguous
+        );
+        assert_eq!(compose_tool_results("note_get", &miss, &miss, &maps), miss);
+        let summary = json!({"summaries":[{"text":"local"}],"matched_total":1});
+        assert_eq!(
+            compose_tool_results("get_summary", &summary, &remote, &maps),
+            summary
+        );
+        let a = sym("local", "a", 1);
+        let mut b = sym("server", "b", 2);
+        b["name"] = json!("b");
+        b["path"] = json!("src/lib.rs");
+        let merged = compose_tool_results(
+            "read_symbols",
+            &json!({"symbols":[a],"not_found":["b","missing"],"truncated":false}),
+            &json!({"symbols":[b],"not_found":["a","missing"],"truncated":true,"dropped":["d"],"budget_exceeded_by_first_symbol":{"requested_tokens":1,"actual_tokens":8}}),
+            &maps,
+        );
+        assert_eq!(merged["symbols"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["not_found"], json!(["missing"]));
+        assert_eq!(merged["truncated"], true);
+        assert_eq!(merged["dropped"], json!(["d"]));
+        assert!(merged.get("results").is_none());
+        assert!(merged.get("budget_exceeded_by_first_symbol").is_some());
+    }
+
+    #[test]
+    fn summary_disposition_distinguishes_empty_misses_from_matched_budget_results() {
+        let missing = json!({"level":"symbol","summaries":[],"returned":0,"total":0,"note":"no symbol matched target"});
+        let found = json!({"level":"symbol","summaries":[{"text":"remote summary"}],"returned":1,"total":1});
+        let budget = json!({"summaries":[],"returned":0,"total":3,"truncated_by_budget":true});
+        assert_eq!(
+            lookup_disposition("get_summary", &missing),
+            LookupDisposition::Missing
+        );
+        assert_eq!(
+            lookup_disposition("get_summary", &found),
+            LookupDisposition::Found
+        );
+        assert_eq!(
+            lookup_disposition("get_summary", &budget),
+            LookupDisposition::Found
+        );
+        let maps = VaultMappings::new();
+        assert_eq!(
+            compose_tool_results("get_summary", &missing, &found, &maps),
+            found
+        );
+        assert_eq!(
+            compose_tool_results("get_summary", &budget, &found, &maps),
+            budget
+        );
+        assert_eq!(
+            compose_tool_results("get_summary", &missing, &missing, &maps),
+            missing
+        );
+        for malformed in [
+            json!({"summary":"unknown schema"}),
+            json!({"summaries":[],"total":0}),
+            json!({"summaries":[{}],"returned":1,"total":0}),
+            json!({"summaries":[],"returned":0,"total":0,"error":"failed"}),
+            json!({"status":"unsupported","summaries":[],"returned":0,"total":0}),
+        ] {
+            assert_eq!(
+                lookup_disposition("get_summary", &malformed),
+                LookupDisposition::Invalid
+            );
+            assert_eq!(
+                compose_tool_results("get_summary", &malformed, &found, &maps),
+                malformed
+            );
+        }
+    }
+
+    #[test]
+    fn read_symbols_uses_peer_dispositions_for_qualified_and_budget_omitted_targets() {
+        let maps = VaultMappings::new();
+        for target in [
+            "controllers/index.js::app",
+            "wsgi::app",
+            "Class::method",
+            "api.py::Class::method",
+            "src/owner.rs",
+            "budget-dropped",
+        ] {
+            let local = json!({"status":"not_found","symbols":[],"not_found":[target,"absent"],"did_you_mean":["old suggestion"],"did_you_mean_by_target":{(target):["old suggestion"]}});
+            // Resolution proof is the explicit disposition, independent of
+            // whether a window was returned or budget-omitted.
+            for dropped in [false, true] {
+                let server = json!({"symbols":if dropped {json!([])} else {json!([{"uid":"sym:remote","name":"app","path":"src/controllers/index.js"}])},"not_found":["absent"],"dropped":if dropped {json!(["sym:remote"])} else {json!([])},"truncated":dropped});
+                let merged = compose_tool_results("read_symbols", &local, &server, &maps);
+                assert_eq!(merged["not_found"], json!(["absent"]), "{target}: {merged}");
+                assert!(merged["did_you_mean_by_target"].get(target).is_none());
+                if dropped {
+                    assert_eq!(merged["dropped"], json!(["sym:remote"]));
+                }
+            }
+        }
+        let typed_miss = json!({"status":"not_found","message":"no target"});
+        let explicit = json!({"symbols":[],"not_found":["qualified::target"]});
+        let merged = compose_tool_results("read_symbols", &typed_miss, &explicit, &maps);
+        assert_eq!(merged["not_found"], json!(["qualified::target"]));
+        let malformed = json!({"symbols":[],"not_found":[42]});
+        assert_eq!(
+            compose_tool_results("read_symbols", &explicit, &malformed, &maps)["not_found"],
+            json!(["qualified::target"])
+        );
+        let dropped =
+            json!({"symbols":[],"not_found":[],"dropped":["uid:resolved"],"truncated":true});
+        let local = json!({"status":"not_found","symbols":[],"not_found":["target"],"did_you_mean":["old"]});
+        let merged = compose_tool_results("read_symbols", &local, &dropped, &maps);
+        assert_eq!(merged["not_found"], json!([]));
+        assert_eq!(merged["did_you_mean"], json!([]));
+        assert!(merged.get("status").is_none());
+    }
+
+    #[test]
+    fn regex_fanout_retains_both_plans_and_aggregates_tier_work() {
+        let clean = json!({"results":[{"uid":"local"}],"truncated":false,"scanned_fallback":false,"stale_index":false,"ready_scopes":2,"dirty_scopes":0,"error_scopes":0,"posting_hits":4,"hydrated_candidates":3,"scanned_candidates":0,"timings":{"planning_ms":1,"hydration_ms":2,"verification_ms":3,"total_ms":6},"truncation_reason":null,"note":"local clean"});
+        let dirty = json!({"results":[{"uid":"remote"}],"truncated":true,"scanned_fallback":true,"stale_index":true,"ready_scopes":0,"dirty_scopes":3,"error_scopes":1,"posting_hits":0,"hydrated_candidates":0,"scanned_candidates":9,"timings":{"planning_ms":2,"hydration_ms":0,"verification_ms":4,"total_ms":6},"truncation_reason":"deadline","note":"dirty fallback"});
+        for (local, server) in [(&clean, &dirty), (&dirty, &clean)] {
+            let result = compose_fanout_results("regex_search", local, server);
+            assert_eq!(result["results"].as_array().unwrap().len(), 2);
+            for flag in ["truncated", "scanned_fallback", "stale_index"] {
+                assert_eq!(result[flag], true);
+            }
+            assert_eq!(result["dirty_scopes"], 3);
+            assert_eq!(result["error_scopes"], 1);
+            assert_eq!(result["scanned_candidates"], 9);
+            assert_eq!(result["timings"]["total_ms"], 12);
+            assert_eq!(result["truncation_reason"], "deadline");
+            assert!(result["note"].as_str().unwrap().contains("dirty fallback"));
+            assert!(result["note"].as_str().unwrap().contains("local clean"));
+            assert!(
+                result["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("tier-scope visits")
+            );
+            assert!(result["planner_work"]["tiers"]["server"].is_object());
+        }
+    }
+
     #[test]
     fn the_three_stale_repos_populations_stay_distinct() {
         // Population (1) is what this crate owns. Pin its location and the
@@ -1562,7 +2023,11 @@ mod tests {
         // Same vault hash on both tiers (the nw-901 repro); the instance differs.
         let local = search_response(vec![tag("local", "/shared/vault")]);
         let server = search_response(vec![tag("srv", "/shared/vault")]);
-        let merged = merge_json_results(&local, &server);
+        let mappings = VaultMappings::from([(
+            nestweaver_schema::uid::vault_uid("local", "/shared/vault"),
+            nestweaver_schema::uid::vault_uid("srv", "/shared/vault"),
+        )]);
+        let merged = merge_json_results_with_vault_mappings(&local, &server, &mappings);
         assert_eq!(merged["results"].as_array().unwrap().len(), 1, "{merged}");
         assert_eq!(merged["total_matches"], 1, "{merged}");
         assert_eq!(merged["total_matches_relation"], "eq", "{merged}");
@@ -1586,7 +2051,11 @@ mod tests {
             note("srv", "/srv/clone", "b.md", "Beta"),
             note("srv", "/srv/clone", "c.md", "Gamma"),
         ]);
-        let merged = merge_json_results(&local, &server);
+        let mappings = VaultMappings::from([(
+            nestweaver_schema::uid::vault_uid("local", "/laptop/vault"),
+            nestweaver_schema::uid::vault_uid("srv", "/srv/clone"),
+        )]);
+        let merged = merge_json_results_with_vault_mappings(&local, &server, &mappings);
         assert_eq!(merged["results"].as_array().unwrap().len(), 3, "{merged}");
         assert_eq!(merged["total_matches"], 3, "{merged}");
         assert_eq!(merged["total_matches_relation"], "eq", "{merged}");
@@ -1629,6 +2098,38 @@ mod tests {
         assert_eq!(merged["total_matches_relation"], "gte", "{merged}");
     }
 
+    #[test]
+    fn template_notes_remain_uncertain_until_explicitly_bound() {
+        let row = |instance: &str, rel: &str| json!({"uid": nestweaver_schema::uid::note_uid(&nestweaver_schema::uid::vault_uid(instance, "/vault"), rel), "kind": "note", "title": "Template"});
+        let local = search_response(vec![row("local", "a.md"), row("local", "b.md")]);
+        let server = search_response(vec![row("remote", "a.md"), row("remote", "b.md")]);
+        let separate = merge_json_results(&local, &server);
+        assert_eq!(separate["returned_matches"], 4);
+        assert_eq!(separate["total_matches_relation"], "gte");
+        assert_eq!(
+            separate["total_matches"], 2,
+            "unmapped copies cannot prove four distinct logical notes"
+        );
+        let mappings = VaultMappings::from([(
+            nestweaver_schema::uid::vault_uid("local", "/vault"),
+            nestweaver_schema::uid::vault_uid("remote", "/vault"),
+        )]);
+        let bound = merge_json_results_with_vault_mappings(&local, &server, &mappings);
+        assert_eq!(bound["returned_matches"], 2);
+        assert_eq!(bound["total_matches_relation"], "eq");
+        let one_local = search_response(vec![row("local", "a.md")]);
+        let one_server = search_response(vec![row("remote", "a.md")]);
+        let one = merge_json_results_with_vault_mappings(&one_local, &one_server, &mappings);
+        assert_eq!(one["returned_matches"], 1);
+        assert_eq!(one["total_matches_relation"], "eq");
+        let seed_local = json!({"seeds":[row("local", "a.md")],"connected":[],"seeds_truncated":false,"seeds_expanded":1});
+        let seed_server = json!({"seeds":[row("remote", "a.md")],"connected":[],"seeds_truncated":false,"seeds_expanded":1});
+        let seeds =
+            merge_structured_results_with_vault_mappings(&seed_local, &seed_server, &mappings);
+        assert_eq!(seeds["seeds"].as_array().unwrap().len(), 1);
+        assert_eq!(seeds["seeds_expanded"], 1);
+    }
+
     fn vault_entities(instance: &str, root: &str) -> Vec<Value> {
         let vault = nestweaver_schema::uid::vault_uid(instance, root);
         let note = nestweaver_schema::uid::note_uid(&vault, "zebra.md");
@@ -1657,7 +2158,11 @@ mod tests {
     fn context_merge_keeps_distinct_entities_and_dedups_across_tiers() {
         let local = json!({"seeds": [], "connected": vault_entities("local", "/laptop/v")});
         let server = json!({"seeds": [], "connected": vault_entities("srv", "/srv/c")});
-        let merged = merge_structured_results(&local, &server);
+        let mappings = VaultMappings::from([(
+            nestweaver_schema::uid::vault_uid("local", "/laptop/v"),
+            nestweaver_schema::uid::vault_uid("srv", "/srv/c"),
+        )]);
+        let merged = merge_structured_results_with_vault_mappings(&local, &server, &mappings);
         let connected = merged["connected"].as_array().unwrap();
         assert_eq!(connected.len(), 4, "{merged}");
         assert!(
@@ -2551,7 +3056,11 @@ mod tests {
             ],
         );
 
-        let merged = merge_json_results(&local, &server);
+        let mappings = VaultMappings::from([(
+            nestweaver_schema::uid::vault_uid("local-instance", "/shared/vault"),
+            nestweaver_schema::uid::vault_uid("server-instance", "/shared/vault"),
+        )]);
+        let merged = merge_json_results_with_vault_mappings(&local, &server, &mappings);
 
         assert_eq!(merged["results"].as_array().unwrap().len(), 2);
         assert_eq!(merged["total_matches"], 2);
@@ -2600,7 +3109,11 @@ mod tests {
         let local = complete_search_response("needle", vec![local_note]);
         let server = complete_search_response("needle", vec![server_note]);
 
-        let merged = merge_json_results(&local, &server);
+        let mappings = VaultMappings::from([(
+            nestweaver_schema::uid::vault_uid("local", "/shared/vault"),
+            nestweaver_schema::uid::vault_uid("server", "/shared/vault"),
+        )]);
+        let merged = merge_json_results_with_vault_mappings(&local, &server, &mappings);
 
         assert_eq!(merged["results"].as_array().unwrap().len(), 1);
         assert_eq!(merged["total_matches"], 1);

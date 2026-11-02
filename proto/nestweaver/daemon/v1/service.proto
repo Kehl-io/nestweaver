@@ -731,6 +731,9 @@ message RepoState {
   string repo_name = 3;
   string indexed_sha = 4;
   int64 symbol_count = 5;
+  // Local checkout for ancestry checks. Empty on server-mode bare clones and
+  // older peers. Clients must use only their LOCAL daemon's value.
+  string local_checkout_path = 6;
 }
 message RepoStatesResponse {
   repeated RepoState repos = 1;
@@ -1130,6 +1133,9 @@ service NestWeaverDaemon {
   rpc CodeContext(JsonRequest) returns (JsonResponse);
   rpc GetProjectContext(ProjectContextRequest) returns (ProjectContextResponse);
   rpc GetNote(NoteGetRequest) returns (NoteGetResponse);
+  // Current-only graph counts: returns Unavailable while the completed graph
+  // observation is stale or a writer is active. Use BrainStatusJson for
+  // explicitly last-observed counts with as-of/age/stale and live runtime metadata.
   rpc BrainStatus(BrainStatusRequest) returns (BrainStatusResponse);
   rpc BrainStatusJson(JsonRequest) returns (JsonResponse);
   rpc RepoStates(RepoStatesRequest) returns (RepoStatesResponse);

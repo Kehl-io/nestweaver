@@ -553,6 +553,18 @@ impl JobQueue {
         Ok(count > 0)
     }
 
+    /// Publication admission must fence the exact claim, including remove/re-add
+    /// and lease-reclaim races that preserve the same SQLite row id.
+    pub fn claim_is_active(&self, job: &IndexJob) -> Result<bool, rusqlite::Error> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM index_jobs WHERE id = ?1 AND repo_id = ?2
+             AND status = 'running' AND claimed_by IS ?3",
+            params![job.id, job.repo_id, job.claimed_by],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Mark a job as failed.
     ///
     /// If `is_poison` is true or `attempt >= max_attempts`, the job moves
@@ -1891,5 +1903,30 @@ mod tests {
 
         let job = q.claim_next(0).unwrap().unwrap();
         assert!(job.branch.is_none(), "branch should be None when not set");
+    }
+    #[test]
+    fn publication_fences_removed_and_readded_claim_with_same_row_id() {
+        let q = queue();
+        q.upsert(
+            "repo",
+            "https://example.com/org/repo",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        let old = q.claim_next(0).unwrap().unwrap();
+        assert!(q.claim_is_active(&old).unwrap());
+        q.cancel_repo("repo").unwrap();
+        q.upsert(
+            "repo",
+            "https://example.com/org/repo",
+            JobTrigger::Webhook,
+            None,
+        )
+        .unwrap();
+        let new = q.claim_next(0).unwrap().unwrap();
+        assert_eq!(old.id, new.id);
+        assert!(!q.claim_is_active(&old).unwrap());
+        assert!(q.claim_is_active(&new).unwrap());
     }
 }

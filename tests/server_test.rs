@@ -165,6 +165,7 @@ fn merge_upstream(grpc_addr: String, token: &str) -> UpstreamHandle {
         repos: vec![],
         timeout: "15s".to_string(),
         fallback_timeout: None,
+        vault_mappings: Default::default(),
         ca_cert: None,
     };
     UpstreamHandle::from_config(&cfg).expect("build upstream handle")
@@ -4206,4 +4207,129 @@ async fn daemon_mcp_boundary_single_node_without_upstream() {
         json!([]),
         "stale_repos must be an empty array when no upstream is configured; got {meta}"
     );
+}
+
+/// Exercise the public query router against two real authenticated daemons;
+/// response composition must keep lookup envelopes in every configured mode.
+// The legacy index_repo bootstrap above requires the internal CI artifact.
+// Standard-artifact local acceptance uses owned isolated-daemon fixtures.
+#[cfg(feature = "ci-direct-tests")]
+#[tokio::test]
+async fn hybrid_lookup_modes_preserve_rpc_shapes_and_partial_symbol_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let local_repo = dir.path().join("local-repo");
+    let remote_repo = dir.path().join("remote-repo");
+    let local_db = dir.path().join("local/db.lbug");
+    let remote_db = dir.path().join("remote/db.lbug");
+    write_repo_files(
+        &local_repo,
+        &[("main.js", "function localfn() { return 1; }")],
+    );
+    write_repo_files(
+        &remote_repo,
+        &[("main.js", "function serverfn() { return 2; }")],
+    );
+    index_repo(&local_repo, &local_db);
+    index_repo(&remote_repo, &remote_db);
+    let _local_server =
+        helpers::server_guard::ServerGuard::start_with_auth(&local_db, HYBRID_TOKEN);
+    let remote_server =
+        helpers::server_guard::ServerGuard::start_with_auth(&remote_db, HYBRID_TOKEN);
+    for mode in [
+        RoutingMode::Fallback,
+        RoutingMode::Merge,
+        RoutingMode::Primary,
+    ] {
+        let config = UpstreamConfig {
+            name: Some("server".into()),
+            url: remote_server.grpc_addr(),
+            token: Some(HYBRID_TOKEN.into()),
+            mode,
+            repos: vec![],
+            timeout: "15s".into(),
+            fallback_timeout: Some("15s".into()),
+            ca_cert: None,
+            vault_mappings: Default::default(),
+        };
+        let local = connect_local(&local_db).await;
+        let mut hybrid =
+            HybridClient::from_parts(local, vec![UpstreamHandle::from_config(&config).unwrap()]);
+        let value = hybrid
+            .query(
+                "read_symbols",
+                &json!({"targets":["localfn","main::serverfn"],"include_neighbors":false}),
+            )
+            .await
+            .unwrap();
+        assert!(value.get("results").is_none(), "{mode:?}: {value}");
+        let symbols = value["symbols"]
+            .as_array()
+            .expect("top-level symbol windows");
+        assert!(
+            symbols.iter().any(|row| row["name"] == "serverfn"),
+            "{mode:?}: {value}"
+        );
+        if mode != RoutingMode::Primary {
+            assert_eq!(symbols.len(), 2, "{mode:?}: {value}");
+            assert_eq!(value["not_found"], json!([]), "{mode:?}: {value}");
+        } else {
+            assert_eq!(
+                symbols.len(),
+                1,
+                "Primary must retain upstream preference: {value}"
+            );
+            assert_eq!(value["not_found"], json!(["localfn"]));
+        }
+        let found = hybrid
+            .query(
+                "read_symbols",
+                &json!({"targets":["localfn"],"include_neighbors":false}),
+            )
+            .await
+            .unwrap();
+        if mode == RoutingMode::Fallback {
+            assert_eq!(
+                found["_meta"]["upstream_attempts"][0]["outcome"], "skipped",
+                "{found}"
+            );
+            assert_eq!(found["symbols"][0]["name"], "localfn");
+        }
+        // The local tool reports a clean summary miss as total=returned=0,
+        // without a not_found status. Both modes must still answer remotely.
+        if mode != RoutingMode::Primary {
+            let remote_summary = hybrid
+                .query(
+                    "get_summary",
+                    &json!({"level":"symbol","target":"serverfn"}),
+                )
+                .await
+                .unwrap();
+            assert!(
+                remote_summary["total"].as_u64().unwrap() > 0,
+                "{mode:?}: {remote_summary}"
+            );
+            assert!(
+                !remote_summary["summaries"].as_array().unwrap().is_empty(),
+                "{remote_summary}"
+            );
+            assert_eq!(
+                remote_summary["_meta"]["upstream_attempts"][0]["outcome"],
+                "success"
+            );
+        }
+        if mode == RoutingMode::Merge {
+            let summary = hybrid
+                .query("get_summary", &json!({"level":"symbol","target":"localfn"}))
+                .await
+                .unwrap();
+            assert!(summary.get("summaries").is_some(), "{summary}");
+            assert!(summary.get("results").is_none(), "{summary}");
+            let missing = hybrid
+                .query("read_symbols", &json!({"targets":["no_such_symbol_92841"]}))
+                .await
+                .unwrap();
+            assert_eq!(missing["not_found"], json!(["no_such_symbol_92841"]));
+            assert!(missing.get("results").is_none(), "{missing}");
+        }
+    }
 }

@@ -5,7 +5,7 @@
 //!
 //! - A uid the shared schema parser
 //!   ([`nestweaver_schema::uid::parse_canonical_entity_uid`]) accepts is keyed
-//!   by its domain-qualified, instance-stripped form ([`EntityKey`],
+//!   by its domain-qualified form (vault instance retained; code instance stripped; [`EntityKey`],
 //!   `canonical == true`).
 //! - Any other non-empty uid (`proj:`, `contract:`, off-grammar) is keyed by
 //!   its raw string (`uid:<raw>`, `canonical == false`). That never drops a
@@ -19,34 +19,11 @@
 //!
 //! # Cross-tier vault identity (nw-902)
 //!
-//! `vault_uid` hashes the vault's machine-local root path, so the same vault
-//! indexed at two paths (laptop checkout vs server bare clone) mints two
-//! different vault hashes, and the uid alone cannot say whether two vault
-//! hashes are one vault. Within a tier the vault hash is kept, so distinct
-//! vaults stay distinct. ACROSS tiers a (local vault L, server vault S) pair is
-//! reconciled -- S's rows are rewritten to L's hash -- only on corroborating
-//! evidence ([`reconcile_vault_pairs`]):
-//!
-//! - at least two distinct notes agree on (vault-relative path hash,
-//!   lowercased title), OR
-//! - one `sec:` row agrees on (relative path hash, start line, content hash).
-//!   `sec:` is the only content-bearing uid; `head:` slugs are heading text
-//!   and `tag:` is a name hash, so neither is evidence.
-//!
-//! and the pairing is one-to-one (a vault that corroborates with several
-//! counterparts is left unreconciled). Inside a reconciled pair, notes still
-//! need an equal lowercased title to merge; headings and tags merge by their
-//! vault-relative key. Everything else stays vault-qualified: a duplicate row
-//! is possible, a false merge is not -- except for the limit below.
-//!
-//! Limit: corroboration is evidence, not proof. Two DIFFERENT vaults on
-//! different tiers that share two same-path-same-title notes (for example two
-//! vaults generated from one template) or one section content hash WILL be
-//! reconciled, and their same-path same-title notes will merge. When either
-//! tier holds a vault hash that is neither shared nor reconciled
-//! ([`reconcile_vault_pairs`] returns `true`) callers must not claim an exact
-//! union. A path-independent vault fingerprint would need a persisted-uid
-//! migration and is out of scope.
+//! Vault roots are machine-local. Content, titles, paths and sections cannot
+//! establish shared identity: unrelated template vaults can agree on all of
+//! them. Only an operator's explicit local-vault-UID to upstream-vault-UID
+//! mapping can reconcile different hashes. Without a mapping rows remain
+//! separate and union cardinality remains uncertain.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -71,7 +48,7 @@ pub struct SymbolIdentity {
 /// hashing use `key` only; the other fields drive cross-tier reconciliation.
 #[derive(Debug, Clone)]
 pub struct EntityKey {
-    /// Domain-qualified key with the instance removed (vault hash retained),
+    /// Domain-qualified key (vault instance retained; code instance removed),
     /// or `uid:<raw>` for a uid the schema parser rejects.
     pub key: String,
     /// True only when the schema parser accepted the uid. Raw-keyed rows are
@@ -84,9 +61,6 @@ pub struct EntityKey {
     /// Vault-relative remainder (`note`: path hash; `tag`: name hash;
     /// `head`: `n:slug:line`; `sec`: `n:line:content`).
     rest: String,
-    /// Lowercased, trimmed title (notes only); a merge guard inside a
-    /// reconciled vault pair.
-    title: Option<String>,
 }
 
 impl PartialEq for EntityKey {
@@ -109,7 +83,6 @@ impl EntityKey {
             family,
             vault: None,
             rest: String::new(),
-            title: None,
         }
     }
 
@@ -121,16 +94,13 @@ impl EntityKey {
         }
     }
 
-    fn scoped(family: &'static str, vault: &str, rest: String, title: Option<&str>) -> Self {
+    fn scoped(family: &'static str, vault: &str, rest: String, _title: Option<&str>) -> Self {
         let mut key = Self {
             key: String::new(),
             canonical: true,
             family,
             vault: Some(vault.to_string()),
             rest,
-            title: title
-                .map(|t| t.trim().to_lowercase())
-                .filter(|t| !t.is_empty()),
         };
         key.requalify();
         key
@@ -160,23 +130,55 @@ pub fn entity_key_for_uid(
 ) -> Option<EntityKey> {
     use CanonicalEntityUid as U;
     Some(match parse_canonical_entity_uid(uid)? {
-        U::Note { vault, note, .. } => EntityKey::scoped("note", vault, note.to_string(), title),
-        U::Tag { vault, name, .. } => EntityKey::scoped("tag", vault, name.to_string(), None),
+        U::Note {
+            instance,
+            vault,
+            note,
+        } => EntityKey::scoped(
+            "note",
+            &format!("{instance}:{vault}"),
+            note.to_string(),
+            title,
+        ),
+        U::Tag {
+            instance,
+            vault,
+            name,
+        } => EntityKey::scoped(
+            "tag",
+            &format!("{instance}:{vault}"),
+            name.to_string(),
+            None,
+        ),
         U::Heading {
+            instance,
             vault,
             note,
             slug,
             line,
             ..
-        } => EntityKey::scoped("head", vault, format!("{note}:{slug}:{line}"), None),
+        } => EntityKey::scoped(
+            "head",
+            &format!("{instance}:{vault}"),
+            format!("{note}:{slug}:{line}"),
+            None,
+        ),
         U::Section {
+            instance,
             vault,
             note,
             line,
             content,
             ..
-        } => EntityKey::scoped("sec", vault, format!("{note}:{line}:{content}"), None),
-        U::Vault { vault, .. } => EntityKey::plain("vlt", format!("vlt:{vault}")),
+        } => EntityKey::scoped(
+            "sec",
+            &format!("{instance}:{vault}"),
+            format!("{note}:{line}:{content}"),
+            None,
+        ),
+        U::Vault { instance, vault } => {
+            EntityKey::scoped("vlt", &format!("{instance}:{vault}"), String::new(), None)
+        }
         U::Symbol {
             repo,
             file,
@@ -196,109 +198,85 @@ pub fn entity_key_for_uid(
     })
 }
 
-/// Reconcile local and server vault hashes (nw-902; rule in the module docs).
-///
-/// Rewrites the server rows of every corroborated, one-to-one (local vault,
-/// server vault) pair to the local vault hash and, inside a reconciled pair,
-/// adds the lowercased title to note keys. Returns `true` when, afterwards,
-/// both tiers hold vault-scoped rows and some vault hash is held by only one
-/// tier -- i.e. the union cannot be proven exact.
+/// Explicit local vault UID -> upstream vault UID bindings for one upstream.
+pub type VaultMappings = HashMap<String, String>;
+
+/// Without authoritative bindings, differing vault scopes remain distinct.
 pub fn reconcile_vault_pairs(local: &mut [&mut EntityKey], server: &mut [&mut EntityKey]) -> bool {
+    reconcile_vault_pairs_with_mappings(local, server, &VaultMappings::new())
+}
+
+/// Reconcile only explicitly bound vaults. Malformed or ambiguous bindings
+/// are ignored. Presentation fields never participate in identity.
+pub fn reconcile_vault_pairs_with_mappings(
+    local: &mut [&mut EntityKey],
+    server: &mut [&mut EntityKey],
+    mappings: &VaultMappings,
+) -> bool {
+    let mut pairs = Vec::new();
+    for (l, s) in mappings {
+        if let (
+            Some(CanonicalEntityUid::Vault {
+                instance: li,
+                vault: l,
+            }),
+            Some(CanonicalEntityUid::Vault {
+                instance: si,
+                vault: s,
+            }),
+        ) = (parse_canonical_entity_uid(l), parse_canonical_entity_uid(s))
+        {
+            pairs.push((format!("{li}:{l}"), format!("{si}:{s}")));
+        }
+    }
+    let mut by_local: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut by_server: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (l, s) in &pairs {
+        by_local.entry(l).or_default().insert(s);
+        by_server.entry(s).or_default().insert(l);
+    }
+    let aliases: HashMap<&str, &str> = pairs
+        .iter()
+        .filter(|(l, s)| by_local[l.as_str()].len() == 1 && by_server[s.as_str()].len() == 1)
+        .map(|(l, s)| (s.as_str(), l.as_str()))
+        .collect();
     let vaults = |rows: &[&mut EntityKey]| -> HashSet<String> {
         rows.iter().filter_map(|k| k.vault.clone()).collect()
     };
     let local_vaults = vaults(local);
-    let server_vaults = vaults(server);
-    if local_vaults.is_empty() || server_vaults.is_empty() {
+    let original_server_vaults = vaults(server);
+    if local_vaults.is_empty() || original_server_vaults.is_empty() {
         return false;
     }
-
-    // Evidence index over local vaults that no server row shares verbatim.
-    let mut notes: HashMap<(String, String), HashSet<String>> = HashMap::new();
-    let mut secs: HashMap<String, HashSet<String>> = HashMap::new();
-    for k in local.iter() {
-        let Some(v) = k.vault.as_ref().filter(|v| !server_vaults.contains(*v)) else {
-            continue;
-        };
-        match (k.family, &k.title) {
-            ("note", Some(t)) => {
-                notes
-                    .entry((k.rest.clone(), t.clone()))
-                    .or_default()
-                    .insert(v.clone());
-            }
-            ("sec", _) => {
-                secs.entry(k.rest.clone()).or_default().insert(v.clone());
-            }
-            _ => {}
+    // Validate the simultaneous destination plan. A source occupying another
+    // binding's target is harmless when that source itself moves (chains/swaps).
+    // Recompute after rejecting a collision: restoring a source may reveal an
+    // additional collision with a different target.
+    let mut accepted = aliases;
+    loop {
+        let mut destinations: HashMap<&str, Vec<&str>> = HashMap::new();
+        for source in &original_server_vaults {
+            let target = accepted.get(source.as_str()).copied().unwrap_or(source);
+            destinations.entry(target).or_default().push(source);
         }
-    }
-    // (local vault, server vault) -> (distinct agreeing notes, section match)
-    let mut pairs: HashMap<(String, String), (HashSet<String>, bool)> = HashMap::new();
-    for k in server.iter() {
-        let Some(s) = k.vault.as_ref().filter(|v| !local_vaults.contains(*v)) else {
-            continue;
-        };
-        match (k.family, &k.title) {
-            ("note", Some(t)) => {
-                for l in notes
-                    .get(&(k.rest.clone(), t.clone()))
-                    .into_iter()
-                    .flatten()
-                {
-                    pairs
-                        .entry((l.clone(), s.clone()))
-                        .or_default()
-                        .0
-                        .insert(k.rest.clone());
-                }
-            }
-            ("sec", _) => {
-                for l in secs.get(&k.rest).into_iter().flatten() {
-                    pairs.entry((l.clone(), s.clone())).or_default().1 = true;
-                }
-            }
-            _ => {}
+        let rejected: HashSet<&str> = destinations
+            .values()
+            .filter(|sources| sources.len() > 1)
+            .flat_map(|sources| sources.iter().copied())
+            .filter(|source| accepted.contains_key(source))
+            .collect();
+        if rejected.is_empty() {
+            break;
         }
+        accepted.retain(|source, _| !rejected.contains(source));
     }
-    let corroborated: Vec<(String, String)> = pairs
-        .into_iter()
-        .filter(|(_, (n, sec))| *sec || n.len() >= 2)
-        .map(|(pair, _)| pair)
-        .collect();
-    let mut by_local: HashMap<&str, usize> = HashMap::new();
-    let mut by_server: HashMap<&str, usize> = HashMap::new();
-    for (l, s) in &corroborated {
-        *by_local.entry(l).or_default() += 1;
-        *by_server.entry(s).or_default() += 1;
-    }
-    let reconciled: HashMap<String, String> = corroborated
-        .iter()
-        .filter(|(l, s)| by_local[l.as_str()] == 1 && by_server[s.as_str()] == 1)
-        .map(|(l, s)| (s.clone(), l.clone()))
-        .collect();
-    let reconciled_locals: HashSet<&String> = reconciled.values().collect();
-
     for k in server.iter_mut() {
-        if let Some(l) = k.vault.as_ref().and_then(|v| reconciled.get(v)) {
-            k.vault = Some(l.clone());
+        if let Some(target) = k.vault.as_deref().and_then(|v| accepted.get(v)) {
+            k.vault = Some((*target).to_string());
             k.requalify();
         }
     }
-    let guard_titles = |rows: &mut [&mut EntityKey]| {
-        for k in rows.iter_mut() {
-            if k.family == "note"
-                && k.vault
-                    .as_ref()
-                    .is_some_and(|v| reconciled_locals.contains(v))
-            {
-                k.key = format!("{}|t:{}", k.key, k.title.as_deref().unwrap_or(""));
-            }
-        }
-    };
-    guard_titles(local);
-    guard_titles(server);
-    vaults(local) != vaults(server)
+    local_vaults != vaults(server)
 }
 
 /// Provenance tracking for a merged result.
@@ -467,6 +445,18 @@ pub fn identify_tiers(
     Vec<Option<SymbolIdentity>>,
     bool,
 ) {
+    identify_tiers_with_vault_mappings(local, server, &VaultMappings::new())
+}
+
+pub fn identify_tiers_with_vault_mappings(
+    local: &[serde_json::Value],
+    server: &[serde_json::Value],
+    mappings: &VaultMappings,
+) -> (
+    Vec<Option<SymbolIdentity>>,
+    Vec<Option<SymbolIdentity>>,
+    bool,
+) {
     let mut local_ids: Vec<Option<SymbolIdentity>> = local.iter().map(extract_identity).collect();
     let mut server_ids: Vec<Option<SymbolIdentity>> = server.iter().map(extract_identity).collect();
     let mut local_keys: Vec<&mut EntityKey> = local_ids
@@ -479,7 +469,7 @@ pub fn identify_tiers(
         .flatten()
         .filter_map(|id| id.entity.as_mut())
         .collect();
-    let unproven = reconcile_vault_pairs(&mut local_keys, &mut server_keys);
+    let unproven = reconcile_vault_pairs_with_mappings(&mut local_keys, &mut server_keys, mappings);
     (local_ids, server_ids, unproven)
 }
 
@@ -756,9 +746,9 @@ mod tests {
             assert_eq!(a, c, "location must not matter for {uid}");
             assert!(keys.insert(a), "{uid} collided with another family");
         }
-        // Instance never matters.
+        // Different vault instances require explicit authorization.
         let other = tag_uid(&vault_uid("inst-b", "/some/root"), "zebra");
-        assert_eq!(
+        assert_ne!(
             extract_identity(&json!({"uid": other, "title": "t"})).unwrap(),
             extract_identity(&json!({"uid": uids[1], "title": "t"})).unwrap()
         );
@@ -817,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn two_agreeing_notes_reconcile_a_vault_pair_and_carry_heads_and_tags() {
+    fn identical_templates_never_establish_vault_identity() {
         let local = vec![
             note_row("l", "/a", "x.md", "X"),
             note_row("l", "/a", "y.md", "Y"),
@@ -830,7 +820,7 @@ mod tests {
             head_row("s", "/b", "x.md", "intro"),
             tag_row("s", "/b", "todo"),
         ];
-        assert_eq!(reconcile(local, server), (4, false));
+        assert_eq!(reconcile(local, server), (8, true));
     }
 
     /// A single agreeing note (README/Home/Inbox) is NOT evidence: two
@@ -860,10 +850,9 @@ mod tests {
         assert_eq!(reconcile(local, server), (8, true));
     }
 
-    /// One matching `sec:` (content hash) corroborates alone, then carries the
-    /// vault's notes (equal title), headings and tags.
+    /// Matching section content also occurs in unrelated templates.
     #[test]
-    fn one_matching_section_reconciles_the_whole_pair() {
+    fn matching_sections_never_establish_vault_identity() {
         let local = vec![
             sec_row("l", "/a", "x.md", 3, "abc123"),
             note_row("l", "/a", "x.md", "X"),
@@ -876,7 +865,7 @@ mod tests {
             head_row("s", "/b", "x.md", "intro"),
             tag_row("s", "/b", "todo"),
         ];
-        assert_eq!(reconcile(local, server), (4, false));
+        assert_eq!(reconcile(local, server), (8, true));
         // A different content hash is no evidence.
         let local = vec![sec_row("l", "/a", "x.md", 3, "abc123")];
         let server = vec![sec_row("s", "/b", "x.md", 3, "fff999")];
@@ -886,7 +875,7 @@ mod tests {
     /// Inside a reconciled pair a note needs an equal (case-insensitive)
     /// title: a differing title stays two rows.
     #[test]
-    fn reconciled_pair_still_requires_equal_note_titles() {
+    fn matching_notes_and_different_titles_keep_both_vaults() {
         let local = vec![
             note_row("l", "/a", "x.md", "X"),
             note_row("l", "/a", "y.md", "Y"),
@@ -898,7 +887,7 @@ mod tests {
             note_row("s", "/b", "z.md", "Zebra"),
         ];
         // x (case) and y merge; z has differing titles -> two rows.
-        assert_eq!(reconcile(local, server), (4, false));
+        assert_eq!(reconcile(local, server), (6, true));
     }
 
     /// One local vault corroborating with two server vaults is ambiguous:
@@ -916,6 +905,98 @@ mod tests {
             note_row("s", "/c", "y.md", "Y"),
         ];
         assert_eq!(reconcile(local, server), (6, true));
+    }
+
+    #[test]
+    fn explicit_binding_merges_one_note_and_related_entities() {
+        use nestweaver_schema::uid::vault_uid;
+        let local = vec![
+            note_row("l", "/a", "x.md", "Renamed"),
+            head_row("l", "/a", "x.md", "intro"),
+            tag_row("l", "/a", "todo"),
+        ];
+        let server = vec![
+            note_row("s", "/b", "x.md", "Original"),
+            head_row("s", "/b", "x.md", "intro"),
+            tag_row("s", "/b", "todo"),
+        ];
+        let mappings = VaultMappings::from([(vault_uid("l", "/a"), vault_uid("s", "/b"))]);
+        let merged =
+            crate::merge::rrf_merge_with_vault_mappings(local.clone(), server.clone(), &mappings);
+        assert_eq!(merged.len(), 3);
+        assert!(merged.iter().all(|r| r.provenance == Provenance::Both));
+        assert!(!identify_tiers_with_vault_mappings(&local, &server, &mappings).2);
+        let malformed = VaultMappings::from([("not-a-vault".into(), vault_uid("s", "/b"))]);
+        assert_eq!(
+            crate::merge::rrf_merge_with_vault_mappings(local, server, &malformed).len(),
+            6
+        );
+    }
+
+    #[test]
+    fn authoritative_vault_mapping_chains_and_swaps_apply_simultaneously() {
+        use nestweaver_schema::uid::vault_uid;
+        let a = vault_uid("shared", "/a");
+        let c = vault_uid("shared", "/c");
+        let b = vault_uid("shared", "/b");
+        let local = vec![
+            note_row("shared", "/a", "x.md", "X"),
+            note_row("shared", "/c", "x.md", "X"),
+        ];
+        let server = vec![
+            note_row("shared", "/b", "x.md", "X"),
+            note_row("shared", "/a", "x.md", "X"),
+        ];
+        let mappings = VaultMappings::from([(a.clone(), b), (c.clone(), a.clone())]);
+        assert_eq!(
+            crate::merge::rrf_merge_with_vault_mappings(local.clone(), server.clone(), &mappings)
+                .len(),
+            2
+        );
+        assert!(!identify_tiers_with_vault_mappings(&local, &server, &mappings).2);
+        let same_scopes = vec![
+            note_row("shared", "/a", "x.md", "X"),
+            note_row("shared", "/c", "x.md", "X"),
+        ];
+        let swap = VaultMappings::from([(a.clone(), c.clone()), (c.clone(), a.clone())]);
+        assert_eq!(
+            crate::merge::rrf_merge_with_vault_mappings(local, same_scopes, &swap).len(),
+            2
+        );
+        // B -> A conflicts with an unmapped A in the upstream tier.
+        let collision = VaultMappings::from([(a, vault_uid("shared", "/b"))]);
+        let local = vec![note_row("shared", "/a", "x.md", "X")];
+        let (_, _, uncertain) = identify_tiers_with_vault_mappings(&local, &server, &collision);
+        assert!(uncertain);
+        assert_eq!(
+            crate::merge::rrf_merge_with_vault_mappings(local, server, &collision).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn same_machine_path_on_different_instances_is_not_authority() {
+        let local = vec![note_row("l", "/vault", "x.md", "X")];
+        let server = vec![note_row("s", "/vault", "x.md", "X")];
+        assert_eq!(reconcile(local, server), (2, true));
+    }
+
+    #[test]
+    fn ambiguous_explicit_mapping_never_collapses_vaults() {
+        use nestweaver_schema::uid::vault_uid;
+        let local = vec![
+            note_row("l", "/a", "x.md", "X"),
+            note_row("l", "/b", "x.md", "X"),
+        ];
+        let server = vec![note_row("s", "/c", "x.md", "X")];
+        let mappings = VaultMappings::from([
+            (vault_uid("l", "/a"), vault_uid("s", "/c")),
+            (vault_uid("l", "/b"), vault_uid("s", "/c")),
+        ]);
+        assert_eq!(
+            crate::merge::rrf_merge_with_vault_mappings(local, server, &mappings).len(),
+            3
+        );
     }
 
     #[test]

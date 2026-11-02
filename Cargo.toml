@@ -150,6 +150,7 @@ nestweaver-daemon = { workspace = true }
 nestweaver-proto = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
+tokio-stream = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 libc = "0.2"
 blake3 = { workspace = true }

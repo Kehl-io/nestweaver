@@ -38,7 +38,9 @@ pub fn tool_routing(tool_name: &str) -> ToolRouting {
         | "search_symbols" => ToolRouting::Merge,
 
         // Navigation tools — local-first
-        "read_symbols" | "investigate" | "investigate_hydrate" => ToolRouting::LocalFirst,
+        "read_symbols" | "investigate" | "investigate_hydrate" | "note_get" | "get_summary" => {
+            ToolRouting::LocalFirst
+        }
 
         // Navigation tools — continuation
         "flow_trace" | "investigate_expand" => ToolRouting::Continuation,
@@ -65,9 +67,7 @@ pub fn tool_routing(tool_name: &str) -> ToolRouting {
         | "brain_topic_clusters" => ToolRouting::Combined,
 
         // Vault/note tools — merge (notes may be on server vault)
-        "note_get" | "backlinks" | "get_summary" | "brain_guide" | "brain_diff" => {
-            ToolRouting::Merge
-        }
+        "backlinks" | "brain_guide" | "brain_diff" => ToolRouting::Merge,
 
         // Vault analysis — server-preferred (need full vault)
         "brain_broken_links" | "brain_orphan_documents" => ToolRouting::ServerPreferred,

@@ -44,6 +44,47 @@ pub struct DaemonClient {
     inner: NestWeaverDaemonClient<Channel>,
 }
 
+/// Check only the HealthCheck's selected endpoint binding. OS socket-peer
+/// proof and pidfile authority are separate checks owned by the caller.
+/// Version and physical backing health are deliberately excluded so status
+/// can diagnose a correctly identified old or unhealthy daemon.
+pub fn verify_endpoint_binding(
+    db_path: &Path,
+    health: &nestweaver_proto::HealthCheckResponse,
+) -> Result<()> {
+    anyhow::ensure!(
+        health.pid != 0
+            && health.instance_id
+                == nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path)
+            && nestweaver_daemon::lifecycle::database_path_fingerprint(Path::new(&health.db_path))
+                == nestweaver_daemon::lifecycle::database_path_fingerprint(db_path),
+        "existing daemon does not verify the selected database/instance/PID identity"
+    );
+    Ok(())
+}
+
+/// Shared health admission for existing-only reads. Physical backing health
+/// remains the daemon's independent proof; the path names endpoint identity.
+fn verify_existing_read_health(
+    db_path: &Path,
+    health: &nestweaver_proto::HealthCheckResponse,
+) -> Result<()> {
+    if let Some(skew) =
+        nestweaver_schema::describe_version_skew(&health.version, env!("CARGO_PKG_VERSION"))
+    {
+        anyhow::bail!(
+            "{skew} Restart the replica through its owner; no daemon was started or restarted"
+        );
+    }
+    verify_endpoint_binding(db_path, health)?;
+    anyhow::ensure!(
+        health.backing_file_valid == Some(true),
+        "existing daemon database backing file is unhealthy or unverified: {}",
+        health.backing_file_error
+    );
+    Ok(())
+}
+
 fn require_embedding_identity_repair_capability(
     health: &nestweaver_proto::HealthCheckResponse,
 ) -> Result<()> {
@@ -1383,6 +1424,50 @@ impl DaemonClient {
         }
 
         Ok(client)
+    }
+
+    /// Attach for a read without creating a database, starting or restarting a
+    /// process. An absent logical anchor can name a live snapshot replica.
+    /// Return the SAME verified client for the query; never probe then autostart.
+    pub async fn connect_existing_verified_read(
+        db_path: &Path,
+        config_path: Option<&Path>,
+    ) -> Result<Option<Self>> {
+        // Parse caller intent even when no socket exists. A bad explicit or
+        // persisted config must not be mistaken for an absent local endpoint.
+        let effective = RestartConfig::for_automatic_cold_start(db_path, config_path)?;
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+        if !nestweaver_daemon::lifecycle::daemon_socket_candidates(&instance_id)
+            .iter()
+            .any(|path| path.exists())
+        {
+            return Ok(None);
+        }
+        let mut client = match Self::connect_existing(db_path).await {
+            Ok(client) => client,
+            // Stale socket files are still no live local endpoint. Preserve
+            // missing-DB upstream-only routing without spawning anything.
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                        matches!(
+                            io.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        )
+                    })
+                }) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let health = client.health_check().await?;
+        verify_existing_read_health(db_path, &health)?;
+        let _identity = verified_incumbent_identity(db_path, &instance_id, &health)?;
+        if let Some(config) = effective.as_path() {
+            verify_requested_config_with_health(db_path, &health, config)?;
+        }
+        Ok(Some(client))
     }
 
     /// Connect to an already-running daemon for this database without
@@ -3513,5 +3598,41 @@ mod transient_connection_tests {
         assert!(!is_transient_connection_failure(&answer));
         let mismatch = anyhow::anyhow!("explicit --config x does not match");
         assert!(!is_transient_connection_failure(&mismatch));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_binding_tests {
+    use super::*;
+
+    #[test]
+    fn binding_requires_identity_but_preserves_status_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("replica-anchor.lbug");
+        let valid = nestweaver_proto::HealthCheckResponse {
+            pid: std::process::id(),
+            instance_id: nestweaver_daemon::lifecycle::instance_id_from_db_path(&db),
+            db_path: db.display().to_string(),
+            // Status must still identify a version-skewed unhealthy daemon.
+            version: "0.0.1".to_string(),
+            backing_file_valid: Some(false),
+            ..Default::default()
+        };
+        verify_endpoint_binding(&db, &valid).unwrap();
+        assert!(verify_existing_read_health(&db, &valid).is_err());
+        for property in ["pid", "instance", "path"] {
+            let mut bad = valid.clone();
+            match property {
+                "pid" => bad.pid = 0,
+                "instance" => bad.instance_id = "other".to_string(),
+                "path" => bad.db_path = dir.path().join("other.lbug").display().to_string(),
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_endpoint_binding(&db, &bad).is_err(),
+                "must refuse {property}"
+            );
+        }
+        assert!(!db.exists());
     }
 }
