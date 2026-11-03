@@ -17551,9 +17551,22 @@ pub async fn run_server(
                                         nestweaver_engine::jobs::STALE_RECOVERY_SECS,
                                     ),
                                 ),
-                                Err(_) => {
-                                    tracing::error!("lease reaper: job queue mutex poisoned");
-                                    (Ok(0), Ok(0))
+                                Err(poisoned) => {
+                                    // nw-924: a panic while the queue was held
+                                    // must not retire the reaper for the rest of
+                                    // the process while the worker (which recovers
+                                    // the same mutex) keeps claiming. Recover the
+                                    // guard exactly as the worker does.
+                                    tracing::warn!(
+                                        "lease reaper: job queue mutex poisoned; recovering the guard"
+                                    );
+                                    let guard = poisoned.into_inner();
+                                    (
+                                        guard.reap_expired_leases(now),
+                                        guard.recover_stale(
+                                            nestweaver_engine::jobs::STALE_RECOVERY_SECS,
+                                        ),
+                                    )
                                 }
                             };
                             match reclaimed {
@@ -17700,11 +17713,19 @@ pub async fn run_server(
                             let Some(generation) = in_flight.try_dispatch(&repo_id, &repo_url) else {
                                 continue;
                             };
-                            // Determine which branch ref to check. If the repo
-                            // config specifies a branch, use that ref; otherwise
-                            // fall back to HEAD (symref of the remote's default
-                            // branch) so we aren't hardcoded to "main".
-                            let ref_spec = branch.as_deref().unwrap_or("HEAD").to_string();
+                            // Determine which ref to check. A configured branch
+                            // is probed as the fully qualified `refs/heads/<branch>`
+                            // (nw-919: a bare name is a tail pattern to ls-remote,
+                            // so `refs/tags/main` or `refs/heads/dev/main` could be
+                            // reported first and the scheduler would compare the
+                            // wrong SHA — the worker fetches `refs/heads/<branch>`
+                            // exactly, so the probe must too); otherwise HEAD, the
+                            // remote's default-branch symref, so nothing is
+                            // hardcoded to "main".
+                            let ref_spec = branch
+                                .as_deref()
+                                .map(|b| format!("refs/heads/{b}"))
+                                .unwrap_or_else(|| "HEAD".to_string());
                             let probe_url = repo_url.clone();
                             let probe_cred = poll_credential_method.clone();
                             let task_repo = repo_id.clone();
@@ -18917,12 +18938,21 @@ fn probe_remote_sha(
             )
         );
     }
-    let sha = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
+    // nw-919: `ls-remote <url> <pattern>` tail-matches, so a decoy ref such as
+    // `refs/tags/main` or `refs/heads/dev/main` can be advertised alongside (and
+    // sort before) `refs/heads/main`. Take only the line whose ref name equals
+    // the requested spec; a bare `HEAD` request matches the `HEAD` line.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let sha = cols.next()?;
+            let name = cols.next()?;
+            (name == ref_spec).then(|| sha.to_string())
+        })
         .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+        .unwrap_or_default();
     Ok(if sha.is_empty() { None } else { Some(sha) })
 }
 
@@ -26627,6 +26657,54 @@ repos = ["alpha"]
         assert!(
             result.is_none(),
             "an unadvertised ref must be None, not a SHA"
+        );
+    }
+
+    /// nw-919: with `refs/tags/<branch>` and `refs/heads/dev/<branch>` advertised
+    /// alongside `refs/heads/<branch>`, the probe must report the SHA of the
+    /// exact ref, not whichever tail match ls-remote lists first.
+    #[test]
+    fn probe_remote_sha_ignores_decoy_refs_with_the_same_tail_nw_919() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("src");
+        init_repo(&repo);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["checkout", "-q", "-b", "target"]);
+        let target_sha = git(&["rev-parse", "refs/heads/target"]);
+        // Decoys on a different commit so a wrong pick is observable.
+        git(&["checkout", "-q", "-b", "dev/target"]);
+        std::fs::write(repo.join("b.txt"), "decoy").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "decoy"]);
+        git(&["tag", "target"]);
+        let decoy_sha = git(&["rev-parse", "refs/heads/dev/target"]);
+        assert_ne!(target_sha, decoy_sha);
+        let url = format!("file://{}", repo.display());
+
+        let sha = probe_remote_sha(
+            &[],
+            &url,
+            "refs/heads/target",
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("ls-remote should succeed")
+        .expect("refs/heads/target is advertised");
+        assert_eq!(
+            sha, target_sha,
+            "probe must return the exact ref's SHA, not a decoy"
         );
     }
 
