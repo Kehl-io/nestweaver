@@ -1309,7 +1309,7 @@ impl InstanceConfig {
         // silently select no helper at all; fail the load instead, with the same
         // rule `pull` and the CLI already apply.
         crate::pull::validate_credential_method(&config.git.credential_method)
-            .map_err(|error| error.context("[git] credential_method"))?;
+            .map_err(|error| anyhow::anyhow!("[git] credential_method: {error}"))?;
         crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
         crate::index_limits::NoteLimits::new(config.indexing.max_note_bytes)?;
         // nw-908: `[[repos]] exclude` globs are compiled by every reader that
