@@ -1104,6 +1104,299 @@ pub fn expectation<'a>(
     }
 }
 
+/// A snapshot's verified records, bound to the captured persistent graph epoch.
+/// This is crate-private: adjacent JSON cannot manufacture an admission token.
+pub(crate) struct SnapshotRecords {
+    identity: PublicationIdentity,
+    data_instance_id: String,
+    generation: u64,
+    records: DerivationRecords,
+}
+
+pub(crate) fn bounded_snapshot_bytes(path: &Path) -> Result<Vec<u8>, RecordError> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|e| RecordError::Io(e.kind()))?
+        .take(MAX_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| RecordError::Io(e.kind()))?;
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err(RecordError::LimitExceeded);
+    }
+    Ok(bytes)
+}
+
+impl SnapshotRecords {
+    pub(crate) fn decode(
+        bytes: &[u8],
+        identity: &PublicationIdentity,
+        generation: u64,
+    ) -> Result<Self, RecordError> {
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(RecordError::LimitExceeded);
+        }
+        let envelope: RecordEnvelope = serde_json::from_slice(bytes)
+            .map_err(|_| RecordError::Corrupt("invalid snapshot derivation envelope"))?;
+        let records = decode_records(bytes, &expectation(identity, &envelope.data_instance_id))?;
+        for record in records.vaults.values() {
+            // Repo.root_path is not authoritative managed-provider registration.
+            // Until that evidence is portable, never infer it from a checkout.
+            if record.source.provider != SourceProvider::Filesystem {
+                return Err(RecordError::UnsupportedProvider);
+            }
+            if record.derivation_version != DERIVATION_VERSION
+                || record.phase != DerivationPhase::Current
+                || record.coverage.scope != CoverageScope::FullRegisteredPolicy
+                || record
+                    .witness
+                    .as_ref()
+                    .is_none_or(|w| w.graph_generation > generation)
+            {
+                return Err(RecordError::IncompletePublication);
+            }
+        }
+        Ok(Self {
+            identity: identity.clone(),
+            data_instance_id: envelope.data_instance_id,
+            generation,
+            records,
+        })
+    }
+
+    pub(crate) fn validate_graph(
+        &self,
+        store: &nestweaver_store::GraphStore,
+    ) -> Result<(), RecordError> {
+        self.validate_graph_inner(store, true)
+    }
+    // In the snapshot representation the separately checksummed source epoch
+    // is named `generation`; materialization relocates it before store open.
+    pub(crate) fn validate_snapshot_graph(
+        &self,
+        store: &nestweaver_store::GraphStore,
+    ) -> Result<(), RecordError> {
+        self.validate_graph_inner(store, false)
+    }
+    fn validate_graph_inner(
+        &self,
+        store: &nestweaver_store::GraphStore,
+        relocated: bool,
+    ) -> Result<(), RecordError> {
+        let failure = || RecordError::Corrupt("snapshot derivation does not match frozen graph");
+        if store
+            .publication_identity()
+            .map_err(|_| failure())?
+            .as_ref()
+            != Some(&self.identity)
+            || (relocated && store.graph_generation() != self.generation)
+            || store
+                .data_instance_id()
+                .map_err(|_| failure())?
+                .as_deref()
+                .unwrap_or("default")
+                != self.data_instance_id
+        {
+            return Err(failure());
+        }
+        let vaults = store.list_vaults(None).map_err(|_| failure())?;
+        if vaults.len() != self.records.vaults.len() {
+            return Err(failure());
+        }
+        for vault in vaults {
+            let record = self.records.vaults.get(&vault.uid).ok_or_else(failure)?;
+            if record.data_instance_id != vault.instance_id
+                || record.source.canonical_root != vault.root_path
+            {
+                return Err(failure());
+            }
+            let notes = store.list_notes(Some(&vault.uid)).map_err(|_| failure())?;
+            let witness = record.witness.as_ref().ok_or_else(failure)?;
+            if witness.notes_count != notes.len() as u64
+                || witness.source_inventory_digest != inventory_digest(&notes)
+            {
+                return Err(failure());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Optional export never upgrades producer evidence. A producer with absent,
+/// pending or stale proof can still export a searchable, uncertified snapshot.
+pub(crate) fn snapshot_record_pair(
+    store: &nestweaver_store::GraphStore,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let attempt = || -> Result<(Vec<u8>, Vec<u8>), RecordError> {
+        let db = store.db_path().ok_or(RecordError::InvalidIdentity)?;
+        let identity = store
+            .publication_identity()
+            .map_err(|_| RecordError::InvalidIdentity)?
+            .ok_or(RecordError::InvalidIdentity)?;
+        let bytes = bounded_snapshot_bytes(&record_path(db))?;
+        let generation_bytes = bounded_snapshot_bytes(&crate::sidecar_path(db, ".generation"))?;
+        validate_snapshot_generation(&generation_bytes, store.graph_generation())?;
+        let records = SnapshotRecords::decode(&bytes, &identity, store.graph_generation())?;
+        records.validate_graph(store)?;
+        // Live filesystem policy must still agree at capture. Portable reads
+        // later use this certified policy, not a recipient filesystem alias.
+        for record in records.records.vaults.values() {
+            if record.source.provider == SourceProvider::Filesystem {
+                let source = filesystem_source(Path::new(&record.source.canonical_root))?;
+                let coverage = coverage_identity(
+                    Path::new(&source.canonical_root),
+                    &record.coverage.extra_ignore_patterns,
+                    record.coverage.max_note_bytes,
+                    record.coverage.scope.clone(),
+                )?;
+                if source != record.source || coverage != record.coverage {
+                    return Err(RecordError::IncompletePublication);
+                }
+            }
+        }
+        Ok((bytes, generation_bytes))
+    };
+    match attempt() {
+        Ok(pair) => Some(pair),
+        Err(error) => {
+            tracing::warn!(%error, "snapshot omits uncertified Markdown derivation; derived reads require upstream refresh");
+            None
+        }
+    }
+}
+
+pub(crate) fn validate_snapshot_generation(bytes: &[u8], expected: u64) -> Result<(), RecordError> {
+    if bytes.len() > 21 {
+        return Err(RecordError::LimitExceeded);
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| RecordError::Corrupt("invalid snapshot generation"))?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text != expected.to_string() {
+        return Err(RecordError::Corrupt(
+            "snapshot generation differs from captured graph",
+        ));
+    }
+    Ok(())
+}
+
+/// Explicit immutable-snapshot capability. Only verified materialization can
+/// construct it; it owns the exact read-only handle validated at binding.
+pub struct ValidatedSnapshotDerivation {
+    store: std::sync::Arc<nestweaver_store::GraphStore>,
+    proof: SnapshotRecords,
+    vaults: Vec<nestweaver_schema::Vault>,
+}
+impl ValidatedSnapshotDerivation {
+    pub(crate) fn bind(
+        store: std::sync::Arc<nestweaver_store::GraphStore>,
+        proof: SnapshotRecords,
+    ) -> Result<Self, RecordError> {
+        if store.is_read_write() {
+            return Err(RecordError::InvalidIdentity);
+        }
+        store
+            .verify_backing_file()
+            .map_err(|_| RecordError::InvalidIdentity)?;
+        proof.validate_graph(&store)?;
+        let vaults = store
+            .list_vaults(None)
+            .map_err(|_| RecordError::InvalidIdentity)?;
+        Ok(Self {
+            store,
+            proof,
+            vaults,
+        })
+    }
+    fn admit(
+        &self,
+        store: &nestweaver_store::GraphStore,
+        instance: &str,
+        extra: &[String],
+        max_bytes: u64,
+    ) -> Result<(), DerivationUnavailable> {
+        let validate = || -> Result<(), RecordError> {
+            if !std::ptr::eq(store, self.store.as_ref())
+                || store.is_read_write()
+                || store.graph_generation() != self.proof.generation
+                || store
+                    .publication_identity()
+                    .map_err(|_| RecordError::InvalidIdentity)?
+                    .as_ref()
+                    != Some(&self.proof.identity)
+                || instance != self.proof.data_instance_id
+            {
+                return Err(RecordError::ForeignStoreIdentity);
+            }
+            store
+                .verify_backing_file()
+                .map_err(|_| RecordError::InvalidIdentity)?;
+            let mut extra: Vec<_> = extra
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            extra.sort();
+            extra.dedup();
+            for record in self.proof.records.vaults.values() {
+                if record.coverage.max_note_bytes != max_bytes
+                    || record.coverage.extra_ignore_patterns != extra
+                {
+                    return Err(RecordError::IncompletePublication);
+                }
+            }
+            Ok(())
+        };
+        validate().map_err(|error| DerivationUnavailable::from_record_error(&error))?;
+        // All graph/source/inventory validation happened at receipt binding.
+        // Reuse the same Current/version/witness gate; no per-query graph hash.
+        for vault in &self.vaults {
+            let record = self
+                .proof
+                .records
+                .vaults
+                .get(&vault.uid)
+                .expect("validated frozen vault inventory");
+            admit_vault(
+                Some(&self.proof.records),
+                &expectation(&self.proof.identity, instance),
+                vault,
+                &record.source,
+                &record.coverage,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Explicit snapshot capability is never inferred from read_only or a path.
+pub fn admit_all_vaults_with_snapshot(
+    store: &nestweaver_store::GraphStore,
+    db_path: &Path,
+    data_instance_id: &str,
+    extra_ignore_patterns: &[String],
+    max_note_bytes: u64,
+    read_only: bool,
+    snapshot: Option<&ValidatedSnapshotDerivation>,
+) -> Result<(), DerivationUnavailable> {
+    if read_only && let Some(snapshot) = snapshot {
+        return snapshot.admit(
+            store,
+            data_instance_id,
+            extra_ignore_patterns,
+            max_note_bytes,
+        );
+    }
+    admit_all_vaults(
+        store,
+        db_path,
+        data_instance_id,
+        extra_ignore_patterns,
+        max_note_bytes,
+        read_only,
+    )
+}
+
 /// Admit every persistent vault for note-edge-dependent reads.
 pub fn admit_all_vaults(
     store: &nestweaver_store::GraphStore,

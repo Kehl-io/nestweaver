@@ -192,7 +192,9 @@ impl RepoSource {
 
 /// Readers over `repo`'s indexed sources, in the order to try them: its
 /// working tree, and a server-mode repository's bare clone
-/// (`<db dir>/workspace/<name>.git`, as the worker pool lays them out) at the
+/// (`<clone root>/<name>.git`, as the worker pool lays them out; the root is
+/// [`crate::bare_clone::effective_clone_root`], i.e. the configured
+/// `[workspace] path` or `<db dir>/workspace`) at the
 /// revision it was indexed from. A repository with no recorded working tree
 /// (server mode, whose `file://` URL may still name a directory that has
 /// moved on) tries its bare clone first. The caller takes the first source
@@ -230,7 +232,7 @@ fn bare_clone_source(
     if repo.indexed_sha.is_empty() {
         return None;
     }
-    let bare = db_path.parent()?.join("workspace").join(format!(
+    let bare = crate::bare_clone::effective_clone_root(db_path).join(format!(
         "{}.git",
         crate::pull::clone_dir_name_from_url(&repo.url)
     ));
@@ -1343,5 +1345,58 @@ mod tests {
             retry_max: retry,
             cache_idle: Duration::from_secs(60),
         }
+    }
+
+    /// nw-827: the bare clone is found under the configured clone root, and
+    /// under `<db dir>/workspace` when none is registered.
+    #[test]
+    fn bare_clone_source_follows_the_clone_root_nw_827() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        git(&src, &["init", "-q"]);
+        fs::write(src.join("a.txt"), "a").unwrap();
+        git(&src, &["add", "."]);
+        git(&src, &["commit", "-qm", "init"]);
+        let sha = git(&src, &["rev-parse", "HEAD"]);
+        let url = format!("file://{}", src.display());
+        let repo = nestweaver_schema::Repo {
+            uid: "r".into(),
+            url: url.clone(),
+            indexed_sha: sha,
+            staleness_commits_behind: 0,
+            instance_id: "i".into(),
+            name: None,
+            root_path: None,
+        };
+        let limits = crate::index_limits::IndexLimits::default();
+
+        // Default root: <db dir>/workspace.
+        let db_default = dir.path().join("a").join("brain.lbug");
+        let ws =
+            crate::bare_clone::BareCloneWorkspace::new(&dir.path().join("a/workspace")).unwrap();
+        ws.ensure_clone(&url).unwrap();
+        assert!(bare_clone_source(&repo, &db_default, limits).is_some());
+
+        // Custom root: invisible until registered, then found.
+        let db_custom = dir.path().join("b").join("brain.lbug");
+        let custom = dir.path().join("elsewhere");
+        crate::bare_clone::BareCloneWorkspace::new(&custom)
+            .unwrap()
+            .ensure_clone(&url)
+            .unwrap();
+        assert!(bare_clone_source(&repo, &db_custom, limits).is_none());
+        crate::bare_clone::register_clone_root(&db_custom, custom);
+        assert!(bare_clone_source(&repo, &db_custom, limits).is_some());
     }
 }

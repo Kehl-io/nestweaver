@@ -343,7 +343,7 @@ pub async fn add_repo(
 
 async fn add_repo_owned(
     state: Arc<AdminState>,
-    req: AddRepoRequest,
+    mut req: AddRepoRequest,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     // Validate the URL scheme + host to prevent SSRF (file://, internal
     // hostnames, private/loopback IPs, alternate IPv4 encodings, IPv6-embedded
@@ -383,18 +383,23 @@ async fn add_repo_owned(
         }
     }
 
+    let _mutation_gate = match &state.write_gate {
+        Some(gate) => Some(gate.lock("admin_add_repo").await),
+        None => None,
+    };
     // Persist admin-added repos into instance config FIRST so scheduler/webhook
     // allowlisting survives daemon restarts. If this fails, we never enqueue the
     // index job — the config is the source of truth for what should be indexed.
     if let Some(config_path) = state.config_path.clone() {
         let repo_url = req.url.clone();
         let branch = req.branch.clone();
-        tokio::task::spawn_blocking(move || {
+        let config = tokio::task::spawn_blocking(move || {
             nestweaver_engine::append_repo_to_config_file(
                 &config_path,
                 &repo_url,
                 branch.as_deref(),
-            )
+            )?;
+            nestweaver_engine::InstanceConfig::from_file(&config_path)
         })
         .await
         .map_err(|e| {
@@ -409,6 +414,36 @@ async fn add_repo_owned(
                 format!("persist repo config: {e}"),
             )
         })?;
+        let next = nestweaver_engine::worker::runtime_repo_configs(&config);
+        let id = nestweaver_engine::jobs::canonical_repo_id(&req.url);
+        let settings = next
+            .get(&id)
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "persisted repo was concurrently removed before admission".to_string(),
+                )
+            })?
+            .clone();
+        req.branch = settings.branch.clone();
+        state
+            .runtime_repo_configs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, settings);
+    } else {
+        state
+            .runtime_repo_configs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                nestweaver_engine::jobs::canonical_repo_id(&req.url),
+                nestweaver_engine::worker::RepoRuntimeConfig {
+                    repo_type: nestweaver_engine::config::RepoType::Code,
+                    policy: Default::default(),
+                    branch: req.branch.clone(),
+                },
+            );
     }
 
     // Use the daemon's shared job-queue connection (or a transient fallback).
@@ -425,6 +460,11 @@ async fn add_repo_owned(
             )
         })?;
         let repo_id = nestweaver_engine::jobs::canonical_repo_id(&repo_url);
+        if branch.is_none() {
+            queue
+                .clear_branch(&repo_id)
+                .map_err(internal("clear configured branch"))?;
+        }
         queue
             .upsert(
                 &repo_id,
@@ -468,6 +508,13 @@ async fn add_repo_owned(
         && let Some(ref mut set) = *guard
     {
         set.insert(canonical.clone());
+    }
+
+    // Webhook jobs are enqueued with the configured URL (nw-909).
+    if let Some(ref lock) = state.webhook_repo_urls
+        && let Ok(mut guard) = lock.write()
+    {
+        guard.insert(canonical.clone(), req.url.clone());
     }
 
     // Update webhook branch map if a branch was specified.
@@ -537,39 +584,163 @@ pub async fn remove_repo(
     run_owned_admin_mutation(state, move |state| remove_repo_owned(state, repo_uid)).await
 }
 
+/// A repo resolved for removal: its URL, and its graph uid when it has been
+/// indexed (`None` for a repo that never produced a graph node).
+struct RemovalTarget {
+    url: String,
+    graph_uid: Option<String>,
+}
+
+fn internal<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> (StatusCode, String) + '_ {
+    move |e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e}"))
+}
+
+/// Resolve `{id}` of `DELETE /admin/api/repos/{id}` to ONE repo (nw-878).
+///
+/// `id` is the graph uid, or — for any repo, indexed or not — its canonical
+/// URL (what the job queue and the dead-letter listing report) or its config
+/// `name`. An id naming more than
+/// one distinct repo (duplicate name, or a name equal to another repo's URL) is a 409 listing the candidates rather than a guess. Store,
+/// config and queue errors are 500s: only a clean "no such repo anywhere" is
+/// 404.
+fn resolve_removal_target(
+    state: &AdminState,
+    id: &str,
+) -> Result<RemovalTarget, (StatusCode, String)> {
+    let graph_repos = state
+        .daemon_store
+        .list_repos(None)
+        .map_err(internal("list repos"))?;
+
+    if let Some(repo) = graph_repos.iter().find(|r| r.uid == id) {
+        return Ok(RemovalTarget {
+            url: repo.url.clone(),
+            graph_uid: Some(repo.uid.clone()),
+        });
+    }
+
+    let canonical = nestweaver_engine::jobs::canonical_repo_id(id);
+    let config_repos = match &state.config_path {
+        Some(path) => {
+            nestweaver_engine::InstanceConfig::from_file(path)
+                .map_err(internal("read config"))?
+                .repos
+        }
+        None => Vec::new(),
+    };
+
+    // Candidate URLs keyed by canonical id (first spelling wins; config first).
+    let mut by_url: std::collections::BTreeMap<String, String> = Default::default();
+    fn remember(by_url: &mut std::collections::BTreeMap<String, String>, url: &str) {
+        by_url
+            .entry(nestweaver_engine::jobs::canonical_repo_id(url))
+            .or_insert_with(|| url.to_string());
+    }
+    // Pass 1: the id is a URL.
+    for r in &config_repos {
+        if nestweaver_engine::jobs::canonical_repo_id(&r.url) == canonical {
+            remember(&mut by_url, &r.url);
+        }
+    }
+    for r in &graph_repos {
+        if nestweaver_engine::jobs::canonical_repo_id(&r.url) == canonical {
+            remember(&mut by_url, &r.url);
+        }
+    }
+    {
+        let queue = acquire_job_queue(&state.job_queue, &state.db_path)
+            .map_err(internal("open job queue"))?;
+        for key in [canonical.as_str(), id] {
+            if let Some(job) = queue.job_for_repo(key).map_err(internal("look up job"))?
+                // A cancelled row is a repo that was already removed.
+                && job.status != nestweaver_engine::jobs::JobStatus::Cancelled
+            {
+                remember(&mut by_url, &job.repo_url);
+            }
+        }
+    }
+    // The id is a config/graph name. A name that also matches a different
+    // repo's URL (or another repo's name) is ambiguous, not shadowed.
+    for r in &config_repos {
+        if r.name.as_deref() == Some(id) {
+            remember(&mut by_url, &r.url);
+        }
+    }
+    for r in &graph_repos {
+        if r.name.as_deref() == Some(id) {
+            remember(&mut by_url, &r.url);
+        }
+    }
+
+    let mut urls = by_url.into_values();
+    let Some(url) = urls.next() else {
+        return Err((StatusCode::NOT_FOUND, format!("repo {id} not found")));
+    };
+    let rest: Vec<String> = urls.collect();
+    if !rest.is_empty() {
+        let mut all = vec![url];
+        all.extend(rest);
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "repo id {id} is ambiguous; delete by URL instead: {}",
+                all.join(", ")
+            ),
+        ));
+    }
+    let want = nestweaver_engine::jobs::canonical_repo_id(&url);
+    let graph_uid = graph_repos
+        .iter()
+        .find(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url) == want)
+        .map(|r| r.uid.clone());
+    Ok(RemovalTarget { url, graph_uid })
+}
+
 async fn remove_repo_owned(
     state: Arc<AdminState>,
     repo_uid: String,
 ) -> Result<Json<MessageResponse>, (StatusCode, String)> {
     let store = state.daemon_store.clone();
-    let uid = repo_uid.clone();
+    let _mutation_gate = match &state.write_gate {
+        Some(gate) => Some(gate.lock("admin_remove_repo").await),
+        None => None,
+    };
 
-    // Look up the repo URL before deletion so we can clean up scheduler
-    // and webhook state afterwards.
-    let store_for_lookup = state.daemon_store.clone();
-    let uid_for_lookup = repo_uid.clone();
-    let repo_url: Option<String> = tokio::task::spawn_blocking(move || {
-        store_for_lookup
-            .lookup_repo(&uid_for_lookup)
-            .ok()
-            .flatten()
-            .map(|r| r.url)
-    })
-    .await
-    .ok()
-    .flatten();
+    // Resolve the target repo (graph uid, name, or URL) before any mutation so
+    // scheduler/webhook cleanup knows its URL, and an unknown id is a 404
+    // rather than a silent "removed". One routine serves every id form: the
+    // job cancel, config removal and graph deletion below always run for the
+    // resolved repo.
+    let target = {
+        let state = Arc::clone(&state);
+        let id = repo_uid.clone();
+        tokio::task::spawn_blocking(move || resolve_removal_target(&state, &id))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("task panicked: {e}"),
+                )
+            })??
+    };
+    let repo_url: Option<String> = Some(target.url.clone());
+    let graph_uid = target.graph_uid.clone();
 
     // Purge queued jobs FIRST so no new workers can claim while we delete.
     if let Some(ref url) = repo_url {
         let canonical = nestweaver_engine::jobs::canonical_repo_id(url);
         let job_queue = state.job_queue.clone();
         let db_path = state.db_path.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(queue) = acquire_job_queue(&job_queue, &db_path) {
-                let _ = queue.cancel_repo(&canonical);
-            }
+        tokio::task::spawn_blocking(move || {
+            let queue = acquire_job_queue(&job_queue, &db_path)
+                .map_err(internal("open job queue for removal"))?;
+            queue
+                .cancel_repo(&canonical)
+                .map_err(internal("cancel repo jobs"))?;
+            Ok::<_, (StatusCode, String)>(())
         })
-        .await;
+        .await
+        .map_err(internal("repo cancellation task failed"))??;
     }
 
     // Derive the scheduler name from the config BEFORE removing the config
@@ -620,15 +791,21 @@ async fn remove_repo_owned(
         })?;
     }
 
+    state
+        .runtime_repo_configs
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&nestweaver_engine::jobs::canonical_repo_id(&target.url));
+
     // Delete graph data under write mutex. An already-claimed worker will
     // also acquire this mutex before indexing; when it runs, it checks
     // whether the repo node still exists and skips if deleted.
-    let write_gate = state.write_gate.clone();
     let db_path = state.db_path.clone();
     tokio::task::spawn_blocking(move || {
-        let _guard = write_gate
-            .as_ref()
-            .map(|gate| gate.blocking_lock("admin_remove_repo"));
+        // A repo that never produced a graph node has nothing to delete.
+        let Some(uid) = graph_uid else {
+            return Ok(());
+        };
         run_admin_remove_repo_with(
             &store,
             &db_path,
@@ -691,6 +868,11 @@ async fn remove_repo_owned(
             set.remove(&canonical);
         }
         if let Some(ref lock) = state.webhook_repo_branches
+            && let Ok(mut guard) = lock.write()
+        {
+            guard.remove(&canonical);
+        }
+        if let Some(ref lock) = state.webhook_repo_urls
             && let Ok(mut guard) = lock.write()
         {
             guard.remove(&canonical);
@@ -839,15 +1021,32 @@ pub async fn drain(
 }
 
 /// POST /admin/api/resume — resume normal processing.
+///
+/// nw-881: refused with 503 once shutdown has started, like every other admin
+/// mutation. `begin_shutdown_drain` sets `drained` to stop new claims; an
+/// un-drain here would let the worker claim and run queued jobs inside the
+/// drain and extend it indefinitely.
 pub async fn resume(
     _auth: AdminAuth,
     State(state): State<Arc<AdminState>>,
-) -> Json<MessageResponse> {
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    const REFUSAL: &str = "daemon is shutting down and is not resuming workers; \
+                           retry against the daemon that starts next";
+    if state.shutdown_started.load(Ordering::SeqCst) {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, REFUSAL.to_string()));
+    }
     state.drained.store(false, Ordering::SeqCst);
+    // Shutdown can begin between the check and the store; its `drained = true`
+    // would then be overwritten. Re-assert it (the worker also gates on
+    // `shutdown_started`, so this is belt and braces).
+    if state.shutdown_started.load(Ordering::SeqCst) {
+        state.drained.store(true, Ordering::SeqCst);
+        return Err((StatusCode::SERVICE_UNAVAILABLE, REFUSAL.to_string()));
+    }
     tracing::info!("admin API: workers resumed");
-    Json(MessageResponse {
+    Ok(Json(MessageResponse {
         message: "workers resumed".to_string(),
-    })
+    }))
 }
 
 /// GET /admin/api/drain/status — current drain state.
@@ -1050,9 +1249,17 @@ async fn reload_config_owned(
     let store = state.daemon_store.clone();
     let db_path = state.db_path.clone();
     let job_queue = state.job_queue.clone();
-    let message = tokio::task::spawn_blocking(move || {
+    let runtime_repos = state.runtime_repo_configs.clone();
+    let write_gate = state.write_gate.clone();
+    let (message, reloaded_cfg) = tokio::task::spawn_blocking(move || {
+        let _guard = write_gate.as_ref().map(|gate| gate.blocking_lock("config_reload"));
         match nestweaver_engine::InstanceConfig::from_file(&path) {
             Ok(cfg) => {
+                let next_runtime = nestweaver_engine::worker::runtime_repo_configs(&cfg);
+                let previous_runtime = std::mem::replace(
+                    &mut *runtime_repos.write().unwrap_or_else(|e| e.into_inner()),
+                    next_runtime.clone(),
+                );
                 let repo_count = cfg.repos.len();
                 tracing::info!(
                     path = %path.display(),
@@ -1063,57 +1270,128 @@ async fn reload_config_owned(
                 // ── Reconcile declared repos vs indexed repos ─────────
                 let queue = acquire_job_queue(&job_queue, &db_path).ok();
 
-                // Collect declared repo URLs from config.
-                let declared_urls: std::collections::HashSet<String> =
-                    cfg.repos.iter().map(|r| r.url.clone()).collect();
+                // Compare by canonical id (not raw URL) so `.git` / trailing
+                // slash spellings of one repo are the same repo.
+                let declared_ids: std::collections::HashSet<String> = cfg
+                    .repos
+                    .iter()
+                    .map(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url))
+                    .collect();
 
                 // Collect indexed repo URLs from the store.
-                let indexed_urls: std::collections::HashSet<String> = store
+                let indexed_urls: Vec<String> = store
                     .list_repos(None)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|r| r.url)
                     .collect();
+                let indexed_ids: std::collections::HashSet<String> = indexed_urls
+                    .iter()
+                    .map(|u| nestweaver_engine::jobs::canonical_repo_id(u))
+                    .collect();
 
                 let mut new_repos = 0usize;
                 let mut orphaned_repos = 0usize;
                 let mut skipped_repos = 0usize;
+                let mut dead_lettered_repos = 0usize;
+                let mut branch_changed_repos = 0usize;
+                let mut cancelled_jobs = 0usize;
 
-                // New repos in config but not yet indexed: enqueue.
+                // nw-912: the config is the declared set. Jobs still pending/
+                // running for a repo that is no longer declared must stop, or a
+                // removed repo keeps cloning, indexing and committing.
+                if let Some(ref q) = queue {
+                    match q.cancel_repos_not_in(&declared_ids) {
+                        Ok(cancelled) => {
+                            for repo_id in &cancelled {
+                                tracing::warn!(
+                                    repo = %repo_id,
+                                    "config reload: cancelled job for repo no longer in config"
+                                );
+                            }
+                            cancelled_jobs = cancelled.len();
+                        }
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "config reload: failed to cancel jobs for removed repos"
+                        ),
+                    }
+                }
+
                 for r in &cfg.repos {
-                    if !indexed_urls.contains(&r.url) {
-                        // Config-sourced repos bypass the add_repo API and its
-                        // SSRF validation, so re-run the same synchronous URL
-                        // checks here and refuse to enqueue any internal/private
-                        // target declared in config. DNS resolution is skipped
-                        // (reload must stay non-blocking); literal/encoded
-                        // internal IPs and localhost/metadata hosts are still
-                        // rejected.
-                        if !config_repo_url_allowed(&r.url) {
-                            tracing::warn!(
-                                url = %r.url,
-                                "config reload: skipping repo — URL rejected by SSRF guard"
-                            );
-                            skipped_repos += 1;
-                            continue;
+                    let repo_id = nestweaver_engine::jobs::canonical_repo_id(&r.url);
+                    let existing = queue
+                        .as_ref()
+                        .and_then(|q| q.job_for_repo(&repo_id).ok().flatten());
+                    let quarantined = existing
+                        .as_ref()
+                        .is_some_and(|j| j.status == nestweaver_engine::jobs::JobStatus::DeadLetter);
+                    // nw-913: a changed `branch` must take effect. The job row
+                    // holds the last configured branch, including the default
+                    // branch represented by None.
+                    let branch_changed = existing.as_ref().is_some_and(|j| j.branch != r.branch);
+                    let settings_changed = previous_runtime.get(&repo_id) != next_runtime.get(&repo_id);
+                    let is_new = !indexed_ids.contains(&repo_id);
+
+                    if !quarantined && !is_new && !branch_changed && !settings_changed {
+                        continue;
+                    }
+
+                    // Config-sourced repos bypass the add_repo API and its
+                    // SSRF validation, so re-run the same synchronous URL
+                    // checks here and refuse to enqueue any internal/private
+                    // target declared in config. DNS resolution is skipped
+                    // (reload must stay non-blocking); literal/encoded
+                    // internal IPs and localhost/metadata hosts are still
+                    // rejected.
+                    if !quarantined && !config_repo_url_allowed(&r.url) {
+                        tracing::warn!(
+                            url = %r.url,
+                            "config reload: skipping repo — URL rejected by SSRF guard"
+                        );
+                        skipped_repos += 1;
+                        continue;
+                    }
+                    let trigger = if is_new {
+                        nestweaver_engine::jobs::JobTrigger::Unindexed
+                    } else {
+                        nestweaver_engine::jobs::JobTrigger::Webhook
+                    };
+                    // Shared with startup: a dead-lettered repo stays
+                    // quarantined (only the explicit dead-letter retry resets
+                    // it); a corrected branch is still recorded for that retry.
+                    let enqueued = match queue.as_ref() {
+                        Some(q) => {
+                            if branch_changed && r.branch.is_none() && !quarantined {
+                                let _ = q.clear_branch(&repo_id);
+                            }
+                            q.enqueue_declared_repo(&repo_id, &r.url, trigger, r.branch.as_deref())
+                                .unwrap_or(false)
                         }
+                        None => false,
+                    };
+                    if quarantined {
+                        tracing::warn!(
+                            url = %r.url,
+                            "config reload: repo is dead-lettered — not re-queued (retry it explicitly)"
+                        );
+                        dead_lettered_repos += 1;
+                    } else if is_new {
                         tracing::info!(url = %r.url, "config reload: new repo — queueing for indexing");
-                        if let Some(ref q) = queue {
-                            let repo_id = nestweaver_engine::jobs::canonical_repo_id(&r.url);
-                            let _ = q.upsert(
-                                &repo_id,
-                                &r.url,
-                                nestweaver_engine::jobs::JobTrigger::Unindexed,
-                                r.branch.as_deref(),
-                            );
-                        }
                         new_repos += 1;
+                    } else if enqueued {
+                        tracing::info!(
+                            url = %r.url,
+                            branch = ?r.branch,
+                            "config reload: branch changed — re-queueing for indexing"
+                        );
+                        branch_changed_repos += 1;
                     }
                 }
 
                 // Indexed repos no longer in config: log warning.
                 for url in &indexed_urls {
-                    if !declared_urls.contains(url) {
+                    if !declared_ids.contains(&nestweaver_engine::jobs::canonical_repo_id(url)) {
                         tracing::warn!(
                             url = %url,
                             "config reload: repo no longer in config (orphaned)"
@@ -1139,7 +1417,25 @@ async fn reload_config_owned(
                         skipped_repos
                     ));
                 }
-                Ok(msg)
+                if branch_changed_repos > 0 {
+                    msg.push_str(&format!(
+                        ", {} repos re-queued (branch changed)",
+                        branch_changed_repos
+                    ));
+                }
+                if dead_lettered_repos > 0 {
+                    msg.push_str(&format!(
+                        ", {} dead-lettered repos left quarantined (retry explicitly)",
+                        dead_lettered_repos
+                    ));
+                }
+                if cancelled_jobs > 0 {
+                    msg.push_str(&format!(
+                        ", {} jobs cancelled (repo removed from config)",
+                        cancelled_jobs
+                    ));
+                }
+                Ok((msg, cfg))
             }
             Err(e) => {
                 tracing::error!(path = %path.display(), error = %e, "config reload failed");
@@ -1158,20 +1454,10 @@ async fn reload_config_owned(
         )
     })??;
 
-    // Re-read the config ONCE for both the scheduler and webhook propagation
-    // below. Parsing it separately in each block doubled the I/O and could observe
-    // two different on-disk versions within a single reload if the file changed
-    // mid-handler.
-    let reloaded_cfg = state
-        .config_path
-        .as_ref()
-        .and_then(|p| nestweaver_engine::InstanceConfig::from_file(p).ok());
-
     // Notify the live scheduler so it picks up added/removed repos
     // without a daemon restart.
-    if let Some(ref tx) = state.scheduler_tx
-        && let Some(cfg) = reloaded_cfg.as_ref()
-    {
+    if let Some(ref tx) = state.scheduler_tx {
+        let cfg = &reloaded_cfg;
         let repos: Vec<_> = cfg
             .repos
             .iter()
@@ -1203,7 +1489,8 @@ async fn reload_config_owned(
     }
 
     // Update webhook state so new/changed repos take effect without restart.
-    if let Some(cfg) = reloaded_cfg.as_ref() {
+    {
+        let cfg = &reloaded_cfg;
         if let Some(ref lock) = state.webhook_allowed_repos {
             let new_allowed: std::collections::HashSet<String> = cfg
                 .repos
@@ -1213,6 +1500,21 @@ async fn reload_config_owned(
                 .collect();
             if let Ok(mut guard) = lock.write() {
                 *guard = Some(new_allowed);
+            }
+        }
+        if let Some(ref lock) = state.webhook_repo_urls {
+            let new_urls: std::collections::HashMap<String, String> = cfg
+                .repos
+                .iter()
+                .map(|r| {
+                    (
+                        nestweaver_engine::jobs::canonical_repo_id(&r.url),
+                        r.url.clone(),
+                    )
+                })
+                .collect();
+            if let Ok(mut guard) = lock.write() {
+                *guard = new_urls;
             }
         }
         if let Some(ref lock) = state.webhook_repo_branches {
@@ -1602,16 +1904,76 @@ fn device_error(error: &str) -> (StatusCode, Json<DeviceErrorResponse>) {
 /// Derive the externally-visible base URL of this server from request headers,
 /// honoring a reverse-proxy `X-Forwarded-Proto`. Used to build the verification
 /// URIs handed back to the developer.
-fn verification_base(headers: &axum::http::HeaderMap) -> String {
+///
+/// nw-884: both header values are attacker-influenceable (the endpoint is
+/// unauthenticated and a proxy may forward arbitrary `X-Forwarded-Proto`), and
+/// the result is handed to a client that opens it. So the scheme is restricted
+/// to `http`/`https` and the host to a plain `host[:port]` authority; anything
+/// else falls back to the safe defaults rather than being echoed.
+fn verification_base(
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    advertised: Option<&str>,
+) -> String {
+    // HTTP/2 carries the authority in `:authority` (the request URI), not a
+    // `host` header; try the header first, then the URI, then the address the
+    // daemon itself serves on.
     let host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1");
+        .and_then(valid_authority)
+        .or_else(|| uri.authority().and_then(|a| valid_authority(a.as_str())))
+        .or_else(|| advertised.and_then(valid_authority))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| v == "http" || v == "https")
+        .unwrap_or_else(|| "http".to_string());
     format!("{scheme}://{host}")
+}
+
+/// A syntactically valid `host[:port]` authority: no userinfo, a DNS name /
+/// IPv4 / bracketed IPv6 host, and a numeric port <= 65535 when present.
+fn valid_authority(raw: &str) -> Option<String> {
+    let h = raw.trim();
+    if h.is_empty()
+        || h.len() > 255
+        || !h
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+    {
+        return None;
+    }
+    let authority: axum::http::uri::Authority = h.parse().ok()?;
+    let host = authority.host();
+    let rest = h.strip_prefix(host)?;
+    let host_ok = if let Some(inner) = host.strip_prefix('[') {
+        inner
+            .strip_suffix(']')
+            .is_some_and(|v| v.parse::<std::net::Ipv6Addr>().is_ok())
+    } else {
+        host.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+            && !host.contains(':')
+            && !host.ends_with('-')
+    };
+    if !host_ok {
+        return None;
+    }
+    if !rest.is_empty() {
+        let port = rest.strip_prefix(':')?;
+        if port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return None;
+        }
+    }
+    Some(h.to_string())
 }
 
 /// POST /auth/device — start a device-authorization grant (no auth).
@@ -1620,6 +1982,7 @@ fn verification_base(headers: &axum::http::HeaderMap) -> String {
 /// along with the verification URIs and polling parameters per RFC 8628 §3.2.
 pub async fn device_authorize(
     State(state): State<Arc<AdminState>>,
+    uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<DeviceAuthResponse>, (StatusCode, String)> {
     let device_code = uuid::Uuid::new_v4().to_string();
@@ -1660,7 +2023,7 @@ pub async fn device_authorize(
         code
     };
 
-    let base = verification_base(&headers);
+    let base = verification_base(&headers, &uri, state.advertised_authority.as_deref());
     let verification_uri = format!("{base}/admin/device-approve");
     let verification_uri_complete = format!("{base}/admin/device-approve?user_code={user_code}");
 
@@ -1819,6 +2182,44 @@ mod tests {
         assert!(!error.contains("server mode"), "{json}");
     }
 
+    /// nw-881: `resume` must not un-drain the worker once shutdown has begun.
+    #[tokio::test]
+    async fn resume_is_refused_once_shutdown_starts() {
+        let state = test_admin_state();
+        state.drained.store(true, Ordering::SeqCst);
+        let app = Router::new()
+            .route("/admin/api/resume", post(resume))
+            .with_state(Arc::clone(&state));
+        let call = |app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/resume")
+                    .header("Authorization", "Bearer test-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        // Before shutdown, resume still works.
+        assert_eq!(call(app.clone()).await.status(), StatusCode::OK);
+        assert!(!state.drained.load(Ordering::SeqCst));
+
+        state.drained.store(true, Ordering::SeqCst);
+        state.shutdown_started.store(true, Ordering::SeqCst);
+        assert_eq!(
+            call(app).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "resume must be refused once shutdown has started"
+        );
+        assert!(
+            state.drained.load(Ordering::SeqCst),
+            "a refused resume must leave the pool drained"
+        );
+    }
+
     #[test]
     fn admin_mutation_admission_is_shutdown_visible_and_fail_closed() {
         let state = test_admin_state();
@@ -1908,11 +2309,14 @@ mod tests {
     async fn aborted_remove_request_keeps_admission_until_blocked_writer_finishes() {
         let gate = nestweaver_engine::write_gate::WriteGate::new();
         let blocker = gate.lock("test_block_admin_remove").await;
-        let mut state = test_admin_state();
+        // nw-878: an id that names nothing is a 404 before any graph work, so
+        // really index a repo to make the removal reach the held write gate.
+        let (mut state, _config) = state_with_indexed("", &["https://example.com/missing-repo"]);
         Arc::get_mut(&mut state)
             .expect("test owns the only state Arc")
             .write_gate = Some(gate.clone());
         let active_writes = Arc::clone(&state.active_writes);
+        let missing_uid = nestweaver_schema::repo_uid("test", "https://example.com/missing-repo");
         let app = Router::new()
             .route("/admin/api/repos/{id}", delete(remove_repo))
             .with_state(state);
@@ -1921,7 +2325,7 @@ mod tests {
             app.oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/admin/api/repos/missing-repo")
+                    .uri(format!("/admin/api/repos/{missing_uid}"))
                     .header("Authorization", "Bearer test-admin-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -1972,12 +2376,22 @@ mod tests {
     fn admin_state_with_auth(auth_token: Option<String>) -> Arc<AdminState> {
         let dir = tempfile::tempdir().expect("create tempdir");
         let db_path = dir.path().join("test.lbug");
+        // Leak the tempdir so it lives as long as the store.
+        std::mem::forget(dir);
+        admin_state_over(db_path, auth_token)
+    }
+
+    /// Admin state over the graph DB at `db_path` (which may already hold
+    /// indexed repos).
+    fn admin_state_over(
+        db_path: std::path::PathBuf,
+        auth_token: Option<String>,
+    ) -> Arc<AdminState> {
         let store =
             nestweaver_store::GraphStore::open_or_create(&db_path).expect("open test store");
         let db_path_clone = db_path.clone();
-        // Leak the tempdir so it lives as long as the store.
-        std::mem::forget(dir);
         Arc::new(AdminState {
+            runtime_repo_configs: Default::default(),
             admin_token: "test-admin-token".to_string(),
             auth_token,
             device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -1996,9 +2410,11 @@ mod tests {
             scheduler_tx: None,
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
+            webhook_repo_urls: None,
             write_gate: None,
             job_queue: None,
             resolver: test_resolver(),
+            advertised_authority: None,
         })
     }
 
@@ -2238,6 +2654,7 @@ url = "https://github.com/example/existing"
         let store =
             nestweaver_store::GraphStore::open_or_create(&db_path).expect("open test store");
         let state = Arc::new(AdminState {
+            runtime_repo_configs: Default::default(),
             admin_token: "test-admin-token".to_string(),
             auth_token: Some("test-query-token".to_string()),
             device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -2256,12 +2673,14 @@ url = "https://github.com/example/existing"
             scheduler_tx: None,
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
+            webhook_repo_urls: None,
             write_gate: None,
             job_queue: None,
             // nw-654: `test_resolver()` rather than `state::system_resolver()`
             // — this test asserts on config persistence, not on DNS behaviour,
             // and the real resolver made it depend on live network access.
             resolver: test_resolver(),
+            advertised_authority: None,
         });
 
         let app = Router::new()
@@ -2287,6 +2706,541 @@ url = "https://github.com/example/existing"
         assert!(cfg.repos.iter().any(|repo| {
             repo.url == "https://github.com/example/new" && repo.branch.as_deref() == Some("main")
         }));
+    }
+
+    const CONFIG_HEAD: &str = r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "text-embedding-3-small"
+summary_model = "gpt-4o-mini"
+
+[git]
+credential_method = "ssh"
+"#;
+
+    /// Admin state wired to a fresh instance config containing `repos_toml`.
+    fn state_with_config(repos_toml: &str) -> (Arc<AdminState>, std::path::PathBuf) {
+        state_with_indexed(repos_toml, &[])
+    }
+
+    /// As [`state_with_config`], with each of `indexed_urls` REALLY indexed
+    /// into the graph (a hand-inserted bare repo node is not a valid input to
+    /// the deletion path).
+    fn state_with_indexed(
+        repos_toml: &str,
+        indexed_urls: &[&str],
+    ) -> (Arc<AdminState>, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("instance.toml");
+        std::fs::write(&config_path, format!("{CONFIG_HEAD}\n{repos_toml}")).unwrap();
+        let db_path = dir.path().join("test.lbug");
+        for (i, url) in indexed_urls.iter().enumerate() {
+            let src = dir.path().join(format!("src{i}"));
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("main.js"),
+                format!("function f{i}() {{ return {i}; }}"),
+            )
+            .unwrap();
+            nestweaver_engine::index_directory(&src, &db_path, "test", url, "sha-1").unwrap();
+        }
+        std::mem::forget(dir);
+        let mut state = admin_state_over(db_path, Some("test-query-token".to_string()));
+        Arc::get_mut(&mut state).unwrap().config_path = Some(config_path.clone());
+        *state.runtime_repo_configs.write().unwrap() =
+            nestweaver_engine::worker::runtime_repo_configs(
+                &nestweaver_engine::InstanceConfig::from_file(&config_path).unwrap(),
+            );
+        (state, config_path)
+    }
+
+    fn insert_indexed_repo(state: &AdminState, url: &str) {
+        state
+            .daemon_store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: nestweaver_schema::repo_uid("test", url),
+                url: url.to_string(),
+                indexed_sha: "sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+    }
+
+    fn queue_for(state: &AdminState) -> nestweaver_engine::jobs::JobQueue {
+        nestweaver_engine::jobs::JobQueue::open(&nestweaver_engine::sidecar_path(
+            &state.db_path,
+            ".jobs.sqlite",
+        ))
+        .unwrap()
+    }
+
+    fn dead_letter(q: &nestweaver_engine::jobs::JobQueue, id: &str, branch: Option<&str>) {
+        q.upsert(
+            id,
+            id,
+            nestweaver_engine::jobs::JobTrigger::Unindexed,
+            branch,
+        )
+        .unwrap();
+        let job = q.claim_next(0).unwrap().unwrap();
+        q.fail(job.id, job.claimed_by.as_deref(), "boom", true)
+            .unwrap();
+    }
+
+    async fn call(state: &Arc<AdminState>, method: &str, uri: &str) -> (StatusCode, String) {
+        let app = Router::new()
+            .route("/admin/api/repos/{id}", delete(remove_repo))
+            .route("/admin/api/config/reload", post(reload_config))
+            .with_state(Arc::clone(state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn remove_and_readd_refresh_runtime_strategy_without_reload() {
+        let url = "https://example.com/org/runtime";
+        let (state, path) = state_with_config(&format!(
+            "[[repos]]\nurl = \"{url}\"\ntype = \"vault\"\nexclude = [\"hidden/**\"]\nunskip = [\"vendor\"]\n"
+        ));
+        let id = nestweaver_engine::jobs::canonical_repo_id(url);
+        assert_eq!(
+            state.runtime_repo_configs.read().unwrap()[&id].repo_type,
+            nestweaver_engine::config::RepoType::Vault
+        );
+        let _ = remove_repo_owned(state.clone(), url.into()).await.unwrap();
+        assert!(!state.runtime_repo_configs.read().unwrap().contains_key(&id));
+        let _ = add_repo_owned(
+            state.clone(),
+            AddRepoRequest {
+                url: url.into(),
+                branch: None,
+            },
+        )
+        .await
+        .unwrap();
+        let cfg = nestweaver_engine::InstanceConfig::from_file(&path).unwrap();
+        let expected = nestweaver_engine::worker::runtime_repo_configs(&cfg);
+        assert_eq!(*state.runtime_repo_configs.read().unwrap(), expected);
+        assert_eq!(
+            expected[&id].repo_type,
+            nestweaver_engine::config::RepoType::Code
+        );
+        assert!(expected[&id].policy.exclude.is_empty());
+        assert!(expected[&id].policy.unskip.is_empty());
+        assert_eq!(
+            queue_for(&state).job_for_repo(&id).unwrap().unwrap().status,
+            nestweaver_engine::jobs::JobStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_add_and_reload_share_persisted_policy_and_branch() {
+        let url = "https://example.com/org/policy";
+        let (state, path) = state_with_config(&format!(
+            "[[repos]]\nurl = \"{url}\"\nbranch = \"kept\"\nexclude = [\"hidden/**\"]\nunskip = [\"vendor\"]\n"
+        ));
+        let _ = add_repo_owned(
+            state.clone(),
+            AddRepoRequest {
+                url: url.into(),
+                branch: Some("ignored-duplicate".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let cfg = nestweaver_engine::InstanceConfig::from_file(&path).unwrap();
+        let expected = nestweaver_engine::worker::runtime_repo_configs(&cfg);
+        assert_eq!(*state.runtime_repo_configs.read().unwrap(), expected);
+        let id = nestweaver_engine::jobs::canonical_repo_id(url);
+        assert_eq!(
+            queue_for(&state)
+                .job_for_repo(&id)
+                .unwrap()
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("kept")
+        );
+        let _ = reload_config_owned(state.clone()).await.unwrap();
+        assert_eq!(*state.runtime_repo_configs.read().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn concurrent_add_and_reload_serialize_runtime_admission() {
+        let url = "https://example.com/org/concurrent-runtime";
+        let (mut state, path) = state_with_config("");
+        Arc::get_mut(&mut state).unwrap().write_gate = Some(nestweaver_engine::WriteGate::new());
+        // Hold the actual authority while both operations enter admission, then
+        // let FIFO order decide. Either legal ordering must converge on disk.
+        let held = state.write_gate.as_ref().unwrap().lock("test").await;
+        let adding = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                add_repo_owned(
+                    state,
+                    AddRepoRequest {
+                        url: url.into(),
+                        branch: Some("main".into()),
+                    },
+                )
+                .await
+            })
+        };
+        let reloading = {
+            let state = state.clone();
+            tokio::spawn(async move { reload_config_owned(state).await })
+        };
+        tokio::task::yield_now().await;
+        drop(held);
+        let _ = adding.await.unwrap().unwrap();
+        let _ = reloading.await.unwrap().unwrap();
+        let expected = nestweaver_engine::worker::runtime_repo_configs(
+            &nestweaver_engine::InstanceConfig::from_file(&path).unwrap(),
+        );
+        assert_eq!(*state.runtime_repo_configs.read().unwrap(), expected);
+        let id = nestweaver_engine::jobs::canonical_repo_id(url);
+        assert!(expected.contains_key(&id));
+        assert_eq!(
+            queue_for(&state)
+                .job_for_repo(&id)
+                .unwrap()
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("main")
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_returns_500_when_shared_queue_cancellation_cannot_open() {
+        let url = "https://example.com/org/cancellation-error";
+        let (mut state, path) =
+            state_with_indexed(&format!("[[repos]]\nurl = \"{url}\"\n"), &[url]);
+        let uid = state.daemon_store.list_repos(None).unwrap()[0].uid.clone();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let runtime_before = state.runtime_repo_configs.read().unwrap().clone();
+        let queue = Arc::new(Mutex::new(queue_for(&state)));
+        Arc::get_mut(&mut state).unwrap().job_queue = Some(queue.clone());
+        // Graph UID resolution returns before queue access; poisoning therefore
+        // targets the cancellation stage, not unrelated target discovery.
+        std::thread::spawn(move || {
+            let _guard = queue.lock().unwrap();
+            panic!("inject unavailable cancellation connection");
+        })
+        .join()
+        .unwrap_err();
+        let (status, body) = call(&state, "DELETE", &format!("/admin/api/repos/{uid}")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body.contains("open job queue for removal"), "{body}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+        assert_eq!(*state.runtime_repo_configs.read().unwrap(), runtime_before);
+        assert!(state.daemon_store.lookup_repo(&uid).unwrap().is_some());
+    }
+
+    /// nw-878: a dead-lettered repo that never produced a graph node is
+    /// removable (by config name or by its canonical URL id); its config entry
+    /// and job are gone afterwards; ids that name nothing are 404, not "removed".
+    #[tokio::test]
+    async fn remove_repo_removes_never_indexed_repo_and_404s_unknown_ids() {
+        let (state, config_path) = state_with_config(
+            r#"
+[[repos]]
+url = "https://example.com/org/poison.git"
+name = "poison"
+
+[[repos]]
+url = "https://example.com/org/queued"
+"#,
+        );
+        {
+            let q = queue_for(&state);
+            dead_letter(&q, "https://example.com/org/poison", None);
+            q.upsert(
+                "https://example.com/org/queued",
+                "https://example.com/org/queued",
+                nestweaver_engine::jobs::JobTrigger::Unindexed,
+                None,
+            )
+            .unwrap();
+        }
+
+        let (status, body) = call(&state, "DELETE", "/admin/api/repos/poison").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            &state,
+            "DELETE",
+            "/admin/api/repos/https%3A%2F%2Fexample.com%2Forg%2Fqueued",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let cfg = nestweaver_engine::InstanceConfig::from_file(&config_path).unwrap();
+        assert!(cfg.repos.is_empty(), "config entries must be removed");
+        let q = queue_for(&state);
+        assert!(q.dead_letters().unwrap().is_empty());
+        for id in [
+            "https://example.com/org/poison",
+            "https://example.com/org/queued",
+        ] {
+            assert_eq!(
+                q.job_for_repo(id).unwrap().unwrap().status,
+                nestweaver_engine::jobs::JobStatus::Cancelled
+            );
+        }
+
+        // Already removed, and never-existed ids, are 404.
+        for id in ["poison", "judge-nonexistent-xyz"] {
+            let (status, _) = call(&state, "DELETE", &format!("/admin/api/repos/{id}")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+        }
+    }
+
+    /// nw-912: reload cancels pending jobs for repos no longer in config, and
+    /// leaves declared repos' jobs alone.
+    #[tokio::test]
+    async fn reload_cancels_jobs_for_repos_removed_from_config() {
+        let (state, _config_path) = state_with_config(
+            r#"
+[[repos]]
+url = "https://example.com/org/kept"
+"#,
+        );
+        {
+            let q = queue_for(&state);
+            // A dead letter for an undeclared repo must not stay retryable
+            // (dead-lettered first: `dead_letter` claims the next pending job).
+            dead_letter(&q, "https://example.com/org/removed-dead", None);
+            for id in [
+                "https://example.com/org/kept",
+                "https://example.com/org/removed",
+            ] {
+                q.upsert(id, id, nestweaver_engine::jobs::JobTrigger::Unindexed, None)
+                    .unwrap();
+            }
+        }
+        let (status, body) = call(&state, "POST", "/admin/api/config/reload").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("2 jobs cancelled"), "{body}");
+        let q = queue_for(&state);
+        let st = |id: &str| q.job_for_repo(id).unwrap().unwrap().status;
+        assert_eq!(
+            st("https://example.com/org/removed"),
+            nestweaver_engine::jobs::JobStatus::Cancelled
+        );
+        assert_eq!(
+            st("https://example.com/org/removed-dead"),
+            nestweaver_engine::jobs::JobStatus::Cancelled
+        );
+        assert_eq!(
+            st("https://example.com/org/kept"),
+            nestweaver_engine::jobs::JobStatus::Pending
+        );
+    }
+
+    /// nw-913: reload leaves a dead-lettered repo quarantined (status and
+    /// attempt budget untouched) but records a corrected branch for the
+    /// explicit retry.
+    #[tokio::test]
+    async fn reload_keeps_dead_lettered_repo_quarantined() {
+        let url = "https://example.com/org/poison";
+        let (state, _config_path) =
+            state_with_config(&format!("[[repos]]\nurl = \"{url}\"\nbranch = \"fixed\"\n"));
+        let attempt_before = {
+            let q = queue_for(&state);
+            dead_letter(&q, url, Some("broken"));
+            q.job_for_repo(url).unwrap().unwrap().attempt
+        };
+        let (status, body) = call(&state, "POST", "/admin/api/config/reload").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("new repos queued"), "{body}");
+        assert!(body.contains("1 dead-lettered"), "{body}");
+        let job = queue_for(&state).job_for_repo(url).unwrap().unwrap();
+        assert_eq!(job.status, nestweaver_engine::jobs::JobStatus::DeadLetter);
+        assert_eq!(job.attempt, attempt_before);
+        assert_eq!(job.branch.as_deref(), Some("fixed"));
+    }
+
+    /// nw-913: changing `branch` of an already-indexed repo and reloading
+    /// re-enqueues it on the new branch and reports it; an unchanged reload
+    /// queues nothing.
+    #[tokio::test]
+    async fn reload_requeues_indexed_repo_when_branch_changes() {
+        let url = "https://example.com/org/indexed";
+        let (state, _config_path) = state_with_config(&format!(
+            "[[repos]]\nurl = \"{url}\"\nbranch = \"develop\"\n"
+        ));
+        state
+            .daemon_store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: nestweaver_schema::repo_uid("test", url),
+                url: url.to_string(),
+                indexed_sha: "sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "test".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        {
+            // The job last ran on `main` and succeeded.
+            let q = queue_for(&state);
+            q.upsert(
+                url,
+                url,
+                nestweaver_engine::jobs::JobTrigger::Poll,
+                Some("main"),
+            )
+            .unwrap();
+            let job = q.claim_next(0).unwrap().unwrap();
+            q.complete(job.id, &job.repo_id, job.claimed_by.as_deref())
+                .unwrap();
+        }
+        let (status, body) = call(&state, "POST", "/admin/api/config/reload").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("1 repos re-queued (branch changed)"),
+            "{body}"
+        );
+        let job = queue_for(&state).job_for_repo(url).unwrap().unwrap();
+        assert_eq!(job.status, nestweaver_engine::jobs::JobStatus::Pending);
+        assert_eq!(job.branch.as_deref(), Some("develop"));
+
+        // Unchanged branch: a second reload does not re-queue it again.
+        {
+            let q = queue_for(&state);
+            let job = q.claim_next(0).unwrap().unwrap();
+            q.complete(job.id, &job.repo_id, job.claimed_by.as_deref())
+                .unwrap();
+        }
+        let (_, body) = call(&state, "POST", "/admin/api/config/reload").await;
+        assert!(!body.contains("re-queued"), "{body}");
+        assert_eq!(
+            queue_for(&state).job_for_repo(url).unwrap().unwrap().status,
+            nestweaver_engine::jobs::JobStatus::Succeeded
+        );
+    }
+
+    /// nw-878: deleting an INDEXED repo by config name or by URL runs the same
+    /// removal as the uid path: graph node, jobs and config entry all go.
+    #[tokio::test]
+    async fn remove_repo_by_name_or_url_removes_graph_data_too() {
+        let (state, config_path) = state_with_indexed(
+            r#"
+[[repos]]
+url = "https://example.com/org/by-name"
+name = "by-name"
+
+[[repos]]
+url = "https://example.com/org/by-url.git"
+"#,
+            &[
+                "https://example.com/org/by-name",
+                "https://example.com/org/by-url",
+            ],
+        );
+        let (status, body) = call(&state, "DELETE", "/admin/api/repos/by-name").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            &state,
+            "DELETE",
+            "/admin/api/repos/https%3A%2F%2Fexample.com%2Forg%2Fby-url",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        assert!(state.daemon_store.list_repos(None).unwrap().is_empty());
+        let cfg = nestweaver_engine::InstanceConfig::from_file(&config_path).unwrap();
+        assert!(cfg.repos.is_empty());
+    }
+
+    /// nw-878: an id naming two repos (duplicate name, or a name equal to
+    /// another repo's URL) is a 409 listing candidates; nothing is removed.
+    #[tokio::test]
+    async fn remove_repo_with_ambiguous_id_is_409_and_removes_nothing() {
+        let (state, config_path) = state_with_config(
+            r#"
+[[repos]]
+url = "https://example.com/org/one"
+name = "dup"
+
+[[repos]]
+url = "https://example.com/org/two"
+name = "dup"
+
+[[repos]]
+url = "https://example.com/org/three"
+name = "https://example.com/org/one"
+"#,
+        );
+        for id in ["dup", "https%3A%2F%2Fexample.com%2Forg%2Fone"] {
+            let (status, body) = call(&state, "DELETE", &format!("/admin/api/repos/{id}")).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{id}: {body}");
+            assert!(
+                body.contains("https://example.com/org/two") || body.contains("org/three"),
+                "{body}"
+            );
+        }
+        let cfg = nestweaver_engine::InstanceConfig::from_file(&config_path).unwrap();
+        assert_eq!(cfg.repos.len(), 3);
+    }
+
+    /// nw-878: an unreadable config is a 500, not a "not found".
+    #[tokio::test]
+    async fn remove_repo_with_unreadable_config_is_500_not_404() {
+        let (state, config_path) = state_with_config("");
+        std::fs::write(&config_path, "this is [not toml").unwrap();
+        let (status, body) = call(&state, "DELETE", "/admin/api/repos/anything").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    }
+
+    /// Setting an explicit branch must heal an already-indexed default branch.
+    #[tokio::test]
+    async fn reload_requeues_when_default_branch_becomes_explicit() {
+        let url = "https://example.com/org/unrecorded";
+        let (state, _config_path) =
+            state_with_config(&format!("[[repos]]\nurl = \"{url}\"\nbranch = \"main\"\n"));
+        insert_indexed_repo(&state, url);
+        {
+            let q = queue_for(&state);
+            q.upsert(url, url, nestweaver_engine::jobs::JobTrigger::Poll, None)
+                .unwrap();
+            let job = q.claim_next(0).unwrap().unwrap();
+            q.complete(job.id, &job.repo_id, job.claimed_by.as_deref())
+                .unwrap();
+        }
+        let (status, body) = call(&state, "POST", "/admin/api/config/reload").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("re-queued"), "{body}");
+        let job = queue_for(&state).job_for_repo(url).unwrap().unwrap();
+        assert_eq!(job.status, nestweaver_engine::jobs::JobStatus::Pending);
+        assert_eq!(job.branch.as_deref(), Some("main"));
     }
 
     /// Counterweight for nw-654: injecting a resolver must not weaken the
@@ -2324,6 +3278,7 @@ credential_method = "ssh"
         let store =
             nestweaver_store::GraphStore::open_or_create(&db_path).expect("open test store");
         let state = Arc::new(AdminState {
+            runtime_repo_configs: Default::default(),
             admin_token: "test-admin-token".to_string(),
             auth_token: Some("test-query-token".to_string()),
             device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -2342,9 +3297,11 @@ credential_method = "ssh"
             scheduler_tx: None,
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
+            webhook_repo_urls: None,
             write_gate: None,
             job_queue: None,
             resolver: std::sync::Arc::new(|_host: &str| Ok(vec!["10.0.0.1".parse().unwrap()])),
+            advertised_authority: None,
         });
 
         let app = Router::new()
@@ -2479,6 +3436,7 @@ credential_method = "ssh"
 
         let generation_before = store.graph_generation();
         let state = Arc::new(AdminState {
+            runtime_repo_configs: Default::default(),
             admin_token: "test-admin-token".to_string(),
             auth_token: Some("test-query-token".to_string()),
             device_flow: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -2497,9 +3455,11 @@ credential_method = "ssh"
             scheduler_tx: None,
             webhook_allowed_repos: None,
             webhook_repo_branches: None,
+            webhook_repo_urls: None,
             write_gate: None,
             job_queue: None,
             resolver: crate::state::system_resolver(),
+            advertised_authority: None,
         });
         let app = Router::new()
             .route("/admin/api/repos/{id}", delete(remove_repo))
@@ -3147,5 +4107,72 @@ credential_method = "ssh"
             assert!(bounded.check(key)); // drains each bucket
         }
         assert!(!bounded.check("ip:c"));
+    }
+
+    #[test]
+    fn verification_base_rejects_non_http_schemes_and_hostile_hosts() {
+        // nw-884: attacker-controlled X-Forwarded-Proto / Host must never be
+        // echoed into a verification URI the client will open.
+        let mk = |host: Option<&str>, proto: Option<&str>| {
+            let mut h = axum::http::HeaderMap::new();
+            if let Some(v) = host {
+                h.insert("host", v.parse().unwrap());
+            }
+            if let Some(v) = proto {
+                h.insert("x-forwarded-proto", v.parse().unwrap());
+            }
+            verification_base(
+                &h,
+                &axum::http::Uri::from_static("/auth/device"),
+                Some("nw.bound:9379"),
+            )
+        };
+        assert_eq!(
+            mk(Some("nw.example:9378"), Some("https")),
+            "https://nw.example:9378"
+        );
+        assert_eq!(
+            mk(Some("nw.example"), Some("HTTPS, http")),
+            "https://nw.example"
+        );
+        assert_eq!(
+            mk(Some("127.0.0.1"), Some("javascript")),
+            "http://127.0.0.1"
+        );
+        assert_eq!(mk(Some("127.0.0.1"), Some("file")), "http://127.0.0.1");
+        assert_eq!(mk(Some("[::1]:9378"), None), "http://[::1]:9378");
+        // Invalid or missing Host falls back to the daemon's own address,
+        // never to an echoed value and not to loopback.
+        for bad in [
+            "evil.test/x?y@z",
+            "user@evil.test",
+            ":",
+            "a:b:c",
+            "[[",
+            "host:notaport",
+            "-",
+            "h:99999",
+            "host:",
+            "[::1",
+            "a b",
+        ] {
+            assert_eq!(
+                mk(Some(bad), Some("https")),
+                "https://nw.bound:9379",
+                "{bad}"
+            );
+        }
+        assert_eq!(mk(None, None), "http://nw.bound:9379");
+    }
+
+    #[test]
+    fn verification_base_uses_the_request_uri_authority_for_http2() {
+        // HTTP/2 has no Host header; the authority is on the request URI.
+        let h = axum::http::HeaderMap::new();
+        let uri: axum::http::Uri = "https://nw.example:9379/auth/device".parse().unwrap();
+        assert_eq!(
+            verification_base(&h, &uri, Some("nw.bound:9379")),
+            "http://nw.example:9379"
+        );
     }
 }

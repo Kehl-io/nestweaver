@@ -441,6 +441,28 @@ fn try_hybrid_json_rpc_checked_inner(
         let effective = nestweaver_client::RestartConfig::for_automatic_cold_start(db_path, config)
             .context("load explicit instance config or persisted intent before missing-DB upstream routing")?;
         let config = effective.as_path();
+        if let Some(mut hybrid) = rt.block_on(
+            nestweaver_client::hybrid::HybridClient::connect_existing_verified_read(
+                db_path, config, &start_dir,
+            ),
+        )? {
+            // A verified live replica serves reads even when its logical
+            // anchor has no file. Keep this client; never autostart or fall
+            // through to a direct store after any query failure.
+            return rt
+                .block_on(async {
+                    match daemon_rpc_timeout(&args) {
+                        Some(budget) => tokio::time::timeout(budget, hybrid.query(rpc_name, &args))
+                            .await
+                            .context("existing daemon read timed out; no daemon was started")?,
+                        None => hybrid.query(rpc_name, &args).await,
+                    }
+                })
+                .map(Some)
+                .with_context(|| {
+                    format!("existing daemon query {rpc_name} failed; refusing direct fallback")
+                });
+        }
         let discovered =
             nestweaver_client::discovery::discover_upstreams_with_config(&start_dir, config);
         if discovered.is_empty() {
@@ -1372,5 +1394,554 @@ mod incomplete_index_response_tests {
         let source_property =
             serde_json::json!({"properties":{"refused":true,"reason":"repo_index_incomplete"}});
         assert!(reject_incomplete_index_response(source_property).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod replica_existing_read_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::sync::{Arc, Mutex};
+
+    // An owned real UDS/HTTP2 endpoint backed by an actual read-only graph.
+    // Runtime authority is a genuinely held pidfile flock, never a bypass.
+    #[derive(Clone)]
+    struct ReadEndpoint {
+        health: Arc<Mutex<nestweaver_proto::HealthCheckResponse>>,
+        store: Arc<nestweaver_store::GraphStore>,
+        requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+    impl tonic::server::NamedService for ReadEndpoint {
+        const NAME: &'static str = "nestweaver.daemon.v1.NestWeaverDaemon";
+    }
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for ReadEndpoint {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+        >;
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn call(
+            &mut self,
+            request: tonic::codegen::http::Request<tonic::body::Body>,
+        ) -> Self::Future {
+            let endpoint = self.clone();
+            Box::pin(async move {
+                match request.uri().path() {
+                    "/nestweaver.daemon.v1.NestWeaverDaemon/HealthCheck" => {
+                        struct Health(ReadEndpoint);
+                        impl tonic::server::UnaryService<nestweaver_proto::HealthCheckRequest> for Health {
+                            type Response = nestweaver_proto::HealthCheckResponse;
+                            type Future = std::future::Ready<
+                                Result<tonic::Response<Self::Response>, tonic::Status>,
+                            >;
+                            fn call(
+                                &mut self,
+                                _: tonic::Request<nestweaver_proto::HealthCheckRequest>,
+                            ) -> Self::Future {
+                                let mut health = self.0.health.lock().unwrap().clone();
+                                if let Err(error) = self.0.store.verify_backing_file() {
+                                    health.backing_file_valid = Some(false);
+                                    health.backing_file_error = error.to_string();
+                                }
+                                std::future::ready(Ok(tonic::Response::new(health)))
+                            }
+                        }
+                        Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                            .unary(Health(endpoint), request)
+                            .await)
+                    }
+                    "/nestweaver.daemon.v1.NestWeaverDaemon/BrainStatusJson"
+                    | "/nestweaver.daemon.v1.NestWeaverDaemon/BrainOrphanDocuments"
+                    | "/nestweaver.daemon.v1.NestWeaverDaemon/BrainTopicClusters"
+                    | "/nestweaver.daemon.v1.NestWeaverDaemon/BrainTagGraph"
+                    | "/nestweaver.daemon.v1.NestWeaverDaemon/BrainDocStats"
+                    | "/nestweaver.daemon.v1.NestWeaverDaemon/BrainDiff" => {
+                        let operation = request.uri().path().to_string();
+                        struct Status(ReadEndpoint, String);
+                        impl tonic::server::UnaryService<nestweaver_proto::JsonRequest> for Status {
+                            type Response = nestweaver_proto::JsonResponse;
+                            type Future = std::future::Ready<
+                                Result<tonic::Response<Self::Response>, tonic::Status>,
+                            >;
+                            fn call(
+                                &mut self,
+                                request: tonic::Request<nestweaver_proto::JsonRequest>,
+                            ) -> Self::Future {
+                                self.0.requests.lock().unwrap().push((
+                                    self.1.clone(),
+                                    serde_json::from_str(&request.into_inner().args_json).unwrap(),
+                                ));
+                                let repos = self.0.store.list_repos(None).unwrap().len();
+                                std::future::ready(Ok(tonic::Response::new(nestweaver_proto::JsonResponse {
+                                    result_json: serde_json::json!({"replica_read": true, "repos": repos}).to_string(),
+                                })))
+                            }
+                        }
+                        Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                            .unary(Status(endpoint, operation), request)
+                            .await)
+                    }
+                    "/nestweaver.daemon.v1.NestWeaverDaemon/Search" => {
+                        struct Search(ReadEndpoint);
+                        impl tonic::server::UnaryService<nestweaver_proto::BrainSearchRequest> for Search {
+                            type Response = nestweaver_proto::BrainSearchResponse;
+                            type Future = std::future::Ready<
+                                Result<tonic::Response<Self::Response>, tonic::Status>,
+                            >;
+                            fn call(
+                                &mut self,
+                                request: tonic::Request<nestweaver_proto::BrainSearchRequest>,
+                            ) -> Self::Future {
+                                let request = request.into_inner();
+                                self.0.requests.lock().unwrap().push(("Search".into(), serde_json::json!({
+                                    "query": request.query, "limit": request.limit, "prf": request.prf,
+                                })));
+                                let results: Vec<_> = self
+                                    .0
+                                    .store
+                                    .list_notes(None)
+                                    .unwrap()
+                                    .into_iter()
+                                    .filter(|note| note.title.contains(&request.query))
+                                    .take(request.limit.max(0) as usize)
+                                    .map(|note| nestweaver_proto::SearchResultItem {
+                                        uid: note.uid,
+                                        kind: "Note".into(),
+                                        title: note.title,
+                                        score: 1.0,
+                                        location: Some(note.file_path),
+                                        ..Default::default()
+                                    })
+                                    .collect();
+                                std::future::ready(Ok(tonic::Response::new(
+                                    nestweaver_proto::BrainSearchResponse {
+                                        query: request.query,
+                                        engine: "readonly-fixture".into(),
+                                        total_matches: results.len() as i32,
+                                        returned_matches: results.len() as i32,
+                                        total_matches_relation: "eq".into(),
+                                        results,
+                                        ..Default::default()
+                                    },
+                                )))
+                            }
+                        }
+                        Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                            .unary(Search(endpoint), request)
+                            .await)
+                    }
+                    _ => Ok(tonic::Status::unimplemented("fixture read route").into_http()),
+                }
+            })
+        }
+    }
+
+    struct Replica {
+        dir: tempfile::TempDir,
+        anchor: std::path::PathBuf,
+        socket: std::path::PathBuf,
+        owner: Option<std::fs::File>,
+        health: Arc<Mutex<nestweaver_proto::HealthCheckResponse>>,
+        requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Replica {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let anchor = dir.path().join("absent-replica-anchor.lbug");
+            let backing = dir.path().join("materialized.lbug");
+            let writer = nestweaver_store::GraphStore::open_or_create(&backing).unwrap();
+            let vault_uid = nestweaver_schema::vault_uid("fixture", "/fixture-vault");
+            writer
+                .insert_note(&nestweaver_schema::Note {
+                    uid: nestweaver_schema::note_uid(&vault_uid, "RemoteTransportNote.md"),
+                    vault_uid,
+                    file_path: "RemoteTransportNote.md".into(),
+                    title: "RemoteTransportNote".into(),
+                    note_kind: nestweaver_schema::NoteKind::General,
+                    word_count: 1,
+                    content_hash: "fixture".into(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+            drop(writer);
+            let store = Arc::new(
+                nestweaver_store::GraphStore::open_read_only_without_migration(&backing).unwrap(),
+            );
+            let instance = nestweaver_daemon::lifecycle::instance_id_from_db_path(&anchor);
+            let socket = nestweaver_daemon::lifecycle::socket_path(&instance);
+            std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+            let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance);
+            // A long runtime path moves only the socket to its short fallback;
+            // the pidfile and config binding still live in the runtime dir.
+            std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+            std::fs::write(&pidfile, format!("{}\n", std::process::id())).unwrap();
+            let owner = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            nestweaver_daemon::lifecycle::write_effective_config_binding(
+                &instance,
+                &nestweaver_daemon::lifecycle::EffectiveConfigBinding::new(
+                    std::process::id(),
+                    nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::CompiledDefaults,
+                ),
+            )
+            .unwrap();
+            let health = Arc::new(Mutex::new(nestweaver_proto::HealthCheckResponse {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                instance_id: instance,
+                db_path: anchor.display().to_string(),
+                pid: std::process::id(),
+                backing_file_valid: Some(true),
+                ..Default::default()
+            }));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let endpoint = ReadEndpoint {
+                health: Arc::clone(&health),
+                store,
+                requests: Arc::clone(&requests),
+            };
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let (ready, wait) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+                    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+                    tokio::spawn(async move {
+                        while let Ok((stream, _)) = listener.accept().await {
+                            if sender.send(Ok::<_, std::io::Error>(stream)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    ready.send(()).unwrap();
+                    let server = tonic::transport::Server::builder()
+                        .add_service(endpoint)
+                        .serve_with_incoming(tokio_stream::wrappers::ReceiverStream::new(receiver));
+                    // Dropping this owned test runtime aborts all its peers,
+                    // including a channel deliberately retained by the test.
+                    tokio::select! {
+                        result = server => result.unwrap(),
+                        _ = stopped => {},
+                    }
+                });
+            });
+            wait.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            Self {
+                dir,
+                anchor,
+                socket,
+                owner: Some(owner),
+                health,
+                requests,
+                stop: Some(stop),
+                thread: Some(thread),
+            }
+        }
+        fn stop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+    impl Drop for Replica {
+        fn drop(&mut self) {
+            self.stop();
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+            drop(self.owner.take());
+            let instance = nestweaver_daemon::lifecycle::instance_id_from_db_path(&self.anchor);
+            let runtime = nestweaver_daemon::lifecycle::runtime_dir(&instance);
+            let _ = std::fs::remove_dir_all(&runtime);
+            if self.socket.parent() != Some(runtime.as_path()) {
+                let _ = std::fs::remove_dir_all(self.socket.parent().unwrap());
+            }
+        }
+    }
+
+    fn actual_search(anchor: &std::path::Path) -> anyhow::Result<(i32, Option<String>)> {
+        crate::cli::brain::run_brain(
+            BrainCommands::Search {
+                query: "RemoteTransportNote".into(),
+                limit: Some(7),
+                json: true,
+                db: Some(anchor.to_path_buf()),
+                config: None,
+                prf: true,
+            },
+            &OutputConfig {
+                quiet: true,
+                verbose: false,
+                color: false,
+            },
+            std::time::Instant::now(),
+            true,
+        )
+    }
+
+    #[test]
+    fn actual_brain_read_commands_use_absent_replica_anchor_and_preserve_search_params() {
+        let replica = Replica::new();
+        let (code, stats) = actual_search(&replica.anchor).unwrap();
+        assert_eq!(code, EXIT_SUCCESS);
+        assert!(
+            stats.unwrap().starts_with("1 results"),
+            "real readonly note result required"
+        );
+        let db = Some(replica.anchor.clone());
+        let commands = [
+            BrainCommands::Orphans {
+                vault: None,
+                path_prefix: None,
+                allow: vec![],
+                limit: Some(7),
+                json: true,
+                db: db.clone(),
+                config: None,
+            },
+            BrainCommands::TopicClusters {
+                resolution: 0.5,
+                limit: Some(7),
+                json: true,
+                db: db.clone(),
+                config: None,
+            },
+            BrainCommands::TagGraph {
+                tag: None,
+                limit: Some(7),
+                json: true,
+                db: db.clone(),
+                config: None,
+            },
+            BrainCommands::DocStats {
+                top_tags_limit: 7,
+                json: true,
+                db: db.clone(),
+                config: None,
+            },
+            BrainCommands::Diff {
+                repo: "fixture".into(),
+                since_sha: None,
+                limit: Some(7),
+                json: true,
+                db,
+                config: None,
+            },
+        ];
+        let out = OutputConfig {
+            quiet: true,
+            verbose: false,
+            color: false,
+        };
+        for command in commands {
+            assert_eq!(
+                crate::cli::brain::run_brain(command, &out, std::time::Instant::now(), true)
+                    .unwrap()
+                    .0,
+                EXIT_SUCCESS
+            );
+        }
+        let requests = replica.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            6,
+            "all six actual command branches must issue an RPC"
+        );
+        assert_eq!(
+            requests[0],
+            (
+                "Search".into(),
+                serde_json::json!({"query":"RemoteTransportNote", "limit":7, "prf":true})
+            )
+        );
+        for operation in [
+            "BrainOrphanDocuments",
+            "BrainTopicClusters",
+            "BrainTagGraph",
+            "BrainDocStats",
+            "BrainDiff",
+        ] {
+            assert!(
+                requests.iter().any(|(path, _)| path.ends_with(operation)),
+                "missing {operation}"
+            );
+        }
+        assert!(!replica.anchor.exists());
+    }
+
+    #[test]
+    fn actual_brain_search_bad_health_stopped_typo_and_invalid_file_never_create_store() {
+        let mut replica = Replica::new();
+        replica.health.lock().unwrap().backing_file_valid = Some(false);
+        assert!(actual_search(&replica.anchor).is_err());
+        assert!(replica.requests.lock().unwrap().is_empty());
+        assert!(!replica.anchor.exists());
+        replica.stop();
+        assert!(actual_search(&replica.anchor).is_err());
+        assert!(!replica.anchor.exists());
+        let typo = replica.dir.path().join("typo.lbug");
+        assert!(format!("{:#}", actual_search(&typo).unwrap_err()).contains("database not found"));
+        assert!(!typo.exists());
+        let invalid = replica.dir.path().join("invalid.lbug");
+        std::fs::write(&invalid, b"not a database").unwrap();
+        assert!(actual_search(&invalid).is_err());
+        assert_eq!(std::fs::read(&invalid).unwrap(), b"not a database");
+        assert!(
+            !nestweaver_daemon::lifecycle::pidfile_path(
+                &nestweaver_daemon::lifecycle::instance_id_from_db_path(&invalid)
+            )
+            .exists()
+        );
+    }
+
+    #[test]
+    fn absent_replica_anchor_cli_read_uses_verified_incumbent_and_refuses_bad_evidence() {
+        let replica = Replica::new();
+        let query = |config| {
+            try_hybrid_json_rpc_checked(
+                true,
+                &replica.anchor,
+                config,
+                "brain_status",
+                serde_json::json!({}),
+            )
+        };
+        assert_eq!(query(None).unwrap().unwrap()["replica_read"], true);
+        assert!(!replica.anchor.exists());
+        let valid = replica.health.lock().unwrap().clone();
+        for change in ["pid", "instance", "path", "version", "backing"] {
+            let mut bad = valid.clone();
+            match change {
+                "pid" => bad.pid += 1,
+                "instance" => bad.instance_id = "wrong".into(),
+                "path" => {
+                    bad.db_path = replica
+                        .dir
+                        .path()
+                        .join("different.lbug")
+                        .display()
+                        .to_string()
+                }
+                "version" => bad.version = "0.0.1".into(),
+                "backing" => bad.backing_file_valid = Some(false),
+                _ => unreachable!(),
+            }
+            *replica.health.lock().unwrap() = bad;
+            assert!(query(None).is_err(), "must refuse {change}");
+            assert!(!replica.anchor.exists());
+        }
+        *replica.health.lock().unwrap() = valid;
+        let config = replica.dir.path().join("other.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"instance_id = "replica-test"
+[snapshot_storage]
+backend = "local"
+path = "{}"
+[workspace]
+backend = "local"
+path = "{}"
+[inference]
+endpoint = "http://127.0.0.1:9"
+embedding_model = "offline"
+summary_model = "offline"
+[git]
+credential_method = "ssh"
+"#,
+                replica.dir.path().join("snapshots").display(),
+                replica.dir.path().join("workspace").display()
+            ),
+        )
+        .unwrap();
+        let error = format!("{:#}", query(Some(&config)).unwrap_err());
+        assert!(error.contains("effective config"), "{error}");
+        assert!(!replica.anchor.exists());
+    }
+
+    #[test]
+    fn verified_replica_exit_before_query_never_autostarts_a_replacement() {
+        let mut replica = Replica::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut hybrid = rt
+            .block_on(
+                nestweaver_client::hybrid::HybridClient::connect_existing_verified_read(
+                    &replica.anchor,
+                    None,
+                    replica.dir.path(),
+                ),
+            )
+            .unwrap()
+            .expect("verified existing endpoint");
+        replica.stop();
+        let answer = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                hybrid.query("brain_status", &serde_json::json!({})),
+            )
+            .await
+        });
+        assert!(
+            matches!(answer, Ok(Err(_))),
+            "owned endpoint exited; no read may succeed"
+        );
+        assert!(!replica.anchor.exists());
+        assert_eq!(
+            std::fs::read_to_string(nestweaver_daemon::lifecycle::pidfile_path(
+                &nestweaver_daemon::lifecycle::instance_id_from_db_path(&replica.anchor),
+            ))
+            .unwrap()
+            .trim(),
+            std::process::id().to_string(),
+            "no replacement pidfile"
+        );
+        drop(hybrid);
+    }
+
+    #[test]
+    fn absent_cli_typo_never_spawns_or_creates_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("typo.lbug");
+        let instance = nestweaver_daemon::lifecycle::instance_id_from_db_path(&anchor);
+        let error =
+            try_hybrid_json_rpc_checked(true, &anchor, None, "brain_status", serde_json::json!({}))
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("database not found"));
+        assert!(!anchor.exists());
+        assert!(!nestweaver_daemon::lifecycle::pidfile_path(&instance).exists());
+        assert!(
+            nestweaver_daemon::lifecycle::daemon_socket_candidates(&instance)
+                .iter()
+                .all(|p| !p.exists())
+        );
     }
 }

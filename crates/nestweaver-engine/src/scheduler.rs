@@ -177,7 +177,12 @@ fn compute_interval(
             } else {
                 min_poll
             };
-            base.clamp(floor, max_poll)
+            // nw-880: NOT `base.clamp(floor, max_poll)` — `Ord::clamp` panics
+            // when floor > max_poll, and that can arise from a mistaken
+            // config or from the 5-minute webhook-healthy floor against a
+            // shorter `max_poll`. Raise to the floor, then let the
+            // `max_poll` cap win, so the function is total.
+            base.max(floor).min(max_poll)
         }
     }
 }
@@ -335,6 +340,27 @@ mod tests {
         }
 
         sched
+    }
+
+    /// nw-880: `min_poll > max_poll` (and the 5-minute webhook-healthy floor
+    /// above a shorter `max_poll`) used to panic `Ord::clamp`. The interval
+    /// must be total, with `max_poll` as the cap.
+    #[test]
+    fn interval_never_panics_when_floor_exceeds_max_poll() {
+        let mut sched = PollScheduler::new(Duration::from_secs(45), Duration::from_secs(30));
+        sched.add_repo("r".into(), "https://example.invalid/r".into(), None, None);
+        assert_eq!(
+            sched.next_interval(&sched.repos[0]),
+            Duration::from_secs(30)
+        );
+        // Healthy webhooks raise the floor to 5 minutes, above a 2-minute cap.
+        let mut sched = PollScheduler::new(Duration::from_secs(45), Duration::from_secs(120));
+        sched.set_webhook_healthy(true);
+        sched.add_repo("r".into(), "https://example.invalid/r".into(), None, None);
+        assert_eq!(
+            sched.next_interval(&sched.repos[0]),
+            Duration::from_secs(120)
+        );
     }
 
     #[test]

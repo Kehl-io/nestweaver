@@ -170,10 +170,18 @@ pub async fn device_flow_authenticate(
     eprintln!();
     eprintln!("And enter the code:  {}", auth.user_code);
     eprintln!();
-    if open::that(&auth.verification_uri_complete).is_ok() {
+    // nw-884: the URI comes from the (possibly untrusted) server. Only open an
+    // http(s) URL whose host is the server we connected to; otherwise just
+    // print it (already shown above) and let the user decide.
+    let complete = auth.verification_uri_complete.trim();
+    if should_auto_open(complete, &base) {
+        if open::that(complete).is_ok() {
+            eprintln!("(opened your browser to {complete})");
+        }
+    } else {
         eprintln!(
-            "(opened your browser to {})",
-            auth.verification_uri_complete
+            "(not opening the browser automatically: the verification URL is not an \
+             http(s) URL on the server you connected to)"
         );
     }
     eprintln!("Waiting for approval...");
@@ -236,18 +244,18 @@ pub async fn connect_upstream(
     // Connect and validate via HealthCheck.
     let mut endpoint = Channel::from_shared(grpc_url.clone()).context("invalid upstream URL")?;
 
-    if let Some(ca_path) = ca_cert {
-        let pem = std::fs::read(ca_path)
-            .with_context(|| format!("failed to read CA cert: {}", ca_path.display()))?;
-        let ca = tonic::transport::Certificate::from_pem(pem);
-        let tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca);
-        endpoint = endpoint.tls_config(tls).context("TLS config failed")?;
-    }
+    // nw-833: https:// gets system roots by default; --ca-cert adds to them.
+    endpoint =
+        nestweaver_federation::upstream::configure_endpoint_tls(endpoint, &grpc_url, ca_cert)?;
 
-    let channel = endpoint
-        .connect()
-        .await
-        .context("failed to connect to upstream server")?;
+    let channel = endpoint.connect().await.with_context(|| {
+        if grpc_url.starts_with("https://") {
+            "failed to connect to upstream server (TLS: system roots are trusted by default; \
+             for a private CA pass --ca-cert <pem>)"
+        } else {
+            "failed to connect to upstream server (plain-text http/grpc; use grpcs:// for TLS)"
+        }
+    })?;
 
     let mut client =
         nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient::new(channel)
@@ -292,6 +300,8 @@ pub async fn connect_upstream(
         mode,
         timeout: "1s".to_string(),
         ca_cert: ca_cert.map(|p| p.display().to_string()),
+        fallback_timeout: None,
+        vault_mappings: Default::default(),
     };
 
     let saved_path = save_upstream(&config)?;
@@ -303,9 +313,48 @@ pub async fn connect_upstream(
     Ok(config)
 }
 
+/// Whether the device-flow verification URI may be handed to the OS opener:
+/// an `http`/`https` URL with a non-empty host that is the same host as the
+/// server base URL we connected to.
+fn should_auto_open(verification_uri: &str, connected_base: &str) -> bool {
+    let (Ok(uri), Ok(base)) = (
+        reqwest::Url::parse(verification_uri.trim()),
+        reqwest::Url::parse(connected_base),
+    ) else {
+        return false;
+    };
+    matches!(uri.scheme(), "http" | "https")
+        && uri.host_str().is_some_and(|h| {
+            !h.is_empty() && base.host_str().is_some_and(|b| b.eq_ignore_ascii_case(h))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_open_requires_http_and_the_connected_host() {
+        // nw-884
+        let base = "https://nw.example:9379";
+        assert!(should_auto_open(
+            "https://nw.example:9379/admin/device-approve?user_code=AB",
+            base
+        ));
+        assert!(should_auto_open("  http://NW.example/x  ", base));
+        // Host mismatch: a hostile server pointing the browser elsewhere.
+        assert!(!should_auto_open(
+            "https://evil.test/admin/device-approve",
+            base
+        ));
+        // Non-http(s) schemes and degenerate URLs.
+        assert!(!should_auto_open("javascript://nw.example/x", base));
+        assert!(!should_auto_open("file:///etc/passwd", base));
+        assert!(!should_auto_open("http://", base));
+        assert!(!should_auto_open("http:///x", base));
+        assert!(!should_auto_open("", base));
+        assert!(!should_auto_open("https://nw.example/x", "not a url"));
+    }
 
     #[test]
     fn device_http_base_derives_http_port_and_scheme() {

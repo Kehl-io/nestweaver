@@ -932,6 +932,10 @@ pub struct McpServerConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamEntry {
+    /// Explicit local-vault UID to upstream-vault UID federation identity mapping.
+    #[serde(default)]
+    pub vault_mappings: std::collections::HashMap<String, String>,
+
     #[serde(default)]
     pub name: Option<String>,
     pub url: String,
@@ -946,6 +950,10 @@ pub struct UpstreamEntry {
     /// Path to CA certificate PEM file for self-signed TLS.
     #[serde(default)]
     pub ca_cert: Option<String>,
+    /// Cap on the upstream deadline in `fallback` mode, bounded by `timeout`
+    /// (default 200ms). nw-834.
+    #[serde(default)]
+    pub fallback_timeout: Option<String>,
 }
 
 fn default_upstream_mode() -> String {
@@ -1008,6 +1016,58 @@ impl Default for IndexingConfig {
     }
 }
 
+/// Upper bound for `[server.indexing] workers`. Far above any useful pool and
+/// far below `tokio::sync::Semaphore::MAX_PERMITS`, which a larger value would
+/// panic the worker task on (nw-910).
+pub const MAX_INDEXING_WORKERS: usize = 1024;
+
+impl IndexingConfig {
+    /// Reject values that would wedge or panic the index worker and the poll
+    /// scheduler (nw-910, nw-880). Called from [`InstanceConfig::from_toml_str`]
+    /// so both startup and reload fail with a clear error instead.
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if !(1..=MAX_INDEXING_WORKERS).contains(&self.workers) {
+            anyhow::bail!(
+                "[server.indexing] workers must be between 1 and {MAX_INDEXING_WORKERS}, got {}",
+                self.workers
+            );
+        }
+        // An unparseable duration keeps the long-standing behaviour: warn and
+        // fall back to the default the daemon uses (`unwrap_or` in server.rs
+        // takes the same defaults). Only a value that would break the
+        // scheduler hard-fails: an explicit zero, or min_poll > max_poll
+        // (compared after substituting defaults, so the comparison is real).
+        let resolve = |key: &str,
+                       value: &str,
+                       default: String|
+         -> Result<std::time::Duration, anyhow::Error> {
+            match parse_duration(value) {
+                Some(d) if d.is_zero() => {
+                    anyhow::bail!("[server.indexing] {key} must be greater than zero")
+                }
+                Some(d) => Ok(d),
+                None => {
+                    tracing::warn!(
+                        "server.indexing.{key} = {value:?} is not a valid duration \
+                         (accepted units: ms, s, m, h); using default {default}"
+                    );
+                    Ok(parse_duration(&default).expect("default durations parse"))
+                }
+            }
+        };
+        let min = resolve("min_poll", &self.min_poll, default_min_poll())?;
+        let max = resolve("max_poll", &self.max_poll, default_max_poll())?;
+        if min > max {
+            anyhow::bail!(
+                "[server.indexing] min_poll ({}) must not exceed max_poll ({})",
+                self.min_poll,
+                self.max_poll
+            );
+        }
+        Ok(())
+    }
+}
+
 pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
     if s.is_empty() {
@@ -1034,8 +1094,8 @@ pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
     match unit {
         "ms" => Some(std::time::Duration::from_millis(num)),
         "s" => Some(std::time::Duration::from_secs(num)),
-        "m" => Some(std::time::Duration::from_secs(num * 60)),
-        "h" => Some(std::time::Duration::from_secs(num * 3600)),
+        "m" => num.checked_mul(60).map(std::time::Duration::from_secs),
+        "h" => num.checked_mul(3600).map(std::time::Duration::from_secs),
         _ => None,
     }
 }
@@ -1243,8 +1303,25 @@ impl InstanceConfig {
             }
             config.expected_brain_uuid = Some(parsed.to_string());
         }
+        config.server.indexing.validate()?;
+        // nw-828: the credential method selects the auth wiring for every
+        // server-mode git command. An unknown value used to be accepted here and
+        // silently select no helper at all; fail the load instead, with the same
+        // rule `pull` and the CLI already apply.
+        crate::pull::validate_credential_method(&config.git.credential_method)
+            .map_err(|error| anyhow::anyhow!("[git] credential_method: {error}"))?;
         crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
         crate::index_limits::NoteLimits::new(config.indexing.max_note_bytes)?;
+        // nw-908: `[[repos]] exclude` globs are compiled by every reader that
+        // honours them, including the server worker for each job. An invalid
+        // glob must fail the config load, not dead-letter every index job of
+        // that repo. Compiled by the reader itself, so the load check and the
+        // use can never disagree about what is valid.
+        for repo in &config.repos {
+            crate::content_reader::FilesystemReader::new(Path::new("."))
+                .excluding(&repo.exclude)
+                .map_err(|e| e.context(format!("[[repos]] {}: invalid exclude", repo.url)))?;
+        }
         if let Some(limit) = config.limits.default_result_limit
             && !(1..=1000).contains(&limit)
         {
@@ -1399,6 +1476,73 @@ pub struct ExpectedBrainAdoption {
     pub changed: bool,
 }
 
+/// Serialize config read/modify/replace in-process and across cooperating
+/// processes. The sidecar inode is stable across atomic config replacements.
+static CONFIG_FILE_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_config_file_mutation() -> std::sync::MutexGuard<'static, ()> {
+    // A panic while holding the lock cannot leave the file half-written (all
+    // writes are atomic replaces), so a poisoned lock is safe to reuse.
+    CONFIG_FILE_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_config_path(path: &std::path::Path) -> Result<std::fs::File, anyhow::Error> {
+    let real = std::fs::canonicalize(path)?;
+    let lock_path = real.with_file_name(format!(
+        "{}.lock",
+        real.file_name().unwrap().to_string_lossy()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(&lock_path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "config lock is not a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.nlink() == 1,
+            "config lock must have one link and belong to the current user"
+        );
+    }
+    file.try_lock().map_err(|e| {
+        anyhow::anyhow!(
+            "config is being edited by another process ({}): {e}",
+            lock_path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+/// Atomically replace the config file with `contents` (nw-900): readers see
+/// either the old or the new file, never a truncated one.
+///
+/// A symlinked `path` is resolved first so the link is preserved and its
+/// target is the file replaced. Replacement is rename-based, so the containing
+/// directory must be writable; a single-file bind mount cannot be renamed over
+/// (EBUSY); and only the file mode is carried over (not owner/ACL/xattrs/
+/// hardlinks). There is deliberately no in-place fallback: it would give up
+/// the no-torn-read guarantee.
+fn write_config_file_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let real = std::fs::canonicalize(path)?;
+    nestweaver_store::durable_sidecar::atomic_replace_file(&real, |file| {
+        file.write_all(contents.as_bytes())
+    })
+}
+
 /// Explicitly bind an instance config to `brain_uuid` while preserving TOML
 /// comments and formatting. The complete edited config is validated before a
 /// crash-safe same-directory replacement; a dry run performs every check but
@@ -1408,13 +1552,18 @@ pub fn adopt_expected_brain_uuid(
     brain_uuid: &str,
     dry_run: bool,
 ) -> Result<ExpectedBrainAdoption, anyhow::Error> {
-    use std::io::Write;
-
     let parsed = uuid::Uuid::parse_str(brain_uuid)
         .map_err(|error| anyhow::anyhow!("invalid brain UUID '{brain_uuid}': {error}"))?;
     if parsed.is_nil() {
         anyhow::bail!("invalid brain UUID: nil UUID is not a data identity");
     }
+    // Preview reads one snapshot and has no writer-side filesystem effects.
+    let _config_lock = (!dry_run).then(lock_config_file_mutation);
+    let _path_lock = if dry_run {
+        None
+    } else {
+        Some(lock_config_path(path)?)
+    };
     let adopted = parsed.to_string();
     let source = std::fs::read_to_string(path)?;
     let mut document = source.parse::<toml_edit::DocumentMut>()?;
@@ -1428,9 +1577,7 @@ pub fn adopt_expected_brain_uuid(
         .map_err(|error| anyhow::anyhow!("adopted config would be invalid: {error}"))?;
     let changed = source != rendered;
     if changed && !dry_run {
-        nestweaver_store::durable_sidecar::atomic_replace_file(path, |file| {
-            file.write_all(rendered.as_bytes())
-        })?;
+        write_config_file_atomic(path, &rendered)?;
     }
     Ok(ExpectedBrainAdoption {
         previous,
@@ -1475,6 +1622,8 @@ pub fn append_repo_to_config_file(
     url: &str,
     branch: Option<&str>,
 ) -> Result<bool, anyhow::Error> {
+    let _config_lock = lock_config_file_mutation();
+    let _path_lock = lock_config_path(path)?;
     let mut contents = std::fs::read_to_string(path)?;
     let cfg = InstanceConfig::from_toml_str(&contents)?;
     let target = crate::jobs::canonical_repo_id(url);
@@ -1505,7 +1654,7 @@ pub fn append_repo_to_config_file(
         contents.push_str(&toml_basic_string(branch)?);
         contents.push('\n');
     }
-    std::fs::write(path, contents)?;
+    write_config_file_atomic(path, &contents)?;
     Ok(true)
 }
 
@@ -1528,6 +1677,8 @@ pub fn remove_repo_from_config_file(
     path: &std::path::Path,
     url: &str,
 ) -> Result<bool, anyhow::Error> {
+    let _config_lock = lock_config_file_mutation();
+    let _path_lock = lock_config_path(path)?;
     let contents = std::fs::read_to_string(path)?;
     let target = crate::jobs::canonical_repo_id(url);
     let lines: Vec<&str> = contents.lines().collect();
@@ -1569,7 +1720,7 @@ pub fn remove_repo_from_config_file(
         if contents.ends_with('\n') {
             next.push('\n');
         }
-        std::fs::write(path, next)?;
+        write_config_file_atomic(path, &next)?;
     }
     Ok(removed)
 }
@@ -1990,6 +2141,27 @@ url = "https://github.com/example/repo"
             !cfg.inference.endpoint.is_empty(),
             "inference.endpoint must be set"
         );
+    }
+
+    /// nw-828: an unsupported `[git] credential_method` fails the config load
+    /// instead of silently selecting no credential wiring.
+    #[test]
+    fn unsupported_git_credential_method_fails_config_load() {
+        let toml = MINIMAL_TOML.replace(
+            "credential_method = \"ssh\"",
+            "credential_method = \"typo\"",
+        );
+        let error = InstanceConfig::from_toml_str(&toml).expect_err("typo must be rejected");
+        let message = format!("{error:#}");
+        assert!(message.contains("[git] credential_method"), "{message}");
+        assert!(message.contains("typo"), "{message}");
+        for method in ["gh", "ssh", "credential-helper", "env"] {
+            let toml = MINIMAL_TOML.replace(
+                "credential_method = \"ssh\"",
+                &format!("credential_method = \"{method}\""),
+            );
+            InstanceConfig::from_toml_str(&toml).unwrap_or_else(|e| panic!("{method}: {e:#}"));
+        }
     }
 
     #[test]
@@ -2518,6 +2690,36 @@ use_git_activity = false
         assert_eq!(vendored.use_git_activity, Some(false));
     }
 
+    /// nw-908: an invalid `[[repos]] exclude` glob fails the config load.
+    #[test]
+    fn invalid_repo_exclude_glob_fails_config_load() {
+        let toml = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[repos]]
+url = "https://example.com/org/bad.git"
+exclude = ["src/[unclosed"]
+"#
+        );
+        let error = InstanceConfig::from_toml_str(&toml).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("bad.git") && text.contains("exclude"),
+            "{text}"
+        );
+        let ok = format!(
+            r#"
+{MINIMAL_TOML}
+
+[[repos]]
+url = "https://example.com/org/good.git"
+exclude = ["src/**", "*.gen.rs"]
+"#
+        );
+        InstanceConfig::from_toml_str(&ok).expect("valid globs load");
+    }
+
     #[test]
     fn exclude_globs_for_resolves_by_repo_url() {
         let toml = format!(
@@ -2943,6 +3145,83 @@ path_deboost = []
         );
     }
 
+    /// nw-900: a symlinked instance.toml stays a symlink; its target is updated.
+    #[cfg(unix)]
+    #[test]
+    fn append_follows_symlinked_config_and_keeps_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        let link = dir.path().join("instance.toml");
+        std::fs::write(&target, MINIMAL_TOML).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            append_repo_to_config_file(&link, "https://github.com/example/linked", None).unwrap()
+        );
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the atomic replace"
+        );
+        let cfg = InstanceConfig::from_file(&target).unwrap();
+        assert!(
+            cfg.repos
+                .iter()
+                .any(|r| r.url == "https://github.com/example/linked")
+        );
+    }
+
+    /// nw-900: concurrent appends must all persist (no lost updates) and a
+    /// concurrent reader must never observe a torn/truncated file.
+    #[test]
+    fn concurrent_appends_all_persist_and_reads_are_never_torn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        let path = std::sync::Arc::new(path);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    InstanceConfig::from_file(&path).expect("reader saw a torn config file");
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    append_repo_to_config_file(
+                        &path,
+                        &format!("https://github.com/example/concurrent-{i}"),
+                        None,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        for w in writers {
+            assert!(w.join().unwrap());
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        reader.join().unwrap();
+
+        let cfg = InstanceConfig::from_file(&path).unwrap();
+        for i in 0..8 {
+            let want = format!("https://github.com/example/concurrent-{i}");
+            assert!(
+                cfg.repos.iter().any(|r| r.url == want),
+                "lost update: {want} missing"
+            );
+        }
+    }
+
     #[test]
     fn append_repo_to_config_file_replaces_inline_empty_repos() {
         // The shipped template declares an empty repo set as inline `repos = []`.
@@ -3193,6 +3472,51 @@ url = "https://github.com/example/keep-me"
         assert!(!cfg.indexing.with_trigrams);
     }
 
+    /// nw-910 / nw-880: bad `[server.indexing]` values fail config load with a
+    /// clear error rather than wedging or panicking the worker / scheduler.
+    #[test]
+    fn server_indexing_config_rejects_unsafe_values() {
+        let load = |body: &str| {
+            InstanceConfig::from_toml_str(&format!("{MINIMAL_TOML}\n\n[server.indexing]\n{body}\n"))
+        };
+        assert!(load("workers = 4").is_ok());
+        for bad in [
+            "workers = 0",
+            "workers = 9223372036854775807",
+            "workers = 1025",
+            "min_poll = \"0s\"",
+            "max_poll = \"0s\"",
+            "max_poll = \"30s\"", // below the default min_poll of 45s
+            "min_poll = \"10m\"\nmax_poll = \"5m\"",
+            "min_poll = \"9h\"\nmax_poll = \"bogus\"", // vs default max 8h
+        ] {
+            let err = load(bad).expect_err(bad).to_string();
+            assert!(err.contains("[server.indexing]"), "{bad}: {err}");
+        }
+        assert!(load("min_poll = \"1m\"\nmax_poll = \"1m\"").is_ok());
+        assert!(load("workers = 1024").is_ok());
+        // Unparseable durations warn and use the default; they do not fail load
+        // (and an overflowing hour count is unparseable, not a panic).
+        for odd in [
+            "max_poll = \"1d\"",
+            "min_poll = \"45\"",
+            "max_poll = \"18446744073709551615h\"",
+        ] {
+            let cfg = load(odd).unwrap_or_else(|e| panic!("{odd}: {e}"));
+            cfg.server.indexing.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn parse_duration_overflow_is_none() {
+        assert_eq!(parse_duration("18446744073709551615h"), None);
+        assert_eq!(parse_duration("18446744073709551615m"), None);
+        assert_eq!(
+            parse_duration("2h"),
+            Some(std::time::Duration::from_secs(7200))
+        );
+    }
+
     #[test]
     fn server_indexing_config_defaults() {
         let cfg = IndexingConfig::default();
@@ -3342,5 +3666,97 @@ url = "https://github.com/example/keep-me"
                 .parse::<u32>()
                 .ok()
         })
+    }
+    #[test]
+    fn config_writer_refuses_a_competing_file_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        let held = lock_config_path(&path).unwrap();
+        let error =
+            append_repo_to_config_file(&path, "https://example.com/org/new", None).unwrap_err();
+        assert!(error.to_string().contains("another process"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), MINIMAL_TOML);
+        drop(held);
+        assert!(append_repo_to_config_file(&path, "https://example.com/org/new", None).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_lock_refuses_symlink_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        let victim = dir.path().join("victim");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("instance.toml.lock")).unwrap();
+        assert!(lock_config_path(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+    }
+    #[test]
+    fn identity_preview_has_no_filesystem_side_effects_even_for_invalid_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        let entries = || {
+            let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            entries.sort();
+            entries
+        };
+        let before = entries();
+        assert!(adopt_expected_brain_uuid(&path, "not-a-uuid", true).is_err());
+        assert_eq!(entries(), before);
+        assert!(adopt_expected_brain_uuid(&path, "not-a-uuid", false).is_err());
+        assert_eq!(entries(), before);
+        adopt_expected_brain_uuid(&path, "4f8a9ef0-d161-453d-a4e8-f12609ac3f07", true).unwrap();
+        assert_eq!(entries(), before);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), MINIMAL_TOML);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_preview_is_read_only_without_directory_write_permission() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        const CHILD_PATH: &str = "NW_READ_ONLY_PREVIEW_FIXTURE";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = std::path::PathBuf::from(path);
+            assert!(
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path.with_extension("probe"))
+                    .is_err(),
+                "fixture must actually deny directory writes, including root test runners"
+            );
+            adopt_expected_brain_uuid(&path, "4f8a9ef0-d161-453d-a4e8-f12609ac3f07", true).unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.toml");
+        std::fs::write(&path, MINIMAL_TOML).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("config::tests::identity_preview_is_read_only_without_directory_write_permission")
+            .env(CHILD_PATH, &path);
+        if unsafe { libc::geteuid() } == 0 {
+            command.gid(65534).uid(65534);
+        }
+        let output = command.output();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = output.unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child must execute the permission test: {:?}",
+            output
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), MINIMAL_TOML);
     }
 }

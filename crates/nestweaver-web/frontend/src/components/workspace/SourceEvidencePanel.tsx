@@ -286,7 +286,7 @@ export function SourceEvidencePanel({
         {selectedNodeId && (
           <NodeActionBar
             node={{ uid: selectedNodeId, kind, label, missing }}
-            ids={["open", "related", "trace", "copyLink"]}
+            ids={symbolDetail?._federation || noteDetail?._federation ? ["copyLink"] : ["open", "related", "trace", "copyLink"]}
             compact
             className="mt-3"
           />

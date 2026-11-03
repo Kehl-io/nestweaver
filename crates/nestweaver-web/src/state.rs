@@ -38,6 +38,8 @@ pub struct GraphEvent {
 }
 
 pub struct AppState {
+    /// Optional shared federation data plane; absent preserves local HTTP contracts.
+    pub federation: OnceLock<Arc<crate::federation::WebFederation>>,
     pub store: Arc<GraphStore>,
     pub tantivy: Option<Arc<TantivyIndex>>,
     pub event_tx: broadcast::Sender<GraphEvent>,
@@ -282,6 +284,8 @@ pub struct VaultDerivationHttp {
     pub data_instance_id: String,
     pub read_only: bool,
     pub max_note_bytes: u64,
+    pub snapshot_derivation:
+        Option<Arc<nestweaver_engine::markdown_derivation::ValidatedSnapshotDerivation>>,
 }
 
 impl AppState {
@@ -289,13 +293,14 @@ impl AppState {
         let Some(config) = self.vault_derivation.get() else {
             return Ok(());
         };
-        nestweaver_engine::markdown_derivation::admit_all_vaults(
+        nestweaver_engine::markdown_derivation::admit_all_vaults_with_snapshot(
             &self.store,
             &self.db_path,
             &config.data_instance_id,
             &[],
             config.max_note_bytes,
             config.read_only,
+            config.snapshot_derivation.as_deref(),
         )
         .map_err(|error| crate::error::ApiError::unavailable(error.to_string()))
     }
@@ -314,6 +319,7 @@ impl AppState {
             manifest_recovery: OnceLock::new(),
             vault_derivation: OnceLock::new(),
             idle_activity: OnceLock::new(),
+            federation: OnceLock::new(),
         })
     }
 
@@ -335,6 +341,7 @@ impl AppState {
             manifest_recovery: OnceLock::new(),
             vault_derivation: OnceLock::new(),
             idle_activity: OnceLock::new(),
+            federation: OnceLock::new(),
         })
     }
 
@@ -356,6 +363,7 @@ impl AppState {
             manifest_recovery: OnceLock::new(),
             vault_derivation: OnceLock::new(),
             idle_activity: OnceLock::new(),
+            federation: OnceLock::new(),
         })
     }
 }
@@ -379,6 +387,7 @@ pub struct PendingDevice {
 /// Shared state for admin API routes. Provides access to daemon-level
 /// resources (store, queue depth, drain state) that the admin API needs.
 pub struct AdminState {
+    pub runtime_repo_configs: nestweaver_engine::worker::RuntimeRepoConfigs,
     pub admin_token: String,
     /// Configured org-wide query (read) token, handed to developers on
     /// device-flow approval. `None` when the server runs without query auth.
@@ -425,6 +434,12 @@ pub struct AdminState {
     /// Webhook per-repo branch map, shared with the webhook handler via RwLock.
     pub webhook_repo_branches:
         Option<Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>>,
+    /// Webhook map from canonical repo id to the RAW configured clone URL
+    /// (nw-909), shared with the webhook handler. A webhook enqueues the
+    /// configured URL, never the payload's, so clone credentials and URL form
+    /// match the config.
+    pub webhook_repo_urls:
+        Option<Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>>,
     /// Write gate shared with the daemon to prevent races between admin
     /// repo deletion and worker indexing. `None` in tests or non-server mode.
     ///
@@ -437,4 +452,8 @@ pub struct AdminState {
     /// [`HostResolver`] / [`system_resolver`] — production wires the real
     /// resolver, tests inject a synthetic one.
     pub resolver: HostResolver,
+    /// `host:port` the device-flow endpoints are served on, used to build the
+    /// verification URI when the request carries no usable `Host` (nw-884).
+    /// `None` when the daemon cannot name one (ephemeral port).
+    pub advertised_authority: Option<String>,
 }

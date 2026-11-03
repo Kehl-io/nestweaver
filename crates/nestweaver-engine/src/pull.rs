@@ -109,28 +109,10 @@ pub fn validate_credential_method(method: &str) -> Result<(), anyhow::Error> {
 fn pull_git_command(credential_method: Option<&str>) -> Command {
     let mut command = Command::new("git");
     command.env("GIT_TERMINAL_PROMPT", "0");
-    match credential_method {
-        Some("gh") => {
-            command.args([
-                "-c",
-                "credential.helper=",
-                "-c",
-                "credential.helper=!gh auth git-credential",
-            ]);
-        }
-        Some("ssh") => {
-            command.args(["-c", "credential.helper="]);
-        }
-        Some("env") => {
-            // An explicitly supplied askpass program is Git's native env
-            // protocol. Otherwise expose GH_TOKEN only through helper stdin/
-            // stdout; the token never appears in argv or the remote URL.
-            command.args(["-c", "credential.helper="]);
-            if std::env::var_os("GIT_ASKPASS").is_none() {
-                command.args(["-c", r#"credential.helper=!f() { test "$1" = get && test -n "$GH_TOKEN" && printf '%s\n' 'username=x-access-token' "password=$GH_TOKEN"; }; f"#]);
-            }
-        }
-        _ => {}
+    // One definition of the per-method auth wiring, shared with the isolated
+    // bare-clone/fetch/ls-remote paths (nw-828).
+    for value in crate::git_cmd::credential_helper_values(credential_method) {
+        command.args(["-c", &format!("credential.helper={value}")]);
     }
     command
 }

@@ -13,7 +13,7 @@ import type {
 } from "../api/types";
 
 export type PreviewData =
-  | { type: "symbol"; detail: SymbolDetail; sourceLines: string[] }
+  | { type: "symbol"; detail: SymbolDetail; sourceLines: string[]; sourceState?: "available" | "unsupported" | "unavailable" }
   | { type: "note"; detail: NoteDetail }
   | { type: "file"; path: string; symbols: SymbolCandidate[]; sourceLines: string[] }
   | null;
@@ -155,6 +155,11 @@ export function useNodePreview(
           // Shared with Details/Evidence so one selection costs one request.
           const detail = await fetchSymbol(nodeId);
           if (controller.signal.aborted) return;
+          if (detail._federation?.source_available === false) {
+            const result: PreviewData = { type: "symbol", detail, sourceLines: [], sourceState: "unsupported" };
+            if (isCurrent()) { cacheSet(nodeId, result); setData(result); }
+            return;
+          }
           let sourceLines: string[] = [];
           try {
             const source = await fetchJson<SourceResponse>(

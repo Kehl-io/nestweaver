@@ -113,7 +113,7 @@ def bootstrap(fixture):
                        stderr=result.stderr, exit_code=result.returncode)
         assert result.returncode == 0, result.stderr
     fixture.run("index", "--repo", fixture.repo, "--db", fixture.db)
-    status = fixture.run("brain", "status", "--db", fixture.db, "--json")
+    status = fixture.wait_for_indexed_status()
     fixture.assert_daemon_status(status)
     fixture.record(kind="release_gate_fixture_ready", daemon_pid=fixture.child.pid,
                    graph_status=json.loads(status.stdout), files=files)

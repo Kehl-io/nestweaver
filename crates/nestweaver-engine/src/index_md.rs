@@ -2119,6 +2119,33 @@ pub fn index_markdown_directory_with_store_and_deletion_count_and_note_limits(
     extra_ignore_patterns: &[String],
     note_limits: crate::index_limits::NoteLimits,
 ) -> Result<MarkdownRefreshResult, anyhow::Error> {
+    index_markdown_directory_with_store_and_write_gate(
+        store,
+        vault_root,
+        db_path,
+        instance_id,
+        vault_name,
+        extra_ignore_patterns,
+        note_limits,
+        || Ok(()),
+    )
+}
+
+/// Full filesystem vault refresh with an engine-owned, yieldable write gate.
+#[allow(clippy::too_many_arguments)]
+pub fn index_markdown_directory_with_store_and_write_gate<G, F>(
+    store: &GraphStore,
+    vault_root: &Path,
+    db_path: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    extra_ignore_patterns: &[String],
+    note_limits: crate::index_limits::NoteLimits,
+    acquire_write_guard: F,
+) -> Result<MarkdownRefreshResult, anyhow::Error>
+where
+    F: FnMut() -> Result<G, anyhow::Error>,
+{
     let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
     // nw-436: this reader's prune list is the VAULT one, not the code default
     // `FilesystemReader::with_limits` used to leave in place — see
@@ -2127,7 +2154,15 @@ pub fn index_markdown_directory_with_store_and_deletion_count_and_note_limits(
     // repo's `.claude/` tooling config is meant to.
     let reader = filesystem_note_reader(&canonical, note_limits);
     let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns)?;
-    let result = index_into_store(&reader, store, instance_id, vault_name, &ignore_set)?;
+    let result = index_into_store_with_write_gate(
+        &reader,
+        store,
+        instance_id,
+        vault_name,
+        &ignore_set,
+        None,
+        acquire_write_guard,
+    )?;
 
     let aliases = load_taxonomy_aliases(reader.root());
     if !aliases.is_empty() {
@@ -2223,7 +2258,7 @@ pub fn index_markdown_with_reader_and_write_gate<G, F>(
     acquire_write_guard: F,
 ) -> Result<MarkdownIndexResult, anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     let ignore_set = crate::brainignore::load_brain_ignore_from_reader(reader, &[])?;
     let result = index_into_store_with_write_gate(
@@ -2469,6 +2504,42 @@ pub fn index_markdown_directory_since_with_store_and_ignore_and_note_limits(
     index_markdown_since_with_reader(store, &reader, instance_id, vault_name, since, &ignore_set)
 }
 
+/// Incremental daemon refresh whose caller lets the engine yield its gate.
+/// Acquire both authorities before collecting the graph-dependent refresh plan.
+#[allow(clippy::too_many_arguments)]
+pub fn index_markdown_directory_since_with_store_and_write_gate<G>(
+    store: &GraphStore,
+    vault_root: &Path,
+    instance_id: &str,
+    vault_name: &str,
+    since: std::time::SystemTime,
+    extra_ignore_patterns: &[String],
+    note_limits: crate::index_limits::NoteLimits,
+    mut acquire_write_guard: impl FnMut() -> Result<G, anyhow::Error>,
+) -> Result<MarkdownSinceResult, anyhow::Error> {
+    let canonical = std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    let reader = filesystem_note_reader(&canonical, note_limits);
+    let ignore_set = crate::brainignore::load_brain_ignore(&canonical, extra_ignore_patterns)?;
+    let (_guard, publication) = loop {
+        let guard = acquire_write_guard()?;
+        if let Some(publication) = store.try_acquire_index_publication_lease()? {
+            break (guard, publication);
+        }
+        drop(guard);
+        store.wait_until_index_publication_unowned();
+    };
+    index_markdown_since_with_reader_mode(
+        store,
+        &reader,
+        instance_id,
+        vault_name,
+        since,
+        &ignore_set,
+        None,
+        Some(publication),
+    )
+}
+
 type WatchLeaseAcquirer<'a> =
     dyn Fn() -> Result<Option<Box<dyn crate::watcher::WatchMutationLease>>, anyhow::Error> + 'a;
 
@@ -2688,6 +2759,7 @@ pub(crate) fn refresh_watched_paths(
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
         ignore_set,
         Some(lease),
+        None,
     )?;
     forget_symlink_rows(store.db_path(), vault_root, &not_symlinks);
     Ok(reader
@@ -2775,6 +2847,7 @@ fn index_markdown_since_with_reader(
         since,
         ignore_set,
         None,
+        None,
     )
 }
 
@@ -2808,6 +2881,7 @@ fn index_markdown_since_with_reader_mode(
     since: std::time::SystemTime,
     ignore_set: &GlobSet,
     watch_lease: Option<&WatchLeaseAcquirer<'_>>,
+    publication_lease: Option<nestweaver_store::IndexPublicationLease<'_>>,
 ) -> Result<MarkdownSinceResult, anyhow::Error> {
     let vault_root = reader.root();
     let root_str = vault_root.to_string_lossy().into_owned();
@@ -3481,8 +3555,16 @@ fn index_markdown_since_with_reader_mode(
         // The watcher owns one dirty marker and one publication for its batch.
         crate::manifest::finalize_committed_graph_mutation(store, false)
     } else {
-        let publication =
-            crate::manifest::begin_graph_mutation_publication(store, "incremental vault refresh")?;
+        let publication = match publication_lease {
+            Some(lease) => crate::manifest::begin_graph_mutation_publication_on_lease(
+                store, lease, "incremental vault refresh".into(), None, false,
+            )?,
+            None => crate::manifest::try_begin_graph_mutation_publication(
+                store, "incremental vault refresh",
+            )?.ok_or_else(|| anyhow::anyhow!(
+                "incremental vault refresh deferred: another publisher is active; retry after the watcher batch completes"
+            ))?,
+        };
         plan.commit(store, true, "atomic incremental vault refresh")?;
         publication.finish(true)?
     };
@@ -4272,9 +4354,92 @@ fn index_into_store_with_write_gate<G, F>(
     acquire_write_guard: F,
 ) -> Result<MarkdownRefreshResult, anyhow::Error>
 where
-    F: FnOnce() -> Result<G, anyhow::Error>,
+    F: FnMut() -> Result<G, anyhow::Error>,
+{
+    index_into_store_with_write_gate_attempt(
+        reader,
+        store,
+        instance_id,
+        vault_name,
+        ignore_set,
+        record_repo_sha,
+        acquire_write_guard,
+        0,
+    )
+}
+
+/// How many times a full refresh rescans the vault because another writer
+/// (a watcher batch, a concurrent refresh) owned publication or advanced the
+/// graph between the off-gate scan and the gated write. Each rescan is a full
+/// parse of the vault, so this is bounded: under a persistently busy writer
+/// the refresh fails with a named error instead of rescanning forever.
+const MAX_FULL_REFRESH_RESCANS: u32 = 3;
+
+/// Retry a full refresh after a concurrent writer invalidated its off-gate
+/// snapshot, or fail once [`MAX_FULL_REFRESH_RESCANS`] rescans are spent. Every
+/// rescan is logged with the generation delta so a livelock is visible.
+#[allow(clippy::too_many_arguments)]
+fn rescan_after_concurrent_writer<G, F>(
+    reason: &'static str,
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    vault_name: &str,
+    ignore_set: &GlobSet,
+    record_repo_sha: Option<&str>,
+    acquire_write_guard: F,
+    attempt: u32,
+    snapshot_generation: u64,
+) -> Result<MarkdownRefreshResult, anyhow::Error>
+where
+    F: FnMut() -> Result<G, anyhow::Error>,
+{
+    let next = attempt + 1;
+    let current_generation = store.graph_generation();
+    if next > MAX_FULL_REFRESH_RESCANS {
+        anyhow::bail!(
+            "vault refresh for {vault_name} could not publish after {MAX_FULL_REFRESH_RESCANS} \
+             rescans: {reason} each time (graph generation {snapshot_generation} -> \
+             {current_generation}). Another writer is continuously busy; retry once it is idle"
+        );
+    }
+    tracing::info!(
+        vault = vault_name,
+        attempt = next,
+        max = MAX_FULL_REFRESH_RESCANS,
+        snapshot_generation,
+        current_generation,
+        "full refresh rescanning the vault: {reason}"
+    );
+    index_into_store_with_write_gate_attempt(
+        reader,
+        store,
+        instance_id,
+        vault_name,
+        ignore_set,
+        record_repo_sha,
+        acquire_write_guard,
+        next,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_into_store_with_write_gate_attempt<G, F>(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    vault_name: &str,
+    ignore_set: &GlobSet,
+    record_repo_sha: Option<&str>,
+    mut acquire_write_guard: F,
+    attempt: u32,
+) -> Result<MarkdownRefreshResult, anyhow::Error>
+where
+    F: FnMut() -> Result<G, anyhow::Error>,
 {
     let started = Instant::now();
+    let snapshot_generation = store.graph_generation();
+    let snapshot_publication_revision = store.index_publication_revision();
 
     // The caller canonicalizes vault_root before constructing the reader, so
     // reader.root() is already canonical — agreeing with the watcher (which
@@ -4354,7 +4519,14 @@ where
         && store.lookup_vault(&v_uid).is_ok()
     {
         scan_pb.finish_and_clear();
-        let _write_guard = acquire_write_guard()?;
+        let (_write_guard, publication_lease) = loop {
+            let guard = acquire_write_guard()?;
+            if let Some(lease) = store.try_acquire_index_publication_lease()? {
+                break (guard, lease);
+            }
+            drop(guard);
+            store.wait_until_index_publication_unowned();
+        };
         let since = index_markdown_since_with_reader_mode(
             store,
             reader,
@@ -4363,6 +4535,7 @@ where
             std::time::SystemTime::UNIX_EPOCH,
             ignore_set,
             None,
+            Some(publication_lease),
         )?;
         // Full-index semantics for the sidecar: this run's skips replace the
         // vault's previous ones rather than merging with them.
@@ -4780,6 +4953,46 @@ where
     let _write_reservation =
         crate::cpu_throttle::CpuThrottle::global().reserve_write_headroom(None);
     let _write_guard = acquire_write_guard()?;
+    let Some(publication_lease) = store.try_acquire_index_publication_lease()? else {
+        // A watcher may own publication while needing this gate for its next
+        // note. Yield BOTH authorities, then rescan: disk and graph snapshots
+        // collected above are no longer authoritative after another writer.
+        drop(_write_guard);
+        drop(_write_reservation);
+        store.wait_until_index_publication_unowned();
+        return rescan_after_concurrent_writer(
+            "index publication was owned by another writer",
+            reader,
+            store,
+            instance_id,
+            vault_name,
+            ignore_set,
+            record_repo_sha,
+            acquire_write_guard,
+            attempt,
+            snapshot_generation,
+        );
+    };
+
+    if store.graph_generation() != snapshot_generation
+        || store.index_publication_revision() != snapshot_publication_revision.wrapping_add(1)
+    {
+        drop(publication_lease);
+        drop(_write_guard);
+        drop(_write_reservation);
+        return rescan_after_concurrent_writer(
+            "the graph advanced between the scan and the gated write",
+            reader,
+            store,
+            instance_id,
+            vault_name,
+            ignore_set,
+            record_repo_sha,
+            acquire_write_guard,
+            attempt,
+            snapshot_generation,
+        );
+    }
 
     // Whether this vault was already indexed. If so, the atomic reindex write
     // below cascade-deletes the old data and re-inserts the new data in a
@@ -4940,8 +5153,13 @@ where
     // Before the dirty marker and the graph write: a death from here until
     // the commit below must stay visible after the restart.
     record_vault_index_interrupted(store.db_path(), vault_root);
-    let graph_publication =
-        crate::manifest::begin_graph_mutation_publication(store, "full vault refresh")?;
+    let graph_publication = crate::manifest::begin_graph_mutation_publication_on_lease(
+        store,
+        publication_lease,
+        "full vault refresh".into(),
+        None,
+        false,
+    )?;
     let notes_deleted = {
         let vault_note_refs: Vec<(&str, &str)> = edge_pairs
             .iter()
@@ -4981,7 +5199,7 @@ where
             .collect();
 
         store
-            .bulk_vault_reindex_write(
+            .bulk_vault_reindex_write_with_strategy(
                 &Vault {
                     uid: v_uid.clone(),
                     name: vault_name.to_string(),
@@ -5002,6 +5220,7 @@ where
                 &section_tag_refs,
                 &wl_note_refs,
                 &wl_head_refs,
+                reader.strategy_replacement(),
             )
             .context("bulk_vault_reindex_write")?
     };
@@ -5038,7 +5257,7 @@ where
     // empty indexed_sha and the worker's up-to-date short-circuit never fires —
     // re-indexing the whole vault every poll. `vault_name` is the repo URL in
     // this path; recorded under the same write gate as the vault commit.
-    if let Some(sha) = record_repo_sha {
+    if let Some(sha) = record_repo_sha.filter(|_| reader.strategy_replacement().is_none()) {
         record_repo_indexed_sha(store, instance_id, vault_name, sha)?;
     }
 
@@ -9863,6 +10082,157 @@ sub b body
     /// markdown indexer over a bare clone, producing Note/Section nodes rather
     /// than code symbols. The bare clone has no on-disk `.brainignore`, which
     /// `index_markdown_with_reader` must tolerate.
+    /// A writer that advances the graph every time the refresh reaches its gate
+    /// must not keep the refresh rescanning forever: after the bounded number of
+    /// rescans it fails with a named error instead of livelocking.
+    #[test]
+    fn full_vault_gives_up_after_bounded_rescans_under_a_continuously_busy_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), "# A").unwrap();
+        let reader = filesystem_note_reader(&root, crate::index_limits::NoteLimits::default());
+        let store = GraphStore::in_memory().unwrap();
+        let ignore = crate::brainignore::load_brain_ignore(&root, &[]).unwrap();
+        let mut gate_acquisitions = 0u32;
+        let error = match index_into_store_with_write_gate(
+            &reader,
+            &store,
+            "test",
+            "vault",
+            &ignore,
+            None,
+            || {
+                gate_acquisitions += 1;
+                // Another writer lands between the off-gate scan and this gate
+                // every single time.
+                store.bump_graph_generation();
+                Ok(())
+            },
+        ) {
+            Ok(result) => panic!(
+                "a continuously busy writer must bound the rescans, but the refresh published {} notes",
+                result.index.notes_count
+            ),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("could not publish after"),
+            "error must name the bounded rescans: {message}"
+        );
+        assert_eq!(
+            gate_acquisitions,
+            1 + MAX_FULL_REFRESH_RESCANS,
+            "one initial attempt plus the bounded rescans"
+        );
+    }
+
+    #[test]
+    fn full_vault_revalidates_a_watcher_completed_before_gate_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("edit.md"), "# Before").unwrap();
+        std::fs::write(root.join("remove.md"), "# Removed").unwrap();
+        let reader = filesystem_note_reader(&root, crate::index_limits::NoteLimits::default());
+        let store = GraphStore::in_memory().unwrap();
+        let ignore = crate::brainignore::load_brain_ignore(&root, &[]).unwrap();
+        let mut first_gate = true;
+        let result = index_into_store_with_write_gate(
+            &reader,
+            &store,
+            "test",
+            "vault",
+            &ignore,
+            None,
+            || {
+                if first_gate {
+                    first_gate = false;
+                    // The batch wins the gate, finishes, AND releases its
+                    // publication before this full index acquires either.
+                    let watcher = store.acquire_index_publication_lease()?;
+                    std::fs::write(root.join("edit.md"), "# After")?;
+                    std::fs::remove_file(root.join("remove.md"))?;
+                    std::fs::write(root.join("add.md"), "# Added")?;
+                    drop(watcher);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result.index.notes_count, 2);
+        let notes = store.list_notes(None).unwrap();
+        assert!(notes.iter().any(|note| note.title == "After"));
+        assert!(notes.iter().any(|note| note.file_path == "add.md"));
+        assert!(notes.iter().all(|note| note.file_path != "remove.md"));
+    }
+
+    #[test]
+    fn full_vault_index_yields_and_rescans_after_watcher_publication() {
+        use std::sync::{Arc, Barrier, Mutex, mpsc};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), "# Before\n\nold body").unwrap();
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let gate = Arc::new(Mutex::new(()));
+        let ready = Arc::new(Barrier::new(2));
+        let (gated_tx, gated_rx) = mpsc::channel();
+        let watcher = {
+            let store = Arc::clone(&store);
+            let gate = Arc::clone(&gate);
+            let ready = Arc::clone(&ready);
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let publication = store.acquire_index_publication_lease().unwrap();
+                ready.wait();
+                gated_rx.recv().unwrap();
+                let _gate = gate.lock().unwrap();
+                std::fs::write(root.join("a.md"), "# After\n\nnew body").unwrap();
+                std::fs::write(root.join("b.md"), "# Added during yield").unwrap();
+                drop(publication);
+            })
+        };
+        ready.wait();
+        let (done_tx, done_rx) = mpsc::channel();
+        let index_store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let reader = filesystem_note_reader(&root, crate::index_limits::NoteLimits::default());
+            let mut first = true;
+            let result = index_into_store_with_write_gate(
+                &reader,
+                &index_store,
+                "test",
+                "vault",
+                &crate::brainignore::load_brain_ignore(&root, &[]).unwrap(),
+                None,
+                || {
+                    let guard = gate.lock().unwrap();
+                    if first {
+                        first = false;
+                        gated_tx.send(()).unwrap();
+                    }
+                    Ok(guard)
+                },
+            );
+            done_tx
+                .send(result.map(|result| result.index.notes_count))
+                .unwrap();
+        });
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap(),
+            2
+        );
+        watcher.join().unwrap();
+        let notes = store.list_notes(None).unwrap();
+        assert!(notes.iter().any(|note| note.title == "After"));
+        assert!(notes.iter().any(|note| note.file_path == "b.md"));
+    }
+
     #[test]
     fn index_markdown_with_reader_over_bare_clone_makes_notes() {
         let (_tmp, bare, sha) = setup_bare_repo(&[

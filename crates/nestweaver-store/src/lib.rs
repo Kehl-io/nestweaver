@@ -57,7 +57,8 @@ pub use regex::{
     TrigramRefreshStats, deferred_scopes_note,
 };
 pub use regex_index::{
-    REGEX_INDEX_SCHEMA_VERSION, REGEX_TOKENIZER_FINGERPRINT, RegexIndex, RegexShardMetadata,
+    REGEX_INDEX_SCHEMA_VERSION, REGEX_TOKENIZER_FINGERPRINT, RegexDocumentIdentity, RegexIndex,
+    RegexShardMetadata,
 };
 pub use search::{
     EMBED_CHECKPOINT_INTERVAL, EmbeddingFlushCheckpoint, EmbeddingIndex, SearchResult,

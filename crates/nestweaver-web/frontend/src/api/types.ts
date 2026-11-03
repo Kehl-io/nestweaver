@@ -1,4 +1,5 @@
 export interface SymbolCandidate {
+  federation_source?: string;
   uid: string;
   name: string;
   kind: string;
@@ -23,7 +24,10 @@ export interface Symbol {
   pagerank_score: number;
 }
 
+export interface FederationDetail { source: string; freshness: string; read_only: boolean; source_available?: boolean; }
+
 export interface SymbolDetail {
+  _federation?: FederationDetail;
   symbol: Symbol;
   callers: Symbol[];
   callees: Symbol[];
@@ -208,6 +212,7 @@ export interface BacklinkRow {
 }
 
 export interface SearchHit {
+  federation_source?: string;
   uid: string;
   kind: string;
   title: string;
@@ -265,6 +270,7 @@ export interface BrainStatus {
 }
 
 export interface NoteDetail {
+  _federation?: FederationDetail;
   note: Note;
   headings: Heading[];
   sections: Section[];

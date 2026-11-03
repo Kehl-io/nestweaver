@@ -20,6 +20,7 @@ interface SearchDropdownProps {
 export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownProps) {
   const searchQuery = useStore((s) => s.searchQuery);
   const searchLoading = useStore((s) => s.searchLoading);
+  const searchAvailability = useStore((s) => s.searchAvailability);
   const searchResults = useStore((s) => s.searchResults);
   const brainSearchResults = useStore((s) => s.brainSearchResults);
   const phraseIntent = useStore((s) => s.phraseIntent);
@@ -191,6 +192,12 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
       aria-activedescendant={activeDescendant}
       className="absolute top-full left-0 right-0 max-[899px]:fixed max-[899px]:top-12 max-[899px]:left-4 max-[899px]:right-4 z-50 mt-1 max-h-80 min-h-[10rem] overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] shadow-lg pointer-events-auto"
     >
+      {searchAvailability.length > 0 && <div role="status" aria-label="Search availability" className="border-b border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-text-muted)]">
+        {searchAvailability.some((state) => state.partial) ? "Partial search · upstream unavailable or permission-rejected" : "Federated search"}
+        {" · freshness unknown"}
+        {searchAvailability.some((state) => state.read_only) && " · read only"}
+        {" · "}{[...new Set(searchAvailability.flatMap((state) => state.upstreams.map((peer) => `${peer.source}: ${peer.status}`)))].join(", ")}
+      </div>}
       {searchLoading && (
         <div className="px-3 py-2 text-sm text-[var(--color-text-muted)]">
           Searching...
@@ -283,7 +290,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                   className="col-span-2 min-w-0 break-all text-xs text-[var(--color-text-muted)]"
                   title={s.file_path}
                 >
-                  {s.file_path}
+                  {s.file_path}{s.federation_source && ` · Source: ${s.federation_source}`}
                 </span>
               </button>
               <span className="flex flex-wrap gap-1">
@@ -349,7 +356,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               >
                 <KindBadge kind={n.kind} />
                 <span className="min-w-0 break-all font-medium" title={n.title}>
-                  {n.title}
+                  {n.title}{n.federation_source && <span className="ml-2 text-xs">Source: {n.federation_source}</span>}
                 </span>
                 <span className="ml-auto shrink-0 text-xs text-[var(--color-text-muted)]">
                   {n.score.toFixed(2)}

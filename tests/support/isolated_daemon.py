@@ -90,6 +90,12 @@ class IsolatedDaemon:
                 and "nestweaver" in parts[1] and "daemon" in parts[1]
                 and " run" in parts[1]}
 
+    @staticmethod
+    def is_temp_rooted(command):
+        """True when a daemon command line serves a database under a temp dir."""
+        roots = {tempfile.gettempdir(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"}
+        return any(f" {root}/" in command or f"={root}/" in command for root in roots)
+
     def record(self, **event):
         event["time"] = time.time()
         self.events.append(event)
@@ -228,18 +234,41 @@ class IsolatedDaemon:
                            capture_output=True, check=True, timeout=30)
 
     @staticmethod
-    def assert_daemon_status(result):
+    def assert_daemon_status(result, *, indexed=True, expected_repos=1):
         payload = json.loads(result.stdout)
         if (payload.get("runtime_telemetry") != "available"
                 or not isinstance(payload.get("indexing_active"), bool)
-                or payload.get("repo_count") != 1
+                or (indexed and payload.get("repo_count") != expected_repos)
                 or "daemon_runtime" in payload.get("degraded_components", [])):
             raise AssertionError(f"expected indexed fixture and live daemon telemetry: {payload}")
+
+    def wait_for_indexed_status(self, timeout=25, *, expected_repos=1):
+        deadline = time.monotonic() + min(timeout, self.timeout)
+        last = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.record(kind="indexed_status_timeout", last_status=last)
+                raise TimeoutError(f"indexed status did not become current: {last}")
+            result = self.run("brain", "status", "--db", self.db, "--json",
+                              timeout=min(3, remaining))
+            self.assert_daemon_status(result, indexed=False)
+            last = json.loads(result.stdout)
+            observation = last.get("status_observation")
+            if (not isinstance(observation, dict)
+                    or not isinstance(observation.get("stale"), bool)
+                    or not isinstance(observation.get("busy"), bool)):
+                raise AssertionError(f"expected explicit daemon observation: {last}")
+            if not observation["stale"] and not observation["busy"]:
+                self.assert_daemon_status(result, expected_repos=expected_repos)
+                self.record(kind="indexed_status_current", observation=observation)
+                return result
+            time.sleep(min(0.1, remaining))
 
     def bootstrap(self):
         self.create_repository()
         self.run("index", "--repo", self.repo, "--db", self.db)
-        self.assert_daemon_status(self.run("brain", "status", "--db", self.db, "--json"))
+        self.wait_for_indexed_status()
         result = self.run("impact", "releaseTarget", "--db", self.db, "--json")
         payload = json.loads(result.stdout)
         if payload.get("status") in ("not_found", "ambiguous", "error"):
@@ -319,8 +348,14 @@ class IsolatedDaemon:
         if self.log:
             self.log.close()
         after = self.daemons()
+        # Only daemons that could be someone's production service count. The
+        # daemon_test suite runs its cases in parallel, and every sibling case
+        # starts and stops its own throwaway daemon under the system temp dir;
+        # those come and go during this fixture and are not evidence that we
+        # touched anything. A daemon on a real database path that vanished or
+        # changed identity still fails the guard.
         changed = {pid: command for pid, command in self.initial_daemons.items()
-                   if after.get(pid) != command}
+                   if after.get(pid) != command and not self.is_temp_rooted(command)}
         self.record(kind="production_daemon_check", unchanged=not changed, changed=changed)
         if changed:
             raise AssertionError(f"pre-existing daemon identity changed: {changed}")

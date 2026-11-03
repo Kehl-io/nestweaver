@@ -521,9 +521,13 @@ pub fn instance_label_from_db_path(db_path: &Path) -> String {
 
 /// Runtime directory for the daemon socket and pidfile.
 ///
-/// Prefers `$XDG_RUNTIME_DIR/nestweaver/<instance>/` (Linux with systemd),
-/// falling back to `~/.local/state/nestweaver/<instance>/` (macOS and
-/// everywhere else).
+/// Prefers `$XDG_RUNTIME_DIR/nestweaver/<instance>/` (Linux with systemd).
+/// When that variable is unset (a systemd SYSTEM unit, cron, a sanitized
+/// launcher) on Linux it uses `/run/user/<uid>/nestweaver/<instance>/` if that
+/// per-user directory exists and is ours, because that is exactly where an
+/// interactive CLI of the same user resolves `$XDG_RUNTIME_DIR` (nw-829) — the
+/// daemon and every CLI must agree on the socket location. Otherwise it falls
+/// back to `~/.local/state/nestweaver/<instance>/` (macOS and everywhere else).
 ///
 /// **`$TMPDIR` is deliberately NOT consulted.** On macOS, different
 /// launchers see different `$TMPDIR` values (per-user
@@ -533,10 +537,7 @@ pub fn instance_label_from_db_path(db_path: &Path) -> String {
 /// same DB instance would disagree on the socket location, each trying
 /// to spawn its own daemon.
 pub fn runtime_dir(instance_id: &str) -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(xdg).join("nestweaver").join(instance_id);
-    }
-    state_runtime_dir(instance_id)
+    nestweaver_schema::runtime_paths::runtime_dir(instance_id)
 }
 
 /// Runtime directory a launchd-supervised daemon actually binds.
@@ -549,20 +550,7 @@ pub fn runtime_dir(instance_id: &str) -> PathBuf {
 /// for processes that do inherit their environment; this function is only the
 /// supervised location.
 pub fn launchd_runtime_dir(instance_id: &str) -> PathBuf {
-    state_runtime_dir(instance_id)
-}
-
-fn state_runtime_dir(instance_id: &str) -> PathBuf {
-    // Stable per-user directory that doesn't depend on caller env.
-    // Co-located with daemon logs (which already use this path).
-    dirs::state_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".local/state")
-        })
-        .join("nestweaver")
-        .join(instance_id)
+    nestweaver_schema::runtime_paths::launchd_runtime_dir(instance_id)
 }
 
 /// Maximum unix socket path length (sun_path) on macOS/BSD — 104 bytes
@@ -659,22 +647,24 @@ pub fn launchd_socket_path(instance_id: &str) -> PathBuf {
 
 /// Sockets a client may find this instance listening on.
 ///
-/// The caller's [`socket_path`] is first. On macOS a launchd job binds
-/// [`launchd_socket_path`] instead whenever `XDG_RUNTIME_DIR` differs, so that
-/// path is a second candidate. Linux systemd user units inherit
-/// `XDG_RUNTIME_DIR`, so they stay on the single caller path.
+/// The caller's [`socket_path`] is first. The state-dir socket is a second
+/// candidate whenever it differs (nw-829): a macOS launchd job, a daemon that
+/// started before `/run/user/<uid>` existed, or one from an older release
+/// binds there and never saw the caller's `XDG_RUNTIME_DIR`. The candidate
+/// directories come from the shared
+/// [`nestweaver_schema::runtime_paths::runtime_candidate_dirs`], the same
+/// function the MCP stdio server uses.
 pub fn daemon_socket_candidates(instance_id: &str) -> Vec<PathBuf> {
-    let caller = socket_path(instance_id);
-    // The second candidate exists only on macOS. Building it inside `cfg`
-    // keeps the binding immutable on Linux, where `-D unused-mut` is denied.
-    #[cfg(target_os = "macos")]
-    {
-        let supervised = launchd_socket_path(instance_id);
-        if supervised != caller {
-            return vec![caller, supervised];
-        }
-    }
-    vec![caller]
+    socket_candidates_in(
+        instance_id,
+        &nestweaver_schema::runtime_paths::runtime_candidate_dirs(instance_id),
+    )
+}
+
+fn socket_candidates_in(instance_id: &str, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter()
+        .map(|dir| socket_path_in(instance_id, dir))
+        .collect()
 }
 
 /// The candidate socket that accepts a connection right now, if any.
@@ -685,18 +675,13 @@ pub fn accepting_daemon_socket(instance_id: &str) -> Option<PathBuf> {
 }
 
 /// Pidfiles a client may find this instance's flock on. Same split as
-/// [`daemon_socket_candidates`]: the caller's runtime dir, then the launchd
-/// state dir on macOS when those differ.
+/// [`daemon_socket_candidates`]: the caller's runtime dir, then the state dir
+/// when those differ.
 pub fn pidfile_candidates(instance_id: &str) -> Vec<PathBuf> {
-    let caller = pidfile_path(instance_id);
-    #[cfg(target_os = "macos")]
-    {
-        let supervised = launchd_runtime_dir(instance_id).join("daemon.pid");
-        if supervised != caller {
-            return vec![caller, supervised];
-        }
-    }
-    vec![caller]
+    nestweaver_schema::runtime_paths::runtime_candidate_dirs(instance_id)
+        .into_iter()
+        .map(|dir| dir.join("daemon.pid"))
+        .collect()
 }
 
 fn socket_path_in(instance_id: &str, runtime: &Path) -> PathBuf {
@@ -1703,8 +1688,8 @@ pub fn read_effective_config_binding_for_verified_pid(
         Ok(binding) if binding.pid == expected_pid => Ok(binding),
         // A record in the caller's runtime dir for a different process does
         // not describe the PID the caller already verified. When that dir is
-        // not the one launchd bound, the supervised binding may still match.
-        Ok(binding) => match read_launchd_binding_for_verified_pid(
+        // not the one the daemon bound, an alternate binding may still match.
+        Ok(binding) => match read_alternate_binding_for_verified_pid(
             instance_id,
             expected_pid,
             caller_path.clone(),
@@ -1716,23 +1701,23 @@ pub fn read_effective_config_binding_for_verified_pid(
                 found: binding.pid,
             }),
         },
-        // The caller's runtime dir has no binding. A launchd daemon writes
-        // its binding beside the socket it actually bound, which ignores
-        // XDG_RUNTIME_DIR (nw-729). Accept that record only when its PID is
+        // The caller's runtime dir has no binding. A supervised daemon writes
+        // its binding beside the socket it actually bound, which may differ
+        // from the caller's XDG_RUNTIME_DIR. Accept it only when its PID is
         // the one the caller already verified — a stale file for a different
         // process stays Absent rather than becoming a PidMismatch.
         Err(EffectiveConfigBindingError::Absent { path }) => {
-            read_launchd_binding_for_verified_pid(instance_id, expected_pid, path)
+            read_alternate_binding_for_verified_pid(instance_id, expected_pid, path)
         }
         // `daemon start` creates the caller's runtime dir (mode follows the
-        // umask, often 0755) before it knows a launchd job is already
+        // umask, often 0755) before it knows a supervised daemon is already
         // healthy. That manufactured directory is Unsafe, not Absent, and
-        // used to hide the supervised binding. Trust the launchd record when
+        // used to hide the supervised binding. Trust an alternate record when
         // it matches the verified PID; if it does not, keep the Unsafe error.
-        // Same-path lookups never substitute: the launchd path is this path,
-        // so a loose real runtime dir still fails closed.
+        // Same-path lookups never substitute, so a loose real runtime
+        // directory still fails closed.
         Err(error @ EffectiveConfigBindingError::Unsafe { .. }) => {
-            match read_launchd_binding_for_verified_pid(instance_id, expected_pid, caller_path) {
+            match read_alternate_binding_for_verified_pid(instance_id, expected_pid, caller_path) {
                 Ok(supervised) => Ok(supervised),
                 Err(_) => Err(error),
             }
@@ -1741,24 +1726,20 @@ pub fn read_effective_config_binding_for_verified_pid(
     }
 }
 
-fn read_launchd_binding_for_verified_pid(
+fn read_alternate_binding_for_verified_pid(
     instance_id: &str,
     expected_pid: u32,
     absent: PathBuf,
 ) -> Result<EffectiveConfigBinding, EffectiveConfigBindingError> {
-    #[cfg(target_os = "macos")]
-    {
-        let alt = launchd_runtime_dir(instance_id).join(EFFECTIVE_CONFIG_BINDING_FILE);
-        if alt != effective_config_binding_path(instance_id)
+    let caller_path = effective_config_binding_path(instance_id);
+    for dir in nestweaver_schema::runtime_paths::runtime_candidate_dirs(instance_id) {
+        let alt = dir.join(EFFECTIVE_CONFIG_BINDING_FILE);
+        if alt != caller_path
             && let Ok(binding) = read_effective_config_binding_at(&alt)
             && binding.pid == expected_pid
         {
             return Ok(binding);
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (instance_id, expected_pid);
     }
     Err(EffectiveConfigBindingError::Absent { path: absent })
 }
@@ -2349,7 +2330,9 @@ pub fn daemon_gc_roots() -> DaemonGcRoots {
     // but the roots must still be reported as one).
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .ok()
-        .map(|xdg| PathBuf::from(xdg).join("nestweaver"))
+        .map(PathBuf::from)
+        .or_else(nestweaver_schema::runtime_paths::default_user_runtime_base)
+        .map(|base| base.join("nestweaver"))
         .filter(|root| *root != state);
     DaemonGcRoots {
         state,
@@ -4345,16 +4328,41 @@ mod tests {
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
         let dir_before = runtime_dir("test1234");
+        // A real directory, not a bogus path: TMPDIR is process-global, and a
+        // sibling test that allocates a tempdir while this one holds the lock
+        // (tempfile reads TMPDIR without taking ENV_LOCK) must keep working.
+        let alternate = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("TMPDIR");
         unsafe {
-            std::env::set_var("TMPDIR", "/some/other/tmpdir");
+            std::env::set_var("TMPDIR", alternate.path());
         }
         let dir_after = runtime_dir("test1234");
         unsafe {
-            std::env::remove_var("TMPDIR");
+            match previous {
+                Some(value) => std::env::set_var("TMPDIR", value),
+                None => std::env::remove_var("TMPDIR"),
+            }
         }
         assert_eq!(
             dir_before, dir_after,
             "runtime_dir must not change when TMPDIR changes"
+        );
+    }
+
+    /// nw-829. The candidate list is the shared one: primary first, then the
+    /// legacy state-dir socket, on every platform (not just macOS).
+    #[test]
+    fn socket_candidates_include_the_legacy_state_dir_socket() {
+        use nestweaver_schema::runtime_paths as rp;
+        let id = "legacy01";
+        let dirs = rp::runtime_candidate_dirs_with(None, Some(PathBuf::from("/run/user/7")), id);
+        let sockets = socket_candidates_in(id, &dirs);
+        assert_eq!(
+            sockets,
+            vec![
+                PathBuf::from("/run/user/7/nestweaver/legacy01/daemon.sock"),
+                rp::state_runtime_dir(id).join("daemon.sock"),
+            ]
         );
     }
 
@@ -4377,13 +4385,9 @@ mod tests {
     #[test]
     fn launchd_runtime_dir_ignores_xdg_runtime_dir() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
         let id = "xdghide1";
-        assert_eq!(launchd_runtime_dir(id), runtime_dir(id));
-        assert_eq!(launchd_socket_path(id), socket_path(id));
-        assert_eq!(daemon_socket_candidates(id), vec![socket_path(id)]);
+        // XDG set: the first two candidates do not depend on /run/user (nw-829).
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "/tmp/nw-xdg-hide-test");
         }
@@ -4396,20 +4400,33 @@ mod tests {
             !launchd_runtime_dir(id).starts_with("/tmp/nw-xdg-hide-test"),
             "supervised runtime dir must not follow the caller's XDG_RUNTIME_DIR"
         );
+        // The supervised/legacy state-dir socket and pidfile are a second
+        // candidate on every platform, not only macOS (nw-829).
         let candidates = daemon_socket_candidates(id);
-        assert_eq!(candidates[0], socket_path(id));
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(candidates.len(), 2);
-            assert_eq!(candidates[1], launchd_socket_path(id));
-            assert_eq!(pidfile_candidates(id).len(), 2);
+        assert_eq!(
+            &candidates[..2],
+            &[socket_path(id), launchd_socket_path(id)]
+        );
+        // Linux may additionally discover the owned /run/user socket.
+        assert!((2..=3).contains(&candidates.len()));
+        let unique: std::collections::HashSet<_> = candidates.iter().collect();
+        assert_eq!(unique.len(), candidates.len());
+        #[cfg(target_os = "linux")]
+        if candidates.len() == 3 {
+            assert_eq!(
+                candidates[2],
+                PathBuf::from(format!(
+                    "/run/user/{}/nestweaver/{id}/daemon.sock",
+                    unsafe { libc::geteuid() }
+                ))
+            );
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert_eq!(candidates.len(), 1);
-        }
+        assert_eq!(pidfile_candidates(id).len(), candidates.len());
         unsafe {
-            std::env::remove_var("XDG_RUNTIME_DIR");
+            match previous {
+                Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
         }
     }
 
@@ -4463,6 +4480,101 @@ mod tests {
                 EffectiveConfigBindingSource::CompiledDefaults
             ));
         });
+    }
+
+    #[cfg(unix)]
+    fn write_test_config_binding(dir: &Path, pid: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(EFFECTIVE_CONFIG_BINDING_FILE);
+        let binding =
+            EffectiveConfigBinding::new(pid, EffectiveConfigBindingSource::CompiledDefaults);
+        std::fs::write(&path, serde_json::to_vec(&binding).unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_pid_binding_uses_shared_state_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        with_xdg_state_and_runtime(
+            &scratch.path().join("state"),
+            &scratch.path().join("client"),
+            || {
+                let id = "candidate-binding";
+                let state = nestweaver_schema::runtime_paths::state_runtime_dir(id);
+                write_test_config_binding(&state, 4242);
+                assert_ne!(state, runtime_dir(id));
+                assert_eq!(
+                    read_effective_config_binding_for_verified_pid(id, 4242)
+                        .unwrap()
+                        .pid,
+                    4242
+                );
+
+                // A directory created by the caller must not hide the actual daemon binding.
+                let primary = runtime_dir(id);
+                std::fs::create_dir_all(&primary).unwrap();
+                std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert_eq!(
+                    read_effective_config_binding_for_verified_pid(id, 4242)
+                        .unwrap()
+                        .pid,
+                    4242
+                );
+
+                // Nor may a stale record for a different daemon win over verified identity.
+                write_test_config_binding(&primary, 7);
+                assert_eq!(
+                    read_effective_config_binding_for_verified_pid(id, 4242)
+                        .unwrap()
+                        .pid,
+                    4242
+                );
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_pid_binding_candidates_preserve_primary_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        with_xdg_state_and_runtime(
+            &scratch.path().join("state"),
+            &scratch.path().join("client"),
+            || {
+                let id = "candidate-errors";
+                let state = nestweaver_schema::runtime_paths::state_runtime_dir(id);
+                write_test_config_binding(&state, 7);
+                assert!(matches!(
+                    read_effective_config_binding_for_verified_pid(id, 4242),
+                    Err(EffectiveConfigBindingError::Absent { .. })
+                ));
+                let primary = runtime_dir(id);
+                write_test_config_binding(&primary, 8);
+                assert!(matches!(
+                    read_effective_config_binding_for_verified_pid(id, 4242),
+                    Err(EffectiveConfigBindingError::PidMismatch { found: 8, .. })
+                ));
+                std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert!(matches!(
+                    read_effective_config_binding_for_verified_pid(id, 4242),
+                    Err(EffectiveConfigBindingError::Unsafe { .. })
+                ));
+
+                // A matching alternate cannot suppress malformed authoritative caller metadata.
+                write_test_config_binding(&state, 4242);
+                write_test_config_binding(&primary, 4242);
+                std::fs::write(primary.join(EFFECTIVE_CONFIG_BINDING_FILE), b"not JSON").unwrap();
+                assert!(matches!(
+                    read_effective_config_binding_for_verified_pid(id, 4242),
+                    Err(EffectiveConfigBindingError::Corrupt { .. })
+                ));
+            },
+        );
     }
 
     #[test]

@@ -86,6 +86,71 @@ class FixtureSafetyTests(unittest.TestCase):
                 IsolatedDaemon.assert_daemon_status(
                     subprocess.CompletedProcess([], 0, json.dumps(payload)))
 
+    @staticmethod
+    def status_result(*, stale=False, busy=False, repos=1, **updates):
+        payload = dict(runtime_telemetry="available", indexing_active=False,
+                       repo_count=repos, degraded_components=[],
+                       status_observation=dict(stale=stale, busy=busy))
+        payload.update(updates)
+        return subprocess.CompletedProcess([], 0, json.dumps(payload))
+
+    def test_indexed_status_waits_for_current_counts(self):
+        fixture = self.make_fixture()
+        fixture.run = Mock(side_effect=[self.status_result(stale=True, repos=0),
+                                        self.status_result()])
+        with patch("isolated_daemon.time.sleep"):
+            result = fixture.wait_for_indexed_status()
+        self.assertEqual(json.loads(result.stdout)["repo_count"], 1)
+        self.assertEqual(fixture.run.call_count, 2)
+        self.assertTrue(all(0 < call.kwargs["timeout"] <= 3
+                            for call in fixture.run.call_args_list))
+
+    def test_indexed_status_waits_for_expected_two_repositories(self):
+        fixture = self.make_fixture()
+        fixture.run = Mock(side_effect=[self.status_result(stale=True, repos=1),
+                                        self.status_result(repos=2)])
+        with patch("isolated_daemon.time.sleep"):
+            result = fixture.wait_for_indexed_status(expected_repos=2)
+        self.assertEqual(json.loads(result.stdout)["repo_count"], 2)
+        self.assertEqual(fixture.run.call_count, 2)
+
+    def test_indexed_status_rejects_current_wrong_expected_repository_count(self):
+        fixture = self.make_fixture()
+        fixture.run = Mock(return_value=self.status_result(repos=1))
+        with patch("isolated_daemon.time.sleep") as sleep, self.assertRaises(AssertionError):
+            fixture.wait_for_indexed_status(expected_repos=2)
+        self.assertEqual(fixture.run.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_indexed_status_wait_is_bounded_and_preserves_last_observation(self):
+        fixture = self.make_fixture()
+        fixture.run = Mock(return_value=self.status_result(stale=True, repos=0))
+        fixture.record = Mock()
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+        with patch("isolated_daemon.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("isolated_daemon.time.sleep", side_effect=advance):
+            with self.assertRaisesRegex(TimeoutError, "did not become current"):
+                fixture.wait_for_indexed_status(timeout=0.1)
+        self.assertEqual(fixture.run.call_count, 1)
+        self.assertEqual(fixture.record.call_args.kwargs["last_status"]["repo_count"], 0)
+
+    def test_indexed_status_does_not_retry_invalid_or_direct_observations(self):
+        for result in [self.status_result(repos=0),
+                       self.status_result(stale=True, runtime_telemetry="unavailable"),
+                       self.status_result(stale=True, degraded_components=["daemon_runtime"]),
+                       self.status_result(status_observation=None),
+                       self.status_result(status_observation=dict(stale="false", busy=False))]:
+            with self.subTest(payload=result.stdout):
+                fixture = self.make_fixture()
+                fixture.run = Mock(return_value=result)
+                with patch("isolated_daemon.time.sleep") as sleep, \
+                        self.assertRaises(AssertionError):
+                    fixture.wait_for_indexed_status()
+                self.assertEqual(fixture.run.call_count, 1)
+                sleep.assert_not_called()
+
     def signal_case(self, first_signal, group=False):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
