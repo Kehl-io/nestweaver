@@ -1688,8 +1688,8 @@ pub fn read_effective_config_binding_for_verified_pid(
         Ok(binding) if binding.pid == expected_pid => Ok(binding),
         // A record in the caller's runtime dir for a different process does
         // not describe the PID the caller already verified. When that dir is
-        // not the one launchd bound, the supervised binding may still match.
-        Ok(binding) => match read_launchd_binding_for_verified_pid(
+        // not the one the daemon bound, an alternate binding may still match.
+        Ok(binding) => match read_alternate_binding_for_verified_pid(
             instance_id,
             expected_pid,
             caller_path.clone(),
@@ -1701,23 +1701,23 @@ pub fn read_effective_config_binding_for_verified_pid(
                 found: binding.pid,
             }),
         },
-        // The caller's runtime dir has no binding. A launchd daemon writes
-        // its binding beside the socket it actually bound, which ignores
-        // XDG_RUNTIME_DIR (nw-729). Accept that record only when its PID is
+        // The caller's runtime dir has no binding. A supervised daemon writes
+        // its binding beside the socket it actually bound, which may differ
+        // from the caller's XDG_RUNTIME_DIR. Accept it only when its PID is
         // the one the caller already verified — a stale file for a different
         // process stays Absent rather than becoming a PidMismatch.
         Err(EffectiveConfigBindingError::Absent { path }) => {
-            read_launchd_binding_for_verified_pid(instance_id, expected_pid, path)
+            read_alternate_binding_for_verified_pid(instance_id, expected_pid, path)
         }
         // `daemon start` creates the caller's runtime dir (mode follows the
-        // umask, often 0755) before it knows a launchd job is already
+        // umask, often 0755) before it knows a supervised daemon is already
         // healthy. That manufactured directory is Unsafe, not Absent, and
-        // used to hide the supervised binding. Trust the launchd record when
+        // used to hide the supervised binding. Trust an alternate record when
         // it matches the verified PID; if it does not, keep the Unsafe error.
-        // Same-path lookups never substitute: the launchd path is this path,
-        // so a loose real runtime dir still fails closed.
+        // Same-path lookups never substitute, so a loose real runtime
+        // directory still fails closed.
         Err(error @ EffectiveConfigBindingError::Unsafe { .. }) => {
-            match read_launchd_binding_for_verified_pid(instance_id, expected_pid, caller_path) {
+            match read_alternate_binding_for_verified_pid(instance_id, expected_pid, caller_path) {
                 Ok(supervised) => Ok(supervised),
                 Err(_) => Err(error),
             }
@@ -1726,24 +1726,20 @@ pub fn read_effective_config_binding_for_verified_pid(
     }
 }
 
-fn read_launchd_binding_for_verified_pid(
+fn read_alternate_binding_for_verified_pid(
     instance_id: &str,
     expected_pid: u32,
     absent: PathBuf,
 ) -> Result<EffectiveConfigBinding, EffectiveConfigBindingError> {
-    #[cfg(target_os = "macos")]
-    {
-        let alt = launchd_runtime_dir(instance_id).join(EFFECTIVE_CONFIG_BINDING_FILE);
-        if alt != effective_config_binding_path(instance_id)
+    let caller_path = effective_config_binding_path(instance_id);
+    for dir in nestweaver_schema::runtime_paths::runtime_candidate_dirs(instance_id) {
+        let alt = dir.join(EFFECTIVE_CONFIG_BINDING_FILE);
+        if alt != caller_path
             && let Ok(binding) = read_effective_config_binding_at(&alt)
             && binding.pid == expected_pid
         {
             return Ok(binding);
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (instance_id, expected_pid);
     }
     Err(EffectiveConfigBindingError::Absent { path: absent })
 }
@@ -4383,7 +4379,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var_os("XDG_RUNTIME_DIR");
         let id = "xdghide1";
-        // XDG set: deterministic regardless of the host's /run/user (nw-829).
+        // XDG set: the first two candidates do not depend on /run/user (nw-829).
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "/tmp/nw-xdg-hide-test");
         }
@@ -4399,8 +4395,25 @@ mod tests {
         // The supervised/legacy state-dir socket and pidfile are a second
         // candidate on every platform, not only macOS (nw-829).
         let candidates = daemon_socket_candidates(id);
-        assert_eq!(candidates, vec![socket_path(id), launchd_socket_path(id)]);
-        assert_eq!(pidfile_candidates(id).len(), 2);
+        assert_eq!(
+            &candidates[..2],
+            &[socket_path(id), launchd_socket_path(id)]
+        );
+        // Linux may additionally discover the owned /run/user socket.
+        assert!((2..=3).contains(&candidates.len()));
+        let unique: std::collections::HashSet<_> = candidates.iter().collect();
+        assert_eq!(unique.len(), candidates.len());
+        #[cfg(target_os = "linux")]
+        if candidates.len() == 3 {
+            assert_eq!(
+                candidates[2],
+                PathBuf::from(format!(
+                    "/run/user/{}/nestweaver/{id}/daemon.sock",
+                    unsafe { libc::geteuid() }
+                ))
+            );
+        }
+        assert_eq!(pidfile_candidates(id).len(), candidates.len());
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
@@ -4459,6 +4472,101 @@ mod tests {
                 EffectiveConfigBindingSource::CompiledDefaults
             ));
         });
+    }
+
+    #[cfg(unix)]
+    fn write_test_config_binding(dir: &Path, pid: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(EFFECTIVE_CONFIG_BINDING_FILE);
+        let binding =
+            EffectiveConfigBinding::new(pid, EffectiveConfigBindingSource::CompiledDefaults);
+        std::fs::write(&path, serde_json::to_vec(&binding).unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_pid_binding_uses_shared_state_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        with_xdg_state_and_runtime(
+            &scratch.path().join("state"),
+            &scratch.path().join("client"),
+            || {
+                let id = "candidate-binding";
+                let state = nestweaver_schema::runtime_paths::state_runtime_dir(id);
+                write_test_config_binding(&state, 4242);
+                assert_ne!(state, runtime_dir(id));
+                assert_eq!(
+                    read_effective_config_binding_for_verified_pid(id, 4242)
+                        .unwrap()
+                        .pid,
+                    4242
+                );
+
+                // A directory created by the caller must not hide the actual daemon binding.
+                let primary = runtime_dir(id);
+                std::fs::create_dir_all(&primary).unwrap();
+                std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert_eq!(
+                    read_effective_config_binding_for_verified_pid(id, 4242)
+                        .unwrap()
+                        .pid,
+                    4242
+                );
+
+                // Nor may a stale record for a different daemon win over verified identity.
+                write_test_config_binding(&primary, 7);
+                assert_eq!(
+                    read_effective_config_binding_for_verified_pid(id, 4242)
+                        .unwrap()
+                        .pid,
+                    4242
+                );
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_pid_binding_candidates_preserve_primary_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        with_xdg_state_and_runtime(
+            &scratch.path().join("state"),
+            &scratch.path().join("client"),
+            || {
+                let id = "candidate-errors";
+                let state = nestweaver_schema::runtime_paths::state_runtime_dir(id);
+                write_test_config_binding(&state, 7);
+                assert!(matches!(
+                    read_effective_config_binding_for_verified_pid(id, 4242),
+                    Err(EffectiveConfigBindingError::Absent { .. })
+                ));
+                let primary = runtime_dir(id);
+                write_test_config_binding(&primary, 8);
+                assert!(matches!(
+                    read_effective_config_binding_for_verified_pid(id, 4242),
+                    Err(EffectiveConfigBindingError::PidMismatch { found: 8, .. })
+                ));
+                std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert!(matches!(
+                    read_effective_config_binding_for_verified_pid(id, 4242),
+                    Err(EffectiveConfigBindingError::Unsafe { .. })
+                ));
+
+                // A matching alternate cannot suppress malformed authoritative caller metadata.
+                write_test_config_binding(&state, 4242);
+                write_test_config_binding(&primary, 4242);
+                std::fs::write(primary.join(EFFECTIVE_CONFIG_BINDING_FILE), b"not JSON").unwrap();
+                assert!(matches!(
+                    read_effective_config_binding_for_verified_pid(id, 4242),
+                    Err(EffectiveConfigBindingError::Corrupt { .. })
+                ));
+            },
+        );
     }
 
     #[test]

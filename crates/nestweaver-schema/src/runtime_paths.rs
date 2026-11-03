@@ -18,10 +18,11 @@
 //! different values, which made two clients disagree about the socket.
 //!
 //! Clients probe [`runtime_candidate_dirs`]: the primary directory first, then
-//! the state directory when it differs. That covers a daemon started before
-//! `/run/user/<uid>` existed (or by an older release) and a launchd job on
-//! macOS, neither of which sees the caller's `XDG_RUNTIME_DIR`. The daemon
-//! itself binds only the primary directory.
+//! the state directory and the owned `/run/user/<uid>` directory, deduped.
+//! That covers a daemon started before the user runtime directory existed,
+//! an older release or launchd job using state, and a system unit using the
+//! user runtime directory while its client has a different `XDG_RUNTIME_DIR`.
+//! The daemon itself binds only the primary directory.
 
 use std::path::{Path, PathBuf};
 
@@ -48,7 +49,7 @@ pub fn runtime_dir_with(
 }
 
 /// Every directory a client may find this instance in, primary first: the
-/// resolved runtime dir, then the state dir when it is a different path.
+/// resolved runtime dir, state dir, and owned user runtime dir, deduped.
 pub fn runtime_candidate_dirs(instance_id: &str) -> Vec<PathBuf> {
     let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     runtime_candidate_dirs_with(xdg.as_deref(), default_user_runtime_base(), instance_id)
@@ -60,13 +61,16 @@ pub fn runtime_candidate_dirs_with(
     user_base: Option<PathBuf>,
     instance_id: &str,
 ) -> Vec<PathBuf> {
-    let primary = runtime_dir_with(xdg_runtime_dir, user_base, instance_id);
+    let primary = runtime_dir_with(xdg_runtime_dir, user_base.clone(), instance_id);
     let legacy = state_runtime_dir(instance_id);
-    if legacy == primary {
-        vec![primary]
-    } else {
-        vec![primary, legacy]
+    let user = user_base.map(|base| base.join("nestweaver").join(instance_id));
+    let mut dirs = vec![primary];
+    for candidate in std::iter::once(legacy).chain(user) {
+        if !dirs.contains(&candidate) {
+            dirs.push(candidate);
+        }
     }
+    dirs
 }
 
 /// The directory a launchd-supervised daemon binds: launchd does not pass
@@ -161,6 +165,43 @@ mod tests {
             runtime_candidate_dirs_with(Some(root), None, id),
             vec![state]
         );
+    }
+
+    #[test]
+    fn different_xdg_keeps_the_owned_user_runtime_candidate() {
+        let id = "split829";
+        let dirs = runtime_candidate_dirs_with(
+            Some("/caller-runtime"),
+            Some(PathBuf::from("/run/user/7")),
+            id,
+        );
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/caller-runtime/nestweaver/split829"),
+                state_runtime_dir(id),
+                PathBuf::from("/run/user/7/nestweaver/split829"),
+            ],
+            "a caller-specific XDG must not hide the system-unit socket"
+        );
+    }
+
+    #[test]
+    fn user_runtime_candidate_is_deduped_against_primary_and_state() {
+        let id = "dedup829";
+        let user = PathBuf::from("/run/user/7/nestweaver/dedup829");
+        let same_as_primary = runtime_candidate_dirs_with(
+            Some("/run/user/7"),
+            Some(PathBuf::from("/run/user/7")),
+            id,
+        );
+        assert_eq!(same_as_primary.iter().filter(|p| *p == &user).count(), 1);
+        let state = state_runtime_dir(id);
+        let state_base = state.parent().unwrap().parent().unwrap().to_path_buf();
+        let same_as_state =
+            runtime_candidate_dirs_with(Some("/caller-runtime"), Some(state_base), id);
+        assert_eq!(same_as_state.iter().filter(|p| *p == &state).count(), 1);
+        assert_eq!(same_as_state.len(), 2);
     }
 
     #[test]
