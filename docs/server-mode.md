@@ -84,10 +84,16 @@ different `XDG_RUNTIME_DIR` therefore does not hide a system unit's socket. The
 daemon binds only its primary directory; `daemon status` reports the actual
 selected socket.
 
-This system-unit example deliberately leaves `XDG_RUNTIME_DIR` unset. It works
-with the user runtime directory when available and otherwise uses the state
-fallback, so it does not depend on a login session or lingering. Create the
-`nestweaver` user/group and configure Git credentials for that account. Provide
+This system-unit example deliberately leaves `XDG_RUNTIME_DIR` unset. A
+dedicated service account that never logs in has no `/run/user/<uid>`, so the
+daemon uses the state fallback and needs no login session or lingering. If the
+account can log in interactively, `/run/user/<uid>` exists while a session is
+open, the daemon binds there, and logind removes that directory when the last
+session ends unless lingering is enabled: run `loginctl enable-linger <user>`
+for such an account, or the socket, pidfile and lock vanish under a running
+daemon and clients fall through to the state directory and autostart a second
+writer. Create the `nestweaver` user/group and configure Git credentials for
+that account. Provide
 the instance config and readable TLS files; put `NESTWEAVER_AUTH_TOKEN` and any
 admin token in a root-owned, mode-0600 `/etc/nestweaver/server.env`:
 
@@ -143,8 +149,6 @@ deadline, even if the unit stays deactivating indefinitely. See
 finite 690 s or 720 s timeout is not a safe completion guarantee.
 
 ### Environment variables
-
-All flags### Environment variables
 
 All flags can be set via environment variables:
 
@@ -1073,6 +1077,14 @@ Their union cardinality is uncertain: search reports a `gte` lower bound from
 the tier totals, which can be smaller than the number of returned copies. This
 configuration does not change persisted UIDs or require an identity migration.
 
+Upgrade note (12.2.5): earlier releases treated two vaults as the same when
+their root paths matched, instance aside, so a mirrored vault at the same path
+on a laptop and a server deduplicated by accident. That shortcut is gone: until
+`vault_mappings` binds the pair, a merge returns the local copy and the
+upstream copy of each note side by side, and the merged total is reported as a
+`gte` lower bound so the duplication is visible rather than hidden. Add the
+binding for every vault you mirror before relying on merged note counts.
+
 A row whose `uid` is not a recognised canonical shape (for example `proj:` or
 `contract:` rows) is keyed by its raw uid string, never by title, and never
 counts as proof of a distinct set. On the structured merge the lower-bound
@@ -1207,7 +1219,7 @@ the `source_server` it came from. Provenance is carried in `_meta.sources`.
   },
   "_meta": {
     "scope": "hybrid",
-    "sources": ["local", "server"],
+    "sources": ["local", "<upstream name>"],
     "stale_repos": []
   }
 }
