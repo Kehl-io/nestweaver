@@ -77,39 +77,70 @@ owned by the same user (it is where an interactive session of that user
 resolves `XDG_RUNTIME_DIR`), and otherwise
 `~/.local/state/nestweaver/<instance>/`.
 
-The daemon, the CLI, and the MCP stdio server all resolve this through one
-shared function, and clients probe two places: the resolved runtime directory
-first, then the `~/.local/state/nestweaver/<instance>/` directory (a daemon
-started before `/run/user/<uid>` existed, or by an older release, lives there).
-The daemon itself binds only the first. `/run/user/<uid>` exists only while the
-user has a login session or lingering enabled, so a system unit running as that
-user needs lingering:
+The daemon, CLI, and MCP stdio server share this resolution. On Linux, clients
+probe the resolved runtime directory, the state directory, and the owned
+`/run/user/<uid>/nestweaver/<instance>/` directory, without duplicates. A caller's
+different `XDG_RUNTIME_DIR` therefore does not hide a system unit's socket. The
+daemon binds only its primary directory; `daemon status` reports the actual
+selected socket.
+
+This system-unit example deliberately leaves `XDG_RUNTIME_DIR` unset. It works
+with the user runtime directory when available and otherwise uses the state
+fallback, so it does not depend on a login session or lingering. Create the
+`nestweaver` user/group and configure Git credentials for that account. Provide
+the instance config and readable TLS files; put `NESTWEAVER_AUTH_TOKEN` and any
+admin token in a root-owned, mode-0600 `/etc/nestweaver/server.env`:
 
 ```ini
 # /etc/systemd/system/nestweaver-server.service
 [Unit]
 Description=NestWeaver server
+Wants=network-online.target
 After=network-online.target
 
 [Service]
+Type=simple
 User=nestweaver
-# Optional: pin the runtime dir explicitly instead of relying on the
-# /run/user/<uid> fallback. Must match the CLI user's XDG_RUNTIME_DIR.
-# Environment=XDG_RUNTIME_DIR=/run/user/%U
+Group=nestweaver
+Environment=HOME=/var/lib/nestweaver
+EnvironmentFile=/etc/nestweaver/server.env
+UnsetEnvironment=XDG_RUNTIME_DIR XDG_STATE_HOME
+StateDirectory=nestweaver
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/nestweaver
+UMask=0077
 ExecStart=/usr/local/bin/nestweaver daemon --db /var/lib/nestweaver/brain.lbug run --config /etc/nestweaver/instance.toml --server --bind 0.0.0.0:9378 --tls-cert /etc/nestweaver/tls/server.pem --tls-key /etc/nestweaver/tls/server.key
-Restart=on-failure
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=infinity
+SendSIGKILL=no
+Restart=no
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-```bash
-sudo loginctl enable-linger nestweaver   # keeps /run/user/<uid> present
-```
+systemd creates the state directory with the configured ownership before
+`ExecStart`. NestWeaver accepts `/run/user/<uid>` only when it is a real
+directory owned by the service UID; let logind manage that directory. If an
+operator instead pins that user runtime path explicitly, enable lingering for
+the account and add `Requires=user@<uid>.service` and
+`After=user@<uid>.service`, using its actual numeric UID. The default-fallback
+example above needs neither dependency.
 
-Residual case: if `/run/user/<uid>` did not exist when the daemon started (so it
-used the state directory) and a later CLI has `XDG_RUNTIME_DIR` set, the CLI
-still finds the daemon through the state-directory candidate.
+Run local clients as the same account with the same HOME/state configuration.
+If the daemon started in the state directory before a user runtime directory
+existed, later clients still find it through the state candidate. A deliberately
+custom daemon runtime path outside these candidates must also be configured in
+its clients.
+
+There is no `ExecStop` wrapper: `systemctl stop nestweaver-server` sends SIGTERM
+to the foreground daemon and waits for its drain. Merely queued/deferred jobs
+persist for the next start and do not delay an otherwise idle stop. Genuine
+in-flight writes or index jobs are allowed to finish without an automatic kill
+deadline, even if the unit stays deactivating indefinitely. See
+[Daemon shutdown](guide/daemon-shutdown.md) before changing this stop policy; a
+finite 690 s or 720 s timeout is not a safe completion guarantee.
 
 ### Environment variables
 

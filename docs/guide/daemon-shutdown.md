@@ -10,12 +10,14 @@ supervisor is in the picture.
   the **same drain**, with **listeners still up**. Reads keep being served while
   writes drain — though an individual read can stall for seconds while a write
   commits, which is pre-existing store behaviour and not caused by the drain.
-- **New writes are refused** (`UNAVAILABLE`) once shutdown starts, so the drain
-  is monotone and is guaranteed to finish. Reads are not gated. This covers the
-  gRPC surface; the web admin routes take the write gate but are outside this
-  guard and are invisible to the drain either way.
-- An idle daemon exits **immediately**. Nothing about this makes a normal stop
-  slower.
+- **New writes are refused** (`UNAVAILABLE`) once shutdown starts, so new work
+  cannot extend the drain. A genuinely running write or index job is waited on
+  without a deadline, including work that may be wedged. Reads are not gated.
+  gRPC write RPCs and web admin mutations both refuse new work (gRPC
+  `UNAVAILABLE` or HTTP 503); admitted mutations remain counted by the drain.
+- An idle daemon exits **immediately**, including when jobs are only queued or
+  deferred and `indexing_active` is stale. Queued jobs persist for the next
+  start; the flag alone is not evidence of a running job.
 - If a write is still in flight when the stop grace expires, `daemon stop`
   **reports and stands down**. It leaves the daemon running and exits non-zero.
   It does **not** SIGKILL.
@@ -102,12 +104,17 @@ that apart — check the daemon log before concluding.
 Exit status is non-zero in both cases: the operator asked for the daemon to stop
 and it has not stopped.
 
+The daemon's own log separately reports active writes, genuinely in-flight index
+jobs and the queued-job hint on a 30-second cadence while waiting. An absent
+hint is not a zero count. A queued backlog does not hold the drain once the
+actual write and in-flight-job counters reach zero.
+
 ## What is still served during a drain
 
 Most reads. Reads do not take the write gate — which is why killing read service
-during a write drain bought nothing and was pure cost. The exceptions are
-`embed` and `plan_embed`: they take the same write gate and block until the
-in-flight write completes.
+during a write drain bought nothing and was pure cost. `plan_embed` takes that
+gate and can block until the in-flight write completes. `embed` is a write RPC
+and is refused with `UNAVAILABLE` once shutdown starts.
 
 "Served" is not "fast". A read can stall for **seconds** while a write commits —
 measured at up to 15s under load. This is store-level contention, not something
@@ -115,15 +122,15 @@ the drain introduces: a control run indexing the same repo with **no shutdown at
 all** produced the same stalls at the same magnitude. Do not read "reads keep
 working" as a latency guarantee.
 
-New **writes** during a drain are refused outright with `UNAVAILABLE` — see the
-short version above for why that refusal is what makes the drain terminate.
+New write RPCs during a drain are refused outright with `UNAVAILABLE`; new
+arrivals cannot extend the wait, but existing work still has to finish.
 
 ## Timeouts
 
 | Knob | Default | What it is |
 |---|---|---|
 | `NESTWEAVER_DRAIN_TIMEOUT_SECS` | 660 | Drain ceiling. With a write in flight — or a genuinely running index job (the drain reads the worker pool's own in-flight counter) — this is a **reporting** threshold, not a deadline. With only a stuck `indexing_active` flag (no job in flight, no write) the drain does not wait at all and exits promptly (nw-830). |
-| `NESTWEAVER_STOP_GRACE_SECS` | ceiling + 30 (690) | How long `daemon stop` waits before reporting and standing down. **Not** a kill deadline. Deliberately shorter than the launchd `ExitTimeOut` below, so the CLI reports before launchd kills rather than after. |
+| `NESTWEAVER_STOP_GRACE_SECS` | ceiling + 30 (690) | How long `daemon stop` waits before reporting and standing down. **Not** a kill deadline, and not a limit for a supervisor's stop policy. |
 | `daemon stop --force` | 10s, fixed | SIGTERM, brief wait for a clean exit, then SIGKILL. Ignores the two variables above — an operator using `--force` should not have to wait 11 minutes first. |
 
 ## Process supervisors — read this before assuming a guarantee
@@ -141,31 +148,41 @@ and names the supervisor/manual restart commands instead.
 
 ### Linux, `daemon start` — **fully fixed**
 
-This repo ships **no systemd unit** and no service-installer command. On Linux
-`nestweaver daemon start` spawns a bare detached process supervised by nothing.
+This repo installs **no systemd unit** and has no service-installer command. On
+Linux `nestweaver daemon start` spawns a bare detached process supervised by nothing.
 There is no external timer, so the drain really is unbounded and `daemon stop`
 really does refuse to kill. This is the case the change fixes completely.
 
-### Linux, your own systemd unit — **exposed unless you configure it**
+### Linux, your own systemd unit — wait for genuine work
 
-If you wrote a unit yourself, systemd's `TimeoutStopSec` defaults to **90
-seconds**, after which it sends SIGKILL. That is well inside a normal index, so
-`systemctl stop` will crash the daemon mid-write regardless of anything here.
-Set it to at least the drain ceiling plus a buffer:
+A finite systemd stop timeout can kill a daemon that is correctly draining.
+Neither the daemon's 660 s reporting threshold nor the CLI's 690 s observation
+grace bounds a genuine write. Use an unbounded stop policy rather than adding a
+buffer to either number:
 
 ```ini
 [Service]
 ExecStart=/usr/local/bin/nestweaver daemon --db /var/lib/nestweaver/brain.lbug run
-# Must exceed NESTWEAVER_DRAIN_TIMEOUT_SECS (default 660) or systemd SIGKILLs
-# a draining daemon mid-write. `infinity` removes the deadline entirely at the
-# cost of a stop that can hang; 690s matches `nestweaver daemon stop`.
-TimeoutStopSec=690
+TimeoutStopSec=infinity
 KillSignal=SIGTERM
-Restart=on-failure
+KillMode=mixed
+SendSIGKILL=no
+Restart=no
 ```
 
-Even so, this is a **hard deadline** systemd enforces. It moves the exposure
-window; it does not remove it.
+Keep the daemon in the foreground with `daemon run`, not `daemon start`.
+With no `ExecStop` helper, systemd sends SIGTERM to its tracked main process.
+`KillMode=mixed` leaves its child work to the daemon during that drain;
+`SendSIGKILL=no` disables subsequent automatic escalation. The full
+[server-unit example](../server-mode.md#runtime-directory-and-systemd) also sets
+the service account's HOME and directory ownership explicitly.
+
+`systemctl stop` can remain deactivating indefinitely while a genuine write or
+index job runs. This is deliberate: inspect the live PID/socket and periodic
+drain reports instead of forcing a timing ceiling. Jobs that are merely queued
+or deferred persist and do not delay an idle stop. A longer finite timeout such
+as 720 s only postpones the same unsafe kill; it does not prove that work will
+have finished.
 
 ### Stopping the wrong daemon — **the supervisor does not own the lock**
 
@@ -247,11 +264,12 @@ seconds**.
 
 ### Honest summary
 
-**The interactive case is fixed. The supervised case remains exposed until the
-graph store is crash-safe.** Widening supervisor timeouts moves the deadline out
-to where a legitimate drain usually fits; it does not make the kill safe, and a
-drain longer than the configured timeout still ends in the nw-126 crash. The
-real fix is crash safety in the store, not a larger number here.
+Interactive shutdown and the recommended systemd policy wait for genuine work
+without an automatic kill deadline. The finite launchd and Docker policies
+described above still expose a sufficiently long drain to a forced kill.
+Widening those timeouts does not make the kill safe. None of these policies
+makes the graph store crash-safe or protects a write from an explicit forced
+kill; that requires crash safety in the store.
 
 ### Observe the selected runtime before recovery
 
