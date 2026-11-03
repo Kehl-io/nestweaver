@@ -90,6 +90,12 @@ class IsolatedDaemon:
                 and "nestweaver" in parts[1] and "daemon" in parts[1]
                 and " run" in parts[1]}
 
+    @staticmethod
+    def is_temp_rooted(command):
+        """True when a daemon command line serves a database under a temp dir."""
+        roots = {tempfile.gettempdir(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"}
+        return any(f" {root}/" in command or f"={root}/" in command for root in roots)
+
     def record(self, **event):
         event["time"] = time.time()
         self.events.append(event)
@@ -342,8 +348,14 @@ class IsolatedDaemon:
         if self.log:
             self.log.close()
         after = self.daemons()
+        # Only daemons that could be someone's production service count. The
+        # daemon_test suite runs its cases in parallel, and every sibling case
+        # starts and stops its own throwaway daemon under the system temp dir;
+        # those come and go during this fixture and are not evidence that we
+        # touched anything. A daemon on a real database path that vanished or
+        # changed identity still fails the guard.
         changed = {pid: command for pid, command in self.initial_daemons.items()
-                   if after.get(pid) != command}
+                   if after.get(pid) != command and not self.is_temp_rooted(command)}
         self.record(kind="production_daemon_check", unchanged=not changed, changed=changed)
         if changed:
             raise AssertionError(f"pre-existing daemon identity changed: {changed}")

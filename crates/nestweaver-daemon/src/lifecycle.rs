@@ -4328,12 +4328,20 @@ mod tests {
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
         let dir_before = runtime_dir("test1234");
+        // A real directory, not a bogus path: TMPDIR is process-global, and a
+        // sibling test that allocates a tempdir while this one holds the lock
+        // (tempfile reads TMPDIR without taking ENV_LOCK) must keep working.
+        let alternate = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("TMPDIR");
         unsafe {
-            std::env::set_var("TMPDIR", "/some/other/tmpdir");
+            std::env::set_var("TMPDIR", alternate.path());
         }
         let dir_after = runtime_dir("test1234");
         unsafe {
-            std::env::remove_var("TMPDIR");
+            match previous {
+                Some(value) => std::env::set_var("TMPDIR", value),
+                None => std::env::remove_var("TMPDIR"),
+            }
         }
         assert_eq!(
             dir_before, dir_after,
