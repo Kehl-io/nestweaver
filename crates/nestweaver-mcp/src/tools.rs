@@ -17722,8 +17722,14 @@ mod affected_tests_base_ref_tests {
                         "filter.{driver}.{}",
                         if process { "process" } else { "clean" }
                     );
+                    // Run the script through `sh` rather than exec'ing the file
+                    // git was just handed: a sibling test thread can fork while
+                    // the script's write fd is still open, and exec of that file
+                    // then fails with ETXTBSY ("Text file busy"). The shell only
+                    // reads it.
+                    let command = format!("sh '{}'", script.display());
                     let mut args = config_args.clone();
-                    args.extend([key.as_str(), script.to_str().unwrap()]);
+                    args.extend([key.as_str(), command.as_str()]);
                     git(work.path(), &args);
                     let required = format!("filter.{driver}.required");
                     config_args.extend([required.as_str(), "true"]);
