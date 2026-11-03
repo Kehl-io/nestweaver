@@ -4351,7 +4351,88 @@ fn index_into_store_with_write_gate<G, F>(
     vault_name: &str,
     ignore_set: &GlobSet,
     record_repo_sha: Option<&str>,
+    acquire_write_guard: F,
+) -> Result<MarkdownRefreshResult, anyhow::Error>
+where
+    F: FnMut() -> Result<G, anyhow::Error>,
+{
+    index_into_store_with_write_gate_attempt(
+        reader,
+        store,
+        instance_id,
+        vault_name,
+        ignore_set,
+        record_repo_sha,
+        acquire_write_guard,
+        0,
+    )
+}
+
+/// How many times a full refresh rescans the vault because another writer
+/// (a watcher batch, a concurrent refresh) owned publication or advanced the
+/// graph between the off-gate scan and the gated write. Each rescan is a full
+/// parse of the vault, so this is bounded: under a persistently busy writer
+/// the refresh fails with a named error instead of rescanning forever.
+const MAX_FULL_REFRESH_RESCANS: u32 = 3;
+
+/// Retry a full refresh after a concurrent writer invalidated its off-gate
+/// snapshot, or fail once [`MAX_FULL_REFRESH_RESCANS`] rescans are spent. Every
+/// rescan is logged with the generation delta so a livelock is visible.
+#[allow(clippy::too_many_arguments)]
+fn rescan_after_concurrent_writer<G, F>(
+    reason: &'static str,
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    vault_name: &str,
+    ignore_set: &GlobSet,
+    record_repo_sha: Option<&str>,
+    acquire_write_guard: F,
+    attempt: u32,
+    snapshot_generation: u64,
+) -> Result<MarkdownRefreshResult, anyhow::Error>
+where
+    F: FnMut() -> Result<G, anyhow::Error>,
+{
+    let next = attempt + 1;
+    let current_generation = store.graph_generation();
+    if next > MAX_FULL_REFRESH_RESCANS {
+        anyhow::bail!(
+            "vault refresh for {vault_name} could not publish after {MAX_FULL_REFRESH_RESCANS} \
+             rescans: {reason} each time (graph generation {snapshot_generation} -> \
+             {current_generation}). Another writer is continuously busy; retry once it is idle"
+        );
+    }
+    tracing::info!(
+        vault = vault_name,
+        attempt = next,
+        max = MAX_FULL_REFRESH_RESCANS,
+        snapshot_generation,
+        current_generation,
+        "full refresh rescanning the vault: {reason}"
+    );
+    index_into_store_with_write_gate_attempt(
+        reader,
+        store,
+        instance_id,
+        vault_name,
+        ignore_set,
+        record_repo_sha,
+        acquire_write_guard,
+        next,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_into_store_with_write_gate_attempt<G, F>(
+    reader: &dyn crate::content_reader::ContentReader,
+    store: &GraphStore,
+    instance_id: &str,
+    vault_name: &str,
+    ignore_set: &GlobSet,
+    record_repo_sha: Option<&str>,
     mut acquire_write_guard: F,
+    attempt: u32,
 ) -> Result<MarkdownRefreshResult, anyhow::Error>
 where
     F: FnMut() -> Result<G, anyhow::Error>,
@@ -4879,7 +4960,8 @@ where
         drop(_write_guard);
         drop(_write_reservation);
         store.wait_until_index_publication_unowned();
-        return index_into_store_with_write_gate(
+        return rescan_after_concurrent_writer(
+            "index publication was owned by another writer",
             reader,
             store,
             instance_id,
@@ -4887,6 +4969,8 @@ where
             ignore_set,
             record_repo_sha,
             acquire_write_guard,
+            attempt,
+            snapshot_generation,
         );
     };
 
@@ -4896,7 +4980,8 @@ where
         drop(publication_lease);
         drop(_write_guard);
         drop(_write_reservation);
-        return index_into_store_with_write_gate(
+        return rescan_after_concurrent_writer(
+            "the graph advanced between the scan and the gated write",
             reader,
             store,
             instance_id,
@@ -4904,6 +4989,8 @@ where
             ignore_set,
             record_repo_sha,
             acquire_write_guard,
+            attempt,
+            snapshot_generation,
         );
     }
 
@@ -9995,6 +10082,52 @@ sub b body
     /// markdown indexer over a bare clone, producing Note/Section nodes rather
     /// than code symbols. The bare clone has no on-disk `.brainignore`, which
     /// `index_markdown_with_reader` must tolerate.
+    /// A writer that advances the graph every time the refresh reaches its gate
+    /// must not keep the refresh rescanning forever: after the bounded number of
+    /// rescans it fails with a named error instead of livelocking.
+    #[test]
+    fn full_vault_gives_up_after_bounded_rescans_under_a_continuously_busy_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), "# A").unwrap();
+        let reader = filesystem_note_reader(&root, crate::index_limits::NoteLimits::default());
+        let store = GraphStore::in_memory().unwrap();
+        let ignore = crate::brainignore::load_brain_ignore(&root, &[]).unwrap();
+        let mut gate_acquisitions = 0u32;
+        let error = match index_into_store_with_write_gate(
+            &reader,
+            &store,
+            "test",
+            "vault",
+            &ignore,
+            None,
+            || {
+                gate_acquisitions += 1;
+                // Another writer lands between the off-gate scan and this gate
+                // every single time.
+                store.bump_graph_generation();
+                Ok(())
+            },
+        ) {
+            Ok(result) => panic!(
+                "a continuously busy writer must bound the rescans, but the refresh published {} notes",
+                result.index.notes_count
+            ),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("could not publish after"),
+            "error must name the bounded rescans: {message}"
+        );
+        assert_eq!(
+            gate_acquisitions,
+            1 + MAX_FULL_REFRESH_RESCANS,
+            "one initial attempt plus the bounded rescans"
+        );
+    }
+
     #[test]
     fn full_vault_revalidates_a_watcher_completed_before_gate_acquisition() {
         let dir = tempfile::tempdir().unwrap();

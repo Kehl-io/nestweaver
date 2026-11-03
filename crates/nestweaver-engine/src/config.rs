@@ -1304,6 +1304,12 @@ impl InstanceConfig {
             config.expected_brain_uuid = Some(parsed.to_string());
         }
         config.server.indexing.validate()?;
+        // nw-828: the credential method selects the auth wiring for every
+        // server-mode git command. An unknown value used to be accepted here and
+        // silently select no helper at all; fail the load instead, with the same
+        // rule `pull` and the CLI already apply.
+        crate::pull::validate_credential_method(&config.git.credential_method)
+            .map_err(|error| error.context("[git] credential_method"))?;
         crate::index_limits::IndexLimits::new(config.indexing.max_source_file_bytes)?;
         crate::index_limits::NoteLimits::new(config.indexing.max_note_bytes)?;
         // nw-908: `[[repos]] exclude` globs are compiled by every reader that
@@ -2135,6 +2141,27 @@ url = "https://github.com/example/repo"
             !cfg.inference.endpoint.is_empty(),
             "inference.endpoint must be set"
         );
+    }
+
+    /// nw-828: an unsupported `[git] credential_method` fails the config load
+    /// instead of silently selecting no credential wiring.
+    #[test]
+    fn unsupported_git_credential_method_fails_config_load() {
+        let toml = MINIMAL_TOML.replace(
+            "credential_method = \"ssh\"",
+            "credential_method = \"typo\"",
+        );
+        let error = InstanceConfig::from_toml_str(&toml).expect_err("typo must be rejected");
+        let message = format!("{error:#}");
+        assert!(message.contains("[git] credential_method"), "{message}");
+        assert!(message.contains("typo"), "{message}");
+        for method in ["gh", "ssh", "credential-helper", "env"] {
+            let toml = MINIMAL_TOML.replace(
+                "credential_method = \"ssh\"",
+                &format!("credential_method = \"{method}\""),
+            );
+            InstanceConfig::from_toml_str(&toml).unwrap_or_else(|e| panic!("{method}: {e:#}"));
+        }
     }
 
     #[test]
