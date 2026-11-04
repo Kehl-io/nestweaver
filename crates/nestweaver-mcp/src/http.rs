@@ -796,7 +796,7 @@ async fn handle_mcp(
     let provided_bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(nestweaver_schema::http_auth::bearer_token);
     let mut admin_bypass_rate_limit = false;
 
     // Validate bearer token when auth is configured.

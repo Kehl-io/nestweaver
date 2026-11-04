@@ -95,8 +95,8 @@ pub fn bearer_auth_interceptor(
             .get("authorization")
             .and_then(|v| v.to_str().ok());
         match auth {
-            Some(value) if value.starts_with("Bearer ") => {
-                let bearer = &value[7..];
+            Some(value) if nestweaver_schema::http_auth::bearer_token(value).is_some() => {
+                let bearer = nestweaver_schema::http_auth::bearer_token(value).unwrap_or_default();
 
                 // Constant-time token comparison to prevent timing side-channel attacks.
                 use subtle::ConstantTimeEq;
