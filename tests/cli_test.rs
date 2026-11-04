@@ -9189,7 +9189,8 @@ fn a_genuinely_held_checkpoint_lock_stays_transient() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("checkpoint is in progress"),
+        combined.contains("checkpoint is in progress")
+            || combined.contains("checkpoint recovery is pending"),
         "precondition: the engine still refuses the read-only open: {combined}"
     );
     assert!(

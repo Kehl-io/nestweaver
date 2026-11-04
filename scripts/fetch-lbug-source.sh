@@ -2,9 +2,9 @@
 # Check out the LadybugDB source the `lbug` crate builds from, and point
 # LBUG_SOURCE_DIR at it.
 #
-# Remove once a published lbug crate builds from source. Until then the crate
-# on crates.io cannot compile its own bundled sources, and lbug's build script
-# uses LBUG_SOURCE_DIR instead.
+# Keep the C++ source aligned with the resolved Rust crate: its fallback source
+# download can otherwise select upstream main. LBUG_SOURCE_DIR selects this
+# verified checkout instead.
 #
 # This file is the ONE place the tag and commit are pinned. CI calls it before
 # every cargo build; for local development run
@@ -18,8 +18,8 @@
 # Cargo.lock that pins a different lbug version, fails the script.
 set -euo pipefail
 
-LBUG_TAG="v0.21.2"
-LBUG_COMMIT="c473940c7eafa27413264c907a5e781a8b3f0a4d"
+LBUG_TAG="v0.22.1"
+LBUG_COMMIT="9e29cf5ef6b793a6d5684c57aa0d5330fd9dc928"
 LBUG_REPOSITORY="https://github.com/LadybugDB/ladybug.git"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

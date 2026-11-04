@@ -9789,21 +9789,23 @@ pub(crate) mod engine_format_open_tests {
         drop(GraphStore::open(&db).expect("its own crash debris must not block recovery"));
     }
 
-    /// THE HAZARD, shown on a file the OLD engine wrote: this engine's
-    /// primary-key lookup misses a non-ASCII key, while a scan finds the row.
-    /// An ASCII key is unaffected. This is why a pre-cutover database is
-    /// refused, and why every read the exemption makes is a scan.
+    /// LadybugDB 0.22 detects the legacy non-ASCII hash slot and refuses a
+    /// primary-key lookup instead of silently missing it. Scans still read
+    /// the row, so NestWeaver's read-only rebuild exemption remains usable.
     #[test]
-    fn a_pk_lookup_misses_a_non_ascii_key_the_old_engine_wrote_but_a_scan_finds_it() {
+    fn a_pk_lookup_rejects_a_non_ascii_key_the_old_engine_wrote_but_a_scan_finds_it() {
         let dir = tempfile::tempdir().unwrap();
         let db = old_engine_fixture(dir.path(), "pre-cutover.lbug");
         let raw = lbug::Database::new(&db, bounded_system_config().read_only(true)).unwrap();
         let conn = lbug::Connection::new(&raw).unwrap();
         let count = |query: &str| conn.query(query).unwrap().count();
-        assert_eq!(
-            count("MATCH (r:Repo {uid: 'repo:default:café'}) RETURN r.uid"),
-            0,
-            "the old engine's hash for a non-ASCII key is not where this engine looks"
+        let error = conn
+            .query("MATCH (r:Repo {uid: 'repo:default:café'}) RETURN r.uid")
+            .expect_err("legacy non-ASCII primary-key lookup must fail loudly")
+            .to_string();
+        assert!(
+            error.contains("stale string primary-key hash index"),
+            "{error}"
         );
         let scanned: Vec<String> = conn
             .query("MATCH (r:Repo) RETURN r.uid")

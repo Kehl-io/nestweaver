@@ -33,13 +33,13 @@ out="$work/out"
 )
 
 # 2. Check the new files with the CURRENT engine: a primary-key lookup of the
-#    non-ASCII key must miss while a scan finds it, the file must be refused,
+#    non-ASCII key must fail loudly while a scan finds it, the file must be refused,
 #    and the pending log must be refused before replay.
 (
     cd "$repo"
     NESTWEAVER_OLD_ENGINE_FIXTURE_DIR="$out" \
         cargo test --workspace --features ci-direct-tests --lib -- \
-        engine_format_open_tests::a_pk_lookup_misses \
+        engine_format_open_tests::a_pk_lookup_rejects \
         engine_format_open_tests::a_database_the_old_engine_wrote \
         engine_format_open_tests::an_old_engine_log_is_refused
 )

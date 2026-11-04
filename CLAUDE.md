@@ -570,7 +570,8 @@ federation          (leaf: schema + proto only)
 
 ### Current resolver upgrade
 
-Resolver generation 19 and parsed-cache version 13 add repo-wide PHP function
+Resolver generation 20 and parsed-cache version 14 cover Dart 0.3 and
+PowerShell 0.26.6 grammar changes. Generation 19 and cache 13 add repo-wide PHP function
 namespace identities, `use function` aliases and duplicate refusal. Generation 18
 and cache 12's Scala grammar 0.26.3 repairs remain included. Existing graphs may
 lack those symbols and edges: run

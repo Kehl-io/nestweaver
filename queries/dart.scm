@@ -30,7 +30,7 @@
       name: (identifier) @name))) @definition.method
 
 ; ABSTRACT method declarations — no body, so genuinely one line. In an abstract
-; class or an interface these are a `class_member > declaration` wrapping a bare
+; class or an interface these are a `member_declaration > declaration` wrapping a bare
 ; `function_signature`, which no `method_signature` rule could ever match, so
 ; `Greeter.greet` in testdata/dart/simple.dart was extracted as NOTHING. The
 ; same split as C++: definitions carry a body span, declarations do not.
