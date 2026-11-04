@@ -53,7 +53,7 @@ pub enum SchedulerCommand {
 }
 
 /// Per-repo override for poll behavior.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollOverride {
     /// Always poll at this fixed interval.
     Fixed(Duration),
@@ -85,6 +85,15 @@ impl PollScheduler {
     }
 
     /// Register a repo for polling.
+    ///
+    /// Registering a repo that is already tracked (same `repo_id` AND the same
+    /// canonical URL) updates that entry in place and keeps its adaptive state,
+    /// instead of stacking a second schedule row for it (nw-921: each duplicate
+    /// admin add made every poll interval probe the remote once more). The
+    /// `repo_id` alone is not an identity: it is the configured name or the URL
+    /// basename, so `github.com/acme/api` and `gitlab.com/vendor/api` share one
+    /// and must stay two rows. A re-add without a poll override or branch keeps
+    /// the existing ones; a change polls again immediately, as a fresh row would.
     pub fn add_repo(
         &mut self,
         repo_id: String,
@@ -92,6 +101,25 @@ impl PollScheduler {
         poll_override: Option<PollOverride>,
         branch: Option<String>,
     ) {
+        let canonical = crate::jobs::canonical_repo_id(&repo_url);
+        if let Some(existing) = self.repos.iter_mut().find(|r| {
+            r.repo_id == repo_id && crate::jobs::canonical_repo_id(&r.repo_url) == canonical
+        }) {
+            let mut changed = false;
+            if branch.is_some() && branch != existing.branch {
+                existing.branch = branch;
+                changed = true;
+            }
+            if poll_override.is_some() && poll_override != existing.poll_override {
+                existing.poll_override = poll_override;
+                changed = true;
+            }
+            existing.repo_url = repo_url;
+            if changed {
+                existing.next_poll_at = Instant::now();
+            }
+            return;
+        }
         self.repos.push(RepoSchedule {
             repo_id,
             repo_url,
@@ -361,6 +389,99 @@ mod tests {
             sched.next_interval(&sched.repos[0]),
             Duration::from_secs(120)
         );
+    }
+
+    /// nw-921: registering the same repo again must not add a second schedule
+    /// row; it updates the existing one and keeps its adaptive state.
+    #[test]
+    fn re_adding_a_repo_updates_in_place_instead_of_stacking_rows() {
+        let mut sched = PollScheduler::with_defaults();
+        sched.add_repo("r".into(), "https://example.invalid/r".into(), None, None);
+        let committed = Instant::now();
+        sched.update_commit_time("r", committed);
+        for _ in 0..8 {
+            sched.add_repo(
+                "r".into(),
+                "https://example.invalid/r".into(),
+                None,
+                Some("main".into()),
+            );
+        }
+        assert_eq!(sched.repo_count(), 1, "duplicate adds must not stack rows");
+        assert_eq!(sched.repos[0].branch.as_deref(), Some("main"));
+        assert_eq!(sched.repos[0].last_commit_time, Some(committed));
+        // A different repo is still tracked separately, and polls once per due cycle.
+        sched.add_repo("s".into(), "https://example.invalid/s".into(), None, None);
+        assert_eq!(sched.repo_count(), 2);
+        assert_eq!(
+            sched.due_repos().len(),
+            2,
+            "one probe per repo, not per add"
+        );
+    }
+
+    /// The scheduler id is a name or URL basename, not a unique repo identity:
+    /// two different repos sharing it must both stay tracked and polled.
+    #[test]
+    fn distinct_repos_sharing_a_basename_stay_separate_rows() {
+        let mut sched = PollScheduler::with_defaults();
+        sched.add_repo(
+            "api".into(),
+            "https://github.com/acme/api.git".into(),
+            None,
+            None,
+        );
+        sched.add_repo(
+            "api".into(),
+            "https://gitlab.com/vendor/api".into(),
+            None,
+            None,
+        );
+        assert_eq!(sched.repo_count(), 2);
+        // `.git` / trailing-slash spellings of one repo are still the same repo.
+        sched.add_repo(
+            "api".into(),
+            "https://github.com/acme/api/".into(),
+            None,
+            None,
+        );
+        assert_eq!(sched.repo_count(), 2);
+        let urls: Vec<_> = sched
+            .due_repos()
+            .into_iter()
+            .map(|(_, url, _)| url)
+            .collect();
+        assert_eq!(urls.len(), 2);
+    }
+
+    /// A re-add that carries no override must not silently reset a configured
+    /// one, and a real change makes the repo due again immediately.
+    #[test]
+    fn re_add_keeps_the_configured_override_and_a_change_polls_at_once() {
+        let mut sched = PollScheduler::with_defaults();
+        let fixed = Some(PollOverride::Fixed(Duration::from_secs(3600)));
+        sched.add_repo(
+            "r".into(),
+            "https://example.invalid/r".into(),
+            fixed.clone(),
+            None,
+        );
+        // Drain the initial due state so next_poll_at moves into the future.
+        assert_eq!(sched.due_repos().len(), 1);
+        assert!(sched.due_repos().is_empty());
+        sched.add_repo("r".into(), "https://example.invalid/r".into(), None, None);
+        assert_eq!(sched.repos[0].poll_override, fixed, "override must be kept");
+        assert!(
+            sched.due_repos().is_empty(),
+            "an unchanged re-add must not re-poll"
+        );
+        sched.add_repo(
+            "r".into(),
+            "https://example.invalid/r".into(),
+            None,
+            Some("dev".into()),
+        );
+        assert_eq!(sched.due_repos().len(), 1, "a changed branch polls at once");
     }
 
     #[test]
