@@ -120,9 +120,16 @@ pub(crate) fn acquire_job_queue<'a>(
     db_path: &std::path::Path,
 ) -> anyhow::Result<JobQueueHandle<'a>> {
     if let Some(shared) = shared {
-        let guard = shared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("job queue mutex poisoned"))?;
+        // nw-924: a panic while another thread held this mutex must not take
+        // every admin route down for the rest of the process. The job queue is a
+        // SQLite connection whose own transactions are atomic, and the worker and
+        // lease reaper recover the same mutex, so recover the guard here too and
+        // clear the poison flag so later callers lock normally.
+        let guard = shared.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("admin: job queue mutex was poisoned; recovering the guard");
+            shared.clear_poison();
+            poisoned.into_inner()
+        });
         return Ok(JobQueueHandle::Shared(guard));
     }
     let jobs_path = nestweaver_engine::sidecar_path(db_path, ".jobs.sqlite");
@@ -148,7 +155,7 @@ where
             .headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
+            .and_then(nestweaver_schema::http_auth::bearer_token);
         match token {
             Some(t)
                 if t.as_bytes()
@@ -1291,6 +1298,7 @@ async fn reload_config_owned(
                     .collect();
 
                 let mut new_repos = 0usize;
+                let mut not_queued_repos = 0usize;
                 let mut orphaned_repos = 0usize;
                 let mut skipped_repos = 0usize;
                 let mut dead_lettered_repos = 0usize;
@@ -1360,15 +1368,37 @@ async fn reload_config_owned(
                     // Shared with startup: a dead-lettered repo stays
                     // quarantined (only the explicit dead-letter retry resets
                     // it); a corrected branch is still recorded for that retry.
+                    // nw-924: distinguish "left quarantined" (Ok(false)) from
+                    // "the queue was unavailable or the upsert failed" (Err /
+                    // no queue). The summary below must never claim a repo was
+                    // queued when it was not.
+                    let enqueue_failed;
                     let enqueued = match queue.as_ref() {
                         Some(q) => {
                             if branch_changed && r.branch.is_none() && !quarantined {
                                 let _ = q.clear_branch(&repo_id);
                             }
-                            q.enqueue_declared_repo(&repo_id, &r.url, trigger, r.branch.as_deref())
-                                .unwrap_or(false)
+                            match q.enqueue_declared_repo(
+                                &repo_id,
+                                &r.url,
+                                trigger,
+                                r.branch.as_deref(),
+                            ) {
+                                Ok(enqueued) => {
+                                    enqueue_failed = false;
+                                    enqueued
+                                }
+                                Err(error) => {
+                                    tracing::warn!(url = %r.url, %error, "config reload: could not enqueue repo");
+                                    enqueue_failed = true;
+                                    false
+                                }
+                            }
                         }
-                        None => false,
+                        None => {
+                            enqueue_failed = true;
+                            false
+                        }
                     };
                     if quarantined {
                         tracing::warn!(
@@ -1376,6 +1406,9 @@ async fn reload_config_owned(
                             "config reload: repo is dead-lettered — not re-queued (retry it explicitly)"
                         );
                         dead_lettered_repos += 1;
+                    } else if enqueue_failed {
+                        tracing::warn!(url = %r.url, "config reload: repo NOT queued — job queue unavailable");
+                        not_queued_repos += 1;
                     } else if is_new {
                         tracing::info!(url = %r.url, "config reload: new repo — queueing for indexing");
                         new_repos += 1;
@@ -1407,6 +1440,12 @@ async fn reload_config_owned(
                 );
                 if new_repos > 0 {
                     msg.push_str(&format!(", {} new repos queued", new_repos));
+                }
+                if not_queued_repos > 0 {
+                    msg.push_str(&format!(
+                        ", {} repos could NOT be queued (job queue unavailable; see the daemon log)",
+                        not_queued_repos
+                    ));
                 }
                 if orphaned_repos > 0 {
                     msg.push_str(&format!(", {} orphaned repos", orphaned_repos));
@@ -2447,6 +2486,42 @@ mod tests {
         assert_eq!(handle.queue_depth().expect("depth").pending, 1);
     }
 
+    /// nw-924: a poisoned shared queue mutex must not take admin routes down;
+    /// the guard is recovered, the data is intact, and the poison is cleared.
+    #[test]
+    fn acquire_job_queue_recovers_a_poisoned_shared_mutex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.lbug");
+        let jobs_path = nestweaver_engine::sidecar_path(&db_path, ".jobs.sqlite");
+        let shared = Arc::new(Mutex::new(
+            nestweaver_engine::jobs::JobQueue::open(&jobs_path).expect("open jobs"),
+        ));
+        shared
+            .lock()
+            .unwrap()
+            .upsert(
+                "repo1",
+                "https://example.com/repo1",
+                nestweaver_engine::jobs::JobTrigger::Unindexed,
+                None,
+            )
+            .expect("upsert");
+        let poisoner = Arc::clone(&shared);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the job queue mutex");
+        })
+        .join();
+        assert!(shared.is_poisoned(), "fixture must poison the mutex");
+
+        let opt = Some(Arc::clone(&shared));
+        let handle = acquire_job_queue(&opt, &db_path).expect("acquire must recover");
+        assert!(matches!(handle, JobQueueHandle::Shared(_)));
+        assert_eq!(handle.queue_depth().expect("depth").pending, 1);
+        drop(handle);
+        assert!(!shared.is_poisoned(), "the poison flag must be cleared");
+    }
+
     #[test]
     fn acquire_job_queue_falls_back_when_not_wired() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2531,6 +2606,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// nw-917: the auth-scheme is case-insensitive (RFC 9110), so a lowercase
+    /// or uppercase `bearer` with the right admin token is accepted, while a
+    /// wrong token or another scheme is still refused.
+    #[tokio::test]
+    async fn admin_bearer_scheme_is_case_insensitive() {
+        for (header, expected) in [
+            ("bearer test-admin-token", StatusCode::OK),
+            ("BEARER test-admin-token", StatusCode::OK),
+            ("bearer wrong-token", StatusCode::UNAUTHORIZED),
+            ("Basic test-admin-token", StatusCode::UNAUTHORIZED),
+        ] {
+            let resp = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/api/status")
+                        .header("Authorization", header)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), expected, "{header}");
+        }
     }
 
     #[test]
@@ -2941,21 +3041,22 @@ credential_method = "ssh"
     #[tokio::test]
     async fn removal_returns_500_when_shared_queue_cancellation_cannot_open() {
         let url = "https://example.com/org/cancellation-error";
-        let (mut state, path) =
-            state_with_indexed(&format!("[[repos]]\nurl = \"{url}\"\n"), &[url]);
+        let (state, path) = state_with_indexed(&format!("[[repos]]\nurl = \"{url}\"\n"), &[url]);
         let uid = state.daemon_store.list_repos(None).unwrap()[0].uid.clone();
         let before = std::fs::read_to_string(&path).unwrap();
         let runtime_before = state.runtime_repo_configs.read().unwrap().clone();
-        let queue = Arc::new(Mutex::new(queue_for(&state)));
-        Arc::get_mut(&mut state).unwrap().job_queue = Some(queue.clone());
-        // Graph UID resolution returns before queue access; poisoning therefore
-        // targets the cancellation stage, not unrelated target discovery.
-        std::thread::spawn(move || {
-            let _guard = queue.lock().unwrap();
-            panic!("inject unavailable cancellation connection");
-        })
-        .join()
-        .unwrap_err();
+        // Graph UID resolution returns before queue access; making the queue
+        // sidecar unopenable therefore targets the cancellation stage, not
+        // unrelated target discovery. (A poisoned shared mutex used to stand in
+        // for this, but poison is now recovered on purpose — nw-924 — so it no
+        // longer makes the queue unavailable.) With no shared queue wired the
+        // handler opens the sidecar itself; a directory in its place cannot be
+        // opened as a SQLite database.
+        let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+        let _ = std::fs::remove_file(&jobs_path);
+        let _ = std::fs::remove_file(format!("{}-wal", jobs_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", jobs_path.display()));
+        std::fs::create_dir_all(&jobs_path).unwrap();
         let (status, body) = call(&state, "DELETE", &format!("/admin/api/repos/{uid}")).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
         assert!(body.contains("open job queue for removal"), "{body}");
@@ -3062,6 +3163,57 @@ url = "https://example.com/org/kept"
             st("https://example.com/org/kept"),
             nestweaver_engine::jobs::JobStatus::Pending
         );
+    }
+
+    /// nw-924: reload over a poisoned shared queue still queues the new repo
+    /// and says so (before, the queue was silently dropped and the summary still
+    /// claimed "1 new repos queued").
+    #[tokio::test]
+    async fn reload_queues_new_repos_after_the_shared_queue_was_poisoned() {
+        let url = "https://example.com/org/fresh";
+        let (mut state, _config_path) = state_with_config(&format!("[[repos]]\nurl = \"{url}\"\n"));
+        let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+        let shared = Arc::new(Mutex::new(
+            nestweaver_engine::jobs::JobQueue::open(&jobs_path).unwrap(),
+        ));
+        let poisoner = Arc::clone(&shared);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the job queue mutex");
+        })
+        .join();
+        assert!(shared.is_poisoned());
+        Arc::get_mut(&mut state).expect("unique state").job_queue = Some(Arc::clone(&shared));
+
+        let (status, body) = call(&state, "POST", "/admin/api/config/reload").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("1 new repos queued"), "{body}");
+        assert!(!body.contains("could NOT be queued"), "{body}");
+        let job = shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .job_for_repo(url)
+            .unwrap();
+        assert!(job.is_some(), "the new repo must really be in the queue");
+    }
+
+    /// nw-924: when the queue genuinely cannot be opened the summary must not
+    /// claim the repo was queued.
+    #[tokio::test]
+    async fn reload_does_not_claim_a_repo_was_queued_when_the_queue_is_unavailable() {
+        let url = "https://example.com/org/unreachable-queue";
+        let (state, _config_path) = state_with_config(&format!("[[repos]]\nurl = \"{url}\"\n"));
+        // A directory where the SQLite sidecar must be makes the open fail.
+        let jobs_path = nestweaver_engine::sidecar_path(&state.db_path, ".jobs.sqlite");
+        let _ = std::fs::remove_file(&jobs_path);
+        let _ = std::fs::remove_file(format!("{}-wal", jobs_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", jobs_path.display()));
+        std::fs::create_dir_all(&jobs_path).unwrap();
+
+        let (status, body) = call(&state, "POST", "/admin/api/config/reload").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("new repos queued"), "{body}");
+        assert!(body.contains("1 repos could NOT be queued"), "{body}");
     }
 
     /// nw-913: reload leaves a dead-lettered repo quarantined (status and
