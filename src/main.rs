@@ -1390,8 +1390,8 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
         .into();
     }
 
-    // nw-367. ONE engine sentence — "Cannot open database in read-only mode
-    // while checkpoint is in progress. Please retry later." — is raised from
+    // nw-367. LadybugDB 0.21 says "checkpoint is in progress"; 0.22 says
+    // "checkpoint recovery is pending". Both read-only refusals are raised from
     // two sites with opposite remedies. One requires a genuinely held `fcntl`
     // write lock; the other fires on pure file existence of
     // `<db>.wal.checkpoint` / `<db>.shadow` and consults no process at all.
@@ -1408,7 +1408,9 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // Note what this arm deliberately does NOT do: reach the corrupt-WAL
     // runbook. That runbook moves the frozen WAL aside, which DISCARDS
     // committed transactions; a read-write open replays it instead.
-    if lower.contains("checkpoint is in progress") {
+    if lower.contains("checkpoint is in progress")
+        || lower.contains("checkpoint recovery is pending")
+    {
         let path = extract_db_path(&message);
         if let nestweaver_daemon::lifecycle::CheckpointArtifacts::Debris { artifacts } =
             nestweaver_daemon::lifecycle::checkpoint_artifacts(std::path::Path::new(&path))
@@ -38400,6 +38402,41 @@ credential_method = "ssh"
             "unknown total must be null, not a fabricated count: {by_threshold}"
         );
         assert_eq!(by_depth["total"], serde_json::json!(9));
+    }
+
+    #[test]
+    fn checkpoint_wordings_require_free_locks_before_reporting_debris() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        std::fs::write(&db, b"filesystem lock probe fixture").unwrap();
+        std::fs::write(dir.path().join("brain.lbug.wal.checkpoint"), b"").unwrap();
+        let messages = [
+            "Cannot open database in read-only mode while checkpoint is in progress. Please retry later.",
+            "Cannot open database in read-only mode while checkpoint recovery is pending. If another process is checkpointing, retry after it finishes; otherwise reopen in read-write mode to complete recovery before reopening read-only.",
+        ];
+        let render = |message| {
+            format!(
+                "{:?}",
+                into_diagnostic(anyhow::anyhow!(
+                    "failed to open database at {}: database error: Runtime exception: {message}",
+                    db.display()
+                ))
+            )
+        };
+        for message in messages {
+            let rendered = render(message);
+            assert!(rendered.contains("db_checkpoint_debris"), "{rendered}");
+            assert!(!rendered.contains("MOVE ASIDE"), "{rendered}");
+        }
+        // The canonical self-ownership guard makes the lock probe unknown;
+        // the same text must then retain the engine's transient disclosure.
+        let _authority = nestweaver_store::acquire_db_write_lease(&db).unwrap();
+        for message in messages {
+            let rendered = render(message);
+            assert!(!rendered.contains("db_checkpoint_debris"), "{rendered}");
+            assert!(!rendered.contains("MOVE ASIDE"), "{rendered}");
+            assert!(rendered.contains("checkpoint"), "{rendered}");
+        }
     }
 
     /// nw-126: the incident message, verbatim. A SIGKILLed daemon left a stale

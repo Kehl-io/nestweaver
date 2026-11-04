@@ -25,10 +25,10 @@ repository once; cache invalidation alone does not replace existing graph facts.
 
 ## Storage-engine upgrade (LadybugDB 0.21): rebuild required
 
-This release updates LadybugDB to 0.21 (0.21.1), which changes how text keys are
-hashed. The engine's on-disk format marker did not change, so the engine
-itself would open an older database and then silently miss lookups on
-non-ASCII keys. NestWeaver therefore records the engine format itself (a
+The LadybugDB 0.21 cutover changed how text keys are hashed without changing
+the engine's on-disk format marker. Earlier engines could open an older
+database and silently miss non-ASCII primary-key lookups; 0.22 reports a
+stale-index error instead. NestWeaver continues to record the engine format (a
 `storage.string_hash` row in the database and a `<db>.engine-format` file
 beside it) and refuses, before the engine touches the file, any database that
 lacks it:
