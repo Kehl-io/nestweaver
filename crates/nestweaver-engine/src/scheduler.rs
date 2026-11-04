@@ -85,6 +85,11 @@ impl PollScheduler {
     }
 
     /// Register a repo for polling.
+    ///
+    /// Registering a `repo_id` that is already tracked updates that entry in
+    /// place (URL, branch, poll override) and keeps its adaptive state, instead
+    /// of stacking a second schedule row for the same repo (nw-921: each
+    /// duplicate admin add made every poll interval probe the remote once more).
     pub fn add_repo(
         &mut self,
         repo_id: String,
@@ -92,6 +97,12 @@ impl PollScheduler {
         poll_override: Option<PollOverride>,
         branch: Option<String>,
     ) {
+        if let Some(existing) = self.repos.iter_mut().find(|r| r.repo_id == repo_id) {
+            existing.repo_url = repo_url;
+            existing.branch = branch;
+            existing.poll_override = poll_override;
+            return;
+        }
         self.repos.push(RepoSchedule {
             repo_id,
             repo_url,
@@ -360,6 +371,35 @@ mod tests {
         assert_eq!(
             sched.next_interval(&sched.repos[0]),
             Duration::from_secs(120)
+        );
+    }
+
+    /// nw-921: registering the same repo again must not add a second schedule
+    /// row; it updates the existing one and keeps its adaptive state.
+    #[test]
+    fn re_adding_a_repo_updates_in_place_instead_of_stacking_rows() {
+        let mut sched = PollScheduler::with_defaults();
+        sched.add_repo("r".into(), "https://example.invalid/r".into(), None, None);
+        let committed = Instant::now();
+        sched.update_commit_time("r", committed);
+        for _ in 0..8 {
+            sched.add_repo(
+                "r".into(),
+                "https://example.invalid/r".into(),
+                None,
+                Some("main".into()),
+            );
+        }
+        assert_eq!(sched.repo_count(), 1, "duplicate adds must not stack rows");
+        assert_eq!(sched.repos[0].branch.as_deref(), Some("main"));
+        assert_eq!(sched.repos[0].last_commit_time, Some(committed));
+        // A different repo is still tracked separately, and polls once per due cycle.
+        sched.add_repo("s".into(), "https://example.invalid/s".into(), None, None);
+        assert_eq!(sched.repo_count(), 2);
+        assert_eq!(
+            sched.due_repos().len(),
+            2,
+            "one probe per repo, not per add"
         );
     }
 
