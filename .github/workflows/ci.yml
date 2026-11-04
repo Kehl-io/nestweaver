@@ -266,7 +266,14 @@ jobs:
         # a silence that expires and leaves the same work to do.
         run: |
           brew untap aws/tap || true
-          brew install protobuf
+          brew install protobuf openssl@3
+          # LadybugDB 0.22 requires OpenSSL 3; the runner also has OpenSSL 4.
+          openssl_root="$(brew --prefix openssl@3)"
+          test -f "$openssl_root/include/openssl/ssl.h"
+          {
+            echo "OPENSSL_ROOT_DIR=$openssl_root"
+            echo "CMAKE_PREFIX_PATH=$openssl_root"
+          } >> "$GITHUB_ENV"
       - name: Build Metal-enabled CLI
         run: |
           python3 scripts/ci-build-observe.py metal-cli -- cargo build --locked --release --features metal
