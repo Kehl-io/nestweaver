@@ -1275,7 +1275,13 @@ async fn reload_config_owned(
                 );
 
                 // ── Reconcile declared repos vs indexed repos ─────────
-                let queue = acquire_job_queue(&job_queue, &db_path).ok();
+                let queue = match acquire_job_queue(&job_queue, &db_path) {
+                    Ok(queue) => Some(queue),
+                    Err(error) => {
+                        tracing::warn!(%error, "config reload: job queue could not be opened");
+                        None
+                    }
+                };
 
                 // Compare by canonical id (not raw URL) so `.git` / trailing
                 // slash spellings of one repo are the same repo.
@@ -1443,7 +1449,7 @@ async fn reload_config_owned(
                 }
                 if not_queued_repos > 0 {
                     msg.push_str(&format!(
-                        ", {} repos could NOT be queued (job queue unavailable; see the daemon log)",
+                        ", {} repos could NOT be queued (job queue unavailable or enqueue failed; see the daemon log)",
                         not_queued_repos
                     ));
                 }
