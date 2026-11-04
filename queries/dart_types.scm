@@ -2,7 +2,7 @@
 
 ; Typed variable: Type name = ...
 ; type is wrapped in a (type ...) node
-(initialized_variable_definition
+(initialized_variable_declaration
   (type (type_identifier) @var.type)
   name: (identifier) @var.name)
 
@@ -17,9 +17,9 @@
   name: (identifier) @param.name)
 
 ; Constructor: var x = MyClass(...) or final x = MyClass(...)
-; initialized_variable_definition.value can be call_expression;
+; initialized_variable_declaration.value can be call_expression;
 ; call_expression.function is identifier (the class name)
-(initialized_variable_definition
+(initialized_variable_declaration
   name: (identifier) @ctor.name
   value: (call_expression
     function: (identifier) @ctor.type))

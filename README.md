@@ -186,6 +186,17 @@ notes below before using an older database with a new binary.
 
 **Upgrading an existing database?** Check compatibility before querying it:
 
+Builds with LadybugDB **0.22.1** read the 0.21.2 database format, but a
+writable open/checkpoint can upgrade its storage format from 47 to 49. Take a
+backup with the previous binary before upgrading. To downgrade, reinstall that
+binary and restore the pre-upgrade backup; do not point it at the upgraded file.
+See the [storage upgrade guidance](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
+
+Resolver generation **20** and parsed cache **14** accompany the Dart 0.3 and
+PowerShell 0.26.6 grammar updates. Force re-index each repository once after
+upgrading to publish the new parser facts; invalidating the parse cache alone
+does not replace symbols and edges already stored in the graph.
+
 - A database from before LadybugDB 0.21 needs a **publication rebuild**, not
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).

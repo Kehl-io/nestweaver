@@ -377,7 +377,10 @@ use std::path::Path;
 /// 19 — PHP functions resolve by their declared namespace across the repository,
 ///      with function-use aliases, current-namespace/global precedence and
 ///      duplicate refusal. Parsed cache 13 reparses namespace and call facts.
-pub const RESOLVER_GENERATION: u32 = 19;
+/// 20 — Dart 0.3 and PowerShell 0.26.6 change grammar-derived declarations
+///      and references. Parsed cache 14 discards old facts; existing graphs
+///      need a force reindex to publish the updated symbols and edges.
+pub const RESOLVER_GENERATION: u32 = 20;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

@@ -67,7 +67,9 @@ use serde::{Deserialize, Serialize};
 ///      previously missed by 0.26.2, including local case classes.
 /// 13 — PHP namespace regions, categorized use aliases and named-call identities
 ///      preserve repo-wide function lookup across unchanged source.
-const CACHE_VERSION: u32 = 13;
+/// 14 — Dart 0.3 renames declaration nodes and PowerShell 0.26.6 repairs
+///      native-command argument parsing; discard facts from the older grammars.
+const CACHE_VERSION: u32 = 14;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
