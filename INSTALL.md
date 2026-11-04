@@ -109,6 +109,9 @@ development files, `pkg-config`, and Protocol Buffers:
 ```sh
 # macOS with Homebrew (also install the Xcode Command Line Tools)
 brew install cmake openssl@3 pkg-config protobuf zstd
+# LadybugDB requires OpenSSL 3 even when Homebrew also has OpenSSL 4.
+export OPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+export CMAKE_PREFIX_PATH="$OPENSSL_ROOT_DIR${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 
 # Debian/Ubuntu
 sudo apt-get update
@@ -128,16 +131,13 @@ the checkout's `.cargo/config.toml`: it forces `LBUG_BUILD_FROM_SOURCE=1` so
 the build compiles Ladybug from source, rather than linking a prebuilt archive
 whose hidden ELF symbols cause zstd link errors.
 
-**`LBUG_SOURCE_DIR` is required for now.** The published `lbug` 0.21.2 crate
-cannot build its own bundled sources (the packaging fix is merged upstream but
-not yet released), so the build reads them from a LadybugDB checkout at tag
-`v0.21.2` named by `LBUG_SOURCE_DIR`. `scripts/fetch-lbug-source.sh` makes a
-shallow clone of that tag (about 80 MB, no submodules) under `target/`,
-verifies its commit, and prints the `export` line; `eval` applies it to the
-current shell. Pass a directory to put the clone elsewhere, or point
-`LBUG_SOURCE_DIR` at your own checkout of the same tag. Set it in every shell
-that runs `cargo`. This step goes away once a published `lbug` crate builds
-from source.
+**Use the pinned `LBUG_SOURCE_DIR`.** The source build uses LadybugDB
+`v0.22.1`, matching the Rust dependency. `scripts/fetch-lbug-source.sh` makes a
+shallow clone of that tag (no submodules) under `target/`, verifies its commit,
+and prints the `export` line; `eval` applies it to the current shell. Pass a
+directory to put the clone elsewhere, or point `LBUG_SOURCE_DIR` at your own
+checkout of the same tag. Set it in every shell that runs `cargo`: the crate's
+fallback source download can otherwise select upstream `main`.
 
 No extra linker flags are needed. Exactly one copy of zstd is linked: the one
 Ladybug vendors. Rust code uses it through `nestweaver_store::zstd` instead of
