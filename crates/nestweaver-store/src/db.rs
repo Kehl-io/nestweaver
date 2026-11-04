@@ -9801,8 +9801,7 @@ pub(crate) mod engine_format_open_tests {
         let count = |query: &str| conn.query(query).unwrap().count();
         let error = conn
             .query("MATCH (r:Repo {uid: 'repo:default:café'}) RETURN r.uid")
-            .err()
-            .expect("legacy non-ASCII primary-key lookup must fail loudly")
+            .expect_err("legacy non-ASCII primary-key lookup must fail loudly")
             .to_string();
         assert!(
             error.contains("stale string primary-key hash index"),
