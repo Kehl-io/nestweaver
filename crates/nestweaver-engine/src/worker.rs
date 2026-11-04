@@ -41,6 +41,71 @@ pub fn fixed_instance_id(id: impl Into<String>) -> InstanceIdResolver {
     Arc::new(move || id.clone())
 }
 
+/// One immutable per-job view of live repository indexing settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRuntimeConfig {
+    pub repo_type: RepoType,
+    pub policy: RepoReadPolicy,
+    pub branch: Option<String>,
+}
+
+pub type RuntimeRepoConfigs = Arc<std::sync::RwLock<HashMap<String, RepoRuntimeConfig>>>;
+
+pub fn runtime_repo_configs(
+    config: &crate::config::InstanceConfig,
+) -> HashMap<String, RepoRuntimeConfig> {
+    config
+        .repos
+        .iter()
+        .map(|repo| {
+            (
+                canonical_repo_id(&repo.url),
+                RepoRuntimeConfig {
+                    repo_type: repo.repo_type.clone().unwrap_or(RepoType::Code),
+                    policy: RepoReadPolicy::for_url(config, &repo.url),
+                    branch: repo.branch.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn runtime_repo_snapshot(
+    repos: Option<&RuntimeRepoConfigs>,
+    repo_id: &str,
+) -> Result<Option<RepoRuntimeConfig>, anyhow::Error> {
+    match repos {
+        None => Ok(None),
+        Some(repos) => repos
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(repo_id)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| anyhow::Error::new(JobCancelled)),
+    }
+}
+
+fn validate_runtime_repo_snapshot(
+    repos: Option<&RuntimeRepoConfigs>,
+    repo_id: &str,
+    snapshot: Option<&RepoRuntimeConfig>,
+) -> Result<(), anyhow::Error> {
+    let current = runtime_repo_snapshot(repos, repo_id)?;
+    if repos.is_some() && current.as_ref() != snapshot {
+        return Err(anyhow::Error::new(JobCancelled));
+    }
+    Ok(())
+}
+
+fn preparation_job(job: &IndexJob, snapshot: Option<&RepoRuntimeConfig>) -> IndexJob {
+    let mut prepared = job.clone();
+    if let Some(settings) = snapshot {
+        prepared.branch = settings.branch.clone();
+    }
+    prepared
+}
+
 /// Shared indexing status that can be observed by other components (e.g. the
 /// daemon's `brain_status` handler) to report whether indexing is in progress.
 #[derive(Clone)]
@@ -99,12 +164,20 @@ impl Default for IndexingStatus {
 pub struct WorkerPool {
     concurrency: usize,
     semaphore: Arc<Semaphore>,
+    /// nw-881: the daemon's `shutdown_started` flag. Unlike `drained` (which
+    /// `POST /admin/api/resume` can clear), it never goes back to `false`, so
+    /// once set the worker claims nothing new.
+    shutdown_started: Option<Arc<AtomicBool>>,
     /// Per-repo index strategy, keyed by [`canonical_repo_id`] of the repo URL.
     /// Repos absent from the map (or mapped to [`RepoType::Code`]) are indexed
     /// as code; entries mapped to [`RepoType::Vault`] are indexed as markdown.
     /// Populated from the instance config by the daemon; empty by default, so
     /// an unconfigured pool indexes everything as code (the prior behaviour).
     repo_types: Arc<HashMap<String, RepoType>>,
+    runtime_repos: Option<RuntimeRepoConfigs>,
+    /// nw-908: per-repo `[[repos]] exclude` / `unskip`, keyed like
+    /// `repo_types`. Repos absent from the map use the default policy.
+    repo_policies: Arc<HashMap<String, RepoReadPolicy>>,
     index_limits: crate::index_limits::IndexLimits,
     note_limits: crate::index_limits::NoteLimits,
     /// nw-673: the instance's `[cross_domain]` settings for the discovery
@@ -120,10 +193,17 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     pub fn new(concurrency: usize) -> Self {
+        // nw-910: config validation rejects out-of-range values; this clamp is
+        // the backstop for direct callers. 0 permits would wedge the loop and
+        // more than `Semaphore::MAX_PERMITS` would panic it.
+        let concurrency = concurrency.clamp(1, crate::config::MAX_INDEXING_WORKERS);
         Self {
             concurrency,
             semaphore: Arc::new(Semaphore::new(concurrency)),
+            shutdown_started: None,
             repo_types: Arc::new(HashMap::new()),
+            runtime_repos: None,
+            repo_policies: Arc::new(HashMap::new()),
             index_limits: crate::index_limits::IndexLimits::default(),
             note_limits: crate::index_limits::NoteLimits::default(),
             cross_domain: Arc::new(crate::config::CrossDomainConfig::default()),
@@ -136,6 +216,13 @@ impl WorkerPool {
         }
     }
 
+    /// Attach the daemon's one-way `shutdown_started` flag (nw-881): once it is
+    /// set the worker stops claiming new jobs regardless of `drained`.
+    pub fn with_shutdown_started(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.shutdown_started = Some(flag);
+        self
+    }
+
     /// Attach per-repo index strategies resolved from the instance config.
     ///
     /// The map is keyed by [`canonical_repo_id`] of each repo's URL. Only repos
@@ -143,6 +230,19 @@ impl WorkerPool {
     /// supplying the full set is also fine.
     pub fn with_repo_types(mut self, repo_types: HashMap<String, RepoType>) -> Self {
         self.repo_types = Arc::new(repo_types);
+        self
+    }
+
+    /// Attach per-repo `exclude` / `unskip` policies (nw-908), keyed by
+    /// [`canonical_repo_id`] of each repo's URL like [`Self::with_repo_types`].
+    /// The bare-clone reader then applies them exactly as the local reader does.
+    pub fn with_repo_policies(mut self, policies: HashMap<String, RepoReadPolicy>) -> Self {
+        self.repo_policies = Arc::new(policies);
+        self
+    }
+
+    pub fn with_runtime_repos(mut self, repos: RuntimeRepoConfigs) -> Self {
+        self.runtime_repos = Some(repos);
         self
     }
 
@@ -226,6 +326,7 @@ impl WorkerPool {
     ) {
         let circuit_breakers = Arc::new(RemoteCircuitBreakers::new());
         let repo_types = self.repo_types.clone();
+        let repo_policies = self.repo_policies.clone();
         let index_limits = self.index_limits;
         let note_limits = self.note_limits;
         let cross_domain = Arc::clone(&self.cross_domain);
@@ -289,13 +390,45 @@ impl WorkerPool {
                 break;
             }
 
-            // If drained, sleep instead of claiming new jobs.
-            if let Some(ref flag) = drained
-                && flag.load(Ordering::Relaxed)
-            {
+            // If drained (or shutting down), sleep instead of claiming new
+            // jobs. `shutdown_started` is one-way, so a `resume` racing a
+            // shutdown cannot re-arm the worker (nw-881).
+            if claims_blocked(drained.as_ref(), self.shutdown_started.as_ref()) {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                     _ = shutdown.changed() => {}
+                }
+                continue;
+            }
+
+            // nw-911: take the concurrency permit BEFORE claiming, so a job is
+            // only `running` (attempt consumed, lease ticking) when it can
+            // actually execute. Waiting on the permit also yields to shutdown.
+            let permit = tokio::select! {
+                permit = self.semaphore.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break, // semaphore closed — never happens, but never spin
+                },
+                changed = shutdown.changed() => {
+                    if changed.is_err() {
+                        break; // sender dropped — never spin
+                    }
+                    continue;
+                }
+            };
+            // Increment first, check second (mirrors the admin mutation
+            // admission): the drain reads this counter after shutdown starts,
+            // so either it sees our provisional increment and waits, or we see
+            // `shutdown_started`/`drained` below and back off. The increment is
+            // undone on every path that does not go on to spawn the job, and
+            // never counts toward the idle check further down.
+            if let Some(ref st) = status {
+                st.in_flight.fetch_add(1, Ordering::SeqCst);
+            }
+            // The permit wait may have been long; re-check before claiming.
+            if claims_blocked(drained.as_ref(), self.shutdown_started.as_ref()) {
+                if let Some(ref st) = status {
+                    st.in_flight.fetch_sub(1, Ordering::SeqCst);
                 }
                 continue;
             }
@@ -311,7 +444,16 @@ impl WorkerPool {
                     st.queue_depth
                         .store((depth.pending + depth.running) as u32, Ordering::Relaxed);
                 }
-                q.claim_next(2) // 2s debounce
+                let claimed = q.claim_next(2); // 2s debounce
+                // No job claimed: release the provisional increment before
+                // anything reads `in_flight` again. A claimed job keeps it
+                // (the task decrements on completion).
+                if !matches!(claimed, Ok(Some(_)))
+                    && let Some(ref st) = status
+                {
+                    st.in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+                claimed
             };
 
             let job = match job {
@@ -350,13 +492,6 @@ impl WorkerPool {
                 *st.current_repo.write().await = job.repo_id.clone();
             }
 
-            // Track in-flight tasks so queue depth reflects running work.
-            if let Some(ref st) = status {
-                st.in_flight.fetch_add(1, Ordering::Relaxed);
-            }
-
-            // Acquire a semaphore permit to bound concurrency.
-            let permit = self.semaphore.clone().acquire_owned().await.unwrap();
             let queue = queue.clone();
             let workspace = workspace.clone();
             let store = store.clone();
@@ -365,6 +500,8 @@ impl WorkerPool {
             let write_gate = write_gate.clone();
             let circuit_breakers = circuit_breakers.clone();
             let repo_types = repo_types.clone();
+            let runtime_repos = self.runtime_repos.clone();
+            let repo_policies = repo_policies.clone();
             let cross_domain = Arc::clone(&cross_domain);
             let relink_wake = Arc::clone(&relink_wake);
             let reindex_tracker = self.reindex_tracker.clone();
@@ -382,20 +519,39 @@ impl WorkerPool {
                         .get(&canonical_repo_id(&job_clone.repo_url))
                         .cloned()
                         .unwrap_or(RepoType::Code);
+                    let repo_policy = repo_policies
+                        .get(&canonical_repo_id(&job_clone.repo_url))
+                        .cloned()
+                        .unwrap_or_default();
+                    let runtime_snapshot = runtime_repo_snapshot(runtime_repos.as_ref(), &job_clone.repo_id);
                     tokio::task::spawn_blocking(move || {
+                        // Configured membership is authority: absence cancels
+                        // before any clone/fetch/parse, even if a queue claim survives.
+                        let runtime_snapshot = runtime_snapshot?;
+                        validate_runtime_repo_snapshot(runtime_repos.as_ref(), &job_clone.repo_id,
+                            runtime_snapshot.as_ref())?;
+                        let job_clone = preparation_job(&job_clone, runtime_snapshot.as_ref());
+                        let (repo_type, repo_policy) = runtime_snapshot.as_ref()
+                            .map(|settings| (settings.repo_type.clone(), settings.policy.clone()))
+                            .unwrap_or((repo_type, repo_policy));
                         // nw-286: resolve the instance HERE, once per job, on
                         // the blocking pool — the resolver consults the store,
                         // and the answer can differ from the one that was true
                         // when this pool was spawned.
                         let instance_id = instance_id();
-                        let prepared = prepare_job(
+                        let prepared = prepare_job_with_policy(
                             &job_clone,
                             &workspace,
                             &store,
                             &instance_id,
                             Some(&circuit_breakers),
                             repo_type,
-                        )?;
+                            &repo_policy,
+                        )?
+                        .map(|prepared| PreparedIndexJob {
+                            policy: repo_policy,
+                            ..prepared
+                        });
 
                         // Check if the job was cancelled (admin repo removal)
                         // before indexing. Verifies both ID and repo_id to
@@ -403,7 +559,7 @@ impl WorkerPool {
                         {
                             let q = queue_check.lock().unwrap_or_else(|e| e.into_inner());
                             if !q
-                                .job_is_active(job_clone.id, &job_clone.repo_id)
+                                .claim_is_active(&job_clone)
                                 .unwrap_or(false)
                             {
                                 tracing::info!(
@@ -446,9 +602,11 @@ impl WorkerPool {
                                     let _write_guard = write_gate_for_commit
                                         .as_ref()
                                         .map(|gate| gate.blocking_lock("worker_commit"));
+                                    validate_runtime_repo_snapshot(runtime_repos.as_ref(),
+                                        &job_for_gate.repo_id, runtime_snapshot.as_ref())?;
                                     let q = queue_for_gate.lock().unwrap_or_else(|e| e.into_inner());
                                     if !q
-                                        .job_is_active(job_for_gate.id, &job_for_gate.repo_id)
+                                        .claim_is_active(&job_for_gate)
                                         .unwrap_or(false)
                                     {
                                         tracing::info!(
@@ -502,6 +660,7 @@ impl WorkerPool {
                     Ok(Err(e)) if is_job_cancelled_error(&e) => {
                         let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = q.complete(job.id, &job.repo_id, job.claimed_by.as_deref());
+                        let _ = q.requeue_if_stale(&job.repo_id);
                         tracing::info!(repo = job.repo_id, "index cancelled");
                     }
                     Ok(Err(e)) if is_circuit_open_error(&e) => {
@@ -535,7 +694,7 @@ impl WorkerPool {
 
                 // Update queue depth and in-flight count after job completion.
                 if let Some(ref st) = status_clone {
-                    let remaining_in_flight = st.in_flight.fetch_sub(1, Ordering::Relaxed) - 1;
+                    let remaining_in_flight = st.in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
                     let q = queue.lock().unwrap_or_else(|e| e.into_inner());
                     if let Ok(depth) = q.queue_depth() {
                         let total = (depth.pending + depth.running) as u32;
@@ -568,6 +727,16 @@ impl WorkerPool {
     }
 }
 
+/// True when the worker must not claim new jobs: the admin `drained` flag is
+/// set, or shutdown has started (nw-881).
+fn claims_blocked(
+    drained: Option<&Arc<AtomicBool>>,
+    shutdown_started: Option<&Arc<AtomicBool>>,
+) -> bool {
+    drained.is_some_and(|flag| flag.load(Ordering::SeqCst))
+        || shutdown_started.is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
 #[derive(Debug)]
 struct PreparedIndexJob {
     repo_id: String,
@@ -576,8 +745,50 @@ struct PreparedIndexJob {
     remote_sha: String,
     /// How the repo's contents should be indexed (code vs markdown vault).
     repo_type: RepoType,
+    /// `[[repos]] exclude` / `unskip` for the bare reader (nw-908).
+    policy: RepoReadPolicy,
+    /// The workspace's `[git] credential_method`, so the blob prefetch
+    /// authenticates like the fetch that preceded it (nw-832).
+    credential_method: Option<String>,
 }
 
+/// The per-repo eligibility settings the bare-clone reader must honour so a
+/// server-indexed repo holds what a locally indexed one does (nw-908).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoReadPolicy {
+    /// `[[repos]] exclude` globs.
+    pub exclude: Vec<String>,
+    /// `[[repos]] unskip` directory names.
+    pub unskip: Vec<String>,
+}
+
+impl RepoReadPolicy {
+    /// The policy `config` declares for the repo at `repo_url`.
+    ///
+    /// THE one place a bare-clone policy is resolved from configuration: the
+    /// worker, the daemon's per-repo policy map and manifest recovery all call
+    /// it, so what the worker indexes under and what recovery recomputes the
+    /// fingerprint under cannot disagree (nw-908). Resolution is
+    /// [`InstanceConfig::exclude_globs_for`] / `unskip_names_for`, the same
+    /// lookup the local readers use.
+    pub fn for_url(config: &crate::config::InstanceConfig, repo_url: &str) -> Self {
+        Self {
+            exclude: config.exclude_globs_for(repo_url, None).to_vec(),
+            unskip: config.unskip_names_for(repo_url, None).to_vec(),
+        }
+    }
+
+    /// Apply this policy to a bare reader. Call BEFORE
+    /// `local_objects_only()` (which consumes the reader).
+    pub fn apply(
+        &self,
+        reader: crate::content_reader::GitBareReader,
+    ) -> Result<crate::content_reader::GitBareReader, anyhow::Error> {
+        Ok(reader.excluding(&self.exclude)?.unskipping(&self.unskip))
+    }
+}
+
+#[cfg(test)]
 fn prepare_job(
     job: &IndexJob,
     workspace: &BareCloneWorkspace,
@@ -585,6 +796,27 @@ fn prepare_job(
     instance_id: &str,
     circuit_breakers: Option<&RemoteCircuitBreakers>,
     repo_type: RepoType,
+) -> Result<Option<PreparedIndexJob>, anyhow::Error> {
+    prepare_job_with_policy(
+        job,
+        workspace,
+        store,
+        instance_id,
+        circuit_breakers,
+        repo_type,
+        &RepoReadPolicy::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_job_with_policy(
+    job: &IndexJob,
+    workspace: &BareCloneWorkspace,
+    store: &nestweaver_store::GraphStore,
+    instance_id: &str,
+    circuit_breakers: Option<&RemoteCircuitBreakers>,
+    repo_type: RepoType,
+    policy: &RepoReadPolicy,
 ) -> Result<Option<PreparedIndexJob>, anyhow::Error> {
     let fetch = || -> Result<_, anyhow::Error> {
         // 1. Ensure the bare clone exists.
@@ -631,7 +863,23 @@ fn prepare_job(
             .transpose()
             .map_err(|e| anyhow::anyhow!("repo_index_incomplete: {e}"))?
             .unwrap_or(false);
-        if !incomplete {
+        let reader_limits = if repo_type == RepoType::Vault {
+            crate::index_limits::NoteLimits::default().as_index_limits()
+        } else {
+            crate::index_limits::IndexLimits::default()
+        };
+        let reader = policy.apply(crate::content_reader::GitBareReader::with_limits(
+            &bare_path,
+            &remote_sha,
+            reader_limits,
+        ))?;
+        let expected_policy = match repo_type {
+            RepoType::Code => reader.eligibility_fingerprint(),
+            RepoType::Vault => format!("vault:{}", reader.eligibility_fingerprint()),
+        };
+        let policy_matches =
+            store.get_repo_index_policy(&r_uid)?.as_deref() == Some(expected_policy.as_str());
+        if !incomplete && policy_matches {
             tracing::debug!(repo = job.repo_id, "already up to date");
             return Ok(None);
         }
@@ -647,6 +895,8 @@ fn prepare_job(
         bare_path,
         remote_sha,
         repo_type,
+        policy: policy.clone(),
+        credential_method: workspace.credential_method.clone(),
     }))
 }
 
@@ -1053,10 +1303,6 @@ where
         None => false,
     };
 
-    if prepared.remote_sha == indexed_sha && !index_incomplete {
-        tracing::debug!(repo = prepared.repo_id, "already up to date");
-        return Ok(ReindexOutcome::Skipped);
-    }
     if index_incomplete {
         tracing::warn!(
             repo = prepared.repo_id,
@@ -1075,9 +1321,63 @@ where
         &prepared.remote_sha,
         reader_limits,
     );
+    let reader = prepared
+        .policy
+        .apply(reader)?
+        .with_credential_method(prepared.credential_method.clone());
+
+    let expected_policy = match prepared.repo_type {
+        RepoType::Code => reader.eligibility_fingerprint(),
+        RepoType::Vault => format!("vault:{}", reader.eligibility_fingerprint()),
+    };
+    if prepared.remote_sha == indexed_sha
+        && !index_incomplete
+        && store.get_repo_index_policy(&r_uid)?.as_deref() == Some(expected_policy.as_str())
+    {
+        return Ok(ReindexOutcome::Skipped);
+    }
+    let old_policy = store.get_repo_index_policy(&r_uid)?;
+    let vault_uid =
+        nestweaver_schema::vault_uid(instance_id, &prepared.bare_path.to_string_lossy());
+    let opposite_exists = match prepared.repo_type {
+        RepoType::Code => match store.lookup_vault(&vault_uid) {
+            Ok(_) => true,
+            Err(nestweaver_store::StoreError::NotFound) => false,
+            Err(error) => return Err(error.into()),
+        },
+        RepoType::Vault => {
+            existing_repo.is_some()
+                && !old_policy
+                    .as_deref()
+                    .is_some_and(|policy| policy.starts_with("vault:"))
+        }
+    };
+    let reader = if prepared.repo_type == RepoType::Vault || opposite_exists {
+        let mut repo = existing_repo.clone().unwrap_or(nestweaver_schema::Repo {
+            uid: r_uid.clone(),
+            url: prepared.repo_url.clone(),
+            indexed_sha: String::new(),
+            staleness_commits_behind: 0,
+            instance_id: instance_id.into(),
+            name: None,
+            root_path: None,
+        });
+        repo.indexed_sha = prepared.remote_sha.clone();
+        reader.with_strategy_replacement(nestweaver_store::write::RepoStrategyReplacement {
+            repo,
+            bare_root: prepared.bare_path.to_string_lossy().into_owned(),
+            policy: expected_policy.clone(),
+            to_vault: prepared.repo_type == RepoType::Vault,
+            remove_opposite: opposite_exists,
+        })
+    } else {
+        reader
+    };
+    let mut acquire_write_guard = acquire_write_guard;
 
     match prepared.repo_type {
         RepoType::Vault => {
+            prefetch_blobs_before_index(&reader, prepared, None, nestweaver_parser::is_markdown);
             // Markdown-vault repo: index Note/Section/Heading nodes via the
             // markdown indexer, then record the indexed SHA on the Repo node
             // (nw-003) so an unchanged vault is skipped on the next poll. The
@@ -1090,7 +1390,7 @@ where
                 instance_id,
                 &prepared.repo_url,
                 &prepared.remote_sha,
-                acquire_write_guard,
+                &mut acquire_write_guard,
             )?;
 
             // Discover cross-domain (Note↔Symbol) edges now that the vault's
@@ -1107,6 +1407,7 @@ where
                 vault_uid,
                 &reader as &dyn crate::content_reader::ContentReader,
             );
+            let _cross_domain_guard = acquire_write_guard()?;
             if let Err(e) = crate::cross_domain::discover_cross_domain_links_with_readers_and_config(
                 store,
                 &vault_readers,
@@ -1123,7 +1424,8 @@ where
             Ok(ReindexOutcome::Full)
         }
         RepoType::Code => {
-            let can_incremental = !index_incomplete
+            let can_incremental = reader.strategy_replacement().is_none()
+                && !index_incomplete
                 && !indexed_sha.is_empty()
                 && !force_full_reindex
                 && crate::git_diff::is_ancestor(
@@ -1132,6 +1434,16 @@ where
                     &prepared.remote_sha,
                 );
 
+            // The incremental indexer falls back to a FULL index when the
+            // recorded eligibility policy differs from the reader's (a
+            // changed exclude/unskip); prefetch the set it will really read.
+            let policy_matches = crate::index::repo_policy_matches_reader(store, &r_uid, &reader)?;
+            prefetch_blobs_before_index(
+                &reader,
+                prepared,
+                (can_incremental && policy_matches).then_some(indexed_sha),
+                crate::index::is_parseable,
+            );
             let outcome = if can_incremental {
                 let result = crate::index::incremental_index_with_reader_and_write_gate(
                     &reader,
@@ -1181,6 +1493,28 @@ where
             );
             Ok(outcome)
         }
+    }
+}
+
+/// nw-832: fetch every blob the coming index will read in one batched fetch
+/// instead of letting `cat-file --batch` lazy-fetch them one `git fetch` (and,
+/// over ssh, one handshake) at a time. Best-effort: a failure here is logged
+/// and the index proceeds with the old per-blob lazy fetch.
+fn prefetch_blobs_before_index(
+    reader: &crate::content_reader::GitBareReader,
+    prepared: &PreparedIndexJob,
+    previous_sha: Option<&str>,
+    wants: fn(&std::path::Path) -> bool,
+) {
+    match reader.prefetch_for_index(previous_sha, wants) {
+        Ok(0) => {}
+        Ok(count) => {
+            tracing::info!(repo = %prepared.repo_url, blobs = count, "prefetched blobs in batch")
+        }
+        Err(e) => tracing::warn!(
+            repo = %prepared.repo_url,
+            "blob prefetch failed; falling back to per-blob fetch: {e:#}"
+        ),
     }
 }
 
@@ -1480,6 +1814,245 @@ mod tests {
             store.graph_generation() > 0,
             "server-mode reader indexing should invalidate generation-keyed caches"
         );
+    }
+
+    /// Index `files` through the real prepare/commit path and return which of
+    /// `names` the store holds as symbols afterwards.
+    fn index_bytes_through_worker(
+        files: &[(&str, &[u8])],
+        policy: RepoReadPolicy,
+        names: &[&str],
+    ) -> Result<Vec<String>, anyhow::Error> {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        std::fs::create_dir_all(&src).unwrap();
+        create_source_repo(&src, &[("seed.rs", "pub fn seed() {}\n")]);
+        for (path, bytes) in files {
+            let full = src.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, bytes).unwrap();
+        }
+        for args in [&["add", "."][..], &["commit", "-m", "more"][..]] {
+            Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+        }
+        let url = format!("file://{}", src.display());
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let job = make_code_job(1, "r", &url);
+        let mut prepared = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)?
+            .expect("a fresh repo has work to do");
+        prepared.policy = policy;
+        commit_prepared_job(&prepared, &store, "inst")?;
+        Ok(names
+            .iter()
+            .filter(|name| !store.lookup_symbols_by_name(name).unwrap().is_empty())
+            .map(|name| name.to_string())
+            .collect())
+    }
+
+    /// nw-899: one non-UTF-8 tracked file must not fail the repo index. The
+    /// local index keeps the file lossily; the server index now does too.
+    #[test]
+    fn non_utf8_tracked_file_does_not_fail_the_server_index() {
+        let found = index_bytes_through_worker(
+            &[("latin1.rs", b"pub fn latin1_ok() {}\n// caf\xe9\n")],
+            RepoReadPolicy::default(),
+            &["seed", "latin1_ok"],
+        )
+        .expect("a Latin-1 file must not dead-letter the whole repo");
+        assert_eq!(found, ["seed", "latin1_ok"]);
+    }
+
+    /// nw-908: `[[repos]] exclude` and `unskip` reach the server-side reader
+    /// (the report's fixture: the server held the exact inverse of local).
+    #[test]
+    fn repo_exclude_and_unskip_apply_to_the_server_index() {
+        let files: &[(&str, &[u8])] = &[
+            ("escape/ex.rs", b"pub fn excluded_fn() {}\n"),
+            ("vendor/v.rs", b"pub fn vendor_fn() {}\n"),
+        ];
+        let names = ["excluded_fn", "vendor_fn"];
+        let default = index_bytes_through_worker(files, RepoReadPolicy::default(), &names).unwrap();
+        assert_eq!(default, ["excluded_fn"], "default: vendor/ pruned");
+        let policy = RepoReadPolicy {
+            exclude: vec!["escape/**".to_string()],
+            unskip: vec!["vendor".to_string()],
+        };
+        let configured = index_bytes_through_worker(files, policy, &names).unwrap();
+        assert_eq!(configured, ["vendor_fn"], "configured: the inverse");
+    }
+
+    fn config_with_repo_policy(url: &str) -> crate::config::InstanceConfig {
+        crate::config::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "test-instance"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "/tmp/workspace"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "{url}"
+exclude = ["escape/**"]
+unskip = ["vendor"]
+"#
+        ))
+        .unwrap()
+    }
+
+    /// nw-908: the worker and manifest recovery build their reader through
+    /// `RepoReadPolicy::for_url(..).apply(..)`; the eligibility fingerprint
+    /// that yields is the configured one, and an undeclared repo gets the
+    /// default (so recovery recomputes what the worker recorded).
+    #[test]
+    fn repo_read_policy_resolves_from_config_and_applies_to_the_reader() {
+        let url = "https://example.com/org/repo.git";
+        let config = config_with_repo_policy(url);
+        let policy = RepoReadPolicy::for_url(&config, url);
+        assert_eq!(policy.exclude, ["escape/**"]);
+        assert_eq!(policy.unskip, ["vendor"]);
+        assert_eq!(
+            RepoReadPolicy::for_url(&config, "https://example.com/org/other.git"),
+            RepoReadPolicy::default()
+        );
+
+        let bare = std::path::Path::new("/nonexistent/repo.git");
+        let limits = crate::index_limits::IndexLimits::default();
+        let applied = policy
+            .apply(crate::content_reader::GitBareReader::with_limits(
+                bare, "sha", limits,
+            ))
+            .unwrap();
+        let by_hand = crate::content_reader::GitBareReader::with_limits(bare, "sha", limits)
+            .excluding(&["escape/**".to_string()])
+            .unwrap()
+            .unskipping(&["vendor".to_string()]);
+        let default = crate::content_reader::GitBareReader::with_limits(bare, "sha", limits);
+        use crate::content_reader::ContentReader;
+        assert_eq!(
+            applied.eligibility_fingerprint(),
+            by_hand.eligibility_fingerprint()
+        );
+        assert_ne!(
+            applied.eligibility_fingerprint(),
+            default.eligibility_fingerprint()
+        );
+        // `local_objects_only` (manifest recovery) keeps the policy.
+        assert_eq!(
+            applied.local_objects_only().eligibility_fingerprint(),
+            by_hand.eligibility_fingerprint()
+        );
+    }
+
+    /// A source repo for blobless-clone worker tests: partial clones allowed,
+    /// `n` files under src/ plus `vendor/v.rs` (pruned by default).
+    fn filterable_source(src: &std::path::Path, n: usize) {
+        use crate::content_reader::test_util::allow_partial_clone;
+        let files: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("src/f{i}.rs"), format!("pub fn f{i}() {{}}\n")))
+            .chain(std::iter::once((
+                "vendor/v.rs".to_string(),
+                "pub fn vendor_fn() {}\n".to_string(),
+            )))
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        create_source_repo(src, &refs);
+        allow_partial_clone(src);
+    }
+
+    /// nw-832: through the real worker path, indexing a blobless bare clone
+    /// fetches its blobs in O(1) fetch runs, not one per file.
+    #[test]
+    fn worker_index_of_a_blobless_clone_fetches_blobs_in_one_run() {
+        use crate::content_reader::test_util::{keep_each_fetch_as_a_pack, pack_count};
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        filterable_source(&src, 12);
+        let url = format!("file://{}", src.display());
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let job = make_code_job(1, "r", &url);
+        let prepared = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)
+            .unwrap()
+            .unwrap();
+        keep_each_fetch_as_a_pack(&prepared.bare_path);
+        let before = pack_count(&prepared.bare_path);
+        commit_prepared_job(&prepared, &store, "inst").unwrap();
+        // Default policy prunes vendor/, so 12 src blobs arrive in ONE fetch.
+        assert_eq!(pack_count(&prepared.bare_path) - before, 1);
+        assert!(!store.lookup_symbols_by_name("f11").unwrap().is_empty());
+    }
+
+    /// nw-832 / review R2: when the recorded eligibility policy differs from
+    /// the reader's, the incremental indexer falls back to a FULL index, so the
+    /// prefetch must cover the full eligible set, not just the diff. Here a
+    /// changed `unskip` makes the never-fetched `vendor/v.rs` (unchanged
+    /// between the two commits) part of the index; diff-only prefetch would
+    /// fetch it lazily as a second run.
+    #[test]
+    fn policy_change_makes_the_incremental_prefetch_cover_the_full_set() {
+        use crate::content_reader::test_util::{keep_each_fetch_as_a_pack, pack_count};
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        filterable_source(&src, 4);
+        let url = format!("file://{}", src.display());
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let job = make_code_job(1, "r", &url);
+
+        let first = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)
+            .unwrap()
+            .unwrap();
+        keep_each_fetch_as_a_pack(&first.bare_path);
+        commit_prepared_job(&first, &store, "inst").unwrap();
+        assert!(
+            store
+                .lookup_symbols_by_name("vendor_fn")
+                .unwrap()
+                .is_empty()
+        );
+
+        commit_file(&src, "src/new.rs", "pub fn new_one() {}\n", "two");
+        let mut second = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)
+            .unwrap()
+            .expect("a new commit has work to do");
+        second.policy = RepoReadPolicy {
+            exclude: Vec::new(),
+            unskip: vec!["vendor".to_string()],
+        };
+        let before = pack_count(&second.bare_path);
+        commit_prepared_job(&second, &store, "inst").unwrap();
+        assert_eq!(
+            pack_count(&second.bare_path) - before,
+            1,
+            "new.rs and the newly eligible vendor/v.rs arrive in ONE fetch"
+        );
+        assert!(
+            !store
+                .lookup_symbols_by_name("vendor_fn")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.lookup_symbols_by_name("new_one").unwrap().is_empty());
     }
 
     #[test]
@@ -2620,6 +3193,170 @@ mod tests {
         );
     }
 
+    /// nw-910: a pool size outside the semaphore's usable range must not
+    /// wedge (0 permits) or panic (> MAX_PERMITS) the worker.
+    #[test]
+    fn pool_concurrency_is_clamped_to_a_usable_range() {
+        assert_eq!(WorkerPool::new(0).concurrency(), 1);
+        assert_eq!(
+            WorkerPool::new(usize::MAX).concurrency(),
+            crate::config::MAX_INDEXING_WORKERS
+        );
+        assert_eq!(WorkerPool::new(3).concurrency(), 3);
+    }
+
+    /// Spin up a worker over `jobs` (repo_id -> source dir) and return handles.
+    #[allow(clippy::type_complexity)]
+    fn spawn_test_worker(
+        tmp: &TempDir,
+        concurrency: usize,
+        repos: &[&str],
+        configure: impl FnOnce(WorkerPool) -> WorkerPool,
+        drained: Option<Arc<AtomicBool>>,
+        write_gate: Option<crate::write_gate::WriteGate>,
+    ) -> (
+        Arc<Mutex<JobQueue>>,
+        IndexingStatus,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let queue = JobQueue::open(&tmp.path().join("jobs.db")).unwrap();
+        for repo in repos {
+            let src = tmp.path().join(format!("source-{repo}"));
+            create_source_repo(&src, &[("lib.rs", "pub fn f() -> i32 { 1 }")]);
+            queue
+                .upsert(
+                    repo,
+                    &format!("file://{}", src.display()),
+                    JobTrigger::Unindexed,
+                    None,
+                )
+                .unwrap();
+        }
+        let queue = Arc::new(Mutex::new(queue));
+        let workspace = Arc::new(BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap());
+        let store = Arc::new(nestweaver_store::GraphStore::in_memory().unwrap());
+        let status = IndexingStatus::new();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let pool = configure(WorkerPool::new(concurrency));
+        let (q, st) = (queue.clone(), status.clone());
+        let handle = tokio::spawn(async move {
+            pool.run_with_drain(
+                q,
+                workspace,
+                store,
+                fixed_instance_id("test"),
+                &mut shutdown_rx,
+                Some(st),
+                drained,
+                write_gate,
+            )
+            .await;
+        });
+        (queue, status, shutdown_tx, handle)
+    }
+
+    /// nw-881: `drained` can be cleared by `POST /admin/api/resume`; once
+    /// `shutdown_started` is set the worker must still claim nothing.
+    ///
+    /// Not vacuous: `claim_next(2)` debounces by 2s and the idle loop polls
+    /// every 1s, so a job is first claimable a few seconds in. The control run
+    /// (same setup, `shutdown_started = false`) proves the job IS claimed in
+    /// that time; the gated run then watches for longer than that.
+    #[tokio::test]
+    async fn worker_claims_nothing_once_shutdown_started_even_if_not_drained() {
+        // Positive control: not shutting down -> the job gets claimed.
+        {
+            let tmp = TempDir::new().unwrap();
+            let (queue, status, shutdown_tx, handle) = spawn_test_worker(
+                &tmp,
+                1,
+                &["control-repo"],
+                |pool| pool.with_shutdown_started(Arc::new(AtomicBool::new(false))),
+                Some(Arc::new(AtomicBool::new(false))),
+                None,
+            );
+            let claimed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    let depth = queue.lock().unwrap().queue_depth().unwrap();
+                    if depth.pending == 0 || depth.running > 0 {
+                        break;
+                    }
+                    if status.in_flight.load(Ordering::SeqCst) > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            assert!(
+                claimed.is_ok(),
+                "control: an unblocked worker must claim the job"
+            );
+            shutdown_tx.send(true).unwrap();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), handle).await;
+        }
+
+        // Gated: shutdown started, `drained` "resumed" to false.
+        let tmp = TempDir::new().unwrap();
+        let (queue, status, shutdown_tx, handle) = spawn_test_worker(
+            &tmp,
+            1,
+            &["late-repo"],
+            |pool| pool.with_shutdown_started(Arc::new(AtomicBool::new(true))),
+            Some(Arc::new(AtomicBool::new(false))), // "resumed"
+            None,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(6_000)).await;
+        let depth = queue.lock().unwrap().queue_depth().unwrap();
+        assert_eq!(depth.pending, 1, "the queued job must stay unclaimed");
+        assert_eq!(depth.running, 0);
+        assert_eq!(status.in_flight.load(Ordering::SeqCst), 0);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    /// nw-911: with one permit and two queued jobs, only ONE may be claimed
+    /// (`running`); the other must stay `pending` — not `running` with its
+    /// lease ticking and an attempt consumed while it waits for a permit.
+    #[tokio::test]
+    async fn worker_does_not_claim_a_job_it_has_no_permit_for() {
+        let tmp = TempDir::new().unwrap();
+        let gate = crate::write_gate::WriteGate::new();
+        // Hold the gate so the first job's commit blocks, keeping its permit.
+        let held = gate.lock("test_holds_gate").await;
+        let (queue, status, shutdown_tx, handle) = spawn_test_worker(
+            &tmp,
+            1,
+            &["repo-a", "repo-b"],
+            |pool| pool,
+            None,
+            Some(gate.clone()),
+        );
+        let blocked = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while gate.waiting() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(blocked.is_ok(), "first job must reach its commit and block");
+        // Give the loop ample time to (wrongly) claim the second job.
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        let depth = queue.lock().unwrap().queue_depth().unwrap();
+        assert_eq!(depth.running, 1, "only the job holding a permit is running");
+        assert_eq!(depth.pending, 1, "the second job must remain pending");
+        assert_eq!(status.in_flight.load(Ordering::Relaxed), 1);
+
+        // Releasing the gate lets both finish; shutdown is not blocked on a
+        // permit wait either.
+        drop(held);
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("worker must exit")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn worker_drains_in_flight_job_on_shutdown() {
         // On shutdown the worker must DRAIN: its loop task does not return until
@@ -3012,5 +3749,245 @@ mod tests {
                 .is_some(),
             "keep_b should survive the full reindex"
         );
+    }
+    #[test]
+    fn unchanged_sha_heals_policy_and_code_vault_switches() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(
+            &src,
+            &[
+                ("main.rs", "pub fn keep() {}"),
+                ("vendor/v.rs", "pub fn restored() {}"),
+                ("note.md", "# Note\nBody\n"),
+            ],
+        );
+        let url = format!("file://{}", src.display());
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let job = make_code_job(1, "repo", &url);
+        let first = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)
+            .unwrap()
+            .unwrap();
+        commit_prepared_job(&first, &store, "inst").unwrap();
+        assert!(
+            prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)
+                .unwrap()
+                .is_none()
+        );
+        let policy = RepoReadPolicy {
+            exclude: vec!["main.rs".into()],
+            unskip: vec!["vendor".into()],
+        };
+        let changed =
+            prepare_job_with_policy(&job, &ws, &store, "inst", None, RepoType::Code, &policy)
+                .unwrap()
+                .unwrap();
+        assert_eq!(first.remote_sha, changed.remote_sha);
+        commit_prepared_job(&changed, &store, "inst").unwrap();
+        assert!(store.lookup_symbols_by_name("keep").unwrap().is_empty());
+        assert!(!store.lookup_symbols_by_name("restored").unwrap().is_empty());
+        let vault = prepare_job(&job, &ws, &store, "inst", None, RepoType::Vault)
+            .unwrap()
+            .unwrap();
+        commit_prepared_job(&vault, &store, "inst").unwrap();
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        assert_eq!(store.count_notes().unwrap(), 1);
+        assert!(
+            prepare_job(&job, &ws, &store, "inst", None, RepoType::Vault)
+                .unwrap()
+                .is_none()
+        );
+        let code = prepare_job(&job, &ws, &store, "inst", None, RepoType::Code)
+            .unwrap()
+            .unwrap();
+        commit_prepared_job(&code, &store, "inst").unwrap();
+        assert_eq!(store.count_notes().unwrap(), 0);
+        assert!(!store.lookup_symbols_by_name("keep").unwrap().is_empty());
+    }
+    #[test]
+    fn captured_runtime_branch_controls_prepare_after_claim_and_branch_removal() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("main.rs", "pub fn initial() {}")]);
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output);
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["branch", "old"]);
+        git(&["checkout", "-b", "new"]);
+        commit_file(&src, "main.rs", "pub fn new_branch() {}", "new branch");
+        let head = git(&["rev-parse", "HEAD"]);
+        let url = format!("file://{}", src.display());
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let mut claimed = make_code_job(1, "repo", &url);
+        claimed.branch = Some("old".into());
+        // Models the reload after claim, before capturing the immutable snapshot.
+        for branch in [Some("new".into()), None] {
+            let snapshot = RepoRuntimeConfig {
+                repo_type: RepoType::Code,
+                policy: Default::default(),
+                branch,
+            };
+            let runtime = std::sync::RwLock::new(RepoRuntimeConfig {
+                branch: Some("old".into()),
+                ..snapshot.clone()
+            });
+            let claimed_barrier = std::sync::Barrier::new(2);
+            let snapshot_barrier = std::sync::Barrier::new(2);
+            let sha = std::thread::scope(|scope| {
+                let fetching = scope.spawn(|| {
+                    claimed_barrier.wait();
+                    snapshot_barrier.wait();
+                    let captured = runtime.read().unwrap().clone();
+                    let effective = preparation_job(&claimed, Some(&captured));
+                    assert_eq!(effective.id, claimed.id);
+                    assert_eq!(effective.claimed_by, claimed.claimed_by);
+                    prepare_job_with_policy(
+                        &effective,
+                        &ws,
+                        &store,
+                        "inst",
+                        None,
+                        captured.repo_type.clone(),
+                        &captured.policy,
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .remote_sha
+                });
+                claimed_barrier.wait();
+                *runtime.write().unwrap() = snapshot;
+                snapshot_barrier.wait();
+                fetching.join().unwrap()
+            });
+            assert_eq!(sha, head);
+            assert_eq!(claimed.branch.as_deref(), Some("old"));
+        }
+    }
+
+    #[test]
+    fn strategy_transition_publication_admission_failure_preserves_old_graph() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(
+            &src,
+            &[
+                ("main.rs", "pub fn incumbent() {}"),
+                ("note.md", "# Incumbent"),
+            ],
+        );
+        let url = format!("file://{}", src.display());
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let job = make_code_job(1, "repo", &url);
+        for (old, new) in [
+            (RepoType::Code, RepoType::Vault),
+            (RepoType::Vault, RepoType::Code),
+        ] {
+            let first = prepare_job(
+                &job,
+                &ws,
+                &nestweaver_store::GraphStore::in_memory().unwrap(),
+                "inst",
+                None,
+                old,
+            )
+            .unwrap()
+            .unwrap();
+            commit_prepared_job(&first, &store, "inst").unwrap();
+            let r_uid = nestweaver_schema::repo_uid("inst", &url);
+            let policy = store.get_repo_index_policy(&r_uid).unwrap();
+            let counts = (store.count_symbols().unwrap(), store.count_notes().unwrap());
+            let replacement = prepare_job(&job, &ws, &store, "inst", None, new)
+                .unwrap()
+                .unwrap();
+            let error = commit_prepared_job_with_write_gate(&replacement, &store, "inst", || {
+                Err::<(), _>(anyhow::anyhow!("publication admission refused"))
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("publication admission refused"));
+            assert_eq!(
+                (store.count_symbols().unwrap(), store.count_notes().unwrap()),
+                counts
+            );
+            assert_eq!(store.get_repo_index_policy(&r_uid).unwrap(), policy);
+            // Complete the transition so the reverse iteration starts in its stated strategy.
+            commit_prepared_job(&replacement, &store, "inst").unwrap();
+        }
+    }
+    #[test]
+    fn active_claim_without_runtime_membership_cannot_prepare_or_publish() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("main.rs", "pub fn must_not_publish() {}")]);
+        let url = format!("file://{}", src.display());
+        let id = canonical_repo_id(&url);
+        let queue = JobQueue::open(&tmp.path().join("jobs.db")).unwrap();
+        queue
+            .upsert(&id, &url, crate::jobs::JobTrigger::Unindexed, None)
+            .unwrap();
+        let claimed = queue.claim_next(0).unwrap().unwrap();
+        let runtime: RuntimeRepoConfigs = Default::default();
+        // The actual pre-fetch resolver rejects an absent configured member,
+        // independently of the queue row, which deliberately remains running.
+        assert!(is_job_cancelled_error(
+            &runtime_repo_snapshot(Some(&runtime), &id).unwrap_err()
+        ));
+        assert!(queue.claim_is_active(&claimed).unwrap());
+        // None == None must never be publication authority for a configured map.
+        assert!(is_job_cancelled_error(
+            &validate_runtime_repo_snapshot(Some(&runtime), &id, None).unwrap_err()
+        ));
+        let settings = RepoRuntimeConfig {
+            repo_type: RepoType::Code,
+            policy: Default::default(),
+            branch: None,
+        };
+        runtime.write().unwrap().insert(id.clone(), settings);
+        let captured = runtime_repo_snapshot(Some(&runtime), &id).unwrap();
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let prepared = prepare_job(&claimed, &ws, &store, "inst", None, RepoType::Code)
+            .unwrap()
+            .unwrap();
+        runtime.write().unwrap().remove(&id);
+        let error = commit_prepared_job_with_write_gate(&prepared, &store, "inst", || {
+            validate_runtime_repo_snapshot(Some(&runtime), &id, captured.as_ref())?;
+            assert!(queue.claim_is_active(&claimed).unwrap());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(is_job_cancelled_error(&error));
+        assert!(
+            queue.claim_is_active(&claimed).unwrap(),
+            "test must not rely on queue cancellation"
+        );
+        assert!(store.list_repos(None).unwrap().is_empty());
+        assert_eq!(store.count_symbols().unwrap(), 0);
+        assert_eq!(store.count_notes().unwrap(), 0);
+    }
+
+    #[test]
+    fn configless_runtime_and_explicit_admin_membership_remain_valid() {
+        assert!(runtime_repo_snapshot(None, "legacy").unwrap().is_none());
+        validate_runtime_repo_snapshot(None, "legacy", None).unwrap();
+        let runtime: RuntimeRepoConfigs = Default::default();
+        runtime.write().unwrap().insert(
+            "added".into(),
+            RepoRuntimeConfig {
+                repo_type: RepoType::Code,
+                policy: Default::default(),
+                branch: None,
+            },
+        );
+        let snapshot = runtime_repo_snapshot(Some(&runtime), "added").unwrap();
+        validate_runtime_repo_snapshot(Some(&runtime), "added", snapshot.as_ref()).unwrap();
     }
 }

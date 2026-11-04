@@ -97,6 +97,11 @@ pub fn node_owner(uid: &str) -> NodeOwner {
 /// either end.
 pub const NW_ERROR_CODE_METADATA_KEY: &str = "nw-error-code";
 
+/// `nw-error-code` value the server stamps on a lookup miss (a note, symbol or
+/// other target that does not exist). Defined here so the MCP tool layer that
+/// stamps it and the federation client that classifies it share one literal.
+pub const TOOL_TARGET_NOT_FOUND_CODE: &str = "tool-target-not-found";
+
 /// The code stamped when a `repo` filter selector did not resolve.
 pub const REPO_FILTER_UNRESOLVED_CODE: &str = "repo-filter-unresolved";
 

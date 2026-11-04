@@ -89,6 +89,9 @@ pub(crate) struct PprGraphCached {
 #[derive(Default)]
 struct IndexPublicationLeaseState {
     owner: Option<u64>,
+    owner_label: Option<String>,
+    owner_since: Option<std::time::Instant>,
+    revision: u64,
     /// Token that explicitly reserved or recovered this publication. An
     /// inherited generation base alone cannot authorize a new snapshot lease.
     reservation_owner: Option<u64>,
@@ -142,6 +145,19 @@ impl std::fmt::Debug for IndexPublicationLease<'_> {
 }
 
 impl IndexPublicationLease<'_> {
+    /// Diagnostic operation label, independent of publication authority.
+    pub fn set_operation(&self, operation: &str) {
+        let mut state = self
+            .store
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.owner == Some(self.token) {
+            state.owner_label = Some(operation.to_string());
+        }
+    }
+
     /// The store whose publication lifetime this lease exclusively owns.
     pub fn store(&self) -> &GraphStore {
         self.store
@@ -553,6 +569,13 @@ fn bulk_copy_not_durable(message: &str) -> String {
 
 /// True when `query` has a `RETURN` clause: its rows are part of its answer.
 fn statement_returns_rows(query: &str) -> bool {
+    // EXPLAIN/PROFILE return a plan even when the explained mutation has no
+    // RETURN clause. Preserve that native result for diagnostics.
+    if query.split_whitespace().next().is_some_and(|word| {
+        word.eq_ignore_ascii_case("EXPLAIN") || word.eq_ignore_ascii_case("PROFILE")
+    }) {
+        return true;
+    }
     query
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|word| word.eq_ignore_ascii_case("RETURN"))
@@ -3167,6 +3190,8 @@ impl GraphStore {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let wait_started = std::time::Instant::now();
+        let mut next_report = std::time::Duration::from_secs(30);
         let mut registered_waiter = false;
         while state.owner.is_some() {
             if !registered_waiter {
@@ -3176,11 +3201,20 @@ impl GraphStore {
                 registered_waiter = true;
                 self.index_publication_lease.available.notify_all();
             }
-            state = self
+            let (next, _timeout) = self
                 .index_publication_lease
                 .available
-                .wait(state)
+                .wait_timeout(state, next_report.saturating_sub(wait_started.elapsed()))
                 .unwrap_or_else(|error| error.into_inner());
+            state = next;
+            if Self::wait_report_due(wait_started.elapsed(), &mut next_report)
+                && state.owner.is_some()
+            {
+                tracing::warn!(owner_token = ?state.owner, owner = ?state.owner_label,
+                    owner_age_secs = state.owner_since.map(|since| since.elapsed().as_secs()),
+                    waiters = state.waiters, waited_secs = wait_started.elapsed().as_secs(),
+                    "still waiting for index publication ownership");
+            }
         }
         if registered_waiter {
             state.waiters -= 1;
@@ -3193,6 +3227,14 @@ impl GraphStore {
             StoreError::Query("index publication ownership token exhausted".into())
         })?;
         state.owner = Some(token);
+        state.owner_label = Some(
+            std::thread::current()
+                .name()
+                .unwrap_or("publisher")
+                .to_string(),
+        );
+        state.owner_since = Some(std::time::Instant::now());
+        state.revision = state.revision.wrapping_add(1);
         Ok(IndexPublicationLease {
             store: self,
             token,
@@ -3225,6 +3267,14 @@ impl GraphStore {
             StoreError::Query("index publication ownership token exhausted".into())
         })?;
         state.owner = Some(token);
+        state.owner_label = Some(
+            std::thread::current()
+                .name()
+                .unwrap_or("publisher")
+                .to_string(),
+        );
+        state.owner_since = Some(std::time::Instant::now());
+        state.revision = state.revision.wrapping_add(1);
         Ok(Some(IndexPublicationLease {
             store: self,
             token,
@@ -3304,6 +3354,40 @@ impl GraphStore {
         }
     }
 
+    /// Deterministic cadence shared by unbounded waits. Callers supply
+    /// elapsed time so boundary behavior can be tested without sleeping.
+    #[doc(hidden)]
+    pub fn wait_report_due(elapsed: std::time::Duration, next: &mut std::time::Duration) -> bool {
+        if elapsed < *next {
+            return false;
+        }
+        *next = elapsed.saturating_add(std::time::Duration::from_secs(30));
+        true
+    }
+
+    /// Snapshot changes on acquisition AND release, including a watcher that
+    /// was already active before an off-gate scan began.
+    pub fn index_publication_revision(&self) -> u64 {
+        self.index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .revision
+    }
+
+    pub fn index_publication_owner_snapshot(&self) -> Option<(u64, String, u64)> {
+        let state = self
+            .index_publication_lease
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Some((
+            state.owner?,
+            state.owner_label.clone().unwrap_or_default(),
+            state.owner_since?.elapsed().as_secs(),
+        ))
+    }
+
     /// True when no in-process owner currently holds the index-publication lease.
     ///
     /// A leftover `index_publication_generation_base` while the lease is UNOWNED
@@ -3338,6 +3422,8 @@ impl GraphStore {
         if state.owner.is_none() {
             return;
         }
+        let wait_started = std::time::Instant::now();
+        let mut next_report = std::time::Duration::from_secs(30);
         let mut registered_waiter = false;
         if let Some(count) = state.waiters.checked_add(1) {
             state.waiters = count;
@@ -3345,11 +3431,20 @@ impl GraphStore {
             self.index_publication_lease.available.notify_all();
         }
         while state.owner.is_some() {
-            state = self
+            let (next, _timeout) = self
                 .index_publication_lease
                 .available
-                .wait(state)
+                .wait_timeout(state, next_report.saturating_sub(wait_started.elapsed()))
                 .unwrap_or_else(|error| error.into_inner());
+            state = next;
+            if Self::wait_report_due(wait_started.elapsed(), &mut next_report)
+                && state.owner.is_some()
+            {
+                tracing::warn!(owner_token = ?state.owner, owner = ?state.owner_label,
+                    owner_age_secs = state.owner_since.map(|since| since.elapsed().as_secs()),
+                    waiters = state.waiters, waited_secs = wait_started.elapsed().as_secs(),
+                    "still waiting for index publication ownership");
+            }
         }
         if registered_waiter {
             state.waiters -= 1;
@@ -3368,6 +3463,9 @@ impl GraphStore {
             ));
         }
         state.owner = None;
+        state.owner_label = None;
+        state.owner_since = None;
+        state.revision = state.revision.wrapping_add(1);
         state.reservation_owner = None;
         drop(state);
         self.index_publication_lease.available.notify_all();
@@ -7865,6 +7963,48 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn publication_wait_diagnostics_repeat_at_thirty_second_boundaries() {
+        use std::time::Duration;
+        let mut next = Duration::from_secs(30);
+        assert!(!GraphStore::wait_report_due(
+            Duration::from_secs(29),
+            &mut next
+        ));
+        assert!(GraphStore::wait_report_due(
+            Duration::from_secs(30),
+            &mut next
+        ));
+        assert!(!GraphStore::wait_report_due(
+            Duration::from_secs(59),
+            &mut next
+        ));
+        assert!(GraphStore::wait_report_due(
+            Duration::from_secs(60),
+            &mut next
+        ));
+        assert!(GraphStore::wait_report_due(
+            Duration::from_secs(90),
+            &mut next
+        ));
+    }
+
+    #[test]
+    fn publication_revision_and_owner_cover_the_entire_batch_lifetime() {
+        let store = GraphStore::in_memory().unwrap();
+        let before = store.index_publication_revision();
+        let lease = store.acquire_index_publication_lease().unwrap();
+        lease.set_operation("brain watcher batch");
+        let owned = store.index_publication_revision();
+        assert_ne!(before, owned);
+        let (_, label, age) = store.index_publication_owner_snapshot().unwrap();
+        assert_eq!(label, "brain watcher batch");
+        assert_eq!(age, 0);
+        drop(lease);
+        assert_ne!(owned, store.index_publication_revision());
+        assert!(store.index_publication_owner_snapshot().is_none());
     }
 
     #[test]

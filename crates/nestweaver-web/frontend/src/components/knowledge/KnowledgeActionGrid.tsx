@@ -7,6 +7,7 @@ import { NodeActionBar } from "../actions/NodeActionBar";
 interface KnowledgeActionGridProps {
   node: NodeActionContext | null;
   compact?: boolean;
+  remote?: boolean;
 }
 
 const knowledgeActionIds: NodeActionId[] = [
@@ -22,11 +23,12 @@ const knowledgeActionIds: NodeActionId[] = [
 export function KnowledgeActionGrid({
   node,
   compact = true,
+  remote = false,
 }: KnowledgeActionGridProps) {
   return (
     <NodeActionBar
       node={node}
-      ids={knowledgeActionIds}
+      ids={remote ? ["impact", "copyLink"] : knowledgeActionIds}
       compact={compact}
       className="grid grid-cols-2 gap-1.5"
     />

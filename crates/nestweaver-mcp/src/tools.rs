@@ -4168,6 +4168,17 @@ pub fn tool_doc_entries() -> Vec<(String, String, String, Vec<String>)> {
         .collect()
 }
 
+/// Explicit transport-mode admission, shared with daemon status providers.
+pub fn enforce_lite_tool_allowed(name: &str, lite: bool) -> Result<(), anyhow::Error> {
+    if lite && !LITE_TOOLS.contains(&name) {
+        return Err(anyhow!(
+            "tool '{name}' is not available in lite mode; allowed: {}",
+            LITE_TOOLS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Enforce the `--tools` allowlist and `--lite` mode for a dispatch. Called by
 /// EVERY dispatch entry point (local store, daemon proxy, hybrid routing) so a
 /// restricted server cannot be reached by routing around the local path
@@ -4179,12 +4190,7 @@ pub fn enforce_tool_allowed(name: &str) -> Result<(), anyhow::Error> {
             "tool '{name}' is unavailable in direct read-only mode; remove --no-daemon to route mutations through the daemon"
         ));
     }
-    if is_lite_mode() && !LITE_TOOLS.contains(&name) {
-        return Err(anyhow!(
-            "tool '{name}' is not available in lite mode; allowed: {}",
-            LITE_TOOLS.join(", ")
-        ));
-    }
+    enforce_lite_tool_allowed(name, is_lite_mode())?;
     let allowed = ALLOWED_TOOLS.with(|c| c.borrow().clone());
     if let Some(ref names) = allowed
         && !names.iter().any(|a| a == name)
@@ -4334,6 +4340,36 @@ pub fn dispatch(
     dispatch_cancellable(store, tantivy, name, args, embed_model, None, None)
 }
 
+/// Native-free admission shared by dispatch and the daemon status snapshot.
+/// Callers must supply the visibility already admitted by their transport.
+pub fn admit_tool_arguments(
+    name: &str,
+    args: Value,
+    visible: Option<&nestweaver_engine::authz::VisibleRepos>,
+) -> Result<Value, anyhow::Error> {
+    // Enforce --tools allowlist and --lite mode.
+    enforce_tool_allowed(name)?;
+
+    // Refuse before embedding/graph preflights, response caches, and shared
+    // flights. Otherwise a scoped caller could receive global preflight details,
+    // or a follower could lose the typed authorization error when coalescing.
+    if matches!(
+        visible,
+        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
+    ) && let RepoScope::FailClosed(reason) = repo_scope(name)
+    {
+        return Err(RepositoryScopeRefused {
+            tool: name.to_string(),
+            reason,
+        }
+        .into());
+    }
+
+    let args = canonicalize_tool_arguments(name, args);
+    validate_tool_arguments(name, &args)?;
+    Ok(args)
+}
+
 /// Like [`dispatch`], but threads a cooperative cancellation flag into the
 /// heavy traversals (e.g. `brain_context`/`project_context` vector fan-out) so a
 /// query timeout or client disconnect can stop the work. `cancel = None` is the
@@ -4368,26 +4404,7 @@ pub fn dispatch_cancellable(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
-    // Enforce --tools allowlist and --lite mode.
-    enforce_tool_allowed(name)?;
-
-    // Refuse before embedding/graph preflights, response caches, and shared
-    // flights. Otherwise a scoped caller could receive global preflight details,
-    // or a follower could lose the typed authorization error when coalescing.
-    if matches!(
-        visible,
-        Some(nestweaver_engine::authz::VisibleRepos::Only(_))
-    ) && let RepoScope::FailClosed(reason) = repo_scope(name)
-    {
-        return Err(RepositoryScopeRefused {
-            tool: name.to_string(),
-            reason,
-        }
-        .into());
-    }
-
-    let args = canonicalize_tool_arguments(name, args);
-    validate_tool_arguments(name, &args)?;
+    let args = admit_tool_arguments(name, args, visible)?;
     // Reranking consumes persisted embedding-derived similarity signals even
     // when the primary retrieval request is lexical-only. Guard before the
     // response cache so a prior successful response cannot bypass a newly
@@ -5958,7 +5975,7 @@ fn try_read_symbols_from_bare(
 ) -> Option<nestweaver_engine::read_symbols::ReadSymbolsResult> {
     // Derive workspace root from the thread-local db_path.
     let db_path = current_db_path(store).ok()?;
-    let workspace_root = db_path.parent()?.join("workspace");
+    let workspace_root = nestweaver_engine::bare_clone::effective_clone_root(&db_path);
     if !workspace_root.is_dir() {
         return None;
     }
@@ -6062,7 +6079,7 @@ fn inline_body_reader_resolver(store: &GraphStore) -> Option<BoxedInlineBodyReso
         return None;
     }
     let db_path = current_db_path(store).ok()?;
-    let workspace_root = db_path.parent()?.join("workspace");
+    let workspace_root = nestweaver_engine::bare_clone::effective_clone_root(&db_path);
     if !workspace_root.is_dir() {
         return None;
     }
@@ -7527,7 +7544,7 @@ impl std::error::Error for ToolTargetNotFound {}
 /// The metadata code (under `NW_ERROR_CODE_METADATA_KEY`) the daemon stamps
 /// on a status raised by [`ToolTargetNotFound`]; the envelope itself rides in
 /// the status details.
-pub const TOOL_TARGET_NOT_FOUND_CODE: &str = "tool-target-not-found";
+pub use nestweaver_engine::node_scope::TOOL_TARGET_NOT_FOUND_CODE;
 
 /// Build a [`ToolTargetNotFound`]. `did_you_mean` is omitted when empty, the
 /// nw-481 convention the CLI's envelope already follows.
@@ -11797,6 +11814,24 @@ pub fn brain_status_repo_inventory(
         .collect()
 }
 
+/// File-backed publication disclosure; performs no native graph query.
+pub fn publication_status_json(
+    status: &nestweaver_engine::index_publication::IndexPublicationStatus,
+) -> Value {
+    json!({
+        "dirty": status.dirty,
+        "determinable": status.determinable,
+        "marker_age_s": status.marker_age_s,
+        "writer_pid": status.writer_pid,
+        "writer_alive": status.writer_alive,
+        "writer_liveness_unknown": status.writer_liveness_unknown,
+        "writer_authority_held": status.writer_authority_held,
+        "writer_reason": status.writer_reason,
+        "wedged": status.is_wedged(),
+        "marker_path": status.marker_path,
+    })
+}
+
 /// The ONE `brain_status` document builder, shared by every serving path:
 /// the daemon's gRPC surface (which overwrites the daemon-runtime fields with
 /// live values), the in-process MCP server, and the CLI's direct
@@ -11995,20 +12030,7 @@ pub fn brain_status_json(
     // The `index_publication` payload reuses the single status read taken
     // above; the matching `index_publication_wedged` warning is pushed by
     // `brain_status_warnings_for` from that same read.
-    let index_publication = publication_status.as_ref().map(|status| {
-        json!({
-            "dirty": status.dirty,
-            "determinable": status.determinable,
-            "marker_age_s": status.marker_age_s,
-            "writer_pid": status.writer_pid,
-            "writer_alive": status.writer_alive,
-            "writer_liveness_unknown": status.writer_liveness_unknown,
-            "writer_authority_held": status.writer_authority_held,
-            "writer_reason": status.writer_reason,
-            "wedged": status.is_wedged(),
-            "marker_path": status.marker_path,
-        })
-    });
+    let index_publication = publication_status.as_ref().map(publication_status_json);
 
     // Fold the per-vault failures into the same disclosure the totals use, so
     // a caller has ONE place to look for "what could not be read".
@@ -12114,6 +12136,11 @@ pub fn brain_status_json(
     // is at `json!`'s recursion limit.
     status["manifest_recovery"] = Value::Null;
     status["last_watcher_failure"] = Value::Null;
+    // No daemon observation exists on the shared/direct/standalone path.
+    status["status_observation"] = Value::Null;
+    status["index_publication_owner"] = store.index_publication_owner_snapshot()
+        .map(|(token, operation, age_secs)| json!({"token": token, "operation": operation, "age_secs": age_secs}))
+        .unwrap_or(Value::Null);
     Ok(status)
 }
 
@@ -12123,6 +12150,7 @@ pub fn brain_status_json(
 /// (daemon-bypassed) path — so a `--json 2>/dev/null` consumer can never
 /// silently receive a different schema.
 pub const DAEMON_RUNTIME_STATUS_FIELDS: &[&str] = &[
+    "status_observation",
     "embedding_status",
     "search_status",
     "indexing_active",
@@ -13150,43 +13178,22 @@ fn mcp_daemon_heartbeat_loop(
     }
 }
 
-/// Socket candidates for this process, then the launchd state-dir socket on
-/// macOS when `XDG_RUNTIME_DIR` points somewhere else (nw-729).
+/// Socket candidates for this process: the shared runtime dir first, then the
+/// legacy state-dir socket (nw-829). The directory list is the SAME function the
+/// daemon and CLI use (`nestweaver_schema::runtime_paths`); this crate cannot
+/// depend on the daemon crate (cycle), so the leaf schema crate owns it.
 #[cfg(feature = "daemon")]
-fn mcp_socket_candidates(
-    instance_id: &str,
-    xdg_runtime_dir: Option<&str>,
-) -> Vec<std::path::PathBuf> {
-    let caller = match xdg_runtime_dir {
-        Some(xdg) => std::path::PathBuf::from(xdg)
-            .join("nestweaver")
-            .join(instance_id)
-            .join("daemon.sock"),
-        None => mcp_state_socket(instance_id),
-    };
-    // Second candidate is macOS-only. Avoid `mut` so Linux clippy (`-D unused-mut`)
-    // accepts the single-path return.
-    #[cfg(target_os = "macos")]
-    {
-        let supervised = mcp_state_socket(instance_id);
-        if supervised != caller {
-            return vec![caller, supervised];
-        }
-    }
-    vec![caller]
+fn mcp_socket_candidates(instance_id: &str) -> Vec<std::path::PathBuf> {
+    mcp_socket_candidates_from(nestweaver_schema::runtime_paths::runtime_candidate_dirs(
+        instance_id,
+    ))
 }
 
 #[cfg(feature = "daemon")]
-fn mcp_state_socket(instance_id: &str) -> std::path::PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join(".local/state")
-        })
-        .join("nestweaver")
-        .join(instance_id)
-        .join("daemon.sock")
+fn mcp_socket_candidates_from(dirs: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    dirs.into_iter()
+        .map(|dir| dir.join("daemon.sock"))
+        .collect()
 }
 
 #[cfg(feature = "daemon")]
@@ -13213,8 +13220,7 @@ fn mcp_instance_id(db_path: &std::path::Path) -> String {
 
 #[cfg(feature = "daemon")]
 fn accepting_mcp_socket(db_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-    mcp_socket_candidates(&mcp_instance_id(db_path), xdg.as_deref())
+    mcp_socket_candidates(&mcp_instance_id(db_path))
         .into_iter()
         .find(|sock| std::os::unix::net::UnixStream::connect(sock).is_ok())
 }
@@ -13249,14 +13255,13 @@ async fn connect_daemon_channel(
 /// Ensure the daemon is running (spawning it if needed) and return the
 /// socket path. Mirrors `nestweaver_client::autostart::ensure_daemon`.
 ///
-/// The socket-path derivation is inlined from `nestweaver_daemon::lifecycle`
-/// to avoid a dependency cycle (nestweaver-mcp → nestweaver-daemon → nestweaver-mcp).
-// TODO: deduplicate with nestweaver_daemon::lifecycle::socket_path()
+/// The socket directories come from `nestweaver_schema::runtime_paths`, the
+/// same source `nestweaver_daemon::lifecycle` uses (this crate cannot depend on
+/// the daemon crate: nestweaver-mcp → nestweaver-daemon → nestweaver-mcp).
 #[cfg(feature = "daemon")]
 fn inline_ensure_daemon(db_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     let instance_id = mcp_instance_id(db_path);
-    let candidates = mcp_socket_candidates(&instance_id, xdg.as_deref());
+    let candidates = mcp_socket_candidates(&instance_id);
 
     // Already listening — including a launchd job whose socket is not under
     // this process's XDG_RUNTIME_DIR. Do not spawn `daemon start` over it.
@@ -17717,8 +17722,14 @@ mod affected_tests_base_ref_tests {
                         "filter.{driver}.{}",
                         if process { "process" } else { "clean" }
                     );
+                    // Run the script through `sh` rather than exec'ing the file
+                    // git was just handed: a sibling test thread can fork while
+                    // the script's write fd is still open, and exec of that file
+                    // then fails with ETXTBSY ("Text file busy"). The shell only
+                    // reads it.
+                    let command = format!("sh '{}'", script.display());
                     let mut args = config_args.clone();
-                    args.extend([key.as_str(), script.to_str().unwrap()]);
+                    args.extend([key.as_str(), command.as_str()]);
                     git(work.path(), &args);
                     let required = format!("filter.{driver}.required");
                     config_args.extend([required.as_str(), "true"]);
@@ -29069,6 +29080,7 @@ mod cache_dispatch_tests {
         let status = brain_status_json(&store, None).unwrap();
         assert_eq!(status["db"], json!(db_path.display().to_string()));
         assert_eq!(status["vault_details"], status["vaults"]);
+        assert_eq!(status.get("status_observation"), Some(&Value::Null));
         assert!(status["instance_ids"].is_array());
         for field in DAEMON_RUNTIME_STATUS_FIELDS {
             assert!(
@@ -29162,6 +29174,8 @@ mod cache_dispatch_tests {
         set_current_db_path(db_path.clone());
         let store = GraphStore::open(&db_path).unwrap();
         let mut status = brain_status_json(&store, None).unwrap();
+
+        status["status_observation"] = json!({"cached":true,"age_ms":42});
 
         mark_brain_status_daemon_bypassed(&mut status, "test bypass cause");
 
@@ -39096,7 +39110,6 @@ mod lookup_not_found_contract_tests {
 #[cfg(all(test, feature = "daemon"))]
 mod daemon_supervision_tests {
     use super::is_daemon_transport_failure;
-    use super::mcp_socket_candidates;
 
     #[test]
     fn transport_failure_matches_a_dead_daemon_and_not_an_application_error() {
@@ -39119,24 +39132,32 @@ mod daemon_supervision_tests {
     }
 
     #[test]
-    fn socket_candidates_follow_xdg_then_the_supervised_dir_on_macos() {
-        let caller_only = mcp_socket_candidates("abcd1234", None);
-        assert_eq!(caller_only.len(), 1);
-        assert!(caller_only[0].ends_with("daemon.sock"));
-
-        let hidden = mcp_socket_candidates("abcd1234", Some("/tmp/nw-mcp-xdg"));
-        assert_eq!(
-            hidden[0],
-            std::path::PathBuf::from("/tmp/nw-mcp-xdg/nestweaver/abcd1234/daemon.sock")
+    fn socket_candidates_match_the_shared_runtime_paths() {
+        // nw-829 parity: the MCP crate resolves the same directories as the
+        // daemon/CLI because both call `nestweaver_schema::runtime_paths`. With
+        // no XDG and a per-user runtime dir, the primary is that dir (NOT the
+        // state dir the old MCP twin used) and the state dir is the legacy
+        // second candidate.
+        use nestweaver_schema::runtime_paths as rp;
+        let id = "abcd1234";
+        let dirs = rp::runtime_candidate_dirs_with(
+            None,
+            Some(std::path::PathBuf::from("/run/user/7")),
+            id,
         );
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(hidden.len(), 2);
-            assert_ne!(hidden[0], hidden[1]);
-            assert!(hidden[1].ends_with("nestweaver/abcd1234/daemon.sock"));
-        }
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(hidden.len(), 1);
+        let socks = super::mcp_socket_candidates_from(dirs);
+        assert_eq!(
+            socks,
+            vec![
+                std::path::PathBuf::from("/run/user/7/nestweaver/abcd1234/daemon.sock"),
+                rp::state_runtime_dir(id).join("daemon.sock"),
+            ]
+        );
+        // The env-driven entry point is built from the same function.
+        assert_eq!(
+            super::mcp_socket_candidates(id),
+            super::mcp_socket_candidates_from(rp::runtime_candidate_dirs(id))
+        );
     }
 }
 

@@ -6,8 +6,32 @@
 //! Run with:
 //!   cargo test --test daemon_test -- --test-threads=1
 
+#[test]
+fn daemon_brain_status_text_with_user_upstream_has_a_live_reactor() {
+    let output = std::process::Command::new("python3")
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/support/release_brain_status_upstream.py"),
+        )
+        .arg("--binary")
+        .arg(env!("CARGO_BIN_EXE_nestweaver"))
+        .output()
+        .expect("ordinary text-status fixture must execute");
+    assert!(
+        output.status.success(),
+        "ordinary text status failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[path = "helpers/catalogue_contract.rs"]
 mod catalogue_contract;
+
+#[path = "helpers/status_observation.rs"]
+mod status_observation;
 
 use assert_cmd::Command;
 use nestweaver_engine::{load_filemeta_sidecar, save_filemeta_sidecar, sidecar_path};
@@ -2034,6 +2058,21 @@ fn brain_status_json_via_daemon(db_path: &Path) -> (serde_json::Value, String) {
     let value = serde_json::from_str(&stdout)
         .unwrap_or_else(|error| panic!("brain status stdout is not JSON: {error}\n{stdout}"));
     (value, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+fn current_brain_status_json_via_daemon(db_path: &Path) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let (value, _) = brain_status_json_via_daemon(db_path);
+        if status_observation::is_current(&value) {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon status did not provide a current observation: {value}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// After `rm -f daemon.pid` under a live daemon, an ordinary read must still
@@ -5270,13 +5309,25 @@ fn daemon_mcp_and_cli_add_source_share_default_instance() {
     );
 
     // Exactly one vault row, under the CLI's "default" instance.
-    let status_output = mcp_tool_call_in_mode(
-        &db_path,
-        "brain_status",
-        serde_json::json!({}),
-        McpMode::Daemon,
-    );
-    let status = mcp_call_response(&status_output);
+    let status_deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let status = loop {
+        let output = mcp_tool_call_in_mode(
+            &db_path,
+            "brain_status",
+            serde_json::json!({}),
+            McpMode::Daemon,
+        );
+        let status = mcp_call_response(&output);
+        assert_eq!(status["result"]["isError"], false, "{status}");
+        if status_observation::is_current(&status["result"]["structuredContent"]) {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < status_deadline,
+            "MCP status did not provide a current observation: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
     let vaults = status["result"]["structuredContent"]["vaults"]
         .as_array()
         .unwrap_or_else(|| panic!("brain_status should list vaults; got: {status}"));
@@ -6388,6 +6439,26 @@ fn displaced_watch_controller_exits_without_stopping_replacement() {
         .unwrap()
         .watcher
     };
+    // Holder/queue/watcher age are live JSON runtime fields. Typed graph
+    // counts correctly refuse a stale observation after watcher publication.
+    let live_status = |client: &mut nestweaver_client::DaemonClient| {
+        let response = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    client
+                        .inner_mut()
+                        .brain_status_json(nestweaver_proto::JsonRequest {
+                            args_json: "{}".into(),
+                        }),
+                )
+                .await
+            })
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        serde_json::from_str::<serde_json::Value>(&response.result_json).unwrap()
+    };
     let wait_registration = |client: &mut nestweaver_client::DaemonClient, previous: u64| {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
@@ -6482,21 +6553,23 @@ fn displaced_watch_controller_exits_without_stopping_replacement() {
     // idle state instead of treating a fixed debounce sleep as a drain fence.
     let idle_deadline = std::time::Instant::now() + Duration::from_secs(25);
     loop {
-        let status = rt
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(3), client.brain_status()).await
-            })
-            .unwrap()
-            .unwrap();
-        if status.write_holder.is_empty() && status.write_queue_depth == 0 {
-            assert!(status.watcher.unwrap().age_seconds >= 3);
+        let status = live_status(&mut client);
+        let holder = status["write_holder"].as_str().expect("live write holder");
+        let queued = status["write_queue_depth"]
+            .as_u64()
+            .expect("live write queue");
+        if holder.is_empty() && queued == 0 {
+            assert!(
+                status["watcher"]["age_seconds"]
+                    .as_u64()
+                    .expect("live watcher age")
+                    >= 3
+            );
             break;
         }
         assert!(
             std::time::Instant::now() < idle_deadline,
-            "metadata event did not drain: holder={}, queued={}",
-            status.write_holder,
-            status.write_queue_depth,
+            "metadata event did not drain: holder={holder}, queued={queued}",
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -6533,9 +6606,9 @@ fn displaced_watch_controller_exits_without_stopping_replacement() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(observe(&mut client).is_none());
-    let idle = rt.block_on(client.brain_status()).unwrap();
-    assert_eq!(idle.write_queue_depth, 0);
-    assert!(idle.write_holder.is_empty());
+    let idle = live_status(&mut client);
+    assert_eq!(idle["write_queue_depth"], 0);
+    assert_eq!(idle["write_holder"], "");
     assert!(!sidecar_path(&db, ".index-dirty").exists());
     let mut third = spawn(false);
     let _ = wait_registration(&mut client, 0);
@@ -6649,17 +6722,46 @@ exclude = {exclude}
         write_config(exclude);
         index();
         assert_eq!(count_greet(&mut client), expected);
-        let status = rt
-            .block_on(
-                client
-                    .inner_mut()
-                    .brain_status_json(nestweaver_proto::JsonRequest {
-                        args_json: "{}".into(),
-                    }),
-            )
-            .unwrap()
-            .into_inner();
-        let status: serde_json::Value = serde_json::from_str(&status.result_json).unwrap();
+        // Eligibility inventory is graph-derived, unlike live holder/queue
+        // telemetry. Await an explicitly current completed observation after
+        // the index publication, preserving all exact policy/identity checks.
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        let status = loop {
+            let response = rt
+                .block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(3),
+                        client
+                            .inner_mut()
+                            .brain_status_json(nestweaver_proto::JsonRequest {
+                                args_json: "{}".into(),
+                            }),
+                    )
+                    .await
+                })
+                .expect("status RPC remains bounded");
+            match response {
+                Ok(response) => {
+                    let status: serde_json::Value =
+                        serde_json::from_str(&response.into_inner().result_json).unwrap();
+                    if status["status_observation"]["stale"] == false {
+                        break status;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "no current eligibility observation after indexing: {status}"
+                    );
+                }
+                Err(error) if error.code() == tonic::Code::Unavailable => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "eligibility observation stayed unavailable: {error}"
+                    );
+                }
+                Err(error) => panic!("eligibility status RPC failed: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
         let inventory = &status["repos"][0]["exclusion_inventory"];
         assert_eq!(
             inventory["patterns"],
@@ -7856,12 +7958,7 @@ fn suggest_links_names_a_repo_whose_manifest_the_daemon_refused() {
         "{remedy}"
     );
 
-    let status = daemon_cmd()
-        .args(["brain", "status", "--json", "--db"])
-        .arg(&db_path)
-        .output()
-        .unwrap();
-    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let status = current_brain_status_json_via_daemon(&db_path);
     assert_eq!(
         status["manifest_failures"].as_array().map(Vec::len),
         Some(1),

@@ -19,6 +19,9 @@
 //! Run with:
 //!   cargo test --test parity_test
 
+#[path = "helpers/status_observation.rs"]
+mod status_observation;
+
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output};
@@ -127,7 +130,7 @@ fn wait_for_vault_derivation_current(db_path: &Path) {
         {
             let vault_count = status_vault_count(&value);
             let pending = derivation_pending_count(&value);
-            if vault_count == 0 || pending == Some(0) {
+            if status_observation::is_current(&value) && (vault_count == 0 || pending == Some(0)) {
                 return;
             }
         }

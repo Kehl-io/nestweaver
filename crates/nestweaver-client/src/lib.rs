@@ -5,6 +5,7 @@ pub mod connect;
 pub mod hybrid;
 pub mod progress;
 pub mod repo_identity;
+pub mod runtime_status;
 
 // These modules moved to the `nestweaver-federation` crate (nw-017 Phase B,
 // 5a). Re-export them at their old paths so `nestweaver_client::discovery`,
@@ -42,6 +43,47 @@ pub type ReadinessAbort<'a> = &'a mut dyn FnMut() -> Option<String>;
 /// and establish a connection with version verification.
 pub struct DaemonClient {
     inner: NestWeaverDaemonClient<Channel>,
+}
+
+/// Check only the HealthCheck's selected endpoint binding. OS socket-peer
+/// proof and pidfile authority are separate checks owned by the caller.
+/// Version and physical backing health are deliberately excluded so status
+/// can diagnose a correctly identified old or unhealthy daemon.
+pub fn verify_endpoint_binding(
+    db_path: &Path,
+    health: &nestweaver_proto::HealthCheckResponse,
+) -> Result<()> {
+    anyhow::ensure!(
+        health.pid != 0
+            && health.instance_id
+                == nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path)
+            && nestweaver_daemon::lifecycle::database_path_fingerprint(Path::new(&health.db_path))
+                == nestweaver_daemon::lifecycle::database_path_fingerprint(db_path),
+        "existing daemon does not verify the selected database/instance/PID identity"
+    );
+    Ok(())
+}
+
+/// Shared health admission for existing-only reads. Physical backing health
+/// remains the daemon's independent proof; the path names endpoint identity.
+fn verify_existing_read_health(
+    db_path: &Path,
+    health: &nestweaver_proto::HealthCheckResponse,
+) -> Result<()> {
+    if let Some(skew) =
+        nestweaver_schema::describe_version_skew(&health.version, env!("CARGO_PKG_VERSION"))
+    {
+        anyhow::bail!(
+            "{skew} Restart the replica through its owner; no daemon was started or restarted"
+        );
+    }
+    verify_endpoint_binding(db_path, health)?;
+    anyhow::ensure!(
+        health.backing_file_valid == Some(true),
+        "existing daemon database backing file is unhealthy or unverified: {}",
+        health.backing_file_error
+    );
+    Ok(())
 }
 
 fn require_embedding_identity_repair_capability(
@@ -321,14 +363,31 @@ fn select_restart_config(
 }
 
 fn open_verified_live_pidfile(instance_id: &str, health_pid: u32) -> Result<fs::File> {
-    let mut last_error = None;
+    // nw-829: the legacy state-dir candidate is usually absent. Report the
+    // first error from a candidate whose pidfile EXISTS (that is the real
+    // diagnostic, e.g. "lock is not held"), falling back to the first error.
+    let is_missing = |error: &anyhow::Error| {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        })
+    };
+    let mut reported: Option<anyhow::Error> = None;
     for path in nestweaver_daemon::lifecycle::pidfile_candidates(instance_id) {
         match open_verified_live_pidfile_at(&path, health_pid) {
             Ok(file) => return Ok(file),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                if reported
+                    .as_ref()
+                    .is_none_or(|prev| is_missing(prev) && !is_missing(&error))
+                {
+                    reported = Some(error);
+                }
+            }
         }
     }
-    Err(last_error.expect("pidfile candidates is never empty"))
+    Err(reported.expect("pidfile candidates is never empty"))
 }
 
 fn open_verified_live_pidfile_at(path: &Path, health_pid: u32) -> Result<fs::File> {
@@ -427,13 +486,17 @@ fn adopt_pidfileless_incumbent(
     instance_id: &str,
     health: &nestweaver_proto::HealthCheckResponse,
 ) -> std::result::Result<(), String> {
-    let mut last_error = String::from("no daemon socket accepted a connection");
+    // nw-829: with the legacy state-dir candidate present, a plain "cannot
+    // connect" for it must not mask the peer-credential refusal for the
+    // candidate that DID accept a connection.
+    let mut connect_error = String::from("no daemon socket accepted a connection");
+    let mut peer_error: Option<String> = None;
     let mut corroborated = false;
     for socket in nestweaver_daemon::lifecycle::daemon_socket_candidates(instance_id) {
         let stream = match std::os::unix::net::UnixStream::connect(&socket) {
             Ok(stream) => stream,
             Err(error) => {
-                last_error = format!(
+                connect_error = format!(
                     "cannot connect to daemon socket {}: {error}",
                     socket.display()
                 );
@@ -441,14 +504,14 @@ fn adopt_pidfileless_incumbent(
             }
         };
         if let Err(error) = socket_peer_matches_health(&stream, health.pid) {
-            last_error = error;
+            peer_error = Some(error);
             continue;
         }
         corroborated = true;
         break;
     }
     if !corroborated {
-        return Err(last_error);
+        return Err(peer_error.unwrap_or(connect_error));
     }
     adoption_lock_verdict(
         nestweaver_daemon::lifecycle::db_write_lock(db_path),
@@ -1364,6 +1427,50 @@ impl DaemonClient {
         Ok(client)
     }
 
+    /// Attach for a read without creating a database, starting or restarting a
+    /// process. An absent logical anchor can name a live snapshot replica.
+    /// Return the SAME verified client for the query; never probe then autostart.
+    pub async fn connect_existing_verified_read(
+        db_path: &Path,
+        config_path: Option<&Path>,
+    ) -> Result<Option<Self>> {
+        // Parse caller intent even when no socket exists. A bad explicit or
+        // persisted config must not be mistaken for an absent local endpoint.
+        let effective = RestartConfig::for_automatic_cold_start(db_path, config_path)?;
+        let instance_id = nestweaver_daemon::lifecycle::instance_id_from_db_path(db_path);
+        if !nestweaver_daemon::lifecycle::daemon_socket_candidates(&instance_id)
+            .iter()
+            .any(|path| path.exists())
+        {
+            return Ok(None);
+        }
+        let mut client = match Self::connect_existing(db_path).await {
+            Ok(client) => client,
+            // Stale socket files are still no live local endpoint. Preserve
+            // missing-DB upstream-only routing without spawning anything.
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                        matches!(
+                            io.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        )
+                    })
+                }) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let health = client.health_check().await?;
+        verify_existing_read_health(db_path, &health)?;
+        let _identity = verified_incumbent_identity(db_path, &instance_id, &health)?;
+        if let Some(config) = effective.as_path() {
+            verify_requested_config_with_health(db_path, &health, config)?;
+        }
+        Ok(Some(client))
+    }
+
     /// Connect to an already-running daemon for this database without
     /// auto-starting a new process.
     pub async fn connect_existing(db_path: &Path) -> Result<Self> {
@@ -1448,6 +1555,30 @@ impl DaemonClient {
             .await
             .context("brain_status RPC failed")?;
         Ok(resp.into_inner())
+    }
+
+    /// Read the daemon's immutable configuration provenance without graph counts.
+    pub async fn effective_config(&mut self) -> Result<nestweaver_proto::EffectiveConfig> {
+        self.inner
+            .get_effective_config(nestweaver_proto::BrainStatusRequest {})
+            .await
+            .context("get_effective_config RPC failed")
+            .map(tonic::Response::into_inner)
+    }
+
+    /// Read live runtime diagnostics even when typed graph counts are stale.
+    /// Uses the already-connected daemon and never invents current graph counts.
+    pub async fn brain_runtime_status(&mut self) -> Result<runtime_status::RuntimeStatus> {
+        let response = self
+            .inner
+            .brain_status_json(nestweaver_proto::JsonRequest {
+                args_json: "{}".to_string(),
+            })
+            .await
+            .context("brain_status_json runtime RPC failed")?;
+        let value = serde_json::from_str(&response.into_inner().result_json)
+            .context("decode brain_status_json runtime response")?;
+        runtime_status::RuntimeStatus::from_status_json(&value)
     }
 
     /// List Contract nodes through the daemon, optionally resolving an exact
@@ -3492,5 +3623,41 @@ mod transient_connection_tests {
         assert!(!is_transient_connection_failure(&answer));
         let mismatch = anyhow::anyhow!("explicit --config x does not match");
         assert!(!is_transient_connection_failure(&mismatch));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_binding_tests {
+    use super::*;
+
+    #[test]
+    fn binding_requires_identity_but_preserves_status_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("replica-anchor.lbug");
+        let valid = nestweaver_proto::HealthCheckResponse {
+            pid: std::process::id(),
+            instance_id: nestweaver_daemon::lifecycle::instance_id_from_db_path(&db),
+            db_path: db.display().to_string(),
+            // Status must still identify a version-skewed unhealthy daemon.
+            version: "0.0.1".to_string(),
+            backing_file_valid: Some(false),
+            ..Default::default()
+        };
+        verify_endpoint_binding(&db, &valid).unwrap();
+        assert!(verify_existing_read_health(&db, &valid).is_err());
+        for property in ["pid", "instance", "path"] {
+            let mut bad = valid.clone();
+            match property {
+                "pid" => bad.pid = 0,
+                "instance" => bad.instance_id = "other".to_string(),
+                "path" => bad.db_path = dir.path().join("other.lbug").display().to_string(),
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_endpoint_binding(&db, &bad).is_err(),
+                "must refuse {property}"
+            );
+        }
+        assert!(!db.exists());
     }
 }

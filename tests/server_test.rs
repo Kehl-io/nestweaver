@@ -164,6 +164,8 @@ fn merge_upstream(grpc_addr: String, token: &str) -> UpstreamHandle {
         mode: RoutingMode::Merge,
         repos: vec![],
         timeout: "15s".to_string(),
+        fallback_timeout: None,
+        vault_mappings: Default::default(),
         ca_cert: None,
     };
     UpstreamHandle::from_config(&cfg).expect("build upstream handle")
@@ -4205,4 +4207,229 @@ async fn daemon_mcp_boundary_single_node_without_upstream() {
         json!([]),
         "stale_repos must be an empty array when no upstream is configured; got {meta}"
     );
+}
+
+/// Exercise the public query router against two real authenticated daemons;
+/// response composition must keep lookup envelopes in every configured mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hybrid_lookup_modes_preserve_rpc_shapes_and_partial_symbol_results() {
+    // This case runs against the ordinary shipping binary, including locally.
+    fn shipping_command(db_path: &std::path::Path) -> StdCommand {
+        let mut command = StdCommand::new(env!("CARGO_BIN_EXE_nestweaver"));
+        command
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .current_dir(db_path.parent().unwrap());
+        command
+    }
+    struct BootstrapStop {
+        db_path: std::path::PathBuf,
+        armed: bool,
+    }
+    impl Drop for BootstrapStop {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = shipping_command(&self.db_path)
+                    .args(["daemon", "--db"])
+                    .arg(&self.db_path)
+                    .arg("stop")
+                    .output();
+            }
+        }
+    }
+    fn index_and_provision_source(repo_dir: &std::path::Path, db_path: &std::path::Path) {
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let mut cleanup = BootstrapStop {
+            db_path: db_path.to_path_buf(),
+            armed: true,
+        };
+        let indexed = shipping_command(db_path)
+            .args(["index", "--repo"])
+            .arg(repo_dir)
+            .arg("--db")
+            .arg(db_path)
+            .output();
+        let listed = shipping_command(db_path)
+            .args(["list-repos", "--json", "--db"])
+            .arg(db_path)
+            .output();
+        // Always stop before asserting or parsing, including failed CLI calls.
+        let stopped = shipping_command(db_path)
+            .args(["daemon", "--db"])
+            .arg(db_path)
+            .arg("stop")
+            .output();
+        if stopped.as_ref().is_ok_and(|output| output.status.success()) {
+            cleanup.armed = false;
+        }
+        let indexed = indexed.expect("ordinary index command must execute");
+        let listed = listed.expect("ordinary repo-list command must execute");
+        let stopped = stopped.expect("ordinary stop command must execute");
+        assert!(indexed.status.success(), "index failed: {indexed:?}");
+        assert!(listed.status.success(), "list-repos failed: {listed:?}");
+        assert!(
+            stopped.status.success(),
+            "bootstrap stop failed: {stopped:?}"
+        );
+        let repos: Vec<nestweaver_schema::Repo> = serde_json::from_slice(&listed.stdout).unwrap();
+        assert_eq!(repos.len(), 1, "one actual indexed fixture repo");
+        let repo = &repos[0];
+        assert!(!repo.url.is_empty() && !repo.indexed_sha.is_empty());
+        let workspace = nestweaver_engine::bare_clone::bare_clone_root(db_path, None);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let clone = workspace.join(format!(
+            "{}.git",
+            nestweaver_engine::pull::clone_dir_name_from_url(&repo.url)
+        ));
+        let cloned = StdCommand::new("git")
+            .current_dir(db_path.parent().unwrap())
+            .args(["clone", "--bare", "--"])
+            .arg(repo_dir)
+            .arg(&clone)
+            .output()
+            .unwrap();
+        assert!(
+            cloned.status.success(),
+            "real bare clone failed: {cloned:?}"
+        );
+        let commit = StdCommand::new("git")
+            .current_dir(db_path.parent().unwrap())
+            .arg("--git-dir")
+            .arg(&clone)
+            .args([
+                "cat-file",
+                "-e",
+                &format!("{}^{{commit}}", repo.indexed_sha),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "clone must contain indexed commit: {commit:?}"
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let local_repo = dir.path().join("local-repo");
+    let remote_repo = dir.path().join("remote-repo");
+    let local_db = dir.path().join("local/db.lbug");
+    let remote_db = dir.path().join("remote/db.lbug");
+    write_repo_files(
+        &local_repo,
+        &[("main.js", "function localfn() { return 1; }")],
+    );
+    write_repo_files(
+        &remote_repo,
+        &[("main.js", "function serverfn() { return 2; }")],
+    );
+    index_and_provision_source(&local_repo, &local_db);
+    index_and_provision_source(&remote_repo, &remote_db);
+    let _local_server =
+        helpers::server_guard::ServerGuard::start_with_auth_graceful(&local_db, HYBRID_TOKEN);
+    let remote_server =
+        helpers::server_guard::ServerGuard::start_with_auth_graceful(&remote_db, HYBRID_TOKEN);
+    for mode in [
+        RoutingMode::Fallback,
+        RoutingMode::Merge,
+        RoutingMode::Primary,
+    ] {
+        let config = UpstreamConfig {
+            name: Some("server".into()),
+            url: remote_server.grpc_addr(),
+            token: Some(HYBRID_TOKEN.into()),
+            mode,
+            repos: vec![],
+            timeout: "15s".into(),
+            fallback_timeout: Some("15s".into()),
+            ca_cert: None,
+            vault_mappings: Default::default(),
+        };
+        let local = connect_local(&local_db).await;
+        let mut hybrid =
+            HybridClient::from_parts(local, vec![UpstreamHandle::from_config(&config).unwrap()]);
+        let value = hybrid
+            .query(
+                "read_symbols",
+                &json!({"targets":["localfn","main::serverfn"],"include_neighbors":0}),
+            )
+            .await
+            .unwrap();
+        assert!(value.get("results").is_none(), "{mode:?}: {value}");
+        let symbols = value["symbols"]
+            .as_array()
+            .expect("top-level symbol windows");
+        assert!(
+            symbols.iter().any(|row| row["name"] == "serverfn"),
+            "{mode:?}: {value}"
+        );
+        assert!(
+            symbols.iter().all(|row| row["body_available"] == true
+                && row["body"].as_str().is_some_and(|body| row["name"]
+                    .as_str()
+                    .is_some_and(|name| body.contains(name)))),
+            "each hit must read genuine indexed source: {mode:?}: {value}"
+        );
+        if mode != RoutingMode::Primary {
+            assert_eq!(symbols.len(), 2, "{mode:?}: {value}");
+            assert_eq!(value["not_found"], json!([]), "{mode:?}: {value}");
+        } else {
+            assert_eq!(
+                symbols.len(),
+                1,
+                "Primary must retain upstream preference: {value}"
+            );
+            assert_eq!(value["not_found"], json!(["localfn"]));
+        }
+        let found = hybrid
+            .query(
+                "read_symbols",
+                &json!({"targets":["localfn"],"include_neighbors":0}),
+            )
+            .await
+            .unwrap();
+        if mode == RoutingMode::Fallback {
+            assert_eq!(
+                found["_meta"]["upstream_attempts"][0]["outcome"], "skipped",
+                "{found}"
+            );
+            assert_eq!(found["symbols"][0]["name"], "localfn");
+        }
+        // The local tool reports a clean summary miss as total=returned=0,
+        // without a not_found status. Both modes must still answer remotely.
+        if mode != RoutingMode::Primary {
+            let remote_summary = hybrid
+                .query(
+                    "get_summary",
+                    &json!({"level":"symbol","target":"serverfn"}),
+                )
+                .await
+                .unwrap();
+            assert!(
+                remote_summary["total"].as_u64().unwrap() > 0,
+                "{mode:?}: {remote_summary}"
+            );
+            assert!(
+                !remote_summary["summaries"].as_array().unwrap().is_empty(),
+                "{remote_summary}"
+            );
+            assert_eq!(
+                remote_summary["_meta"]["upstream_attempts"][0]["outcome"],
+                "success"
+            );
+        }
+        if mode == RoutingMode::Merge {
+            let summary = hybrid
+                .query("get_summary", &json!({"level":"symbol","target":"localfn"}))
+                .await
+                .unwrap();
+            assert!(summary.get("summaries").is_some(), "{summary}");
+            assert!(summary.get("results").is_none(), "{summary}");
+            let missing = hybrid
+                .query("read_symbols", &json!({"targets":["no_such_symbol_92841"]}))
+                .await
+                .unwrap();
+            assert_eq!(missing["not_found"], json!(["no_such_symbol_92841"]));
+            assert!(missing.get("results").is_none(), "{missing}");
+        }
+    }
+    eprintln!("hybrid_lookup_modes: all original assertions passed; draining owned query servers");
 }

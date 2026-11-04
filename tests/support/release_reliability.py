@@ -226,6 +226,7 @@ def main():
         fixture.start()
         fixture.prepare_repository()
         fixture.index()
+        fixture.wait_for_indexed_status()
         for kind in ('status', 'impact', 'search'):
             fixture.query(kind)
         threads = [threading.Thread(target=fixture.worker, args=(n,)) for n in range(2)]

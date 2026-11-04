@@ -6,6 +6,8 @@
 
 #[path = "manifest_recovery.rs"]
 mod manifest_recovery;
+#[path = "status_snapshot.rs"]
+mod status_snapshot;
 #[path = "vault_derivation.rs"]
 mod vault_derivation;
 
@@ -1311,6 +1313,8 @@ const SEARCH_RECONCILIATION_DEBT_VERSION: u32 = 1;
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 struct SearchReconciliationDebt {
     version: u32,
+    #[serde(default)]
+    owner: u64,
     operation: String,
     created_at_unix: i64,
     graph_generation_before: u64,
@@ -1380,15 +1384,50 @@ fn write_search_reconciliation_debt(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SearchDebtAdmission {
     had_existing_debt: bool,
+    owner: u64,
+}
+
+// Sidecar read/modify/replace and compare-clear are one short critical
+// section. Never hold this mutex across graph/search work or a write-gate wait.
+static SEARCH_DEBT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SEARCH_DEBT_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn clear_owned_search_debt(db_path: &Path, owner: u64) -> Result<(), anyhow::Error> {
+    let _lock = SEARCH_DEBT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if load_search_reconciliation_debt(db_path)?.is_some_and(|debt| debt.owner == owner) {
+        clear_search_reconciliation_debt(db_path)?;
+    }
+    Ok(())
 }
 
 fn establish_search_reconciliation_debt(
     state: &DaemonState,
     operation: &str,
 ) -> Result<SearchDebtAdmission, anyhow::Error> {
+    establish_search_reconciliation_debt_after(state, operation, None)
+}
+
+fn establish_search_reconciliation_debt_after(
+    state: &DaemonState,
+    operation: &str,
+    previous: Option<SearchDebtAdmission>,
+) -> Result<SearchDebtAdmission, anyhow::Error> {
+    let _lock = SEARCH_DEBT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let owner = now.max(SEARCH_DEBT_OWNER.load(Ordering::SeqCst).saturating_add(1));
+    SEARCH_DEBT_OWNER.store(owner, Ordering::SeqCst);
     let existing = load_search_reconciliation_debt(&state.db_path)?;
-    let had_existing_debt = existing.is_some();
-    let debt = match existing {
+    // Renewing this operation's own fresh preflight marker does not turn a
+    // proven prewrite refusal into inherited divergence. Another admission's
+    // marker, or previously inherited divergence, still requires full repair.
+    let had_existing_debt = previous.is_some_and(|prior| prior.had_existing_debt)
+        || existing
+            .as_ref()
+            .is_some_and(|debt| previous.is_none_or(|prior| prior.owner != debt.owner));
+    let mut debt = match existing {
         Some(mut debt) => {
             // Preserve the earliest possible divergence point. The latest
             // operation remains useful in diagnostics, while the generation
@@ -1399,6 +1438,7 @@ fn establish_search_reconciliation_debt(
         }
         None => SearchReconciliationDebt {
             version: SEARCH_RECONCILIATION_DEBT_VERSION,
+            owner: 0,
             operation: operation.to_string(),
             created_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1409,8 +1449,27 @@ fn establish_search_reconciliation_debt(
             last_error: String::new(),
         },
     };
+    debt.owner = owner;
     write_search_reconciliation_debt(&state.db_path, &debt)?;
-    Ok(SearchDebtAdmission { had_existing_debt })
+    Ok(SearchDebtAdmission {
+        had_existing_debt,
+        owner,
+    })
+}
+
+/// Debt must be durable at the actual graph-write boundary, not just before
+/// an off-gate scan. A newer operation may have repaired/cleared the preflight
+/// marker while this one was still scanning. Every gate attempt renews it;
+/// publication contention then releases the gate and the next attempt renews
+/// again before it can write. Never acquire the gate under SEARCH_DEBT_LOCK.
+fn acquire_search_mutation_gate(
+    state: &DaemonState,
+    operation: &'static str,
+    admission: &mut SearchDebtAdmission,
+) -> Result<WriteLease, anyhow::Error> {
+    let guard = state.write_gate.blocking_lock(operation);
+    *admission = establish_search_reconciliation_debt_after(state, operation, Some(*admission))?;
+    Ok(guard)
 }
 
 /// A registration refusal happens before any graph write. Recording it as
@@ -1420,7 +1479,7 @@ fn establish_search_reconciliation_debt(
 fn search_debt_after_prewrite_refusal(
     state: &DaemonState,
     error: &anyhow::Error,
-    had_existing_debt: bool,
+    admission: SearchDebtAdmission,
 ) -> bool {
     let refused = error
         .downcast_ref::<nestweaver_engine::vault_registration::VaultRegisteredUnderOtherInstance>()
@@ -1431,8 +1490,8 @@ fn search_debt_after_prewrite_refusal(
     if !refused {
         return false;
     }
-    if !had_existing_debt
-        && let Err(marker_error) = clear_search_reconciliation_debt(&state.db_path)
+    if !admission.had_existing_debt
+        && let Err(marker_error) = clear_owned_search_debt(&state.db_path, admission.owner)
     {
         tracing::error!(
             error = %marker_error,
@@ -1447,9 +1506,11 @@ fn record_search_reconciliation_failure(
     operation: &str,
     error: &anyhow::Error,
 ) -> Result<(), anyhow::Error> {
+    let _lock = SEARCH_DEBT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut debt =
         load_search_reconciliation_debt(&state.db_path)?.unwrap_or(SearchReconciliationDebt {
             version: SEARCH_RECONCILIATION_DEBT_VERSION,
+            owner: 0,
             operation: operation.to_string(),
             created_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2771,7 +2832,13 @@ pub struct DaemonState {
     /// serving substring fallback for the rest of its life. See
     /// [`SearchRuntime`]; read it through [`DaemonState::tantivy`].
     search: Arc<SearchRuntime>,
+    /// Physical graph path; replicas use their private materialized snapshot.
     pub db_path: PathBuf,
+    /// Immutable endpoint binding selected before replica materialization.
+    /// HealthCheck reports this path so status/UI/stop verify the same --db
+    /// identity that owns the socket and pidfile. Store/backing-file checks
+    /// continue to use the physical db_path and GraphStore handle.
+    pub selected_db_path: PathBuf,
     /// Runtime identity: the SHA-256-derived id of the canonical `--db` path
     /// (see [`lifecycle::instance_id_from_db_path`]). Used ONLY for runtime
     /// paths — sockets/pidfiles/launchd/replica locks — where the 104-byte
@@ -2854,6 +2921,9 @@ pub struct DaemonState {
     pub(crate) manifest_recovery: Arc<nestweaver_engine::manifest::ManifestRecoveryRuntime>,
     manifest_recovery_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub read_only: bool,
+    /// Opaque capability minted by verified immutable snapshot materialization.
+    pub snapshot_derivation:
+        Option<Arc<nestweaver_engine::markdown_derivation::ValidatedSnapshotDerivation>>,
     /// Whether the server-side worker pool is currently indexing a repo.
     pub indexing_active: Arc<AtomicBool>,
     rpc_indexing_repo: Arc<std::sync::Mutex<Option<String>>>,
@@ -2865,8 +2935,8 @@ pub struct DaemonState {
     /// yet finished). Shared into the worker's `IndexingStatus` so the WORKER
     /// — not the `indexing_active` flag — is the authority on whether a job
     /// genuinely exists; the shutdown drain reads it to tell a running job
-    /// (unbounded wait, reads stay served) from a stuck flag (bounded by the
-    /// drain ceiling).
+    /// (unbounded wait, reads stay served) from a stuck flag (reported, not
+    /// waited on — nw-830).
     pub indexing_in_flight: Arc<AtomicU32>,
     /// Brain-status documents served by this daemon process. A daemon-side
     /// witness counter: a client that adopted this daemon after its pidfile
@@ -2892,6 +2962,7 @@ pub struct DaemonState {
     /// pool through the admin API must not thereby make every later Shutdown
     /// RPC a silent no-op.
     pub shutdown_started: Arc<AtomicBool>,
+    status_snapshots: status_snapshot::StatusSnapshots,
     /// Admin token for admin API authentication (separate from query token).
     pub admin_token: Option<String>,
     /// Shared admin state, set once after construction. Used by `serve_ui`
@@ -3430,11 +3501,13 @@ fn stop_active_watcher(state: &DaemonState) {
 /// indexing behaviour can be tested against a real worker-pool index, which
 /// this crate's tests cannot drive (they link the engine without its
 /// `cfg(test)` `file://` clone allowance). The doc comment on `run_drain`
-/// covers why the ceiling is a reporting threshold for in-flight writes and a
-/// real deadline for a stuck `indexing_active` flag.
+/// covers why the ceiling is a reporting threshold for in-flight writes and
+/// running jobs, while a stuck `indexing_active` flag is reported, not waited
+/// on (nw-830).
 async fn run_shutdown_drain(state: Arc<DaemonState>, ceiling: u64) {
     nestweaver_engine::drain::run_drain(
         nestweaver_engine::drain::DrainSignals {
+            queue_depth_hint: Some(Arc::clone(&state.indexing_queue_depth)),
             active_writes: Arc::clone(&state.active_writes),
             indexing_active: Arc::clone(&state.indexing_active),
             indexing_in_flight: Arc::clone(&state.indexing_in_flight),
@@ -3639,6 +3712,11 @@ async fn run_trigram_reconciler(state: Arc<DaemonState>, period: Duration) {
             }
         }
 
+        // A queued writer gets the next FIFO turn before background upkeep.
+        if state.write_gate.waiting() > 0 {
+            continue;
+        }
+
         // Admission guard BEFORE the write gate, in that order, exactly as the
         // RPC write paths do.
         //
@@ -3656,22 +3734,38 @@ async fn run_trigram_reconciler(state: Arc<DaemonState>, period: Duration) {
         let Ok(_admission) = ConnectionGuard::write(&state) else {
             break;
         };
-        let lease = state.write_gate.lock("trigram_reconcile").await;
         let reconcile_state = Arc::clone(&state);
-        let outcome =
-            tokio::task::spawn_blocking(move || reconcile_state.store.refresh_trigram_index(false))
-                .await;
-        drop(lease);
+        let outcome = tokio::task::spawn_blocking(move || {
+            reconcile_state
+                .store
+                .refresh_trigram_index_with_write_gate(false, || {
+                    reconcile_state
+                        .write_gate
+                        .blocking_lock("trigram_reconcile")
+                })
+        })
+        .await;
 
         match outcome {
             Ok(Ok(stats)) => {
                 consecutive_failures = 0;
-                backoff_until = None;
+                // Bound background duty cycle even when every watcher note
+                // re-dirties the scope faster than the configured interval.
+                backoff_until = Some(
+                    Instant::now() + Duration::from_millis(stats.elapsed_ms.saturating_mul(5)),
+                );
                 force_full_pass = false;
                 if stats.scopes_refreshed > 0 {
                     tracing::info!(
                         scopes_refreshed = stats.scopes_refreshed,
                         nodes_changed = stats.nodes_changed,
+                        nodes_added = stats.nodes_added,
+                        nodes_deleted = stats.nodes_deleted,
+                        trigram_sets_built = stats.trigram_sets_built,
+                        postings_scanned = stats.postings_scanned,
+                        postings_added = stats.postings_added,
+                        postings_deleted = stats.postings_deleted,
+                        elapsed_ms = stats.elapsed_ms,
                         "trigram reconcile"
                     );
                 }
@@ -4559,6 +4653,18 @@ impl DaemonService {
         args_json: &str,
         extensions: &tonic::Extensions,
     ) -> Result<Response<JsonResponse>, Status> {
+        if tool_name == "brain_status" {
+            let value = self
+                .guarded_status_snapshot(
+                    status_snapshot::StatusArguments::Json(args_json),
+                    extensions,
+                    false,
+                )
+                .await?;
+            return Ok(Response::new(JsonResponse {
+                result_json: value.to_string(),
+            }));
+        }
         let visible = self.state.visible_repos_for(extensions)?;
         self.dispatch_json_tool_with_ownership(
             tool_name,
@@ -4885,6 +4991,15 @@ impl DaemonService {
         args: serde_json::Value,
         extensions: &tonic::Extensions,
     ) -> Result<serde_json::Value, Status> {
+        if tool_name == "brain_status" {
+            return self
+                .guarded_status_snapshot(
+                    status_snapshot::StatusArguments::Value(args),
+                    extensions,
+                    true,
+                )
+                .await;
+        }
         // nw-415: TAKES THE REQUEST'S EXTENSIONS, NOT A CALLER-SUPPLIED SCOPE.
         //
         // Six typed RPCs used to hand this a literal `VisibleRepos::All` under
@@ -5975,7 +6090,7 @@ fn finish_search_reconciliation(
         mutation
     };
     match reconcile_search_index(&reconciliation, &state.store, mutation, operation) {
-        Ok(()) => clear_search_reconciliation_debt(&state.db_path),
+        Ok(()) => clear_owned_search_debt(&state.db_path, admission.owner),
         Err(error) => {
             if let Err(marker_error) =
                 record_search_reconciliation_failure(state, operation, &error)
@@ -5996,7 +6111,7 @@ fn reconcile_pending_search_debt(
     reconciliation: SearchIndexReconciliation,
     operation: &str,
 ) -> Result<(), anyhow::Error> {
-    let Some(_) = load_search_reconciliation_debt(&state.db_path)? else {
+    let Some(debt) = load_search_reconciliation_debt(&state.db_path)? else {
         return Ok(());
     };
     match reconcile_search_index(
@@ -6005,7 +6120,7 @@ fn reconcile_pending_search_debt(
         IndexedSearchMutation::Unknown,
         operation,
     ) {
-        Ok(()) => clear_search_reconciliation_debt(&state.db_path),
+        Ok(()) => clear_owned_search_debt(&state.db_path, debt.owner),
         Err(error) => {
             if let Err(marker_error) =
                 record_search_reconciliation_failure(state, operation, &error)
@@ -7651,7 +7766,7 @@ impl NestWeaverDaemon for DaemonService {
         Ok(Response::new(HealthCheckResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             instance_id: self.state.instance_id.clone(),
-            db_path: self.state.db_path.display().to_string(),
+            db_path: self.state.selected_db_path.display().to_string(),
             uptime_seconds: uptime,
             active_connections: active,
             // The daemon's own PID, so the CLI can cross-check a pidfile
@@ -7723,7 +7838,13 @@ impl NestWeaverDaemon for DaemonService {
             // the archive.
             instance_id: self.state.effective_data_instance_id(),
             workspace_path: if req.include_clones {
-                self.state.db_path.parent().map(|p| p.join("workspace"))
+                Some(bare_clone_root(
+                    &self.state.db_path,
+                    self.state
+                        .instance_cfg
+                        .as_ref()
+                        .map(|c| c.workspace.path.as_str()),
+                ))
             } else {
                 None
             },
@@ -8299,6 +8420,49 @@ impl NestWeaverDaemon for DaemonService {
             state.db_path.clone(),
         );
 
+        // The browser uses the same shared federation primitives as the CLI;
+        // local execution is injected to avoid a web/client/daemon cycle.
+        {
+            let configs: Vec<_> = state
+                .instance_cfg
+                .as_ref()
+                .map(|cfg| {
+                    cfg.upstream
+                        .iter()
+                        .map(nestweaver_mcp::federation::upstream_entry_to_config)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let local_state = state.clone();
+            let local: nestweaver_web::federation::LocalQuery = Arc::new(move |tool, args| {
+                let local_state = local_state.clone();
+                Box::pin(async move {
+                    tokio::task::spawn_blocking(move || {
+                        nestweaver_mcp::tools::dispatch_cli(
+                            &local_state.store,
+                            local_state.tantivy().as_deref(),
+                            &tool,
+                            args,
+                            None,
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                })
+            });
+            match nestweaver_web::federation::WebFederation::new(&configs, local, state.read_only) {
+                Ok(federation) => {
+                    let _ = app_state.federation.set(Arc::new(federation));
+                }
+                Err(error) => {
+                    return Err(Status::failed_precondition(format!(
+                        "UI federation configuration: {error}"
+                    )));
+                }
+            }
+        }
+
         let _ = app_state
             .manifest_recovery
             .set(Arc::clone(&state.manifest_recovery));
@@ -8309,6 +8473,7 @@ impl NestWeaverDaemon for DaemonService {
                 data_instance_id: state.effective_data_instance_id(),
                 read_only: state.read_only,
                 max_note_bytes: vault_derivation::http_max_note_bytes(&state),
+                snapshot_derivation: state.snapshot_derivation.clone(),
             });
         // nw-749. Browser polls never enter a gRPC ConnectionGuard, so the
         // UI router notifies the same idle handle the gRPC server uses.
@@ -9175,10 +9340,9 @@ impl NestWeaverDaemon for DaemonService {
         let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _ownership = MutationWorkerOwnership {
-                _write_lease: write_lock.blocking_lock("index_vault"),
-                _connection_guard: guard,
-            };
+            // Admission spans scan and write; the engine owns the gate so it
+            // can yield to a watcher publication without an AB-BA deadlock.
+            let _connection_guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
                 message: format!("Scanning vault {}", vault_path.display()),
@@ -9201,8 +9365,10 @@ impl NestWeaverDaemon for DaemonService {
             }
 
             let indexed_before = indexed_search_rows_before(&state);
-            let search_admission = match establish_search_reconciliation_debt(&state, "index_vault")
-            {
+            let mut search_admission = match establish_search_reconciliation_debt(
+                &state,
+                "index_vault",
+            ) {
                 Ok(admission) => admission,
                 Err(error) => {
                     let _ = tx.blocking_send(Ok(IndexProgress {
@@ -9217,7 +9383,7 @@ impl NestWeaverDaemon for DaemonService {
             };
 
             let index_result =
-                nestweaver_engine::index_markdown_directory_with_store_and_deletion_count_and_note_limits(
+                nestweaver_engine::index_md::index_markdown_directory_with_store_and_write_gate(
                     &state.store,
                     &vault_path,
                     &state.db_path,
@@ -9225,7 +9391,9 @@ impl NestWeaverDaemon for DaemonService {
                     &vault_name,
                     &extra_patterns,
                     note_limits,
+                    || acquire_search_mutation_gate(&state, "index_vault", &mut search_admission),
                 );
+            let _postflight_gate = write_lock.blocking_lock("index_vault_postflight");
             // nw-675: a full vault index recreates every note, and the
             // cascade takes their code links. Owed, disclosed, and rebuilt
             // by the code-link reconciler; recorded after the write, as in
@@ -9375,11 +9543,7 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
                 Err(e) => {
-                    if !search_debt_after_prewrite_refusal(
-                        &state,
-                        &e,
-                        search_admission.had_existing_debt,
-                    ) {
+                    if !search_debt_after_prewrite_refusal(&state, &e, search_admission) {
                         let error = anyhow::anyhow!("IndexVault graph mutation failed: {e:#}");
                         if let Err(marker_error) =
                             record_search_reconciliation_failure(&state, "index_vault", &error)
@@ -9440,10 +9604,7 @@ impl NestWeaverDaemon for DaemonService {
         let guard = ConnectionGuard::write(&self.state)?;
         let write_lock = self.state.write_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _ownership = MutationWorkerOwnership {
-                _write_lease: write_lock.blocking_lock("refresh_vault_since"),
-                _connection_guard: guard,
-            };
+            let _connection_guard = guard;
             let _ = tx.blocking_send(Ok(IndexProgress {
                 phase: Phase::Discovering as i32,
                 message: format!(
@@ -9486,7 +9647,7 @@ impl NestWeaverDaemon for DaemonService {
             }
 
             let indexed_before = indexed_search_rows_before(&state);
-            let search_admission = match establish_search_reconciliation_debt(
+            let mut search_admission = match establish_search_reconciliation_debt(
                 &state,
                 "refresh_vault_since",
             ) {
@@ -9503,7 +9664,7 @@ impl NestWeaverDaemon for DaemonService {
                 }
             };
 
-            let refreshed = nestweaver_engine::index_markdown_directory_since_with_store_and_ignore_and_note_limits(
+            let refreshed = nestweaver_engine::index_md::index_markdown_directory_since_with_store_and_write_gate(
                 &state.store,
                 &vault_path,
                 &instance_id,
@@ -9511,7 +9672,9 @@ impl NestWeaverDaemon for DaemonService {
                 since,
                 &extra_patterns,
                 note_limits,
+                || acquire_search_mutation_gate(&state, "refresh_vault_since", &mut search_admission),
             );
+            let _postflight_gate = write_lock.blocking_lock("refresh_vault_since_postflight");
             // nw-675: every re-indexed note is recreated without its code
             // links; recorded after the write, as in IndexVault.
             nestweaver_engine::code_links::mark_code_links_pending(
@@ -9648,11 +9811,7 @@ impl NestWeaverDaemon for DaemonService {
                     }));
                 }
                 Err(error) => {
-                    if !search_debt_after_prewrite_refusal(
-                        &state,
-                        &error,
-                        search_admission.had_existing_debt,
-                    ) {
+                    if !search_debt_after_prewrite_refusal(&state, &error, search_admission) {
                         let debt_error =
                             anyhow::anyhow!("RefreshVaultSince graph mutation failed: {error:#}");
                         if let Err(marker_error) = record_search_reconciliation_failure(
@@ -10592,6 +10751,15 @@ impl NestWeaverDaemon for DaemonService {
         }))
     }
 
+    async fn get_effective_config(
+        &self,
+        request: Request<BrainStatusRequest>,
+    ) -> Result<Response<EffectiveConfig>, Status> {
+        self.runtime_effective_config(request.extensions())
+            .await
+            .map(Response::new)
+    }
+
     async fn brain_status(
         &self,
         r: Request<BrainStatusRequest>,
@@ -10609,10 +10777,7 @@ impl NestWeaverDaemon for DaemonService {
         // The fail-closed guard above owns the current policy. Keep the
         // earlier indexing-target suppression as defense in depth: a worker
         // identifier is not an authoritative graph UID suitable for scoping.
-        let restricted = matches!(
-            self.state.visible_repos_for(r.extensions())?,
-            nestweaver_engine::authz::VisibleRepos::Only(_)
-        );
+        let restricted = false; // Status admission above permits only an unscoped frame.
         let (_, extensions, _) = r.into_parts();
         let args = serde_json::json!({});
         let value = self
@@ -10736,10 +10901,7 @@ impl NestWeaverDaemon for DaemonService {
         // one would have left the repo-identity leak fully reachable here.
         // See the typed twin above: the worker's job identifier is not a
         // graph UID and cannot be proven visible under a restricted policy.
-        let restricted = matches!(
-            self.state.visible_repos_for(r.extensions())?,
-            nestweaver_engine::authz::VisibleRepos::Only(_)
-        );
+        let restricted = false; // Status admission above permits only an unscoped frame.
         let (_, extensions, req) = r.into_parts();
         let resp = self
             .dispatch_json_tool("brain_status", &req.args_json, &extensions)
@@ -10873,6 +11035,11 @@ impl NestWeaverDaemon for DaemonService {
                             Status::internal(format!("symbol count for {} failed: {e:#}", r.uid))
                         })?;
                     Ok(RepoState {
+                        local_checkout_path: if state.server_mode {
+                            String::new()
+                        } else {
+                            r.root_path.clone().unwrap_or_default()
+                        },
                         repo_uid: r.uid,
                         repo_url: r.url.clone(),
                         repo_name: r.name.clone().unwrap_or_else(|| {
@@ -13052,6 +13219,7 @@ fn watcher_is_attached(state: &DaemonState) -> bool {
 /// without classifying it here or as mutating, forcing a deliberate
 /// (fail-closed) read/write decision.
 const READ_ONLY_ALLOWED_METHODS: &[&str] = &[
+    "GetEffectiveConfig",
     "AffectedTests",
     "BlastRadius",
     "BrainBrokenLinks",
@@ -13220,6 +13388,7 @@ fn declared_rpc_repo_scope(method: &str) -> Option<RpcRepoScope> {
         // dispatch while per-repo authorization is enabled.
         "BrainStatus"
         | "BrainStatusJson"
+        | "GetEffectiveConfig"
         | "DetectImplicitProjectsJson"
         | "BrainGuide"
         | "Clusters"
@@ -13380,8 +13549,9 @@ fn replica_mounts_admin_api(read_only: bool, admin_token_configured: bool) -> bo
 /// encrypted (`--tls-cert` + `--tls-key`). Loopback binds, and bind strings
 /// that cannot be parsed as a socket address (e.g. `localhost:9378`), retain
 /// the pre-existing auth-only requirement. Returns the first violated invariant.
-fn validate_bind_security(
+fn validate_bind_security_resolved(
     bind_addr: &str,
+    resolved: &[std::net::SocketAddr],
     auth_token: &Option<String>,
     tls_cert: &Option<PathBuf>,
     tls_key: &Option<PathBuf>,
@@ -13410,17 +13580,107 @@ fn validate_bind_security(
             }
         }
         Err(_) => {
-            // Bind string isn't a socket address (e.g. `localhost:9378`); we cannot
-            // confirm it is loopback. Preserve the auth-only requirement.
+            // Bind string isn't a literal socket address (e.g. `localhost:9378`,
+            // `0:9378`). nw-879: `resolved` is the address set the listeners will
+            // actually bind (resolved ONCE by the caller). If every address is
+            // loopback the bind is process-local (auth-only requirement
+            // preserved); if ANY address is non-loopback, or nothing resolved,
+            // fail closed and demand auth AND TLS.
+            let all_loopback =
+                !resolved.is_empty() && resolved.iter().all(|a| a.ip().is_loopback());
             if auth_token.is_none() {
                 anyhow::bail!(
                     "Cannot determine if bind address '{bind_addr}' is loopback. \
                      Use --auth-token or specify an IP address."
                 );
             }
+            if !all_loopback && !tls_enabled {
+                anyhow::bail!(
+                    "Cannot bind to '{bind_addr}' without TLS: it is not a loopback \
+                     address (or could not be proven to be one), so bearer tokens and \
+                     source data would be sent in cleartext. Provide --tls-cert and \
+                     --tls-key (or bind to a loopback address)."
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// Resolve `--bind` ONCE into the exact address set both listeners bind
+/// (nw-879). A literal `ip:port` is itself; a name is looked up. A lookup
+/// failure yields an empty set, which the validator treats as non-loopback.
+async fn resolve_bind_addrs(bind_addr: &str) -> Vec<std::net::SocketAddr> {
+    if let Ok(addr) = bind_addr.parse::<std::net::SocketAddr>() {
+        return vec![addr];
+    }
+    match tokio::net::lookup_host(bind_addr).await {
+        Ok(addrs) => addrs.collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Resolve the bind once, validate every resolved address, and return the
+/// validated set to bind. An empty set is an error (nothing to bind).
+async fn resolve_and_validate_bind(
+    bind_addr: &str,
+    auth_token: &Option<String>,
+    tls_cert: &Option<PathBuf>,
+    tls_key: &Option<PathBuf>,
+    acme_enabled: bool,
+) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    let resolved = resolve_bind_addrs(bind_addr).await;
+    validate_bind_security_resolved(
+        bind_addr,
+        &resolved,
+        auth_token,
+        tls_cert,
+        tls_key,
+        acme_enabled,
+    )?;
+    if resolved.is_empty() {
+        anyhow::bail!("Cannot resolve bind address '{bind_addr}' to any socket address");
+    }
+    Ok(resolved)
+}
+
+/// The MCP HTTP listener address paired with a gRPC listener address: same
+/// IP, port + 1 (or 0 for an ephemeral gRPC port).
+fn mcp_addr_for(grpc: std::net::SocketAddr) -> anyhow::Result<std::net::SocketAddr> {
+    if grpc.port() == 0 {
+        return Ok(std::net::SocketAddr::from((grpc.ip(), 0)));
+    }
+    let port = grpc.port().checked_add(1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "MCP port overflow: gRPC port {} + 1 exceeds u16::MAX",
+            grpc.port()
+        )
+    })?;
+    Ok(std::net::SocketAddr::from((grpc.ip(), port)))
+}
+
+/// Synchronous resolve-and-validate for tests.
+#[cfg(test)]
+fn validate_bind_security(
+    bind_addr: &str,
+    auth_token: &Option<String>,
+    tls_cert: &Option<PathBuf>,
+    tls_key: &Option<PathBuf>,
+    acme_enabled: bool,
+) -> anyhow::Result<()> {
+    use std::net::ToSocketAddrs;
+    let resolved: Vec<_> = bind_addr
+        .to_socket_addrs()
+        .map(|a| a.collect())
+        .unwrap_or_default();
+    validate_bind_security_resolved(
+        bind_addr,
+        &resolved,
+        auth_token,
+        tls_cert,
+        tls_key,
+        acme_enabled,
+    )
 }
 
 /// Whether an `--acme-domain` request can ACTUALLY provide TLS in THIS build.
@@ -13722,6 +13982,24 @@ fn build_repo_types(
                 repo.repo_type
                     .clone()
                     .unwrap_or(nestweaver_engine::RepoType::Code),
+            )
+        })
+        .collect()
+}
+
+/// Build the per-repo `exclude` / `unskip` map consumed by
+/// [`nestweaver_engine::worker::WorkerPool::with_repo_policies`] (nw-908), keyed
+/// like [`build_repo_types`].
+fn build_repo_policies(
+    config: &nestweaver_engine::InstanceConfig,
+) -> std::collections::HashMap<String, nestweaver_engine::worker::RepoReadPolicy> {
+    config
+        .repos
+        .iter()
+        .map(|repo| {
+            (
+                nestweaver_engine::jobs::canonical_repo_id(&repo.url),
+                nestweaver_engine::worker::RepoReadPolicy::for_url(config, &repo.url),
             )
         })
         .collect()
@@ -15342,6 +15620,7 @@ pub async fn run_server(
     }
 
     let instance_id = lifecycle::instance_id_from_db_path(&db_path);
+    let selected_db_path = db_path.clone();
     let instance_label = lifecycle::instance_label_from_db_path(&db_path);
     // nw-019: two identities. `instance_id` (db-path hash) is for RUNTIME paths
     // only — sockets/pidfiles/launchd/replica locks (104-byte sun_path limit).
@@ -15467,6 +15746,7 @@ pub async fn run_server(
         .as_ref()
         .and_then(|o| o.snapshot.as_ref())
         .is_some();
+    let mut snapshot_receipt = None;
     let db_path = if let Some(snapshot_dir) = server_opts.as_ref().and_then(|o| o.snapshot.clone())
     {
         let schema_hash = instance_cfg
@@ -15480,14 +15760,17 @@ pub async fn run_server(
         // mutable path and clobber each other's materialized copy.
         let working_dir = replica_working_dir(&db_path, &instance_id);
         tracing::info!(snapshot = %snapshot_dir.display(), "booting as read-only snapshot replica");
-        nestweaver_engine::materialize_snapshot_with_config(
+        let receipt = nestweaver_engine::snapshot::materialize_snapshot_with_config_receipt(
             &snapshot_dir,
             &working_dir,
             env!("CARGO_PKG_VERSION"),
             schema_hash.as_deref(),
             embedding_model,
         )
-        .with_context(|| format!("failed to materialize snapshot {}", snapshot_dir.display()))?
+        .with_context(|| format!("failed to materialize snapshot {}", snapshot_dir.display()))?;
+        let path = receipt.db_path().to_path_buf();
+        snapshot_receipt = Some(receipt);
+        path
     } else {
         db_path
     };
@@ -15552,6 +15835,11 @@ pub async fn run_server(
             }
         }
     };
+    let store = Arc::new(store);
+    let snapshot_derivation = snapshot_receipt
+        .map(|receipt| receipt.bind(Arc::clone(&store)))
+        .transpose()?
+        .flatten();
     drop(publication_root_lock);
     #[cfg(feature = "release-fixture-hooks")]
     nestweaver_engine::release_fixture::bind_daemon_store(&store)?;
@@ -15802,14 +16090,17 @@ pub async fn run_server(
     // guard above has already bailed, so here a non-loopback ACME-only bind
     // would fail closed rather than being waved through as "TLS" and then
     // serving cleartext.
+    // The resolved set is kept and bound as-is by both listeners (nw-879).
+    let mut resolved_bind: Vec<std::net::SocketAddr> = Vec::new();
     if let Some(ref opts) = server_opts {
-        validate_bind_security(
+        resolved_bind = resolve_and_validate_bind(
             &opts.bind_addr,
             &opts.auth_token,
             &opts.tls_cert,
             &opts.tls_key,
             acme_provides_tls(opts.acme_domain.is_some()),
-        )?;
+        )
+        .await?;
     }
 
     // Reject any present webhook secret that is too short to be safe.
@@ -15876,10 +16167,12 @@ pub async fn run_server(
     let (embedding_reload_tx, mut embedding_reload_rx) =
         tokio::sync::mpsc::channel::<EmbeddingReloadRequest>(8);
     let state = Arc::new(DaemonState {
-        store: Arc::new(store),
+        store,
+        snapshot_derivation,
 
         search: Arc::clone(&search),
         db_path: db_path.clone(),
+        selected_db_path,
         read_only,
         instance_id: instance_id.clone(),
         data_instance_id,
@@ -15915,6 +16208,7 @@ pub async fn run_server(
         rate_limiters: rate_limiters.clone(),
         drained: Arc::new(AtomicBool::new(false)),
         shutdown_started: Arc::new(AtomicBool::new(false)),
+        status_snapshots: status_snapshot::StatusSnapshots::default(),
         admin_token,
         admin_state: std::sync::OnceLock::new(),
         worker_handle: std::sync::Mutex::new(None),
@@ -16104,6 +16398,9 @@ pub async fn run_server(
     // does NOT flow through it — its replica safety comes from the read-only
     // store open plus the `MUTATING_TOOLS` permission gate in the MCP handler
     // (see http.rs). Don't assume this guard wraps `/mcp`.
+    let status_service = DaemonService::new(state.clone());
+    status_service.prewarm_status_observations().await;
+
     let svc = ReadOnlyGuard::new(
         read_only,
         state.permission_source.is_enabled(),
@@ -16309,6 +16606,14 @@ pub async fn run_server(
 
     // Shared job queue Arc — created once and shared across webhook handler,
     // worker pool, and poll scheduler to avoid concurrent SQLite opens.
+    let runtime_repo_configs: nestweaver_engine::worker::RuntimeRepoConfigs =
+        std::sync::Arc::new(std::sync::RwLock::new(
+            state
+                .instance_cfg
+                .as_deref()
+                .map(nestweaver_engine::worker::runtime_repo_configs)
+                .unwrap_or_default(),
+        ));
     let mut shared_job_queue_opt: Option<
         std::sync::Arc<std::sync::Mutex<nestweaver_engine::jobs::JobQueue>>,
     > = None;
@@ -16364,6 +16669,8 @@ pub async fn run_server(
             // A read-only replica must reject mutating MCP tools before dispatch,
             // just as the gRPC ReadOnlyGuard rejects mutating RPCs.
             s.read_only = read_only;
+            s.brain_status_provider =
+                Some(DaemonService::http_brain_status_provider(state.clone()));
             // Build the daemon-side federation coordinator from the instance
             // config's `[[upstream]]` entries. `None` for the common
             // single-node case (no upstreams) — the `/mcp` boundary then stamps
@@ -16412,6 +16719,9 @@ pub async fn run_server(
             std::sync::Arc<std::sync::RwLock<Option<std::collections::HashSet<String>>>>,
         > = None;
         let mut webhook_repo_branches: Option<
+            std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+        > = None;
+        let mut webhook_repo_urls: Option<
             std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
         > = None;
 
@@ -16466,7 +16776,9 @@ pub async fn run_server(
                         continue;
                     }
                     let canonical_id = nestweaver_engine::jobs::canonical_repo_id(&repo_cfg.url);
-                    if let Err(e) = queue.upsert(
+                    // nw-913: the same declared-repo enqueue config reload uses —
+                    // a dead-lettered repo stays quarantined across a restart.
+                    if let Err(e) = queue.enqueue_declared_repo(
                         &canonical_id,
                         &repo_cfg.url,
                         nestweaver_engine::jobs::JobTrigger::Unindexed,
@@ -16479,6 +16791,16 @@ pub async fn run_server(
                         );
                     }
                 }
+            }
+            // nw-912: jobs (including dead letters) for repos that are no
+            // longer declared must not survive a restart either.
+            let declared: std::collections::HashSet<String> = cfg
+                .repos
+                .iter()
+                .map(|r| nestweaver_engine::jobs::canonical_repo_id(&r.url))
+                .collect();
+            if let Err(e) = queue.cancel_repos_not_in(&declared) {
+                tracing::warn!(error = %e, "startup: failed to cancel jobs for undeclared repos");
             }
         }
 
@@ -16512,10 +16834,29 @@ pub async fn run_server(
                         .collect()
                 })
                 .unwrap_or_default();
+            // canonical id → RAW configured clone URL, so a matched webhook
+            // enqueues the configured URL rather than the payload's (nw-909).
+            let repo_urls: std::collections::HashMap<String, String> = state
+                .instance_cfg
+                .as_ref()
+                .map(|cfg| {
+                    cfg.repos
+                        .iter()
+                        .map(|r| {
+                            (
+                                nestweaver_engine::jobs::canonical_repo_id(&r.url),
+                                r.url.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let shared_allowed = std::sync::Arc::new(std::sync::RwLock::new(allowed_repos));
             let shared_branches = std::sync::Arc::new(std::sync::RwLock::new(repo_branches));
+            let shared_urls = std::sync::Arc::new(std::sync::RwLock::new(repo_urls));
             webhook_allowed_repos = Some(std::sync::Arc::clone(&shared_allowed));
             webhook_repo_branches = Some(std::sync::Arc::clone(&shared_branches));
+            webhook_repo_urls = Some(std::sync::Arc::clone(&shared_urls));
             let webhook_state = std::sync::Arc::new(crate::webhook::WebhookState {
                 config: crate::webhook::WebhookConfig {
                     secret: secret.clone(),
@@ -16524,6 +16865,7 @@ pub async fn run_server(
                 job_queue: std::sync::Arc::clone(&shared_job_queue),
                 allowed_repos: shared_allowed,
                 repo_branches: shared_branches,
+                repo_urls: shared_urls,
             });
             mcp_router = mcp_router.route(
                 "/webhook",
@@ -16541,6 +16883,7 @@ pub async fn run_server(
             && let Some(ref admin_tok) = opts.admin_token
         {
             let admin_state = std::sync::Arc::new(nestweaver_web::state::AdminState {
+                runtime_repo_configs: runtime_repo_configs.clone(),
                 admin_token: admin_tok.clone(),
                 auth_token: opts.auth_token.clone(),
                 device_flow: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -16563,12 +16906,21 @@ pub async fn run_server(
                 scheduler_tx: Some(scheduler_tx.clone()),
                 webhook_allowed_repos: webhook_allowed_repos.clone(),
                 webhook_repo_branches: webhook_repo_branches.clone(),
+                webhook_repo_urls: webhook_repo_urls.clone(),
                 write_gate: Some(state.write_gate.clone()),
                 // Share the daemon's single job-queue connection. Opening a
                 // second connection from admin routes races the worker's WAL
                 // checkpoint and crashes with SIGBUS on macOS.
                 job_queue: shared_job_queue_opt.clone(),
                 resolver: nestweaver_web::state::system_resolver(),
+                // nw-884: the address the device-flow routes are served on
+                // (the MCP HTTP listener), for the verification URI when the
+                // request has no usable Host. Unknown for an ephemeral port.
+                advertised_authority: resolved_bind
+                    .first()
+                    .and_then(|a| mcp_addr_for(*a).ok())
+                    .filter(|a| a.port() != 0)
+                    .map(|a| a.to_string()),
             });
             // Store the admin state so serve_ui can mount the admin API on
             // the web UI server as well (shared Arc = same state).
@@ -16618,13 +16970,13 @@ pub async fn run_server(
         // The request surface is audited panic-free today; this guards future edits.
         mcp_router = mcp_router.layer(tower_http::catch_panic::CatchPanicLayer::new());
 
-        // Parse the bind address to determine the MCP port.  When the gRPC
-        // bind uses port 0 (OS-assigned), the MCP server also binds to port 0
-        // and records the actual port in the port file (second line).
-        let mcp_bind_addr: std::net::SocketAddr = opts
-            .bind_addr
-            .parse()
-            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+        // The MCP listener binds the SAME validated address set as gRPC, each
+        // with port + 1 (port 0 stays ephemeral and is recorded in the port
+        // file). nw-879: no loopback fallback for a non-literal bind.
+        let mcp_bind_addrs: Vec<std::net::SocketAddr> = resolved_bind
+            .iter()
+            .map(|addr| mcp_addr_for(*addr))
+            .collect::<anyhow::Result<_>>()?;
 
         // T5.1 defense-in-depth: a non-loopback MCP HTTP listener MUST be
         // authenticated. `validate_bind_security` already forces `--auth-token`
@@ -16632,27 +16984,17 @@ pub async fn run_server(
         // but that guarantee is indirect. Assert it directly at bind time so a
         // future refactor that weakens the upstream check fails loudly here
         // rather than silently exposing an unauthenticated network surface.
-        if !mcp_bind_addr.ip().is_loopback() && mcp_auth_token.is_none() {
+        if let Some(addr) = mcp_bind_addrs
+            .iter()
+            .find(|a| !a.ip().is_loopback() && mcp_auth_token.is_none())
+        {
             anyhow::bail!(
                 "refusing to bind MCP HTTP listener to non-loopback {} without \
                  authentication — validate_bind_security should have required \
                  --auth-token; this is a bug, not a config error",
-                mcp_bind_addr
+                addr
             );
         }
-        let mcp_bind = if mcp_bind_addr.port() == 0 {
-            std::net::SocketAddr::from((mcp_bind_addr.ip(), 0))
-        } else {
-            std::net::SocketAddr::from((
-                mcp_bind_addr.ip(),
-                mcp_bind_addr.port().checked_add(1).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "MCP port overflow: gRPC port {} + 1 exceeds u16::MAX",
-                        mcp_bind_addr.port()
-                    )
-                })?,
-            ))
-        };
 
         // ACME auto-TLS (opt-in via --acme-domain) takes precedence over manual
         // --tls-cert. On success both listeners share the ACME acceptor; gRPC
@@ -16790,9 +17132,9 @@ pub async fn run_server(
             manual_tls_config
         };
 
-        let mcp_listener = tokio::net::TcpListener::bind(mcp_bind)
+        let mcp_listener = tokio::net::TcpListener::bind(&mcp_bind_addrs[..])
             .await
-            .with_context(|| format!("bind MCP HTTP: {mcp_bind}"))?;
+            .with_context(|| format!("bind MCP HTTP: {mcp_bind_addrs:?}"))?;
         let mcp_actual_addr = mcp_listener.local_addr()?;
         let mcp_tls_label = if tls_config.is_some() { " (TLS)" } else { "" };
         tracing::info!(%mcp_actual_addr, "MCP HTTP server listening{}", mcp_tls_label);
@@ -16804,7 +17146,7 @@ pub async fn run_server(
         // Finish every fallible public-listener setup step before spawning
         // either server. Otherwise a TCP bind/port-file error would return
         // from run_server while a detached MCP task still owned the store.
-        let tcp_listener = tokio::net::TcpListener::bind(&opts.bind_addr)
+        let tcp_listener = tokio::net::TcpListener::bind(&resolved_bind[..])
             .await
             .with_context(|| format!("bind TCP: {}", opts.bind_addr))?;
         let actual_addr = tcp_listener.local_addr()?;
@@ -17061,6 +17403,7 @@ pub async fn run_server(
                 Arc::new(move || worker_state.effective_data_instance_id());
             let mut worker_shutdown = shutdown_tx.subscribe();
             let worker_drained = Arc::clone(&state.drained);
+            let worker_shutdown_started = Arc::clone(&state.shutdown_started);
             let worker_write_gate = state.write_gate.clone();
             let worker_count = state
                 .instance_cfg
@@ -17081,6 +17424,12 @@ pub async fn run_server(
                 .as_ref()
                 .map(|c| build_repo_types(&c.repos))
                 .unwrap_or_default();
+            // nw-908: `[[repos]] exclude` / `unskip` reach the bare reader.
+            let worker_repo_policies = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| build_repo_policies(c))
+                .unwrap_or_default();
             let worker_index_limits = state
                 .instance_cfg
                 .as_ref()
@@ -17099,11 +17448,26 @@ pub async fn run_server(
                 .map(|config| config.cross_domain.clone())
                 .unwrap_or_default();
             let worker_job_queue = std::sync::Arc::clone(&shared_job_queue);
+            let worker_workspace_path = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| c.workspace.path.clone());
+            let worker_credential_method = state
+                .instance_cfg
+                .as_ref()
+                .map(|c| c.git.credential_method.clone());
+            let worker_runtime_repos = state
+                .instance_cfg
+                .as_ref()
+                .map(|_| runtime_repo_configs.clone());
             let worker_handle = tokio::spawn(async move {
-                let workspace_dir = worker_db
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join("workspace");
+                // nw-827: `[workspace] path` when set, else `<db dir>/workspace`.
+                let workspace_dir = bare_clone_root(&worker_db, worker_workspace_path.as_deref());
+                tracing::info!(root = %workspace_dir.display(), "bare clone root");
+                nestweaver_engine::bare_clone::register_clone_root(
+                    &worker_db,
+                    workspace_dir.clone(),
+                );
                 // Recover jobs orphaned by a previous crash. At startup no worker is
                 // alive, so EVERY `running` row is orphaned — reclaim them all
                 // immediately instead of waiting out the ~30-min lease/threshold.
@@ -17115,17 +17479,25 @@ pub async fn run_server(
                 }
                 let workspace =
                     match nestweaver_engine::bare_clone::BareCloneWorkspace::new(&workspace_dir) {
-                        Ok(w) => w,
+                        // nw-828: bare clone/fetch authenticate per `[git] credential_method`.
+                        Ok(w) => w.with_credential_method(worker_credential_method),
                         Err(e) => {
                             tracing::error!("failed to create bare clone workspace: {e}");
                             return;
                         }
                     };
                 let pool = nestweaver_engine::worker::WorkerPool::new(worker_count)
+                    .with_shutdown_started(worker_shutdown_started)
                     .with_repo_types(worker_repo_types)
+                    .with_repo_policies(worker_repo_policies)
                     .with_index_limits(worker_index_limits)
                     .with_note_limits(worker_note_limits)
                     .with_cross_domain_config(worker_cross_domain);
+                let pool = if let Some(repos) = worker_runtime_repos {
+                    pool.with_runtime_repos(repos)
+                } else {
+                    pool
+                };
 
                 pool.run_with_drain(
                     worker_job_queue,
@@ -17179,9 +17551,22 @@ pub async fn run_server(
                                         nestweaver_engine::jobs::STALE_RECOVERY_SECS,
                                     ),
                                 ),
-                                Err(_) => {
-                                    tracing::error!("lease reaper: job queue mutex poisoned");
-                                    (Ok(0), Ok(0))
+                                Err(poisoned) => {
+                                    // nw-924: a panic while the queue was held
+                                    // must not retire the reaper for the rest of
+                                    // the process while the worker (which recovers
+                                    // the same mutex) keeps claiming. Recover the
+                                    // guard exactly as the worker does.
+                                    tracing::warn!(
+                                        "lease reaper: job queue mutex poisoned; recovering the guard"
+                                    );
+                                    let guard = poisoned.into_inner();
+                                    (
+                                        guard.reap_expired_leases(now),
+                                        guard.recover_stale(
+                                            nestweaver_engine::jobs::STALE_RECOVERY_SECS,
+                                        ),
+                                    )
                                 }
                             };
                             match reclaimed {
@@ -17219,6 +17604,8 @@ pub async fn run_server(
         let poll_state = Arc::clone(&state);
         let poll_job_queue = shared_job_queue_opt.clone();
         let poll_cfg = state.instance_cfg.clone();
+        // nw-828: the poll's ls-remote authenticates exactly like clone/fetch.
+        let poll_credential_method = poll_cfg.as_ref().map(|c| c.git.credential_method.clone());
         let poll_drained = Arc::clone(&state.drained);
         let mut poll_shutdown = shutdown_tx.subscribe();
         let mut scheduler_rx = scheduler_rx; // move into the spawned task
@@ -17272,6 +17659,22 @@ pub async fn run_server(
                 }
             }
 
+            // nw-882: probes run concurrently (bounded) and OFF this loop, so a
+            // dead remote costs one permit for one git timeout instead of
+            // stalling every other repo, the scheduler command channel, and
+            // shutdown. `in_flight` maps repo_id -> url for probes whose result
+            // is still wanted: RemoveRepo/Reload drop entries so a stale result
+            // is discarded rather than enqueued for a repo no longer tracked.
+            let permits = Arc::new(tokio::sync::Semaphore::new(POLL_PROBE_CONCURRENCY));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut probes: tokio::task::JoinSet<PollProbeOutcome> = tokio::task::JoinSet::new();
+            let mut in_flight = PollInFlight::default();
+            // An interval (not a per-iteration sleep): probe completions and
+            // scheduler commands must not keep resetting the poll tick.
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // the first tick completes immediately; skip it
+
             loop {
                 tokio::select! {
                     _ = poll_shutdown.changed() => break,
@@ -17283,11 +17686,13 @@ pub async fn run_server(
                                 }
                                 nestweaver_engine::scheduler::SchedulerCommand::RemoveRepo { repo_id } => {
                                     scheduler.remove_repo(&repo_id);
+                                    in_flight.forget_repo(&repo_id);
                                 }
                                 nestweaver_engine::scheduler::SchedulerCommand::ReloadConfig { repos, min_poll: new_min, max_poll: new_max } => {
                                     if let Some(m) = new_min { min_poll = m; }
                                     if let Some(m) = new_max { max_poll = m; }
                                     scheduler = PollScheduler::new(min_poll, max_poll);
+                                    in_flight.reset();
                                     for (id, url, ovr, branch) in repos {
                                         scheduler.add_repo(id, url, ovr, branch);
                                     }
@@ -17296,94 +17701,141 @@ pub async fn run_server(
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    _ = tick.tick() => {
                         // Skip polling when drained.
                         if poll_drained.load(std::sync::atomic::Ordering::Relaxed) {
                             continue;
                         }
-                        let due = scheduler.due_repos();
-                        for (repo_id, repo_url, branch) in due {
-                            // Determine which branch ref to check. If the repo
-                            // config specifies a branch, use that ref; otherwise
-                            // fall back to HEAD (symref of the remote's default
-                            // branch) so we aren't hardcoded to "main".
-                            let url = repo_url.clone();
-                            let ref_spec = branch.as_deref().unwrap_or("HEAD").to_string();
-                            // SSRF guard the remote probe too: reject internal targets
-                            // and pin the resolved IP (closes a DNS-rebinding vector on
-                            // the ls-remote ref probe, mirroring clone/fetch).
-                            let ls_guard = match nestweaver_engine::ssrf::guard_git_url(&url) {
-                                Ok(g) => g,
-                                Err(e) => {
-                                    tracing::warn!(url = %url, error = %e, "skipping poll: repo URL failed SSRF guard");
-                                    continue;
-                                }
+                        for (repo_id, repo_url, branch) in scheduler.due_repos() {
+                            // A probe for this repo is still running (a slow
+                            // remote outlived its poll interval): don't stack
+                            // another one behind it.
+                            let Some(generation) = in_flight.try_dispatch(&repo_id, &repo_url) else {
+                                continue;
                             };
-                            // Run the ls-remote probe OFF the async runtime via
-                            // spawn_blocking, and bounded by GIT_TIMEOUT (which
-                            // kills+reaps the child): a hung remote no longer
-                            // stalls this scheduler task's runtime, and can never
-                            // block past the timeout. The status check inside
-                            // `probe_remote_sha` distinguishes a genuine failure
-                            // (Err → log+skip) from an unadvertised ref
-                            // (Ok(None) → nothing to enqueue).
-                            let probe_args = ls_guard.config_args.clone();
-                            let probe_url = url.clone();
-                            let probe_ref = ref_spec.clone();
-                            let probe = tokio::task::spawn_blocking(move || {
-                                probe_remote_sha(&probe_args, &probe_url, &probe_ref)
-                            })
-                            .await;
-                            let remote_sha = match probe {
-                                Ok(Ok(Some(sha))) => sha,
-                                Ok(Ok(None)) => continue,
-                                Ok(Err(e)) => {
-                                    tracing::warn!(url = %url, error = %e, "poll ls-remote failed");
-                                    continue;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(url = %url, error = %e, "poll ls-remote task panicked");
-                                    continue;
-                                }
-                            };
-                            // A completed ls-remote probe.
-                            nestweaver_web::routes::metrics::POLL_CHECKS.inc();
-                            let r_uid = nestweaver_schema::repo_uid(
-                                &poll_state.effective_data_instance_id(),
-                                &url,
+                            // Determine which ref to check. A configured branch
+                            // is probed as the fully qualified `refs/heads/<branch>`
+                            // (nw-919: a bare name is a tail pattern to ls-remote,
+                            // so `refs/tags/main` or `refs/heads/dev/main` could be
+                            // reported first and the scheduler would compare the
+                            // wrong SHA — the worker fetches `refs/heads/<branch>`
+                            // exactly, so the probe must too); otherwise HEAD, the
+                            // remote's default-branch symref, so nothing is
+                            // hardcoded to "main".
+                            let ref_spec = branch
+                                .as_deref()
+                                .map(|b| format!("refs/heads/{b}"))
+                                .unwrap_or_else(|| "HEAD".to_string());
+                            let probe_url = repo_url.clone();
+                            let probe_cred = poll_credential_method.clone();
+                            let task_repo = repo_id.clone();
+                            let task = spawn_poll_probe(
+                                &mut probes,
+                                Arc::clone(&permits),
+                                Arc::clone(&cancel),
+                                repo_id,
+                                repo_url,
+                                branch,
+                                generation,
+                                move |cancel| {
+                                    // SSRF guard the remote probe too: reject
+                                    // internal targets and pin the resolved IP
+                                    // (closes a DNS-rebinding vector on the
+                                    // ls-remote ref probe, mirroring
+                                    // clone/fetch). It does blocking DNS, so it
+                                    // runs here on the blocking thread, not on
+                                    // the async task.
+                                    run_guarded_poll_probe(
+                                        cancel,
+                                        || {
+                                            nestweaver_engine::ssrf::guard_git_url(&probe_url)
+                                                .map_err(|e| anyhow::anyhow!("repo URL failed SSRF guard: {e}"))
+                                        },
+                                        |guard, cancel| {
+                                            probe_remote_sha(
+                                                &guard.config_args,
+                                                &probe_url,
+                                                &ref_spec,
+                                                probe_cred.as_deref(),
+                                                cancel,
+                                            )
+                                        },
+                                    )
+                                },
                             );
-                            let indexed_sha = poll_store.lookup_repo(&r_uid)
-                                .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
-                            if remote_sha != indexed_sha {
-                                // A new commit was observed on the remote.
-                                nestweaver_web::routes::metrics::POLL_CHANGES_DETECTED.inc();
+                            in_flight.track(task, task_repo, generation);
+                        }
+                    }
+                    Some(joined) = probes.join_next_with_id(), if !probes.is_empty() => {
+                        let (task, outcome) = match joined {
+                            Ok(done) => done,
+                            Err(e) => {
+                                // The wrapper never panics in practice; if it
+                                // does, free the repo so it is polled again.
+                                tracing::warn!(error = %e, "poll probe task failed");
+                                in_flight.failed(e.id());
+                                continue;
                             }
-                            if remote_sha != indexed_sha
-                                && let Some(ref jq) = poll_job_queue
-                                && let Ok(queue) = jq.lock()
-                            {
-                                let canonical_id =
-                                    nestweaver_engine::jobs::canonical_repo_id(&url);
-                                let _ = queue.upsert(
-                                    &canonical_id,
-                                    &url,
-                                    nestweaver_engine::jobs::JobTrigger::Poll,
-                                    branch.as_deref(),
-                                );
-                                // A new commit was just observed — record it so
-                                // the scheduler's adaptive interval shortens for
-                                // active repos. Only on new-commit detection;
-                                // calling this every poll would peg the interval
-                                // at the min_poll floor.
-                                scheduler.update_commit_time(
-                                    &repo_id,
-                                    std::time::Instant::now(),
-                                );
+                        };
+                        // Discard results for repos removed/reloaded meanwhile
+                        // (stale generation) and any that finish during a drain.
+                        let drained = poll_drained.load(std::sync::atomic::Ordering::Relaxed);
+                        if !in_flight.finish(task, &outcome.repo_id, outcome.generation, drained) {
+                            continue;
+                        }
+                        let PollProbeOutcome { repo_id, url, branch, result, .. } = outcome;
+                        // The status check inside `probe_remote_sha`
+                        // distinguishes a genuine failure (Err → log+skip) from
+                        // an unadvertised ref (Ok(None) → nothing to enqueue).
+                        let remote_sha = match result {
+                            Ok(Some(sha)) => sha,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                tracing::warn!(url = %url, error = %e, "poll ls-remote failed");
+                                continue;
                             }
+                        };
+                        // A completed ls-remote probe.
+                        nestweaver_web::routes::metrics::POLL_CHECKS.inc();
+                        let r_uid = nestweaver_schema::repo_uid(
+                            &poll_state.effective_data_instance_id(),
+                            &url,
+                        );
+                        let indexed_sha = poll_store.lookup_repo(&r_uid)
+                            .ok().flatten().map(|r| r.indexed_sha).unwrap_or_default();
+                        if remote_sha != indexed_sha {
+                            // A new commit was observed on the remote.
+                            nestweaver_web::routes::metrics::POLL_CHANGES_DETECTED.inc();
+                        }
+                        if remote_sha != indexed_sha
+                            && let Some(ref jq) = poll_job_queue
+                            && let Ok(queue) = jq.lock()
+                        {
+                            let canonical_id =
+                                nestweaver_engine::jobs::canonical_repo_id(&url);
+                            let _ = queue.upsert(
+                                &canonical_id,
+                                &url,
+                                nestweaver_engine::jobs::JobTrigger::Poll,
+                                branch.as_deref(),
+                            );
+                            // A new commit was just observed — record it so
+                            // the scheduler's adaptive interval shortens for
+                            // active repos. Only on new-commit detection;
+                            // calling this every poll would peg the interval
+                            // at the min_poll floor.
+                            scheduler.update_commit_time(
+                                &repo_id,
+                                std::time::Instant::now(),
+                            );
                         }
                     }
                 }
             }
+            // Shutdown: stop waiting on probes and kill any git still running
+            // so the runtime can exit without waiting out the network timeout.
+            cancel.store(true, Ordering::Release);
+            probes.abort_all();
         });
     }
 
@@ -17719,6 +18171,10 @@ pub async fn run_server(
     {
         tracing::error!(%error, "manifest reconciliation task failed while draining");
     }
+
+    // This retained task can own a blocking status read admitted before a
+    // writer. Join after writers drain and before releasing instance authority.
+    status_snapshot::drain_status_refresh(&state).await;
 
     // Watchers LAST, and before the socket/pidfile/instance-lock teardown
     // below. `stop_active_watcher` above only SIGNALS them; a `spawn_blocking`
@@ -18263,6 +18719,187 @@ fn proto_to_atomic_change(
     }
 }
 
+/// Root directory of the server's bare clones (nw-827): `[workspace] path`
+/// when set, else `<db dir>/workspace`. One definition for the worker, backup
+/// and manifest recovery.
+pub(crate) fn bare_clone_root(db_path: &Path, workspace_path: Option<&str>) -> PathBuf {
+    nestweaver_engine::bare_clone::bare_clone_root(db_path, workspace_path)
+}
+
+/// Most poll probes (`git ls-remote`) in flight at once (nw-882).
+const POLL_PROBE_CONCURRENCY: usize = 8;
+
+/// A finished poll probe, handed back to the scheduler loop.
+struct PollProbeOutcome {
+    repo_id: String,
+    url: String,
+    branch: Option<String>,
+    /// [`PollInFlight`] generation the probe was dispatched under.
+    generation: u64,
+    result: anyhow::Result<Option<String>>,
+}
+
+/// Bookkeeping for poll probes whose results are still wanted (nw-882).
+///
+/// One probe per repo at a time; a result is accepted only if its repo is still
+/// tracked under the same generation (RemoveRepo/Reload bump it, so a probe that
+/// outlives a remove + re-add never enqueues its stale url/branch) and the
+/// daemon is not draining.
+#[derive(Default)]
+struct PollInFlight {
+    generation: u64,
+    /// repo_id -> (generation at dispatch, url)
+    entries: std::collections::HashMap<String, (u64, String)>,
+    /// probe task -> repo_id, so a failed task can free its repo.
+    tasks: std::collections::HashMap<tokio::task::Id, (String, u64)>,
+}
+
+impl PollInFlight {
+    /// Register a probe for `repo_id`; `None` if one is already running.
+    fn try_dispatch(&mut self, repo_id: &str, url: &str) -> Option<u64> {
+        if self.entries.contains_key(repo_id) {
+            return None;
+        }
+        self.entries
+            .insert(repo_id.to_string(), (self.generation, url.to_string()));
+        Some(self.generation)
+    }
+
+    fn track(&mut self, task: tokio::task::Id, repo_id: String, generation: u64) {
+        self.tasks.insert(task, (repo_id, generation));
+    }
+
+    /// The repo was removed: drop its entry and invalidate its running probe.
+    fn forget_repo(&mut self, repo_id: &str) {
+        self.entries.remove(repo_id);
+        self.generation += 1;
+    }
+
+    /// Config reload: every running probe becomes stale.
+    fn reset(&mut self) {
+        self.entries.clear();
+        self.generation += 1;
+    }
+
+    /// A probe finished. True when its result should be acted on.
+    fn finish(
+        &mut self,
+        task: tokio::task::Id,
+        repo_id: &str,
+        generation: u64,
+        drained: bool,
+    ) -> bool {
+        self.tasks.remove(&task);
+        match self.entries.get(repo_id) {
+            Some((entry_generation, _)) if *entry_generation == generation => {
+                self.entries.remove(repo_id);
+                !drained
+            }
+            _ => false,
+        }
+    }
+
+    /// A probe task died without an outcome: free its repo for the next tick.
+    fn failed(&mut self, task: tokio::task::Id) {
+        // Only the entry this task owns: a stale task (its repo was removed
+        // and re-dispatched since) must not free the newer probe's entry.
+        if let Some((repo_id, generation)) = self.tasks.remove(&task)
+            && self
+                .entries
+                .get(&repo_id)
+                .is_some_and(|(entry_generation, _)| *entry_generation == generation)
+        {
+            self.entries.remove(&repo_id);
+        }
+    }
+}
+
+/// Run `probe` on a dedicated thread once a concurrency permit is free, and
+/// collect its outcome in `set`. The permit is held for the probe's whole
+/// execution (not just its queueing), so at most `permits` probes run at once.
+/// `probe` receives the shared cancel flag. Git stops promptly when set;
+/// uncancellable system DNS stays on a permit-bounded detached read-only thread
+/// so it cannot retain Tokio runtime shutdown. A late probe never starts git.
+#[allow(clippy::too_many_arguments)]
+fn spawn_poll_probe<F>(
+    set: &mut tokio::task::JoinSet<PollProbeOutcome>,
+    permits: Arc<tokio::sync::Semaphore>,
+    cancel: Arc<AtomicBool>,
+    repo_id: String,
+    url: String,
+    branch: Option<String>,
+    generation: u64,
+    probe: F,
+) -> tokio::task::Id
+where
+    F: FnOnce(&AtomicBool) -> anyhow::Result<Option<String>> + Send + 'static,
+{
+    set.spawn(async move {
+        let result = match permits.acquire_owned().await {
+            Ok(permit) => {
+                let flag = Arc::clone(&cancel);
+                let (send, receive) = tokio::sync::oneshot::channel();
+                // DNS may block inside the system resolver and cannot observe
+                // cancellation. A read-only probe must not retain Tokio's
+                // blocking pool and thus delay foreground runtime shutdown.
+                // The detached thread owns its permit for its entire lifetime,
+                // bounding even cancelled DNS probes. It owns no graph state.
+                let spawned = std::thread::Builder::new()
+                    .name("nw-poll-probe".into())
+                    .spawn(move || {
+                        let _permit = permit;
+                        let result = if flag.load(Ordering::Acquire) {
+                            Err(anyhow::anyhow!("poll probe cancelled"))
+                        } else {
+                            probe(&flag)
+                        };
+                        let _ = send.send(result);
+                    });
+                match spawned {
+                    Ok(thread) => {
+                        drop(thread); // Detached; aborting receive never waits on DNS.
+                        receive.await.unwrap_or_else(|error| {
+                            Err(anyhow::anyhow!(
+                                "poll probe thread ended without a result: {error}"
+                            ))
+                        })
+                    }
+                    Err(error) => Err(anyhow::anyhow!("start poll probe thread: {error}")),
+                }
+            }
+            Err(e) => Err(anyhow::anyhow!("poll probe limiter closed: {e}")),
+        };
+        PollProbeOutcome {
+            repo_id,
+            url,
+            branch,
+            generation,
+            result,
+        }
+    })
+    .id()
+}
+
+/// Check cancellation again after a potentially uninterruptible DNS guard,
+/// before launching git. Both closures perform read-only network work only.
+fn run_guarded_poll_probe<T, G, P>(
+    cancel: &AtomicBool,
+    guard: G,
+    probe: P,
+) -> anyhow::Result<Option<String>>
+where
+    G: FnOnce() -> anyhow::Result<T>,
+    P: FnOnce(T, &AtomicBool) -> anyhow::Result<Option<String>>,
+{
+    anyhow::ensure!(!cancel.load(Ordering::Acquire), "poll probe cancelled");
+    let guarded = guard()?;
+    anyhow::ensure!(
+        !cancel.load(Ordering::Acquire),
+        "poll probe cancelled after DNS"
+    );
+    probe(guarded, cancel)
+}
+
 /// Probe a remote's ref SHA via `git ls-remote`, with a hard timeout.
 ///
 /// This is the blocking body run off the async runtime by the poll scheduler.
@@ -18278,26 +18915,44 @@ fn probe_remote_sha(
     config_args: &[String],
     url: &str,
     ref_spec: &str,
+    credential_method: Option<&str>,
+    cancel: &AtomicBool,
 ) -> anyhow::Result<Option<String>> {
     let mut cmd = std::process::Command::new("git");
+    // nw-828: same isolation + `[git] credential_method` wiring as the bare
+    // clone/fetch commands (one shared function).
+    nestweaver_engine::git_cmd::apply_git_isolation_with_credentials(&mut cmd, credential_method);
     cmd.args(config_args);
-    cmd.args(["ls-remote", url, ref_spec]);
-    let output = nestweaver_engine::git_cmd::run_git_with_timeout(
+    cmd.args(["ls-remote", "--", url, ref_spec]);
+    let output = nestweaver_engine::git_cmd::run_git_with_timeout_cancellable(
         cmd,
         nestweaver_engine::git_cmd::git_net_timeout(),
+        cancel,
     )?;
     if !output.status.success() {
         anyhow::bail!(
             "git ls-remote failed for {url} ({ref_spec}): {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            nestweaver_engine::bare_clone::with_credential_hint(
+                String::from_utf8_lossy(&output.stderr).trim(),
+                credential_method,
+            )
         );
     }
-    let sha = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
+    // nw-919: `ls-remote <url> <pattern>` tail-matches, so a decoy ref such as
+    // `refs/tags/main` or `refs/heads/dev/main` can be advertised alongside (and
+    // sort before) `refs/heads/main`. Take only the line whose ref name equals
+    // the requested spec; a bare `HEAD` request matches the `HEAD` line.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let sha = cols.next()?;
+            let name = cols.next()?;
+            (name == ref_spec).then(|| sha.to_string())
+        })
         .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+        .unwrap_or_default();
     Ok(if sha.is_empty() { None } else { Some(sha) })
 }
 
@@ -18721,6 +19376,442 @@ credential_method = "gh"
         assert!(status.message().contains("must be absolute"), "{status:?}");
     }
 
+    async fn status_http_call(
+        app: axum::Router,
+        token: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"brain_status","arguments":{}}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn effective_config_runtime_preserves_defaults_and_status_authorization() {
+        use nestweaver_engine::authz::Identity;
+        let mut state = test_state_with_writer();
+        let defaults = DaemonService::new(state.clone())
+            .get_effective_config(Request::new(BrainStatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            defaults.source,
+            Some(effective_config::Source::CompiledDefaults(_))
+        ));
+        Arc::get_mut(&mut state).unwrap().permission_source =
+            Arc::new(nestweaver_engine::authz::StaticConfigPermissionSource::new(
+                std::collections::HashMap::from([(
+                    "restricted".to_string(),
+                    vec!["github.com/visible/*".to_string()],
+                )]),
+            ));
+        let service = DaemonService::new(state);
+        for identity in [Identity::Anonymous, Identity::Token("restricted".into())] {
+            let mut request = Request::new(BrainStatusRequest {});
+            request.extensions_mut().insert(identity);
+            assert_eq!(
+                service
+                    .get_effective_config(request)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        let mut request = Request::new(BrainStatusRequest {});
+        request.extensions_mut().insert(Identity::Admin);
+        assert!(service.get_effective_config(request).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn brain_status_json_cold_idle_dirty_marker_keeps_diagnostics_available() {
+        let state = test_state_with_writer();
+        seed_vault_note_heading_embeddings(&state, "status:dirty", "status", "/missing/dirty");
+        let marker = nestweaver_store::index_publication::marker_path(&state.db_path);
+        std::fs::write(
+            &marker,
+            nestweaver_store::index_publication::format_marker_payload(std::process::id(), 1, None),
+        )
+        .unwrap();
+        let expected = nestweaver_engine::index_publication::status(&state.db_path);
+        assert!(expected.dirty);
+        assert!(state.store.index_publication_owner_snapshot().is_none());
+        let service = DaemonService::new(state.clone());
+        service.prewarm_status_observations().await;
+        let started = Instant::now();
+        let response = service
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let value: serde_json::Value =
+            serde_json::from_str(&response.into_inner().result_json).unwrap();
+        assert_eq!(value["notes"], 1);
+        assert_eq!(value["vault_count"], 1);
+        assert_eq!(value["status_observation"]["stale"], true);
+        assert_eq!(value["status_observation"]["busy"], false);
+        assert_eq!(value["index_publication"]["dirty"], true);
+        assert_eq!(value["index_publication"]["wedged"], expected.is_wedged());
+        assert_eq!(value["index_publication_owner"], serde_json::Value::Null);
+        assert_eq!(
+            service
+                .brain_status(Request::new(BrainStatusRequest {}))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        state.shutdown_started.store(true, Ordering::Release);
+        status_snapshot::drain_status_refresh(&state).await;
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn brain_status_json_stays_truthful_under_real_native_admission_and_recovers() {
+        let mut state = test_state_with_writer();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("process-config.toml");
+        std::fs::write(&config_path, "# process configuration provenance fixture\n").unwrap();
+        let canonical_config = std::fs::canonicalize(&config_path).unwrap();
+        let runtime_instance = lifecycle::instance_id_from_db_path(&state.db_path);
+        Arc::get_mut(&mut state).unwrap().effective_config =
+            EffectiveConfigProvenance::Configured(canonical_config.clone());
+        // The real binding file can disappear after process startup. It is
+        // never the authority for the already-running process's provenance.
+        let binding_path = lifecycle::effective_config_binding_path(&runtime_instance);
+        std::fs::create_dir_all(binding_path.parent().unwrap()).unwrap();
+        let binding = lifecycle::EffectiveConfigBinding::new(
+            std::process::id(),
+            lifecycle::EffectiveConfigBindingSource::Configured {
+                path: canonical_config.to_str().unwrap().to_string(),
+            },
+        );
+        std::fs::write(&binding_path, serde_json::to_vec(&binding).unwrap()).unwrap();
+        std::fs::remove_file(&binding_path).unwrap();
+        seed_vault_note_heading_embeddings(&state, "status:before", "status", "/missing/status");
+        let service = DaemonService::new(state.clone());
+        service.prewarm_status_observations().await;
+        let request = || {
+            Request::new(JsonRequest {
+                args_json: "{}".into(),
+            })
+        };
+        let before: serde_json::Value = serde_json::from_str(
+            &service
+                .brain_status_json(request())
+                .await
+                .unwrap()
+                .into_inner()
+                .result_json,
+        )
+        .unwrap();
+        assert!(before["status_observation"].is_object());
+        assert_eq!(before["notes"], 1);
+        assert_eq!(before["vault_count"], 1);
+        assert_eq!(before["status_observation"]["stale"], false);
+
+        let mut http = nestweaver_mcp::http::McpHttpState::with_auth(
+            true,
+            state.store.clone(),
+            state.tantivy(),
+            state.db_path.clone(),
+            state.instance_cfg.clone(),
+            true,
+            "query-token".into(),
+            Some("admin-token".into()),
+        );
+        http.brain_status_provider = Some(DaemonService::http_brain_status_provider(state.clone()));
+        http.permission_source =
+            Arc::new(nestweaver_engine::authz::StaticConfigPermissionSource::new(
+                std::collections::HashMap::from([(
+                    "query-token".into(),
+                    vec!["github.com/example/*".into()],
+                )]),
+            ));
+        let http = nestweaver_mcp::http::router(Arc::new(http));
+        let lease = state.store.acquire_index_publication_lease().unwrap();
+        lease.set_operation("status native bulk regression");
+        let write = state.write_gate.lock("status_native_bulk").await;
+        nestweaver_engine::code_links::mark_code_links_pending(
+            &state.db_path,
+            "new live status debt",
+        );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        state.store.set_write_observer(Some(Arc::new(move |what| {
+            if what == "BEGIN TRANSACTION"
+                && let Some(tx) = entered_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+                // The production observer executes AFTER acquiring the
+                // real exclusive NativeAdmission, before native BEGIN.
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+            }
+        })));
+        let store = state.store.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            let conn = store.begin_transaction().unwrap();
+            conn.query("CREATE (v:Vault {uid: 'status:after', name: 'After', root_path: '/missing/after', instance_id: 'status'})").unwrap();
+            store.commit_transaction(&conn).unwrap();
+        });
+        let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx).await;
+        if !matches!(entered, Ok(Ok(()))) {
+            let _ = release_tx.send(());
+            let _ = writer.await;
+            state.store.set_write_observer(None);
+            panic!("writer never acquired real native admission: {entered:?}");
+        }
+        // Exercise the WHOLE handler, including its post-dispatch annotations.
+        let observed_started = Instant::now();
+        let observed = tokio::time::timeout(
+            Duration::from_millis(500),
+            service.brain_status_json(request()),
+        )
+        .await;
+        let observed_elapsed = observed_started.elapsed();
+        let provenance_started = Instant::now();
+        let provenance = tokio::time::timeout(
+            Duration::from_millis(500),
+            service.get_effective_config(Request::new(BrainStatusRequest {})),
+        )
+        .await;
+        let provenance_elapsed = provenance_started.elapsed();
+        let typed = tokio::time::timeout(
+            Duration::from_millis(500),
+            service.brain_status(Request::new(BrainStatusRequest {})),
+        )
+        .await;
+        let mut query = request();
+        query
+            .extensions_mut()
+            .insert(nestweaver_engine::authz::Identity::Token(
+                "different-principal".into(),
+            ));
+        let isolated =
+            tokio::time::timeout(Duration::from_millis(500), service.brain_status_json(query))
+                .await;
+        let mut overflow = Vec::new();
+        for number in 0..12 {
+            let mut query = request();
+            query
+                .extensions_mut()
+                .insert(nestweaver_engine::authz::Identity::Token(format!(
+                    "overflow-{number}"
+                )));
+            overflow.push(service.brain_status_json(query).await);
+        }
+        let reserved_after_pressure = service.brain_status_json(request()).await;
+        let http_started = Instant::now();
+        let http_status = status_http_call(http.clone(), "admin-token").await;
+        let http_elapsed = http_started.elapsed();
+        let http_denied = status_http_call(http.clone(), "wrong-token").await;
+        let http_scoped = status_http_call(http, "query-token").await;
+        let invalid = service
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{".into(),
+            }))
+            .await;
+        // Always unblock and join the actual writer before any assertion that
+        // could fail; no leaked blocked native owner on regression failure.
+        let _ = release_tx.send(());
+        writer.await.unwrap();
+        state.store.set_write_observer(None);
+        drop(write);
+        drop(lease);
+        state.store.try_bump_graph_generation().unwrap();
+
+        assert!(
+            observed_elapsed < Duration::from_millis(500),
+            "whole RPC blocked for {observed_elapsed:?}"
+        );
+        let observed: serde_json::Value =
+            serde_json::from_str(&observed.unwrap().unwrap().into_inner().result_json).unwrap();
+        assert!(provenance_elapsed < Duration::from_millis(500));
+        assert!(matches!(provenance.unwrap().unwrap().into_inner().source,
+            Some(effective_config::Source::ConfiguredPath(path))
+                if path == canonical_config.to_str().unwrap()));
+        assert!(!binding_path.exists());
+        assert_eq!(observed["notes"], 1);
+        assert_eq!(
+            observed["vault_count"], 1,
+            "last completed counts, never fake current zeros"
+        );
+        assert_eq!(observed["status_observation"]["stale"], true);
+        assert_eq!(observed["status_observation"]["busy"], true);
+        assert_eq!(
+            observed["index_publication_owner"]["operation"],
+            "status native bulk regression"
+        );
+        assert_eq!(observed["write_holder"], "status_native_bulk");
+        assert_eq!(observed["code_links"]["pending"], true);
+        assert_eq!(typed.unwrap().unwrap_err().code(), tonic::Code::Unavailable);
+        assert_eq!(
+            isolated.unwrap().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        assert_eq!(invalid.unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert!(
+            http_elapsed < Duration::from_millis(500),
+            "whole MCP HTTP call blocked for {http_elapsed:?}"
+        );
+        assert_eq!(http_status.0, axum::http::StatusCode::OK);
+        assert_ne!(
+            http_status.1["result"]["isError"], true,
+            "{}",
+            http_status.1
+        );
+        let http_value: serde_json::Value = serde_json::from_str(
+            http_status.1["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(http_value["notes"], 1);
+        assert_eq!(http_value["status_observation"]["stale"], true);
+        assert_eq!(
+            http_value["index_publication_owner"]["operation"],
+            "status native bulk regression"
+        );
+        assert_eq!(http_value["code_links"]["pending"], true);
+        assert_eq!(http_denied.0, axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            http_scoped.1["result"]["isError"], true,
+            "restricted HTTP principal must fail before native preflight: {}",
+            http_scoped.1
+        );
+
+        assert!(
+            overflow
+                .into_iter()
+                .all(|response| response.unwrap_err().code() == tonic::Code::Unavailable)
+        );
+        let reserved: serde_json::Value =
+            serde_json::from_str(&reserved_after_pressure.unwrap().into_inner().result_json)
+                .unwrap();
+        assert_eq!(
+            reserved["notes"], 1,
+            "other principals cannot evict the prewarmed control observation"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let fresh = loop {
+            let value: serde_json::Value = serde_json::from_str(
+                &service
+                    .brain_status_json(request())
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .result_json,
+            )
+            .unwrap();
+            if value["status_observation"]["stale"] == false && value["vault_count"] == 2 {
+                break value;
+            }
+            assert!(Instant::now() < deadline, "status did not recover: {value}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(fresh["notes"], 1);
+        assert_eq!(fresh["index_publication_owner"], serde_json::Value::Null);
+        assert_eq!(
+            fresh["status_observation"]["as_of_generation"],
+            state.store.graph_generation()
+        );
+        service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .unwrap();
+        // Query/non-admin callers remain valid when repository policy is off;
+        // their independently keyed observation is captured rather than denied.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut query = request();
+            query
+                .extensions_mut()
+                .insert(nestweaver_engine::authz::Identity::Token(
+                    "different-principal".into(),
+                ));
+            if let Ok(response) = service.brain_status_json(query).await {
+                let value: serde_json::Value =
+                    serde_json::from_str(&response.into_inner().result_json).unwrap();
+                if value["vault_count"] == 2 && value["status_observation"]["stale"] == false {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "valid query principal never obtained its own completed observation"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        state.shutdown_started.store(true, Ordering::Release);
+        status_snapshot::drain_status_refresh(&state).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_vault_rpc_yields_to_a_paused_batch_using_daemon_gate_factory() {
+        let state = test_state_with_writer();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.md"), "# Before").unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let watcher_state = Arc::clone(&state);
+        let watcher_root = root.clone();
+        let watcher = tokio::task::spawn_blocking(move || {
+            let publication = watcher_state
+                .store
+                .acquire_index_publication_lease()
+                .unwrap();
+            publication.set_operation("brain watcher batch");
+            ready_tx.send(()).unwrap();
+            watcher_state
+                .store
+                .wait_for_index_publication_waiters(1, Duration::from_secs(10));
+            let factory = daemon_mutation_lease_factory(Arc::clone(&watcher_state));
+            let _write = factory("watch_vault_batch").unwrap();
+            std::fs::write(watcher_root.join("note.md"), "# After").unwrap();
+            drop(publication);
+        });
+        ready_rx.await.unwrap();
+        assert!(state.store.index_publication_owner_snapshot().is_some());
+        let events =
+            tokio::time::timeout(Duration::from_secs(20), index_vault_via_rpc(&state, &root))
+                .await
+                .expect("RPC must yield the gate to the paused watcher");
+        assert!(events.iter().any(|event| event.phase == Phase::Done as i32));
+        watcher.await.unwrap();
+        assert_eq!(state.store.list_notes(None).unwrap()[0].title, "After");
+        assert!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     async fn index_vault_via_rpc(state: &Arc<DaemonState>, root: &Path) -> Vec<IndexProgress> {
         index_vault_via_rpc_with_ignore(state, root, &[]).await
     }
@@ -18844,14 +19935,19 @@ credential_method = "gh"
     }
 
     async fn cross_repo_links_owed(state: &Arc<DaemonState>) -> bool {
-        DaemonService::new(state.clone())
-            .brain_status(Request::new(BrainStatusRequest {}))
+        // Debt is live runtime metadata. Typed graph counts intentionally
+        // refuse while their last observation is stale after a publication.
+        let response = DaemonService::new(state.clone())
+            .brain_status_json(Request::new(JsonRequest {
+                args_json: "{}".into(),
+            }))
             .await
             .unwrap()
-            .into_inner()
-            .cross_repo_links
+            .into_inner();
+        let value: serde_json::Value = serde_json::from_str(&response.result_json).unwrap();
+        value["cross_repo_links"]["pending"]
+            .as_bool()
             .expect("a live daemon reports cross_repo_links")
-            .pending
     }
 
     /// IndexRepo re-infers cross-repo links over the whole graph once per
@@ -18871,6 +19967,9 @@ credential_method = "gh"
         assert_eq!(linked_names(&forward), both_directions());
         let links = cross_repo_link_rows(&forward);
         assert_eq!(cross_repo_link_rows(&backward), links);
+        DaemonService::new(forward.clone())
+            .prewarm_status_observations()
+            .await;
         assert!(!cross_repo_links_owed(&forward).await);
 
         index_repo_via_rpc(&forward, &alpha, true).await;
@@ -18895,9 +19994,19 @@ credential_method = "gh"
         index_repo_via_rpc(&state, &beta, false).await;
         let links = cross_repo_link_rows(&state);
         assert_eq!(linked_names(&state), both_directions());
-        assert!(!cross_repo_links_owed(&state).await);
-
         let service = DaemonService::new(state.clone());
+        service.prewarm_status_observations().await;
+        assert!(!cross_repo_links_owed(&state).await);
+        // A failed assertion must still signal this fixture's watcher and
+        // relinker to stop; runtime teardown then drains their real work.
+        struct Cleanup(Arc<DaemonState>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                stop_active_watcher(&self.0);
+                let _ = self.0.shutdown_tx.send(true);
+            }
+        }
+        let _cleanup = Cleanup(state.clone());
         let started = service
             .watch_code(Request::new(WatchCodeRequest {
                 repo_path: alpha.display().to_string(),
@@ -19315,6 +20424,399 @@ repos = ["alpha"]
         vault_derivation::admit_tool(&state, "backlinks").unwrap();
     }
 
+    #[tokio::test]
+    async fn snapshot_derivation_round_trip_admits_only_verified_immutable_rpc_reads() {
+        use nestweaver_engine::snapshot::{Manifest, Stamp};
+        let producer = test_state_with_writer();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("producer-vault");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("A.md"), "# A\nSee [[B]]\n").unwrap();
+        std::fs::write(root.join("B.md"), "# B\n").unwrap();
+        let progress = index_vault_via_rpc(&producer, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+        assert_eq!(
+            vault_derivation_record(&producer).phase,
+            nestweaver_engine::markdown_derivation::DerivationPhase::Current
+        );
+        let stamp = Stamp {
+            format_version: 0,
+            capabilities: vec![],
+            instance_id: "default".into(),
+            brain_uuid: String::new(),
+            publication_uuid: String::new(),
+            engine_version: env!("CARGO_PKG_VERSION").into(),
+            min_compatible_engine: env!("CARGO_PKG_VERSION").into(),
+            schema_hash_core: nestweaver_schema::core_schema_hash(),
+            schema_hash_extensions: "none".into(),
+            schema_hash_effective: nestweaver_engine::schema_hashes(None).2,
+            embedding_model_id: String::new(),
+            embedding_dimension: 0,
+            embedding_count: 0,
+            built_at: "2026-11-02T00:00:00Z".into(),
+            repos: vec![],
+        };
+        let snapshot = dir.path().join("snapshot");
+        let captured = producer.store.graph_generation();
+        let built = nestweaver_engine::snapshot::build_snapshot_from_store(
+            &snapshot,
+            &stamp,
+            &Manifest { repos: vec![] },
+            &producer.store,
+        )
+        .unwrap();
+        assert!(
+            built
+                .capabilities
+                .iter()
+                .any(|cap| cap == "markdown-derivation-proof-v1")
+        );
+        assert_eq!(
+            std::fs::read(snapshot.join("markdown-derivation.json")).unwrap(),
+            std::fs::read(nestweaver_engine::markdown_derivation::record_path(
+                &producer.db_path
+            ))
+            .unwrap(),
+            "the certified record is transported byte-for-byte, never restamped"
+        );
+        nestweaver_engine::snapshot::verify_snapshot(&snapshot).unwrap();
+
+        fn copy_tree(from: &Path, to: &Path) {
+            std::fs::create_dir(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let destination = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &destination);
+                } else {
+                    std::fs::copy(entry.path(), destination).unwrap();
+                }
+            }
+        }
+        // Negative-only tampering re-seals outer checksums. Semantic validation
+        // must still reject it; positive proof above came only from IndexVault.
+        fn reseal(snapshot: &Path) {
+            let publication =
+                snapshot.join(nestweaver_engine::publication::PUBLICATION_MANIFEST_FILE);
+            let mut bundle: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&publication).unwrap()).unwrap();
+            for descriptor in bundle["artifacts"].as_array_mut().unwrap() {
+                let bytes =
+                    std::fs::read(snapshot.join(descriptor["path"].as_str().unwrap())).unwrap();
+                descriptor["byte_size"] = serde_json::json!(bytes.len());
+                descriptor["blake3"] =
+                    serde_json::json!(nestweaver_engine::hash::blake3_hex_bytes(&bytes));
+            }
+            std::fs::write(&publication, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+            let checksums = snapshot.join("checksum.blake3");
+            let updated = std::fs::read_to_string(&checksums)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let (_, name) = line.split_once("  ").unwrap();
+                    let bytes = std::fs::read(snapshot.join(name)).unwrap();
+                    format!(
+                        "{}  {name}\n",
+                        nestweaver_engine::hash::blake3_hex_bytes(&bytes)
+                    )
+                })
+                .collect::<String>();
+            std::fs::write(checksums, updated).unwrap();
+        }
+        for fault in [
+            "count",
+            "inventory",
+            "unreconciled",
+            "managed_bare",
+            "partial",
+            "epoch",
+            "malformed_epoch",
+            "future",
+            "foreign",
+        ] {
+            let bad = dir.path().join(format!("bad-{fault}"));
+            copy_tree(&snapshot, &bad);
+            if fault == "epoch" || fault == "malformed_epoch" {
+                std::fs::write(
+                    bad.join("generation"),
+                    if fault == "epoch" {
+                        (captured + 1).to_string()
+                    } else {
+                        "not-a-generation".into()
+                    },
+                )
+                .unwrap();
+            } else {
+                let path = bad.join("markdown-derivation.json");
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                if fault == "future" {
+                    record["schema_version"] = serde_json::json!(999);
+                } else if fault == "foreign" {
+                    record["identity"]["publication_uuid"] =
+                        serde_json::json!("11111111-1111-4111-8111-111111111111");
+                } else if matches!(fault, "inventory" | "unreconciled" | "managed_bare") {
+                    let first = record["payload"]["vaults"]
+                        .as_object_mut()
+                        .unwrap()
+                        .values_mut()
+                        .next()
+                        .unwrap();
+                    match fault {
+                        "inventory" => {
+                            first["witness"]["source_inventory_digest"] =
+                                serde_json::json!("f".repeat(64))
+                        }
+                        "unreconciled" => {
+                            first["phase"] =
+                                serde_json::json!("graph_committed_awaiting_reconciliation");
+                            first["pending_generation"] =
+                                first["witness"]["graph_generation"].clone();
+                            first["completed_generation"] = serde_json::Value::Null;
+                            first["witness"]["search_reconciled"] = serde_json::json!(false);
+                        }
+                        "managed_bare" => {
+                            first["source"]["provider"] = serde_json::json!("managed_bare");
+                            first["source"]["provider_repo_uid"] =
+                                serde_json::json!("repo:fixture:0123456789ab");
+                            first["witness"]["source"] = first["source"].clone();
+                        }
+                        _ => unreachable!(),
+                    }
+                    record["payload_checksum"] =
+                        serde_json::json!(nestweaver_engine::hash::blake3_hex_bytes(
+                            &serde_json::to_vec(&record["payload"]).unwrap()
+                        ));
+                } else if fault == "partial" {
+                    record["payload"]["vaults"] = serde_json::json!({});
+                    record["payload_checksum"] =
+                        serde_json::json!(nestweaver_engine::hash::blake3_hex_bytes(
+                            &serde_json::to_vec(&record["payload"]).unwrap()
+                        ));
+                } else {
+                    let first = record["payload"]["vaults"]
+                        .as_object_mut()
+                        .unwrap()
+                        .values_mut()
+                        .next()
+                        .unwrap();
+                    first["witness"]["notes_count"] = serde_json::json!(3);
+                    record["payload_checksum"] =
+                        serde_json::json!(nestweaver_engine::hash::blake3_hex_bytes(
+                            &serde_json::to_vec(&record["payload"]).unwrap()
+                        ));
+                }
+                std::fs::write(path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+            }
+            reseal(&bad);
+            assert!(
+                nestweaver_engine::snapshot::verify_snapshot(&bad).is_err(),
+                "must refuse {fault}"
+            );
+            let destination = dir.path().join(format!("work-{fault}"));
+            assert!(
+                nestweaver_engine::snapshot::materialize_snapshot_with_config_receipt(
+                    &bad,
+                    &destination,
+                    env!("CARGO_PKG_VERSION"),
+                    None,
+                    None
+                )
+                .is_err()
+            );
+            assert!(!destination.exists());
+        }
+        let missing = dir.path().join("missing-epoch");
+        copy_tree(&snapshot, &missing);
+        std::fs::remove_file(missing.join("generation")).unwrap();
+        assert!(nestweaver_engine::snapshot::verify_snapshot(&missing).is_err());
+
+        // Producer proof absence remains a supported graph/search snapshot,
+        // but cannot acquire a derived-read capability by being read-only.
+        let source_record = nestweaver_engine::markdown_derivation::record_path(&producer.db_path);
+        let held_record = source_record.with_extension("held-proof");
+        std::fs::rename(&source_record, &held_record).unwrap();
+        let legacy = dir.path().join("legacy-no-proof");
+        let legacy_stamp = nestweaver_engine::snapshot::build_snapshot_from_store(
+            &legacy,
+            &stamp,
+            &Manifest { repos: vec![] },
+            &producer.store,
+        )
+        .unwrap();
+        std::fs::rename(&held_record, &source_record).unwrap();
+        assert!(
+            !legacy_stamp
+                .capabilities
+                .iter()
+                .any(|cap| cap == "markdown-derivation-proof-v1")
+        );
+        nestweaver_engine::snapshot::verify_snapshot(&legacy).unwrap();
+        let legacy_receipt = nestweaver_engine::snapshot::materialize_snapshot_with_config_receipt(
+            &legacy,
+            &dir.path().join("legacy-work"),
+            env!("CARGO_PKG_VERSION"),
+            None,
+            None,
+        )
+        .unwrap();
+        let legacy_path = legacy_receipt.db_path().to_path_buf();
+        let legacy_store =
+            Arc::new(GraphStore::open_read_only_without_migration(&legacy_path).unwrap());
+        assert!(
+            legacy_receipt
+                .bind(Arc::clone(&legacy_store))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            nestweaver_engine::markdown_derivation::admit_all_vaults_with_snapshot(
+                &legacy_store,
+                &legacy_path,
+                "default",
+                &[],
+                vault_derivation::http_max_note_bytes(&producer),
+                true,
+                None
+            )
+            .is_err()
+        );
+
+        let wrong_path_receipt =
+            nestweaver_engine::snapshot::materialize_snapshot_with_config_receipt(
+                &snapshot,
+                &dir.path().join("wrong-receipt-binding"),
+                env!("CARGO_PKG_VERSION"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            wrong_path_receipt.bind(Arc::clone(&legacy_store)).is_err(),
+            "even the same lineage cannot rebind a receipt to another path"
+        );
+
+        // A receipt cannot be rebound to a replacement with matching UUIDs,
+        // epoch and note hashes but different graph contents before open.
+        let altered = nestweaver_engine::snapshot::materialize_snapshot_with_config_receipt(
+            &snapshot,
+            &dir.path().join("altered-before-open"),
+            env!("CARGO_PKG_VERSION"),
+            None,
+            None,
+        )
+        .unwrap();
+        let altered_path = altered.db_path().to_path_buf();
+        let changed = GraphStore::open_or_create(&altered_path).unwrap();
+        let edit = changed.begin_transaction().unwrap();
+        edit.query("MATCH (n:Note) SET n.title = 'altered without an epoch bump'")
+            .unwrap();
+        changed.commit_transaction(&edit).unwrap();
+        drop(edit);
+        assert_eq!(changed.graph_generation(), captured);
+        changed.checkpoint().unwrap();
+        drop(changed);
+        let changed =
+            Arc::new(GraphStore::open_read_only_without_migration(&altered_path).unwrap());
+        assert!(
+            altered.bind(changed).is_err(),
+            "receipt must verify the actual graph digest at handoff"
+        );
+
+        let work = dir.path().join("replica");
+        let receipt = nestweaver_engine::snapshot::materialize_snapshot_with_config_receipt(
+            &snapshot,
+            &work,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            None,
+        )
+        .unwrap();
+        let path = receipt.db_path().to_path_buf();
+        let store = Arc::new(GraphStore::open_read_only_without_migration(&path).unwrap());
+        assert_eq!(
+            store.graph_generation(),
+            captured,
+            "raw captured epoch must survive relocation"
+        );
+        let token = receipt
+            .bind(Arc::clone(&store))
+            .unwrap()
+            .expect("verified proof capability");
+        std::fs::rename(&root, dir.path().join("source-no-longer-mounted")).unwrap();
+        let mut replica = test_state_with_writer();
+        let replica_mut = Arc::get_mut(&mut replica).unwrap();
+        replica_mut.store = Arc::clone(&store);
+        replica_mut.db_path = path.clone();
+        replica_mut.selected_db_path = dir.path().join("absent-selected-anchor.lbug");
+        replica_mut.read_only = true;
+        replica_mut.snapshot_derivation = Some(Arc::clone(&token));
+        let service = DaemonService::new(Arc::clone(&replica));
+        let args = |value: serde_json::Value| {
+            Request::new(nestweaver_proto::JsonRequest {
+                args_json: value.to_string(),
+            })
+        };
+        service
+            .brain_orphan_documents(args(serde_json::json!({"limit":10})))
+            .await
+            .unwrap();
+        service
+            .brain_topic_clusters(args(serde_json::json!({"resolution":0.5,"limit":10})))
+            .await
+            .unwrap();
+        service
+            .brain_tag_graph(args(serde_json::json!({"limit":10})))
+            .await
+            .unwrap();
+        let stats = service
+            .brain_doc_stats(args(serde_json::json!({"top_tags_limit":10})))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(serde_json::from_str::<serde_json::Value>(&stats.result_json).is_ok());
+        assert_eq!(store.count_notes().unwrap(), 2);
+        assert_eq!(store.graph_generation(), captured);
+        let max_bytes = vault_derivation::http_max_note_bytes(&replica);
+        assert!(
+            nestweaver_engine::markdown_derivation::admit_all_vaults_with_snapshot(
+                &store,
+                &path,
+                "default",
+                &[],
+                max_bytes + 1,
+                true,
+                Some(&token)
+            )
+            .is_err()
+        );
+        let different_handle = GraphStore::open_read_only_without_migration(&path).unwrap();
+        assert!(
+            nestweaver_engine::markdown_derivation::admit_all_vaults_with_snapshot(
+                &different_handle,
+                &path,
+                "default",
+                &[],
+                max_bytes,
+                true,
+                Some(&token)
+            )
+            .is_err()
+        );
+        assert!(
+            nestweaver_engine::markdown_derivation::admit_all_vaults(
+                &store,
+                &path,
+                "default",
+                &[],
+                max_bytes,
+                true
+            )
+            .is_err(),
+            "adjacent records and read_only alone cannot bypass unavailable source admission"
+        );
+    }
+
     /// `brain status` must answer while the daemon re-derives a vault (the
     /// derivation holds the write gate for its whole run), on both status
     /// routes, and the JSON must name the vault and phase being derived.
@@ -19341,6 +20843,9 @@ repos = ["alpha"]
             .unwrap()
             .expect("a vault with no record is due for derivation");
 
+        let service = DaemonService::new(Arc::clone(&state));
+        service.prewarm_status_observations().await;
+
         let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let worker_state = Arc::clone(&state);
@@ -19363,7 +20868,6 @@ repos = ["alpha"]
             .await
             .unwrap();
 
-        let service = DaemonService::new(Arc::clone(&state));
         let json = tokio::time::timeout(
             Duration::from_secs(30),
             service.brain_status_json(Request::new(JsonRequest {
@@ -19380,16 +20884,31 @@ repos = ["alpha"]
         assert_eq!(running["phase"], "refreshing notes", "{running}");
         assert_eq!(running["indexed_notes"], 2, "{running}");
         assert_eq!(value["write_holder"], "vault_derivation");
-        tokio::time::timeout(
-            Duration::from_secs(30),
+        let typed = tokio::time::timeout(
+            Duration::from_millis(500),
             service.brain_status(Request::new(BrainStatusRequest {})),
         )
-        .await
-        .expect("typed status must not wait for the derivation")
-        .expect("typed status must answer during a derivation");
+        .await;
 
         release_tx.send(()).unwrap();
         worker.await.unwrap().unwrap();
+        assert_eq!(typed.unwrap().unwrap_err().code(), tonic::Code::Unavailable);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let after = loop {
+            let value = service
+                .status_snapshot(serde_json::json!({}), &tonic::Extensions::new(), false)
+                .await
+                .unwrap();
+            if value["status_observation"]["stale"] == false {
+                break value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "status did not refresh after derivation: {value}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(after["vault_derivation"]["in_progress"].is_null());
         let after = service
             .brain_status_json(Request::new(JsonRequest {
                 args_json: "{}".into(),
@@ -19403,6 +20922,8 @@ repos = ["alpha"]
             "a finished derivation is no longer in progress: {after}"
         );
         assert_eq!(after["vault_derivation"]["pending_or_blocked_vaults"], 0);
+        state.shutdown_started.store(true, Ordering::Release);
+        status_snapshot::drain_status_refresh(&state).await;
     }
 
     /// Status must not fail outright because its eligibility refresh cannot
@@ -23191,6 +24712,136 @@ repos = ["alpha"]
     }
 
     #[test]
+    fn older_scan_reestablishes_debt_after_newer_mutation_completed() {
+        let state = test_state_with_writer();
+        let mut older = establish_search_reconciliation_debt(&state, "index_vault older").unwrap();
+        let original_owner = older.owner;
+        let newer = establish_search_reconciliation_debt(&state, "index_vault newer").unwrap();
+        finish_search_reconciliation(
+            &state,
+            IndexedSearchMutation::Changed,
+            "index_vault newer",
+            newer,
+        )
+        .unwrap();
+        assert!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .is_none(),
+            "newer completed while older was still scanning off gate"
+        );
+        // This is the exact callback both full and incremental RPCs pass to
+        // their engines. Simulate older reaching its write after newer clears.
+        let gate = acquire_search_mutation_gate(&state, "index_vault", &mut older).unwrap();
+        assert_ne!(older.owner, original_owner);
+        assert_eq!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .unwrap()
+                .owner,
+            older.owner
+        );
+        state
+            .store
+            .insert_note(&nestweaver_schema::Note {
+                uid: "note:late-write".into(),
+                vault_uid: "vlt:late-write".into(),
+                file_path: "late.md".into(),
+                title: "Late graph write".into(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 3,
+                content_hash: "late".into(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        drop(gate);
+        // An interruption here leaves the real on-disk marker for startup.
+        assert_eq!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .unwrap()
+                .owner,
+            older.owner
+        );
+        assert!(search_reconciliation_debt_path(&state.db_path).is_file());
+    }
+
+    #[test]
+    fn renewing_own_fresh_debt_preserves_prewrite_refusal_cleanup() {
+        let state = test_state_with_writer();
+        let mut admission = establish_search_reconciliation_debt(&state, "index_vault").unwrap();
+        let first_owner = admission.owner;
+        let gate = acquire_search_mutation_gate(&state, "index_vault", &mut admission).unwrap();
+        assert_ne!(admission.owner, first_owner);
+        assert!(!admission.had_existing_debt);
+        drop(gate);
+        clear_owned_search_debt(&state.db_path, admission.owner).unwrap();
+        assert!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_search_postflight_and_refusal_cannot_clear_new_admission() {
+        let state = test_state_with_writer();
+        let first = establish_search_reconciliation_debt(&state, "index_vault A").unwrap();
+        let second = establish_search_reconciliation_debt(&state, "index_vault B").unwrap();
+        assert_ne!(first.owner, second.owner);
+        finish_search_reconciliation(
+            &state,
+            IndexedSearchMutation::Unchanged,
+            "index_vault A",
+            first,
+        )
+        .unwrap();
+        assert_eq!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .unwrap()
+                .owner,
+            second.owner
+        );
+        // The prewrite refusal leg uses the same compare-clear primitive;
+        // even a fresh admission may only remove its own current marker.
+        let refusal =
+            anyhow::Error::new(nestweaver_engine::vault_registration::DuplicateVaultName {
+                name: "vault".into(),
+                root: "/requested".into(),
+                existing_name: "vault".into(),
+                existing_root: "/existing".into(),
+                existing_uid: "vlt:existing".into(),
+                existing_instance: "default".into(),
+            });
+        assert!(search_debt_after_prewrite_refusal(&state, &refusal, first));
+        assert_eq!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .unwrap()
+                .owner,
+            second.owner
+        );
+        finish_search_reconciliation(
+            &state,
+            IndexedSearchMutation::Changed,
+            "index_vault B",
+            second,
+        )
+        .unwrap();
+        assert!(
+            load_search_reconciliation_debt(&state.db_path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_later_noop_cannot_clear_an_earlier_failed_search_reconciliation() {
         let state = test_state_with_writer();
         let first = establish_search_reconciliation_debt(&state, "index_vault").unwrap();
@@ -24979,7 +26630,7 @@ repos = ["alpha"]
         init_repo(&repo);
         let url = format!("file://{}", repo.display());
 
-        let sha = probe_remote_sha(&[], &url, "HEAD")
+        let sha = probe_remote_sha(&[], &url, "HEAD", None, &AtomicBool::new(false))
             .expect("ls-remote against a valid repo should succeed")
             .expect("HEAD should advertise a SHA");
         assert_eq!(sha.len(), 40, "should be a full SHA, got {sha:?}");
@@ -24995,11 +26646,65 @@ repos = ["alpha"]
         init_repo(&repo);
         let url = format!("file://{}", repo.display());
 
-        let result = probe_remote_sha(&[], &url, "refs/heads/does-not-exist")
-            .expect("ls-remote itself should still succeed for an unknown ref");
+        let result = probe_remote_sha(
+            &[],
+            &url,
+            "refs/heads/does-not-exist",
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("ls-remote itself should still succeed for an unknown ref");
         assert!(
             result.is_none(),
             "an unadvertised ref must be None, not a SHA"
+        );
+    }
+
+    /// nw-919: with `refs/tags/<branch>` and `refs/heads/dev/<branch>` advertised
+    /// alongside `refs/heads/<branch>`, the probe must report the SHA of the
+    /// exact ref, not whichever tail match ls-remote lists first.
+    #[test]
+    fn probe_remote_sha_ignores_decoy_refs_with_the_same_tail_nw_919() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("src");
+        init_repo(&repo);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["checkout", "-q", "-b", "target"]);
+        let target_sha = git(&["rev-parse", "refs/heads/target"]);
+        // Decoys on a different commit so a wrong pick is observable.
+        git(&["checkout", "-q", "-b", "dev/target"]);
+        std::fs::write(repo.join("b.txt"), "decoy").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "decoy"]);
+        git(&["tag", "target"]);
+        let decoy_sha = git(&["rev-parse", "refs/heads/dev/target"]);
+        assert_ne!(target_sha, decoy_sha);
+        let url = format!("file://{}", repo.display());
+
+        let sha = probe_remote_sha(
+            &[],
+            &url,
+            "refs/heads/target",
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("ls-remote should succeed")
+        .expect("refs/heads/target is advertised");
+        assert_eq!(
+            sha, target_sha,
+            "probe must return the exact ref's SHA, not a decoy"
         );
     }
 
@@ -25013,11 +26718,283 @@ repos = ["alpha"]
         let tmp = tempfile::TempDir::new().unwrap();
         let bogus = format!("file://{}/not-a-repo", tmp.path().display());
 
-        let result = probe_remote_sha(&[], &bogus, "HEAD");
+        let result = probe_remote_sha(&[], &bogus, "HEAD", None, &AtomicBool::new(false));
         assert!(
             result.is_err(),
             "a non-zero git exit must be an error, not Ok(None): {result:?}"
         );
+    }
+
+    /// nw-882: probes run concurrently up to the permit limit instead of one
+    /// after another. Four 400ms probes under four permits finish in about one
+    /// probe's time; under two permits no more than two ever overlap.
+    #[tokio::test]
+    async fn poll_probes_run_concurrently_and_bounded_nw_882() {
+        use std::sync::atomic::AtomicUsize;
+        for (limit, expect_max) in [(4usize, 4usize), (2, 2)] {
+            let permits = Arc::new(tokio::sync::Semaphore::new(limit));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let running = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let mut set = tokio::task::JoinSet::new();
+            let start = Instant::now();
+            for i in 0..4 {
+                let running = running.clone();
+                let peak = peak.clone();
+                spawn_poll_probe(
+                    &mut set,
+                    permits.clone(),
+                    cancel.clone(),
+                    format!("r{i}"),
+                    format!("https://example.invalid/{i}"),
+                    None,
+                    0,
+                    move |_| {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(400));
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        Ok(Some("sha".to_string()))
+                    },
+                );
+            }
+            let mut done = 0;
+            while let Some(outcome) = set.join_next().await {
+                assert!(outcome.unwrap().result.unwrap().is_some());
+                done += 1;
+            }
+            assert_eq!(done, 4);
+            assert_eq!(peak.load(Ordering::SeqCst), expect_max, "limit {limit}");
+            if limit == 4 {
+                // Serial would be 1.6s.
+                assert!(start.elapsed() < Duration::from_millis(1200));
+            }
+        }
+    }
+
+    /// nw-882: the in-flight bookkeeping behind the poll loop.
+    #[tokio::test]
+    async fn poll_in_flight_dedups_and_discards_stale_results_nw_882() {
+        let id = |_: ()| tokio::spawn(async {}).id();
+        let mut f = PollInFlight::default();
+
+        // A second dispatch is skipped while the first runs.
+        let g = f.try_dispatch("a", "https://x/a").unwrap();
+        assert!(f.try_dispatch("a", "https://x/a").is_none());
+        let t = id(());
+        f.track(t, "a".into(), g);
+        assert!(f.finish(t, "a", g, false), "fresh result accepted");
+        assert!(f.try_dispatch("a", "https://x/a").is_some(), "freed");
+
+        // A removed repo's result is discarded.
+        let mut f = PollInFlight::default();
+        let g = f.try_dispatch("a", "u").unwrap();
+        f.forget_repo("a");
+        assert!(!f.finish(id(()), "a", g, false));
+
+        // Drained: result discarded, entry still freed.
+        let g = f.try_dispatch("b", "u").unwrap();
+        assert!(!f.finish(id(()), "b", g, true));
+        assert!(f.try_dispatch("b", "u").is_some());
+
+        // Remove + re-add + redispatch: the old probe's result is stale and
+        // must not consume the new probe's entry.
+        let mut f = PollInFlight::default();
+        let old = f.try_dispatch("a", "old").unwrap();
+        f.forget_repo("a");
+        let new = f.try_dispatch("a", "new").unwrap();
+        assert_ne!(old, new);
+        assert!(!f.finish(id(()), "a", old, false));
+        assert!(f.finish(id(()), "a", new, false));
+
+        // Reload invalidates everything.
+        let g = f.try_dispatch("c", "u").unwrap();
+        f.reset();
+        assert!(!f.finish(id(()), "c", g, false));
+
+        // A dead probe task frees its repo.
+        let mut f = PollInFlight::default();
+        f.try_dispatch("d", "u").unwrap();
+        let t = id(());
+        f.track(t, "d".into(), 0);
+        f.failed(t);
+        assert!(f.try_dispatch("d", "u").is_some());
+
+        // A stale task failing must not free a newer entry for the same repo.
+        let mut f = PollInFlight::default();
+        let old = f.try_dispatch("e", "old").unwrap();
+        let stale = id(());
+        f.track(stale, "e".into(), old);
+        f.forget_repo("e");
+        let new = f.try_dispatch("e", "new").unwrap();
+        f.failed(stale);
+        assert!(f.try_dispatch("e", "new").is_none(), "newer entry survives");
+        assert!(f.finish(id(()), "e", new, false));
+    }
+
+    /// nw-882: setting the shared cancel flag releases probes that are still
+    /// running, and probes still queued behind the limiter never start work.
+    #[tokio::test]
+    async fn poll_probes_stop_on_cancel_nw_882() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..3 {
+            spawn_poll_probe(
+                &mut set,
+                permits.clone(),
+                cancel.clone(),
+                format!("r{i}"),
+                format!("https://example.invalid/{i}"),
+                None,
+                0,
+                |cancel| {
+                    // Stand-in for a hung git: runs until cancelled.
+                    while !cancel.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    anyhow::bail!("cancelled")
+                },
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let start = Instant::now();
+        cancel.store(true, Ordering::Release);
+        let mut finished = 0;
+        while let Some(outcome) = set.join_next().await {
+            assert!(outcome.unwrap().result.is_err());
+            finished += 1;
+        }
+        assert_eq!(finished, 3);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A blocked system resolver must not hold Runtime::drop hostage. The
+    /// fixture releases every blocked probe and joins its runtime-owner thread
+    /// before asserting, so reverting the fix fails without leaking test work.
+    #[test]
+    fn blocked_poll_dns_does_not_hold_runtime_shutdown_or_start_git_after_cancel() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+        let limit = 2;
+        let permits = Arc::new(tokio::sync::Semaphore::new(limit));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let git_launches = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let thread_permits = permits.clone();
+        let thread_cancel = cancel.clone();
+        let thread_started = started.clone();
+        let thread_active = active.clone();
+        let thread_peak = peak.clone();
+        let thread_git = git_launches.clone();
+        let owner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut probes = tokio::task::JoinSet::new();
+            runtime.block_on(async {
+                for i in 0..3 {
+                    let entered = entered_tx.clone();
+                    let release = release_rx.clone();
+                    let finished = finished_tx.clone();
+                    let started = thread_started.clone();
+                    let active = thread_active.clone();
+                    let peak = thread_peak.clone();
+                    let git = thread_git.clone();
+                    spawn_poll_probe(
+                        &mut probes,
+                        thread_permits.clone(),
+                        thread_cancel.clone(),
+                        format!("r{i}"),
+                        format!("https://example.invalid/{i}"),
+                        None,
+                        0,
+                        move |cancel| {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(current, Ordering::SeqCst);
+                            let result = run_guarded_poll_probe(
+                                cancel,
+                                || {
+                                    entered.send(()).unwrap();
+                                    release.lock().unwrap().recv().unwrap();
+                                    Ok(())
+                                },
+                                |(), _| {
+                                    git.fetch_add(1, Ordering::SeqCst);
+                                    Ok(Some("sha".into()))
+                                },
+                            );
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            finished.send(result.is_err()).unwrap();
+                            result
+                        },
+                    );
+                }
+                let ready_deadline = Instant::now() + Duration::from_secs(5);
+                while thread_started.load(Ordering::SeqCst) < limit
+                    && Instant::now() < ready_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+            stop_rx.recv().unwrap();
+            runtime.block_on(async {
+                probes.abort_all();
+                while probes.join_next().await.is_some() {}
+            });
+            drop(runtime);
+            exited_tx.send(()).unwrap();
+        });
+        let first_entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let second_entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        cancel.store(true, Ordering::Release);
+        stop_tx.send(()).unwrap();
+        let exited_while_dns_blocked = exited_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let permits_while_blocked = permits.available_permits();
+        // Always release and join before checking the outcome, including the
+        // old spawn_blocking implementation whose runtime is still waiting.
+        let _ = release_tx.send(());
+        let _ = release_tx.send(());
+        let _ = release_tx.send(()); // Also release an erroneously admitted third probe.
+        let first_cancelled = finished_rx.recv_timeout(Duration::from_secs(5)).ok();
+        let second_cancelled = finished_rx.recv_timeout(Duration::from_secs(5)).ok();
+        let owner_joined = owner.join();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (permits.available_permits() != limit || active.load(Ordering::SeqCst) != 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(owner_joined.is_ok());
+        assert!(first_entered && second_entered);
+        assert!(
+            exited_while_dns_blocked,
+            "blocked DNS retained Tokio runtime shutdown"
+        );
+        assert_eq!(
+            permits_while_blocked, 0,
+            "blocked detached threads must retain permits"
+        );
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            limit,
+            "queued third probe must not start a thread"
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), limit);
+        assert_eq!(first_cancelled, Some(true));
+        assert_eq!(second_cancelled, Some(true));
+        assert_eq!(git_launches.load(Ordering::SeqCst), 0);
+        assert_eq!(permits.available_permits(), limit);
     }
 
     /// Dropping the request-future scope (client cancel / disconnect) must trip
@@ -25235,6 +27212,77 @@ repos = ["alpha"]
 
         // Non-loopback bind with auth token AND TLS is acceptable.
         assert!(validate_bind_security("0.0.0.0:9378", &tok, &cert, &key, false).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_security_requires_tls_for_non_literal_bind() {
+        // nw-879: `0:PORT` resolves to 0.0.0.0 but is not a literal SocketAddr;
+        // it must still require TLS. Unresolvable names fail closed too.
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+        let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
+        assert!(validate_bind_security("0:19389", &tok, &None, &None, false).is_err());
+        assert!(validate_bind_security("0:19389", &tok, &cert, &key, false).is_ok());
+        assert!(
+            validate_bind_security("no-such-host.invalid:9378", &tok, &None, &None, false).is_err()
+        );
+        // A name that resolves only to loopback keeps the auth-only rule.
+        assert!(validate_bind_security("localhost:9378", &tok, &None, &None, false).is_ok());
+        assert!(validate_bind_security("localhost:9378", &None, &None, &None, false).is_err());
+    }
+
+    #[test]
+    fn mcp_addr_follows_the_grpc_ip_with_port_plus_one() {
+        // nw-879: for a name that resolved to a routable IP the MCP listener
+        // must use THAT ip (old code fell back to 127.0.0.1:0).
+        let grpc: std::net::SocketAddr = "0.0.0.0:19389".parse().unwrap();
+        assert_eq!(
+            mcp_addr_for(grpc).unwrap(),
+            "0.0.0.0:19390".parse().unwrap()
+        );
+        let eph: std::net::SocketAddr = "10.1.2.3:0".parse().unwrap();
+        assert_eq!(mcp_addr_for(eph).unwrap(), "10.1.2.3:0".parse().unwrap());
+        assert!(mcp_addr_for("1.2.3.4:65535".parse().unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_bind_returns_the_set_both_listeners_bind() {
+        let tok = Some("a".repeat(MIN_TOKEN_LEN));
+        let cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+        let key = Some(std::path::PathBuf::from("/tmp/key.pem"));
+        // `0` resolves to 0.0.0.0: refused without TLS, returned with TLS.
+        assert!(
+            resolve_and_validate_bind("0:19389", &tok, &None, &None, false)
+                .await
+                .is_err()
+        );
+        let set = resolve_and_validate_bind("0:19389", &tok, &cert, &key, false)
+            .await
+            .unwrap();
+        assert!(
+            set.iter()
+                .all(|a| a.port() == 19389 && !a.ip().is_loopback())
+        );
+        // Unresolvable: never silently becomes a loopback bind.
+        assert!(
+            resolve_and_validate_bind("no-such-host.invalid:9378", &tok, &cert, &key, false)
+                .await
+                .is_err()
+        );
+        // A resolved set with a non-loopback member needs TLS even if the
+        // classification is done on an explicit (mixed) answer set.
+        let mixed: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:9378".parse().unwrap(),
+            "192.0.2.7:9378".parse().unwrap(),
+        ];
+        assert!(
+            validate_bind_security_resolved("multi.test:9378", &mixed, &tok, &None, &None, false)
+                .is_err()
+        );
+        assert!(
+            validate_bind_security_resolved("multi.test:9378", &mixed, &tok, &cert, &key, false)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -26592,7 +28640,7 @@ repos = ["alpha"]
     /// fast, clear "channel closed" failure instead of hanging forever.
     /// Tests that need a live reload path call
     /// `test_state_with_writer_generation` directly and keep the receiver.
-    fn test_state_with_writer() -> Arc<DaemonState> {
+    pub(super) fn test_state_with_writer() -> Arc<DaemonState> {
         test_state_with_writer_generation(None).0
     }
 
@@ -26627,6 +28675,8 @@ repos = ["alpha"]
                     reconciliation: SearchIndexReconciliation::Available(tantivy),
                 },
             )),
+            snapshot_derivation: None,
+            selected_db_path: db_path.clone(),
             db_path,
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),
@@ -26663,6 +28713,7 @@ repos = ["alpha"]
             rate_limiters: None,
             drained: Arc::new(AtomicBool::new(false)),
             shutdown_started: Arc::new(AtomicBool::new(false)),
+            status_snapshots: status_snapshot::StatusSnapshots::default(),
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
@@ -26855,6 +28906,129 @@ repos = ["alpha"]
             .map(|f| f.repo_uid.as_str())
             .collect();
         assert_eq!(refused, ["repo:beta"], "{:?}", snapshot.failures);
+    }
+
+    /// nw-908: manifest recovery recomputes a server repo's eligibility
+    /// fingerprint with the SAME `[[repos]] exclude`/`unskip` policy the worker
+    /// indexed it under. Before, it rebuilt the bare reader with no policy, so
+    /// the fingerprint never matched for any configured repo and the manifest
+    /// debt was never paid.
+    #[tokio::test]
+    async fn manifest_recovery_uses_the_workers_repo_policy_for_bare_clones() {
+        use nestweaver_engine::content_reader::{ContentReader, GitBareReader};
+        use nestweaver_engine::worker::RepoReadPolicy;
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let mut state = test_state_with_writer();
+        let dir = state.db_path.parent().unwrap().to_path_buf();
+        let src = dir.join("policy-src");
+        std::fs::create_dir_all(src.join("escape")).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn kept() {}\n").unwrap();
+        std::fs::write(src.join("escape/gen.rs"), "pub fn generated() {}\n").unwrap();
+        git(&src, &["init", "-q"]);
+        git(&src, &["config", "user.email", "t@t.t"]);
+        git(&src, &["config", "user.name", "t"]);
+        git(&src, &["add", "."]);
+        git(&src, &["commit", "-q", "-m", "init"]);
+        // A remote-style url: a `file://` url would read as a local checkout.
+        let url = "https://example.com/org/policy.git".to_string();
+        let clone = dir.join("workspace").join("policy.git");
+        std::fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        git(
+            &dir,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &src.display().to_string(),
+                &clone.display().to_string(),
+            ],
+        );
+        git(&clone, &["remote", "set-url", "origin", &url]);
+        let sha = git(&clone, &["rev-parse", "HEAD"]);
+
+        let workspace_root = dir.join("workspace").display().to_string();
+        let config = nestweaver_engine::InstanceConfig::from_toml_str(&format!(
+            r#"
+instance_id = "default"
+
+[snapshot_storage]
+backend = "local"
+path = "/tmp/snapshots"
+
+[workspace]
+backend = "local"
+path = "{workspace_root}"
+
+[inference]
+endpoint = "http://localhost:8080"
+embedding_model = "unused"
+summary_model = "unused"
+
+[git]
+credential_method = "ssh"
+
+[[repos]]
+url = "{url}"
+exclude = ["escape/**"]
+unskip = ["vendor"]
+"#
+        ))
+        .unwrap();
+        let limits = config.indexing.limits();
+        let state_mut = Arc::get_mut(&mut state).expect("test owns the only state Arc");
+        state_mut.server_mode = true;
+        state_mut.instance_cfg = Some(Arc::new(config.clone()));
+        state
+            .store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:policy".into(),
+                url: url.clone(),
+                indexed_sha: sha.clone(),
+                staleness_commits_behind: 0,
+                instance_id: "default".into(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+
+        // Counterweight: a policy recorded WITHOUT the configured exclude
+        // (what an unconfigured reader would compute) is refused for this repo.
+        state
+            .store
+            .set_repo_index_policy(
+                "repo:policy",
+                &GitBareReader::with_limits(&clone, &sha, limits).eligibility_fingerprint(),
+            )
+            .unwrap();
+        let refused = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
+        assert_eq!(refused.failures.len(), 1, "{:?}", refused.failures);
+
+        // The worker's construction records the configured fingerprint.
+        let worker_reader = RepoReadPolicy::for_url(&config, &url)
+            .apply(GitBareReader::with_limits(&clone, &sha, limits))
+            .unwrap();
+        state
+            .store
+            .set_repo_index_policy("repo:policy", &worker_reader.eligibility_fingerprint())
+            .unwrap();
+        let accepted = super::manifest_recovery::capture(
+            &state,
+            super::manifest_recovery::REPO_CAPTURE_BUDGET,
+        )
+        .unwrap();
+        assert!(accepted.failures.is_empty(), "{:?}", accepted.failures);
     }
 
     /// nw-705: the manifest rebuild is per repository. One repo it must refuse
@@ -27382,7 +29556,9 @@ credential_method = "gh"
                     reconciliation: SearchIndexReconciliation::Disabled,
                 },
             )),
+            snapshot_derivation: None,
             db_path: std::path::PathBuf::from(":memory:"),
+            selected_db_path: std::path::PathBuf::from(":memory:"),
             instance_id: "default".to_string(),
             data_instance_id: "default".to_string(),
             instance_stated_by_config: false,
@@ -27418,6 +29594,7 @@ credential_method = "gh"
             rate_limiters: None,
             drained: Arc::new(AtomicBool::new(false)),
             shutdown_started: Arc::new(AtomicBool::new(false)),
+            status_snapshots: status_snapshot::StatusSnapshots::default(),
             admin_token: None,
             admin_state: std::sync::OnceLock::new(),
             worker_handle: std::sync::Mutex::new(None),
@@ -27615,11 +29792,13 @@ credential_method = "gh"
 
     /// A3. The incident: an embed had run 12h32m and `brain status` still said
     /// `state: ready`, `queue_depth: 0`, with nothing progress-shaped anywhere.
-    /// Status must now say a pass is running, how far along it is, and that a
-    /// write is queued behind it — on both the typed and JSON routes.
+    /// JSON status discloses live pass/queue progress with last-observed graph
+    /// counts. Typed status refuses stale counts and resumes after the writer.
     #[tokio::test]
     async fn status_reports_a_running_embed_pass_and_a_queued_write() {
         let state = test_state_with_writer();
+        let service = DaemonService::new(Arc::clone(&state));
+        service.prewarm_status_observations().await;
         let pass = state.embed_progress.begin("all");
         pass.set_total(88_131);
         pass.advance(41_230);
@@ -27637,27 +29816,9 @@ credential_method = "gh"
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        let service = DaemonService::new(Arc::clone(&state));
-        let typed = service
+        let busy_typed = service
             .brain_status(Request::new(BrainStatusRequest {}))
-            .await
-            .expect("typed brain status")
-            .into_inner();
-
-        assert_eq!(
-            typed.write_queue_depth, 1,
-            "a write RPC waiting on the gate must not report as zero queued"
-        );
-        assert_eq!(typed.write_holder, "embed");
-        let embedding = typed.embedding_status.expect("embedding status");
-        assert!(embedding.pass_active, "a running pass must say so");
-        assert_eq!(embedding.pass_processed, 41_230);
-        assert_eq!(embedding.pass_total, 88_131);
-        assert_eq!(embedding.pass_scope, "all");
-        assert!(
-            embedding.pass_started_at > 0,
-            "a running pass must carry a start stamp so the client can derive ETA"
-        );
+            .await;
 
         let json = service
             .brain_status_json(Request::new(JsonRequest {
@@ -27673,6 +29834,14 @@ credential_method = "gh"
         assert_eq!(value["embedding_status"]["pass_active"], true);
         assert_eq!(value["embedding_status"]["pass_processed"], 41_230);
         assert_eq!(value["embedding_status"]["pass_total"], 88_131);
+        assert_eq!(value["embedding_status"]["pass_scope"], "all");
+        assert!(
+            value["embedding_status"]["pass_started_at"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(value["status_observation"]["stale"], true);
         assert_eq!(
             value["queue_depth"], 0,
             "queue_depth keeps meaning index JOBS; the blocked RPC is reported separately"
@@ -27684,6 +29853,26 @@ credential_method = "gh"
         // phantom holder.
         assert_eq!(state.write_gate.waiting(), 0);
         assert!(state.write_gate.holder_snapshot().is_none());
+        assert_eq!(busy_typed.unwrap_err().code(), tonic::Code::Unavailable);
+        let typed = service
+            .brain_status(Request::new(BrainStatusRequest {}))
+            .await
+            .expect("typed status recovers when the writer releases")
+            .into_inner();
+        assert_eq!(typed.write_queue_depth, 0, "the queued write has drained");
+        assert!(typed.write_holder.is_empty());
+        let embedding = typed.embedding_status.expect("embedding status");
+        assert!(embedding.pass_active, "a running pass must say so");
+        assert_eq!(embedding.pass_processed, 41_230);
+        assert_eq!(embedding.pass_total, 88_131);
+        assert_eq!(embedding.pass_scope, "all");
+        assert!(
+            embedding.pass_started_at > 0,
+            "a running pass must carry a start stamp so the client can derive ETA"
+        );
+
+        state.shutdown_started.store(true, Ordering::Release);
+        status_snapshot::drain_status_refresh(&state).await;
     }
 
     /// The state vocabulary must narrow to `embedding` mid-pass, so one field
@@ -29493,6 +31682,7 @@ external_model = "external-model"
         let mut state = test_state_with_writer();
         let state_mut = Arc::get_mut(&mut state).expect("test state must be uniquely owned");
         state_mut.store = Arc::clone(&degraded);
+        state_mut.selected_db_path = db_path.clone();
         state_mut.db_path = db_path;
         let service = DaemonService::new(state);
         let mut request = Request::new(EmbedRequest {
@@ -30653,22 +32843,23 @@ external_model = "unavailable-test-model"
         use nestweaver_engine::authz::Identity;
 
         let service = nw415_service();
-        service.state.indexing_active.store(true, Ordering::Relaxed);
-        *service.state.indexing_repo.write().await = NW415_HIDDEN_URL.to_string();
-
-        let status = service
+        service.prewarm_status_observations().await;
+        let before = service
             .brain_status(nw415_request(BrainStatusRequest {}, Identity::Admin))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(
-            status.repo_count, 2,
-            "an unscoped caller must still see both repos"
+            before.repo_count, 2,
+            "current unscoped counts before indexing"
         );
-        assert_eq!(
-            status.indexing_repo, NW415_HIDDEN_URL,
-            "an admin may see the process-level indexing job identifier"
-        );
+        service.state.indexing_active.store(true, Ordering::Relaxed);
+        *service.state.indexing_repo.write().await = NW415_HIDDEN_URL.to_string();
+
+        let busy = service
+            .brain_status(nw415_request(BrainStatusRequest {}, Identity::Admin))
+            .await;
+        assert_eq!(busy.unwrap_err().code(), tonic::Code::Unavailable);
         let repos = service
             .repo_states(nw415_request(RepoStatesRequest {}, Identity::Admin))
             .await
@@ -30754,6 +32945,27 @@ external_model = "unavailable-test-model"
             .unwrap()
             .into_inner();
         assert_eq!(note.uid, "note:nw415");
+        service
+            .state
+            .indexing_active
+            .store(false, Ordering::Relaxed);
+        service.state.indexing_repo.write().await.clear();
+        let after = service
+            .brain_status(nw415_request(BrainStatusRequest {}, Identity::Admin))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            after.repo_count, 2,
+            "current unscoped counts after indexing"
+        );
+        assert!(!after.indexing_active);
+        assert!(after.indexing_repo.is_empty());
+        service
+            .state
+            .shutdown_started
+            .store(true, Ordering::Release);
+        status_snapshot::drain_status_refresh(&service.state).await;
     }
 
     // ── nw-412 ──────────────────────────────────────────────────────
@@ -31892,11 +34104,11 @@ external_model = "unavailable-test-model"
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_sets_drained_before_draining() {
         let state = test_state_with_writer();
-        // Stand in for an in-flight index: the drain wait loop waits on
-        // `!indexing_active`, so with this set it never completes during the
-        // test — proving `drained` is set by the handler itself, not by the
-        // loop's completion.
-        state.indexing_active.store(true, Ordering::Relaxed);
+        // Stand in for a genuinely running index job: the drain loop waits on
+        // the worker's in-flight counter (not the `indexing_active` flag, nw-830),
+        // so with this set it never completes during the test — proving
+        // `drained` is set by the handler itself, not by the loop's completion.
+        state.indexing_in_flight.store(1, Ordering::Relaxed);
         assert!(
             !state.drained.load(Ordering::Relaxed),
             "precondition: drained starts clear"
@@ -31914,6 +34126,8 @@ external_model = "unavailable-test-model"
             "shutdown must set drained immediately (before the drain wait loop) \
              so the worker pool stops claiming new jobs the moment shutdown begins"
         );
+        // Release the hold so the spawned drain can finish.
+        state.indexing_in_flight.store(0, Ordering::Relaxed);
     }
 
     /// A `tracing` writer that accumulates formatted events in memory so a
@@ -32791,16 +35005,13 @@ external_model = "unavailable-test-model"
         );
     }
 
-    /// The unbounded wait is for in-flight WRITES only. `indexing_active` on its
-    /// own must stay bounded by the ceiling, because it cannot clear by itself
-    /// once the worker is drained with a non-empty queue: the worker's idle
-    /// branch is skipped (drained `continue`s before claiming) and its post-job
-    /// branch clears only when pending + running + in-flight all hit zero. A
-    /// server-mode daemon shut down with work still queued would otherwise never
-    /// exit — and would log "still waiting on 0 in-flight write(s)", asserting
-    /// an in-flight write it does not have.
+    /// nw-830: `indexing_active` on its own (no in-flight write, no job in
+    /// flight on the worker pool's counter) must not hold the drain at all. The
+    /// flag cannot clear once the worker is drained with a non-empty queue (or
+    /// idles in breaker backoff), so waiting on it only burned the full ceiling
+    /// — 660s by default, longer than a supervisor's stop timeout.
     #[tokio::test]
-    async fn drain_with_only_indexing_active_stays_bounded_by_the_ceiling() {
+    async fn drain_with_only_indexing_active_exits_promptly() {
         let state = test_state_with_writer();
         state.drained.store(true, Ordering::Relaxed);
         state.indexing_active.store(true, Ordering::Relaxed);
@@ -32814,28 +35025,19 @@ external_model = "unavailable-test-model"
             .finish();
         let _log_guard = tracing::subscriber::set_default(subscriber);
 
+        // A one-hour ceiling: only a prompt exit passes the 10s timeout.
         tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            run_shutdown_drain(Arc::clone(&state), 1),
+            std::time::Duration::from_secs(10),
+            run_shutdown_drain(Arc::clone(&state), 3600),
         )
         .await
-        .expect(
-            "an indexing-only drain MUST stay bounded: `indexing_active` cannot \
-             clear once the worker is drained with a non-empty queue, so waiting \
-             on it forever turns a bounded shutdown into a permanent hang",
-        );
+        .expect("a drain with no genuinely running work must not wait on the flag");
 
         assert!(
             *shutdown_rx.borrow(),
-            "the bounded path must broadcast — that broadcast is what lets the \
-             worker loop observe shutdown and exit"
+            "the drain must broadcast so the worker loop observes shutdown"
         );
-
         let text = logs.text();
-        assert!(
-            text.contains("drain ceiling (1s) reached with no in-flight writes"),
-            "the indexing-only ceiling must report itself accurately: {text}"
-        );
         assert!(
             !text.contains("still waiting on 0 in-flight write(s)"),
             "the drain must never assert an in-flight write it does not have: {text}"
@@ -32849,8 +35051,10 @@ external_model = "unavailable-test-model"
     #[tokio::test]
     async fn duplicate_shutdown_does_not_start_a_second_drain() {
         let state = test_state_with_writer();
-        // Keeps the first drain loop alive for the whole test.
-        state.indexing_active.store(true, Ordering::Relaxed);
+        // Keeps the first drain loop genuinely running for the whole test: a
+        // job in flight on the worker pool's counter (the flag alone no longer
+        // holds a drain, nw-830).
+        state.indexing_in_flight.store(1, Ordering::Relaxed);
 
         let logs = CapturedLogs::new();
         let subscriber = tracing_subscriber::fmt()
@@ -32888,6 +35092,8 @@ external_model = "unavailable-test-model"
     #[tokio::test]
     async fn health_check_reports_own_pid() {
         let state = test_state_with_writer();
+        let physical_path = state.db_path.clone();
+        assert_eq!(state.selected_db_path, physical_path);
         let service = DaemonService::new(state);
         let resp = service
             .health_check(Request::new(HealthCheckRequest {}))
@@ -32895,7 +35101,59 @@ external_model = "unavailable-test-model"
             .expect("health check ok")
             .into_inner();
         assert_eq!(resp.pid, std::process::id());
+        assert_eq!(resp.db_path, physical_path.display().to_string());
         assert!(resp.embedding_identity_repair);
+    }
+
+    #[tokio::test]
+    async fn health_check_replica_endpoint_retains_selected_path_and_physical_backing() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected_path = dir.path().join("replica-anchor.lbug");
+        let physical_path = dir.path().join("materialized-graph.lbug");
+        drop(GraphStore::open_or_create(&physical_path).unwrap());
+        let store = Arc::new(GraphStore::open_read_only_without_migration(&physical_path).unwrap());
+        let mut state = test_state_with_writer();
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.store = store;
+        state_mut.db_path = physical_path.clone();
+        state_mut.selected_db_path = selected_path.clone();
+        state_mut.instance_id = lifecycle::instance_id_from_db_path(&selected_path);
+        state_mut.read_only = true;
+        let service = DaemonService::new(Arc::clone(&state));
+        let health = service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            !selected_path.exists(),
+            "the endpoint anchor is not the backing file"
+        );
+        assert_eq!(health.db_path, selected_path.display().to_string());
+        assert_eq!(
+            health.instance_id,
+            lifecycle::instance_id_from_db_path(&selected_path)
+        );
+        assert_eq!(health.pid, std::process::id());
+        assert_eq!(state.db_path, physical_path);
+        assert_eq!(state.store.db_path(), Some(physical_path.as_path()));
+        assert_eq!(health.backing_file_valid, Some(true));
+        assert!(health.backing_file_error.is_empty());
+        state.store.verify_backing_file().unwrap();
+
+        // Endpoint identity must not turn backing-file health into an anchor
+        // existence check: losing the real file is still disclosed.
+        let moved_path = dir.path().join("moved-materialized-graph.lbug");
+        std::fs::rename(&physical_path, &moved_path).unwrap();
+        let missing_backing = service
+            .health_check(Request::new(HealthCheckRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        std::fs::rename(&moved_path, &physical_path).unwrap();
+        assert_eq!(missing_backing.db_path, selected_path.display().to_string());
+        assert_eq!(missing_backing.backing_file_valid, Some(false));
+        assert!(!missing_backing.backing_file_error.is_empty());
     }
 
     /// nw-730. The watcher's health poll is the only traffic a `brain watch`
@@ -33966,7 +36224,12 @@ external_model = "unavailable-test-model"
         let calls = Arc::new(AtomicU32::new(0));
         let mut guard = ReadOnlyGuard::new(false, true, CountingService(calls.clone()));
 
-        for method in ["ExportGraph", "IndexRepo", "UnknownFutureRpc"] {
+        for method in [
+            "ExportGraph",
+            "GetEffectiveConfig",
+            "IndexRepo",
+            "UnknownFutureRpc",
+        ] {
             let mut req = http::Request::builder()
                 .uri(format!("/nestweaver.daemon.v1.NestWeaverDaemon/{method}"))
                 .body(tonic::body::Body::default())
@@ -35124,11 +37387,19 @@ mod watcher_e2e_tests {
         // batch-lease fix this permanently reported `watch_code` here.
         let idle_status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let status = client
+                // Counts must be current; a publication can legitimately
+                // make typed status retryable until its observation refreshes.
+                let status = match client
                     .brain_status(nestweaver_proto::BrainStatusRequest {})
                     .await
-                    .expect("brain status while watcher is idle")
-                    .into_inner();
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(error) if error.code() == tonic::Code::Unavailable => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(error) => panic!("brain status while watcher is idle: {error}"),
+                };
                 if status.repo_count > 0 && status.write_holder.is_empty() {
                     break status;
                 }

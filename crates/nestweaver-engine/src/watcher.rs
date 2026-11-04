@@ -1672,12 +1672,20 @@ impl BrainWatcher {
         let mut removals = Vec::new();
         let mut removed_paths: Vec<PathBuf> = Vec::new();
         let mut docs: Vec<nestweaver_store::tantivy_index::NoteDocBatchEntry> = Vec::new();
+        let total_chunks = targets.len().div_ceil(crate::cross_domain::NOTES_PER_TXN);
+        let mut completed_chunks = 0;
         for (path, relative, uid) in &targets {
             // Flush a full chunk before scanning further, so at most one
             // chunk of scanned edges is ever held.
             if chunk.len() == crate::cross_domain::NOTES_PER_TXN {
                 let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
                 self.flush_sidecar_chunk(store, &chunk, &chunk_paths, timings, &mut debt);
+                completed_chunks += 1;
+                tracing::info!(
+                    completed_chunks,
+                    total_chunks,
+                    "watcher sidecar chunk progress"
+                );
                 chunk.clear();
                 chunk_paths.clear();
             }
@@ -1755,6 +1763,11 @@ impl BrainWatcher {
         if !chunk.is_empty() || tantivy_work.is_some() {
             let _lease = self.try_acquire_batch_lease(true, "watch_vault_sidecars")?;
             self.flush_sidecar_chunk(store, &chunk, &chunk_paths, timings, &mut debt);
+            tracing::info!(
+                completed_chunks = completed_chunks + 1,
+                total_chunks,
+                "watcher sidecar chunk progress"
+            );
             if let Some(index) = tantivy_work {
                 let tantivy_started = Instant::now();
                 index.apply_note_batch(&docs, &removals)?;

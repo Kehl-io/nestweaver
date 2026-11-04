@@ -44,6 +44,13 @@ def restored_semantics(binary, db):
             status = json.loads(fixture.run('brain', 'status', '--db', db, '--json',
                                            timeout=min(10, remaining)).stdout)
             fixture.record(kind='restore_derivation_observation', status=status)
+            observation = status.get('status_observation')
+            assert (isinstance(observation, dict)
+                    and isinstance(observation.get('stale'), bool)
+                    and isinstance(observation.get('busy'), bool)), status
+            if observation['stale'] or observation['busy']:
+                time.sleep(min(0.25, max(0, deadline-time.monotonic())))
+                continue
             compatibility = status['index_compatibility']
             derivation = status.get('vault_derivation') or {}
             assert compatibility['incomplete_repos'] == [], status

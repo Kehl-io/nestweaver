@@ -26,7 +26,17 @@ pub async fn search(
     }
     let limit = params.limit.unwrap_or(20).min(1000);
     let results = nestweaver_engine::search_symbols(&state.store, &q, limit)?;
-    let json = serde_json::to_value(&results)?;
+    let mut json = serde_json::to_value(&results)?;
+    if let Some(fed) = state.federation.get().filter(|f| f.is_configured()) {
+        json = fed
+            .search(
+                "search_symbols",
+                &serde_json::json!({"query":q,"limit":limit}),
+                json,
+                limit,
+            )
+            .await;
+    }
     Ok(Json(json).into_response())
 }
 
@@ -93,6 +103,20 @@ pub async fn symbol_by_uid(
             if !symbols.is_empty() {
                 let json = labelled_symbols_json(symbols)?;
                 return Ok(Json(json).into_response());
+            }
+            if let Some(fed) = state.federation.get() {
+                match fed
+                    .lookup("symbol_lookup", &serde_json::json!({"name_or_uid":uid}))
+                    .await
+                {
+                    crate::federation::LookupOutcome::Found { source, value } => {
+                        let mut detail = value["detail"].clone();
+                        detail["_federation"] = serde_json::json!({"source":source,"freshness":"unknown","read_only":true,"source_available":false});
+                        return Ok(Json(detail).into_response());
+                    }
+                    crate::federation::LookupOutcome::Missing => {}
+                    outcome => return Err(outcome.into_error()),
+                }
             }
             Err(ApiError::not_found(format!("symbol '{uid}' not found")))
         }

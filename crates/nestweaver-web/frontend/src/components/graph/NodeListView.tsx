@@ -564,6 +564,16 @@ function impactRows(
   }
 
   rows.push(...affectedTestRows(tests, rows.length, states?.result ?? trustResult));
+  const orgTests = graphAttribute<AffectedTestsResult>(graph, "orgAffectedTests");
+  if (orgTests) {
+    rows.push(...affectedTestRows(orgTests, rows.length, "partial").map((row) => ({ ...row, id: `org:${row.id}`, primary: `Org · ${row.primary}`, metadata: `Upstream static hints; freshness unknown. ${row.metadata}` })));
+  }
+  const blast = graphAttribute<{ local_impact?: { status?: string; affected_symbols?: unknown[] }; org_wide_impact?: { status?: string; source_server?: string; results?: { status?: string; affected_symbols?: unknown[] } } }>(graph, "blastRadius");
+  if (blast) {
+    for (const [tier, result] of [["Local", blast.local_impact], ["Org", blast.org_wide_impact?.results]] as const) {
+      rows.push({ id: `blast:${tier}`, order: rows.length, uid: null, primary: `${tier} blast radius`, kind: "Blast radius", relationship: result ? `${result.affected_symbols?.length ?? 0} returned affected symbols` : "Unavailable", status: result?.status ?? "unavailable", location: blast.org_wide_impact?.source_server ?? "", metadata: "Static analysis, partial with unknown freshness. Run the full suite when a tier is unavailable or degraded." });
+    }
+  }
 
   if (graph.order > 0) {
     const nodeRows = graphRows(graph, activeLensLabel, targetUid, states?.result ?? trustResult);

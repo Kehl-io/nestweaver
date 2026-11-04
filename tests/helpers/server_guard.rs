@@ -33,9 +33,25 @@ pub struct ServerGuard {
     #[allow(dead_code)]
     db_path: PathBuf,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
+    graceful_on_drop: bool,
 }
 
 impl ServerGuard {
+    /// Opt in before startup so readiness failures also drain cooperatively.
+    pub fn start_with_auth_graceful(db_path: &Path, token: &str) -> Self {
+        Self::spawn_inner_with_shutdown(
+            db_path,
+            Some(token),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+    }
+
     /// Spawn the server without authentication.
     pub fn start(db_path: &Path) -> Self {
         Self::spawn(db_path, None)
@@ -182,6 +198,31 @@ impl ServerGuard {
         config_path: Option<&Path>,
         webhook_secret_old: Option<&str>,
     ) -> Self {
+        Self::spawn_inner_with_shutdown(
+            db_path,
+            auth_token,
+            tls_cert,
+            tls_key,
+            webhook_secret,
+            admin_token,
+            config_path,
+            webhook_secret_old,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner_with_shutdown(
+        db_path: &Path,
+        auth_token: Option<&str>,
+        tls_cert: Option<&Path>,
+        tls_key: Option<&Path>,
+        webhook_secret: Option<&str>,
+        admin_token: Option<&str>,
+        config_path: Option<&Path>,
+        webhook_secret_old: Option<&str>,
+        graceful_on_drop: bool,
+    ) -> Self {
         let port_file = db_path
             .parent()
             .unwrap_or(Path::new("."))
@@ -271,6 +312,7 @@ impl ServerGuard {
             port_file: port_file.clone(),
             db_path: db_path.to_path_buf(),
             stderr_thread,
+            graceful_on_drop,
         };
 
         // Wait for the port file to appear. The deadline scales: 30 s default
@@ -311,7 +353,18 @@ impl ServerGuard {
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if self.graceful_on_drop {
+            if matches!(self.child.try_wait(), Ok(None)) {
+                // SAFETY: this guard owns the unreaped Child, so its PID cannot
+                // be reused before wait; SIGTERM requests ordinary shutdown.
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        } else {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
         // The stderr pipe hits EOF once the child is reaped; join the reader
         // thread so it doesn't linger across tests in the same process.

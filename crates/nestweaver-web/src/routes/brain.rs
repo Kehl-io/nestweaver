@@ -285,10 +285,27 @@ pub async fn note_by_uid(
     State(state): State<Arc<AppState>>,
     Path(uid): Path<String>,
 ) -> Result<Response, ApiError> {
-    let note = state
-        .store
-        .lookup_note(&uid)
-        .map_err(|_| ApiError::not_found(format!("note '{uid}' not found")))?;
+    let note = match state.store.lookup_note(&uid) {
+        Ok(note) => note,
+        Err(_) => {
+            if let Some(fed) = state.federation.get() {
+                match fed
+                    .lookup("note_get", &json!({"uid":uid,"include_body":true}))
+                    .await
+                {
+                    crate::federation::LookupOutcome::Found {
+                        source,
+                        value: remote,
+                    } => {
+                        return Ok(Json(json!({"note":{"uid":uid,"title":remote["title"],"file_path":remote["path"],"note_kind":remote["note_kind"],"word_count":remote["word_count"],"vault_uid":"","pagerank_score":0.0},"headings":[],"sections":[],"body":remote["body"],"_federation":{"source":source,"freshness":"unknown","read_only":true,"unsupported":["remote-note-navigation","remote-edits"]}})).into_response());
+                    }
+                    crate::federation::LookupOutcome::Missing => {}
+                    outcome => return Err(outcome.into_error()),
+                }
+            }
+            return Err(ApiError::not_found(format!("note '{uid}' not found")));
+        }
+    };
 
     let headings = state.store.headings_in_note(&uid)?;
     let sections = state.store.sections_in_note(&uid)?;
@@ -421,7 +438,7 @@ pub async fn unlinked_mentions(
     Ok(Json(json).into_response())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct BrainSearchParams {
     pub q: Option<String>,
     pub limit: Option<usize>,
@@ -434,8 +451,33 @@ pub async fn brain_search(
     Query(params): Query<BrainSearchParams>,
 ) -> Result<Response, ApiError> {
     let state2 = state.clone();
-    crate::rank_events::with_rank_event(&state, move || brain_search_response(&state2, params))
+    let query = params.clone();
+    let response =
+        crate::rank_events::with_rank_event(&state, move || brain_search_response(&state2, params))
+            .await?;
+    let Some(fed) = state.federation.get().filter(|f| f.is_configured()) else {
+        return Ok(response);
+    };
+    // A local workspace ID is not proof of remote membership. Only the all
+    // workspace can safely include upstream rows.
+    let selected = workspaces::workspace_param(query.workspace.as_deref(), query.scope.as_deref());
+    if selected.is_some_and(|id| id != "all") {
+        return Ok(response);
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
         .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let local: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 500);
+    let result = fed
+        .search(
+            "brain_search",
+            &json!({"query":query.q.unwrap_or_default(),"limit":limit}),
+            local,
+            limit,
+        )
+        .await;
+    Ok(Json(result).into_response())
 }
 
 fn brain_search_response(

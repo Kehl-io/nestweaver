@@ -3056,40 +3056,12 @@ impl GraphStore {
         &self,
         note_uids: &[String],
     ) -> Result<Vec<(String, String, String, f64)>, StoreError> {
-        const CHUNK: usize = 256;
         let conn = self.conn()?;
         let mut out = Vec::new();
-        for chunk in note_uids.chunks(CHUNK) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let uids = Value::List(
-                lbug::LogicalType::String,
-                chunk.iter().map(|uid| Value::String(uid.clone())).collect(),
-            );
-            for query in [
-                "UNWIND $uids AS u \
-                 MATCH (n:Note {uid: u})-[r:REFERENCES_CODE_NOTE_TO_SYMBOL]->(b:Symbol) \
-                 RETURN n.uid, n.uid, b.uid, r.confidence",
-                "UNWIND $uids AS u \
-                 MATCH (n:Note {uid: u})-[:NOTE_HAS_SECTION]->(s:Section)\
-                 -[r:REFERENCES_CODE_SECTION_TO_SYMBOL]->(b:Symbol) \
-                 RETURN n.uid, s.uid, b.uid, r.confidence",
-            ] {
-                let mut stmt = conn
-                    .prepare(query)
-                    .map_err(|e| StoreError::Query(format!("prepare: {e}")))?;
-                let rows = conn
-                    .execute(&mut stmt, vec![("uids", uids.clone())])
-                    .map_err(|e| StoreError::Query(format!("execute: {e}")))?;
-                for row in rows {
-                    out.push((
-                        extract_string(&row, 0)?,
-                        extract_string(&row, 1)?,
-                        extract_string(&row, 2)?,
-                        extract_f64(&row, 3)?,
-                    ));
-                }
+        for note_uid in note_uids {
+            for (from, to, confidence, _) in Self::cross_domain_edges_for_note_on(&conn, note_uid)?
+            {
+                out.push((note_uid.clone(), from, to, f64::from(confidence)));
             }
         }
         Ok(out)

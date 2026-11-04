@@ -1871,6 +1871,10 @@ const ENV_REGISTRY: &[EnvVar] = &[
         role: EnvRole::Configures,
     },
     EnvVar {
+        name: "NESTWEAVER_CA_CERT",
+        role: EnvRole::Configures,
+    },
+    EnvVar {
         name: "NESTWEAVER_CRASH_REPORT_DIRS",
         role: EnvRole::Configures,
     },
@@ -3266,6 +3270,14 @@ impl RankingBounds {
             _ => shown.to_string(),
         }
     }
+}
+
+fn decode_hybrid_regex_result(
+    value: serde_json::Value,
+) -> anyhow::Result<nestweaver_store::regex::RegexSearchResult> {
+    // nw-875: a malformed transport envelope is never evidence of no matches.
+    serde_json::from_value(strip_hybrid_meta(value))
+        .context("invalid regex_search response from daemon or upstream")
 }
 
 /// Print a ranking payload as an OBJECT carrying its own staleness, rather than
@@ -6143,6 +6155,18 @@ fn format_effective_config(config: Option<&nestweaver_proto::EffectiveConfig>) -
     }
 }
 
+fn format_watcher_status(watcher: &nestweaver_proto::WatcherStatus) -> String {
+    format!(
+        "Watcher: {} {} (session {}, controller {:?}, started {}, age {}s)",
+        watcher.kind,
+        watcher.target,
+        watcher.id,
+        watcher.controller_pid,
+        watcher.started_unix_seconds,
+        watcher.age_seconds
+    )
+}
+
 fn format_daemon_status_response(
     response: Result<&nestweaver_proto::BrainStatusResponse, &str>,
 ) -> String {
@@ -6161,15 +6185,7 @@ fn format_daemon_status_response(
                 }
             ));
             if let Some(watcher) = &status.watcher {
-                lines.push(format!(
-                    "Watcher: {} {} (session {}, controller {:?}, started {}, age {}s)",
-                    watcher.kind,
-                    watcher.target,
-                    watcher.id,
-                    watcher.controller_pid,
-                    watcher.started_unix_seconds,
-                    watcher.age_seconds
-                ));
+                lines.push(format_watcher_status(watcher));
             }
             lines.push("Embedding:".to_string());
             if let Some(embedding) = status.embedding_status.as_ref() {
@@ -6269,17 +6285,122 @@ fn format_daemon_not_running_status(summary: &str) -> String {
     )
 }
 
+enum DaemonDiagnosticStatus {
+    Current(Box<nestweaver_proto::BrainStatusResponse>),
+    Runtime {
+        status: Box<nestweaver_client::runtime_status::RuntimeStatus>,
+        config: Option<nestweaver_proto::EffectiveConfig>,
+        config_error: Option<String>,
+    },
+}
+
+fn daemon_rpc_error_has_code(error: &anyhow::Error, code: tonic::Code) -> bool {
+    error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == code)
+}
+
+fn format_live_daemon_status(
+    status: &nestweaver_client::runtime_status::RuntimeStatus,
+    config: Option<&nestweaver_proto::EffectiveConfig>,
+    config_error: Option<&str>,
+) -> String {
+    let config = match config_error {
+        Some(error) => format!("unknown (provenance query failed: {error})"),
+        None => format_effective_config(config),
+    };
+    let mut lines = vec![
+        format!("Config: {config}"),
+        "Runtime diagnostics: live; current graph observation unavailable".to_string(),
+        format!(
+            "Supervision: {}",
+            if status.supervision.is_empty() {
+                "unknown/unverifiable"
+            } else {
+                &status.supervision
+            }
+        ),
+    ];
+    if let Some(watcher) = &status.watcher {
+        lines.push(format_watcher_status(watcher));
+    }
+    lines.push("Embedding:".to_string());
+    lines.push(
+        status
+            .embedding_status
+            .as_ref()
+            .map(format_embedding_status)
+            .unwrap_or_else(|| "  State:            unknown (older daemon)".to_string()),
+    );
+    lines.push("Search index:".to_string());
+    lines.push(
+        status
+            .search_status
+            .as_ref()
+            .map(format_search_status)
+            .unwrap_or_else(|| "  State:            unknown (older daemon)".to_string()),
+    );
+    if let Some(line) = status
+        .code_links
+        .as_ref()
+        .and_then(format_code_links_status)
+    {
+        lines.push(line);
+    }
+    if let Some(line) = status
+        .cross_repo_links
+        .as_ref()
+        .and_then(format_cross_repo_links_status)
+    {
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 fn print_daemon_embedding_status(db_path: &Path) {
     let result = tokio::runtime::Runtime::new()
         .map_err(anyhow::Error::from)
         .and_then(|runtime| {
             runtime.block_on(async {
                 let mut client = nestweaver_client::DaemonClient::connect_existing(db_path).await?;
-                client.brain_status().await
+                match client.brain_status().await {
+                    Ok(status) => Ok(DaemonDiagnosticStatus::Current(Box::new(status))),
+                    Err(error) if daemon_rpc_error_has_code(&error, tonic::Code::Unavailable) => {
+                        let status = client.brain_runtime_status().await?;
+                        let (config, config_error) = match client.effective_config().await {
+                            Ok(config) => (Some(config), None),
+                            Err(error)
+                                if daemon_rpc_error_has_code(
+                                    &error,
+                                    tonic::Code::Unimplemented,
+                                ) =>
+                            {
+                                (None, None)
+                            }
+                            Err(error) => (None, Some(format!("{error:#}"))),
+                        };
+                        Ok(DaemonDiagnosticStatus::Runtime {
+                            status: Box::new(status),
+                            config,
+                            config_error,
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
             })
         });
     match result {
-        Ok(status) => println!("{}", format_daemon_status_response(Ok(&status))),
+        Ok(DaemonDiagnosticStatus::Current(status)) => {
+            println!("{}", format_daemon_status_response(Ok(&status)))
+        }
+        Ok(DaemonDiagnosticStatus::Runtime {
+            status,
+            config,
+            config_error,
+        }) => println!(
+            "{}",
+            format_live_daemon_status(&status, config.as_ref(), config_error.as_deref())
+        ),
         Err(error) => {
             let error = format!("{error:#}");
             println!("{}", format_daemon_status_response(Err(&error)));
@@ -6304,6 +6425,65 @@ mod daemon_status_renderer_tests {
             fallback_used: false,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn busy_live_diagnostics_keep_authoritative_config_without_graph_counts() {
+        let status = nestweaver_client::runtime_status::RuntimeStatus::from_status_json(
+            &serde_json::json!({
+                "runtime_telemetry":"available", "repo_count":null,
+                "write_holder":"embed", "write_holder_seconds":95,"write_queue_depth":2,
+                "embedding_status":{"state":"embedding","model_id":"actual-model"},
+                "code_links":{"pending":true,"reason":"current debt"}
+            }),
+        )
+        .unwrap();
+        let config = nestweaver_proto::EffectiveConfig {
+            source: Some(Source::ConfiguredPath("/canonical/live.toml".into())),
+        };
+        let text = format_live_daemon_status(&status, Some(&config), None);
+        assert!(
+            text.starts_with("Config: /canonical/live.toml\nRuntime diagnostics: live"),
+            "{text}"
+        );
+        assert!(
+            text.contains("current graph observation unavailable"),
+            "{text}"
+        );
+        assert!(text.contains("actual-model"), "{text}");
+        assert!(text.contains("current debt"), "{text}");
+        let legacy = format_live_daemon_status(&status, None, None);
+        assert!(legacy.contains("Config: unknown"), "{legacy}");
+        assert!(!legacy.contains("daemon is not running"), "{legacy}");
+        let denied = format_live_daemon_status(&status, None, Some("permission denied"));
+        assert!(
+            denied.contains("Config: unknown (provenance query failed: permission denied)"),
+            "{denied}"
+        );
+        assert!(denied.contains("actual-model"), "{denied}");
+        assert!(
+            !denied.contains("unreachable") && !denied.contains("booting"),
+            "{denied}"
+        );
+    }
+
+    #[test]
+    fn only_current_status_unavailable_selects_live_fallback() {
+        for code in [
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Unimplemented,
+        ] {
+            assert!(!daemon_rpc_error_has_code(
+                &anyhow::Error::new(tonic::Status::new(code, "fixture")),
+                tonic::Code::Unavailable
+            ));
+        }
+        assert!(daemon_rpc_error_has_code(
+            &anyhow::Error::new(tonic::Status::unavailable("busy")),
+            tonic::Code::Unavailable
+        ));
     }
 
     #[test]
@@ -10967,27 +11147,19 @@ const STOP_WAIT_NOTICE_SECS: u64 = 60;
 ///
 /// `serving_reads` is OBSERVED, not assumed — the caller re-probes the socket
 /// immediately before printing. The first version of this message asserted
-/// "still serving reads" unconditionally, which is false in the stuck-flag
-/// index drain: with `active_writes == 0`, `indexing_active` set, and the
-/// worker pool reporting ZERO jobs in flight (the flag cannot clear once the
-/// pool is drained with a non-empty queue), the drain breaks and BROADCASTS at
-/// the ceiling, closing every listener at 660s, while this command's grace is
-/// 690s — so at report time the daemon could have had no listeners for thirty
-/// seconds. A GENUINELY RUNNING index job is not this case: like an in-flight
-/// write, it keeps the listeners up past the ceiling, so reads stay served.
-/// That is exactly the overclaim class this change exists to remove, so it
-/// must not be reintroduced by the command announcing the fix.
+/// "still serving reads" unconditionally. A drain no longer closes listeners
+/// at the ceiling for a stuck `indexing_active` flag (nw-830: a drain with no
+/// write and no job in flight exits promptly), so the negative branch does not
+/// name a cause; it reports the observation only.
 ///
 /// THE NEGATIVE BRANCH REPORTS THE OBSERVATION, NOT A CAUSE. All the caller
-/// knows is that one `connect()` did not answer. The stuck-flag ceiling
-/// broadcast is the *likely* explanation and is named as such, but it is not
-/// the only one: ECONNREFUSED while the process is mid-exit, `EMFILE`/`ENFILE`
-/// in this CLI process, a socket already swept by `daemon gc`, or a full listen
-/// backlog all produce the same failed connect — including 690s into a WRITE
-/// drain, where "no in-flight write" would be flatly false. Stating a
-/// fabricated diagnosis confidently is the same defect as the overclaim this
-/// branch exists to fix, merely inverted, so the wording stays hedged and the
-/// write-specific sentence is omitted rather than negated.
+/// knows is that one `connect()` did not answer. ECONNREFUSED while the process
+/// is mid-exit, `EMFILE`/`ENFILE` in this CLI process, a socket already swept
+/// by `daemon gc`, or a full listen backlog all produce the same failed
+/// connect — including during a WRITE drain, where "no in-flight write" would
+/// be flatly false. Stating a fabricated diagnosis confidently is the same
+/// defect as the overclaim this branch exists to fix, merely inverted, so the
+/// wording stays hedged.
 fn stop_still_draining_message(pid: i32, waited_secs: u64, serving_reads: bool) -> String {
     let state_line = if serving_reads {
         "It is still running and still answering on its socket — reads are still served, \
@@ -10995,13 +11167,9 @@ fn stop_still_draining_message(pid: i32, waited_secs: u64, serving_reads: bool) 
          aborted (`spawn_blocking` is not cancellable) has to finish."
     } else {
         "It is still running, but its socket did not answer just now, so reads may be \
-         DOWN. The likeliest cause is a stuck-flag index drain: with nothing in the \
-         write queue and the worker pool idle, the daemon broadcasts at the drain \
-         ceiling, which closes every listener (a genuinely running index job keeps \
-         them up, like a write — the broadcast is only for a flag that outlived its \
-         work). This probe cannot tell that apart from a socket already cleaned up, \
-         a refused connection during exit, or a local file-descriptor limit — check \
-         the daemon log before concluding."
+         DOWN. The daemon may be mid-exit, its socket may already have been cleaned up, \
+         or this process may be at its file-descriptor limit; this probe cannot tell \
+         that apart — check the daemon log before concluding."
     };
     format!(
         "Daemon (PID {pid}) is STILL DRAINING after {waited_secs}s and was NOT stopped.\n\
@@ -14769,9 +14937,7 @@ fn daemon_status_reachable_pid(db_path: &Path, socket: &Path) -> Result<Option<i
         .map_err(|_| "endpoint health check timed out".to_string())?
         .map_err(|error| format!("endpoint health check failed: {error}"))?;
     if health.pid != peer_pid as u32
-        || health.instance_id != nestweaver_daemon::instance_id_from_db_path(db_path)
-        || nestweaver_daemon::lifecycle::database_path_fingerprint(Path::new(&health.db_path))
-            != nestweaver_daemon::lifecycle::database_path_fingerprint(db_path)
+        || nestweaver_client::verify_endpoint_binding(db_path, &health).is_err()
     {
         return Err(
             "socket peer does not verify the selected database/instance identity".to_string(),
@@ -24325,24 +24491,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 )? {
                     // Strip the hybrid `_meta` provenance so both output
                     // modes match the direct path byte-for-byte.
-                    let res: nestweaver_store::regex::RegexSearchResult =
-                        serde_json::from_value(strip_hybrid_meta(value)).unwrap_or_else(|_| {
-                            nestweaver_store::regex::RegexSearchResult {
-                                results: vec![],
-                                truncated: false,
-                                scanned_fallback: false,
-                                stale_index: false,
-                                ready_scopes: 0,
-                                dirty_scopes: 0,
-                                error_scopes: 0,
-                                posting_hits: 0,
-                                hydrated_candidates: 0,
-                                scanned_candidates: 0,
-                                truncation_reason: None,
-                                timings: Default::default(),
-                                note: None,
-                            }
-                        });
+                    let res = decode_hybrid_regex_result(value)?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&res)?);
                     } else if res.results.is_empty() {
@@ -28833,16 +28982,12 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         }
 
                         // OBSERVE whether the socket answers; do NOT infer why.
-                        // A stuck-flag index drain (`indexing_active` set with
-                        // the worker pool reporting zero jobs in flight)
-                        // broadcasts at the ceiling, which closes every
-                        // listener 30s before this grace expires, so "still
-                        // serving reads" cannot be asserted — but a failed
-                        // connect does not prove that particular cause
-                        // either (ECONNREFUSED mid-exit, EMFILE in this process,
-                        // a socket swept by `daemon gc`, a full listen backlog).
-                        // The message therefore reports the observation and
-                        // hedges the cause. A socket owned by a different PID is
+                        // A failed connect has several possible causes
+                        // (ECONNREFUSED mid-exit, EMFILE in this process, a
+                        // socket swept by `daemon gc`, a full listen backlog),
+                        // so "still serving reads" cannot be asserted and no
+                        // cause is named: the message reports the observation
+                        // and hedges. A socket owned by a different PID is
                         // likewise not this daemon's read service.
                         let serving_reads = daemon_socket_reported_pid(&socket) == Some(pid);
                         eprintln!(
@@ -38556,6 +38701,33 @@ credential_method = "ssh"
         );
     }
 
+    #[test]
+    fn malformed_hybrid_regex_response_is_an_error_not_zero_matches() {
+        // nw-875: the old fallback fabricated an empty successful response.
+        for value in [serde_json::json!({"results": []}), serde_json::json!(null)] {
+            let error = decode_hybrid_regex_result(value).unwrap_err();
+            assert!(error.to_string().contains("invalid regex_search response"));
+        }
+    }
+
+    #[test]
+    fn hybrid_regex_decode_preserves_planner_and_truncation_evidence() {
+        let value = serde_json::json!({
+            "results": [], "truncated": true, "scanned_fallback": false,
+            "stale_index": true, "ready_scopes": 4, "dirty_scopes": 2,
+            "error_scopes": 1, "posting_hits": 17, "hydrated_candidates": 9,
+            "scanned_candidates": 3, "truncation_reason": null,
+            "timings": {"planning_ms": 1, "hydration_ms": 2, "verification_ms": 3, "total_ms": 6},
+            "note": "incomplete scan",
+            "_meta": {"sources": ["local", "server"]}
+        });
+        let result = decode_hybrid_regex_result(value).unwrap();
+        assert!(result.truncated && result.stale_index);
+        assert_eq!((result.ready_scopes, result.dirty_scopes), (4, 2));
+        assert_eq!((result.error_scopes, result.posting_hits), (1, 17));
+        assert_eq!(result.note.as_deref(), Some("incomplete scan"));
+    }
+
     /// `index --repo <file>` is rejected naming the path; a missing
     /// path is also rejected naming the path; a directory passes.
     #[test]
@@ -39074,20 +39246,11 @@ mod stop_grace_tests {
         );
     }
 
-    /// The stuck-flag index drain is the case the first version of this message
-    /// got wrong. With `active_writes == 0`, `indexing_active` set, and the
-    /// worker pool reporting zero jobs in flight, the drain breaks and
-    /// BROADCASTS at the ceiling — which closes every listener at 660s, while
-    /// this command's grace runs to 690s. So there is a real window in which
-    /// the daemon is alive, unreachable, and the command was announcing "still
-    /// serving reads" about it. (A genuinely running index job keeps the
-    /// listeners up past the ceiling, so the broadcast case is provably a
-    /// stuck flag.)
-    ///
-    /// The caller re-probes the socket and passes what it observed. Both
-    /// branches are asserted here because the honest branch is the whole point:
-    /// a message that could only ever say the reassuring thing would not be
-    /// reporting, it would be guessing.
+    /// The first version of this message announced "still serving reads"
+    /// unconditionally. The caller re-probes the socket and passes what it
+    /// observed. Both branches are asserted here because the honest branch is
+    /// the whole point: a message that could only ever say the reassuring thing
+    /// would not be reporting, it would be guessing.
     ///
     /// It must not overcorrect either. A failed `connect()` is one observation
     /// with several possible causes, so this test pins that the message reports
@@ -39116,9 +39279,13 @@ mod stop_grace_tests {
         // `daemon gc`, or a full backlog — including during a WRITE drain,
         // where a confident "no in-flight write" would be flatly wrong.
         assert!(
-            msg.contains("likeliest cause") && msg.contains("cannot tell that apart"),
-            "the message must present the index-only drain as the likely cause, \
-             not as an established fact: {msg}"
+            msg.contains("cannot tell that apart"),
+            "the message must hedge the cause, not state one: {msg}"
+        );
+        assert!(
+            !msg.contains("stuck-flag") && !msg.contains("likeliest cause"),
+            "a stuck flag no longer holds the drain (nw-830), so it must not \
+             be named as a cause: {msg}"
         );
         assert!(
             !msg.contains("no in-flight write"),

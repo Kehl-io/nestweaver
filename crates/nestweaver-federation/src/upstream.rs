@@ -3,9 +3,10 @@
 //! Wraps a `tonic::Channel` with bearer token injection, health state,
 //! timeout, routing mode, and repo glob matching.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -184,24 +185,169 @@ impl HealthState {
     }
 }
 
+/// Pure TLS decision for [`configure_endpoint_tls`] (nw-833). Takes the
+/// system-roots probe result as input so it never reads the host trust store.
+///
+/// * `ca` set: trust ONLY that CA (pinning, exactly as before nw-833).
+/// * no `ca`, native roots available: trust the system roots.
+/// * no `ca`, no native roots: a clear error naming the fix.
+fn build_tls(
+    ca: Option<tonic::transport::Certificate>,
+    native_roots_available: bool,
+) -> Result<tonic::transport::ClientTlsConfig> {
+    let tls = tonic::transport::ClientTlsConfig::new();
+    match ca {
+        Some(ca) => Ok(tls.ca_certificate(ca)),
+        None if native_roots_available => Ok(tls.with_native_roots()),
+        None => anyhow::bail!(
+            "no system CA roots were found to verify this grpcs:// upstream; install your \
+             platform's CA certificates, or pass --ca-cert <pem> (ca_cert in config, \
+             NESTWEAVER_CA_CERT in the environment)"
+        ),
+    }
+}
+
+/// Configure TLS on `endpoint` (nw-833).
+///
+/// A `ca_cert` PEM is the ONLY trust anchor for that upstream (pinned, as
+/// before). An `https://` endpoint with no `ca_cert` verifies against the
+/// system roots, so `grpcs://host` works against a publicly trusted
+/// certificate; if the host has no system roots that is an error naming
+/// `--ca-cert`. Plain `http://` endpoints without a `ca_cert` are untouched.
+///
+/// Shared by [`UpstreamHandle::from_config`] and `nestweaver connect` so the
+/// two never disagree about how a `grpcs://` URL is trusted.
+pub fn configure_endpoint_tls(
+    endpoint: tonic::transport::Endpoint,
+    url: &str,
+    ca_cert: Option<&std::path::Path>,
+) -> Result<tonic::transport::Endpoint> {
+    if ca_cert.is_none() && !url.starts_with("https://") {
+        return Ok(endpoint);
+    }
+    let ca = ca_cert
+        .map(|ca_path| {
+            std::fs::read(ca_path)
+                .with_context(|| format!("failed to read CA cert: {}", ca_path.display()))
+                .map(tonic::transport::Certificate::from_pem)
+        })
+        .transpose()?;
+    // Probe only when it matters: tonic loads the native store while building
+    // the connector, so a trial config tells us whether any roots exist.
+    let roots = ca.is_none()
+        && endpoint
+            .clone()
+            .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())
+            .is_ok();
+    endpoint
+        .tls_config(build_tls(ca, roots)?)
+        .context("TLS config failed")
+}
+
+/// Default cap on the `fallback`-mode upstream deadline. In Fallback mode the
+/// local index is the fast path and the server is consulted only when local
+/// results are sparse, so by default the upstream must not block the local
+/// answer past the product's <200ms budget. Per-upstream `fallback_timeout`
+/// overrides it (nw-834); `timeout` always bounds it.
+pub const DEFAULT_FALLBACK_CAP: Duration = Duration::from_millis(200);
+
+/// Latency EWMA plus the consecutive-ceiling-timeout streak. They share one
+/// cell so a detached query future clears the streak and folds the sample in a
+/// single call ([`record_latency_into`]).
+#[derive(Default)]
+pub struct LatencyCell {
+    /// EWMA in ms as `f64` bits; `0` is the cold-start sentinel.
+    ewma_bits: AtomicU64,
+    /// Consecutive timeouts at the full mode ceiling (nw-905).
+    streak: AtomicU32,
+}
+
+impl LatencyCell {
+    pub fn ewma_ms(&self) -> Option<f64> {
+        match self.ewma_bits.load(Ordering::Relaxed) {
+            0 => None,
+            bits => Some(f64::from_bits(bits)),
+        }
+    }
+}
+
 /// Runtime handle for a single upstream NestWeaver server.
 pub struct UpstreamHandle {
     pub name: String,
     channel: Channel,
+    connected: tokio::sync::Mutex<bool>,
+    query_outcome: AtomicU8,
+    pub vault_mappings: crate::dedup::VaultMappings,
     token: Option<String>,
     repo_globs: Vec<glob::Pattern>,
     pub mode: RoutingMode,
     pub timeout: Duration,
+    /// Ceiling of the adaptive deadline in `fallback` mode (nw-834):
+    /// `fallback_timeout` (default 200ms), never above `timeout`.
+    fallback_cap: Duration,
     health: Arc<HealthState>,
     /// EWMA (in milliseconds) of observed *successful* upstream RPC latencies,
     /// encoded as `f64` bits inside an `AtomicU64` for lock-free interior
     /// mutability. A stored value of `0.0` (bits `0`) is the cold-start
     /// sentinel meaning "no samples yet". Feeds the mode-aware adaptive
     /// timeout (see [`crate::health::effective_timeout`]).
-    latency_ewma: Arc<AtomicU64>,
+    latency_ewma: Arc<LatencyCell>,
+    tool_latencies: Mutex<HashMap<String, Arc<LatencyCell>>>,
+}
+
+/// Connection establishment has its own bounded budget, independent of the
+/// adaptive query deadline. TLS handshakes must not consume a 50ms warm RPC budget.
+pub const COLD_CONNECT_BUDGET: Duration = Duration::from_secs(5);
+
+/// Observable outcome of the latest routed query; skipped is distinct from
+/// a completed empty answer, timeout, rejection, or transport failure.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum QueryOutcome {
+    Skipped,
+    Success,
+    Timeout,
+    Rejected,
+    Unavailable,
 }
 
 impl UpstreamHandle {
+    pub fn record_query_outcome(&self, outcome: QueryOutcome) {
+        self.query_outcome.store(outcome as u8, Ordering::Relaxed);
+    }
+
+    pub fn query_outcome(&self) -> &'static str {
+        match self.query_outcome.load(Ordering::Relaxed) {
+            1 => "success",
+            2 => "timeout",
+            3 => "rejected",
+            4 => "unavailable",
+            _ => "skipped",
+        }
+    }
+
+    /// Establish the lazy channel once under a separate connection budget.
+    /// The lock prevents concurrent cold calls from multiplying handshakes.
+    pub async fn ensure_connected(&self) -> Result<()> {
+        tokio::time::timeout(COLD_CONNECT_BUDGET, async {
+            let mut connected = self.connected.lock().await;
+            if *connected {
+                return Ok(());
+            }
+            let mut client = self.client();
+            let mut req = tonic::Request::new(nestweaver_proto::HealthCheckRequest {});
+            self.inject_auth(&mut req);
+            client
+                .health_check(req)
+                .await
+                .context("upstream cold-connect health check failed")?;
+            *connected = true;
+            Ok(())
+        })
+        .await
+        .context("upstream cold-connect timed out")?
+    }
+
     /// Create from a discovered config. Uses `connect_lazy` so the channel
     /// doesn't block during construction — the first RPC triggers the real
     /// TCP handshake.
@@ -212,18 +358,21 @@ impl UpstreamHandle {
         // Parsed once and reused for both the per-RPC deadline below and the
         // stored `timeout` (same input + fallback).
         let per_rpc_timeout = parse_duration(&config.timeout).unwrap_or(Duration::from_secs(1));
-        let mut endpoint = Channel::from_shared(url)
+        let mut endpoint = Channel::from_shared(url.clone())
             .context("invalid upstream URL")?
             .connect_timeout(Duration::from_secs(5))
-            .timeout(per_rpc_timeout);
+            // Transport backstop strictly ABOVE every client-side deadline
+            // (the tokio timeout in the query paths never exceeds `timeout`),
+            // so the client deadline always fires first and feeds
+            // `health::handle_query_timeout` instead of racing a transport
+            // `DeadlineExceeded` that would eject immediately (nw-905).
+            .timeout(per_rpc_timeout.max(COLD_CONNECT_BUDGET) + Duration::from_secs(1));
 
-        if let Some(ref ca_path) = config.ca_cert {
-            let pem = std::fs::read(ca_path)
-                .with_context(|| format!("failed to read CA cert: {ca_path}"))?;
-            let ca = tonic::transport::Certificate::from_pem(pem);
-            let tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca);
-            endpoint = endpoint.tls_config(tls).context("TLS config failed")?;
-        }
+        endpoint = configure_endpoint_tls(
+            endpoint,
+            &url,
+            config.ca_cert.as_deref().map(std::path::Path::new),
+        )?;
 
         let channel = endpoint.connect_lazy();
 
@@ -234,6 +383,18 @@ impl UpstreamHandle {
             .collect();
 
         let timeout = per_rpc_timeout;
+        let default_cap = DEFAULT_FALLBACK_CAP;
+        let fallback_cap = match config.fallback_timeout.as_deref() {
+            None => default_cap,
+            Some(raw) => parse_duration(raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    fallback_timeout = raw,
+                    "unparseable fallback_timeout; using the 200ms default"
+                );
+                default_cap
+            }),
+        }
+        .min(timeout);
 
         Ok(Self {
             name: config
@@ -241,12 +402,17 @@ impl UpstreamHandle {
                 .clone()
                 .unwrap_or_else(|| "upstream".to_string()),
             channel,
+            connected: tokio::sync::Mutex::new(false),
+            query_outcome: AtomicU8::new(0),
+            vault_mappings: config.vault_mappings.clone(),
             token: config.token.clone(),
             repo_globs: patterns,
             mode: config.mode,
             timeout,
+            fallback_cap,
             health: Arc::new(HealthState::new()),
-            latency_ewma: Arc::new(AtomicU64::new(0)),
+            latency_ewma: Arc::new(LatencyCell::default()),
+            tool_latencies: Mutex::new(HashMap::new()),
         })
     }
 
@@ -291,6 +457,9 @@ impl UpstreamHandle {
     /// Passive mark-down (a live query failed). Ejects with escalating backoff;
     /// the background probe task restores it — this is never permanent.
     pub fn mark_unhealthy(&self) {
+        if let Ok(mut connected) = self.connected.try_lock() {
+            *connected = false;
+        }
         self.health.mark_down(now_ms());
     }
 
@@ -300,44 +469,112 @@ impl UpstreamHandle {
     }
 
     /// Fold an observed *successful* RPC duration into the latency EWMA.
+    /// A success also clears the ceiling-timeout streak (nw-905).
     pub fn record_latency(&self, observed: Duration) {
+        self.record_query_outcome(QueryOutcome::Success);
         record_latency_into(&self.latency_ewma, observed);
+    }
+
+    /// Latency for one tool only. An unseen tool has no learned deadline.
+    pub fn tool_latency_ewma_ms(&self, tool: &str) -> Option<f64> {
+        self.tool_latencies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tool)
+            .and_then(|cell| cell.ewma_ms())
+    }
+
+    fn tool_latency_cell(&self, tool: &str) -> Arc<LatencyCell> {
+        Arc::clone(
+            self.tool_latencies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(tool.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// Success learns only this tool's cost, but resets the upstream-wide
+    /// ceiling-timeout streak, preserving the any-success recovery policy.
+    pub fn record_tool_latency(&self, tool: &str, observed: Duration) {
+        record_latency_into(&self.tool_latency_cell(tool), observed);
+        self.reset_timeout_streak();
+        self.record_query_outcome(QueryOutcome::Success);
+    }
+
+    pub fn record_tool_timeout(&self, tool: &str, deadline: Duration, at_ceiling: bool) -> u32 {
+        learn_timeout_into(&self.tool_latency_cell(tool), deadline);
+        if at_ceiling {
+            self.latency_ewma.streak.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            0
+        }
+    }
+
+    /// Ceiling of the adaptive deadline in `fallback` mode (nw-834).
+    pub fn fallback_cap(&self) -> Duration {
+        self.fallback_cap
+    }
+
+    /// Clear the ceiling-timeout streak.
+    pub fn reset_timeout_streak(&self) {
+        self.latency_ewma.streak.store(0, Ordering::Relaxed);
+    }
+
+    /// Learn from a timeout (nw-905). A timed-out call only proves the true
+    /// latency is AT LEAST `deadline`, so the estimate is raised to it (never
+    /// lowered) — the next adaptive deadline widens by `TIMEOUT_K` instead of
+    /// staying pinned at the floor. Returns the new count of consecutive
+    /// timeouts that hit `at_ceiling` (a deadline that could not widen
+    /// further); a miss below the ceiling returns 0 and never counts toward
+    /// ejection.
+    pub fn record_timeout(&self, deadline: Duration, at_ceiling: bool) -> u32 {
+        learn_timeout_into(&self.latency_ewma, deadline);
+        if at_ceiling {
+            self.latency_ewma.streak.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            0
+        }
     }
 
     /// Current latency EWMA in milliseconds, or `None` on a cold start
     /// (no successful samples observed yet).
     pub fn latency_ewma_ms(&self) -> Option<f64> {
-        let bits = self.latency_ewma.load(Ordering::Relaxed);
-        if bits == 0 {
-            None
-        } else {
-            Some(f64::from_bits(bits))
-        }
+        self.latency_ewma.ewma_ms()
     }
 
-    /// Clone the EWMA cell so latency can be recorded from a detached query
+    /// Clone the latency cell so latency can be recorded from a detached query
     /// future that cannot hold a borrow of the handle (e.g. the parallel
     /// merge path). Update it with [`record_latency_into`].
-    pub fn latency_ewma_ref(&self) -> Arc<AtomicU64> {
+    pub fn latency_ewma_ref(&self) -> Arc<LatencyCell> {
         Arc::clone(&self.latency_ewma)
     }
 }
 
-/// Fold an observed duration (in `slot`, encoded as `f64` millis bits) into an
-/// EWMA. On a cold start (`slot == 0.0`) the first observation seeds the
-/// estimate directly; thereafter it is smoothed by [`LATENCY_EWMA_ALPHA`].
-/// Lossy under concurrent writers (a race just drops a sample), which is fine
-/// for a latency estimate.
-pub fn record_latency_into(slot: &AtomicU64, observed: Duration) {
+fn learn_timeout_into(cell: &LatencyCell, deadline: Duration) {
+    let deadline_ms = deadline.as_secs_f64() * 1000.0;
+    if deadline_ms > cell.ewma_ms().unwrap_or(0.0) {
+        cell.ewma_bits
+            .store(deadline_ms.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Fold an observed successful duration into the cell's EWMA and clear the
+/// timeout streak. On a cold start the first observation seeds the estimate
+/// directly; thereafter it is smoothed by [`LATENCY_EWMA_ALPHA`]. Lossy under
+/// concurrent writers (a race just drops a sample), which is fine for a
+/// latency estimate.
+pub fn record_latency_into(cell: &LatencyCell, observed: Duration) {
     let sample_ms = observed.as_secs_f64() * 1000.0;
-    let prev_bits = slot.load(Ordering::Relaxed);
+    let prev_bits = cell.ewma_bits.load(Ordering::Relaxed);
     let next = if prev_bits == 0 {
         sample_ms
     } else {
         let prev = f64::from_bits(prev_bits);
         LATENCY_EWMA_ALPHA * sample_ms + (1.0 - LATENCY_EWMA_ALPHA) * prev
     };
-    slot.store(next.to_bits(), Ordering::Relaxed);
+    cell.ewma_bits.store(next.to_bits(), Ordering::Relaxed);
+    cell.streak.store(0, Ordering::Relaxed);
 }
 
 /// Parse a human-readable duration string like "1s", "500ms", or bare seconds.
@@ -410,21 +647,69 @@ mod tests {
 
     #[test]
     fn record_latency_cold_start_seeds_directly() {
-        let slot = AtomicU64::new(0);
+        let slot = LatencyCell::default();
         record_latency_into(&slot, Duration::from_millis(80));
         // First sample seeds the EWMA exactly (no smoothing yet).
-        let ms = f64::from_bits(slot.load(Ordering::Relaxed));
+        let ms = slot.ewma_ms().unwrap();
         assert!((ms - 80.0).abs() < 1e-9, "expected ~80ms, got {ms}");
     }
 
     #[test]
     fn record_latency_smooths_subsequent_samples() {
-        let slot = AtomicU64::new(0);
+        let slot = LatencyCell::default();
         record_latency_into(&slot, Duration::from_millis(100));
         record_latency_into(&slot, Duration::from_millis(200));
         // EWMA = alpha*200 + (1-alpha)*100 = 0.2*200 + 0.8*100 = 120.
-        let ms = f64::from_bits(slot.load(Ordering::Relaxed));
+        let ms = slot.ewma_ms().unwrap();
         assert!((ms - 120.0).abs() < 1e-9, "expected ~120ms, got {ms}");
+    }
+
+    #[tokio::test]
+    async fn cold_connect_has_a_separate_bounded_budget_and_no_rpc_latency_sample() {
+        // A real TCP listener that never speaks HTTP/2 holds connection setup.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = UpstreamConfig {
+            name: Some("cold".into()),
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: None,
+            mode: RoutingMode::Fallback,
+            repos: vec![],
+            timeout: "30ms".into(),
+            ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
+        };
+        let handle = UpstreamHandle::from_config(&config).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), handle.ensure_connected())
+                .await
+                .is_err(),
+            "a 30ms RPC ceiling must not abort cold connection establishment"
+        );
+        let result = tokio::time::timeout(
+            COLD_CONNECT_BUDGET + Duration::from_secs(1),
+            handle.ensure_connected(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cold connection must finish within its own finite budget"
+        );
+        assert!(result.unwrap().is_err());
+        assert_eq!(
+            handle.latency_ewma_ms(),
+            None,
+            "handshake latency is not query latency"
+        );
+        assert!(
+            !*handle.connected.lock().await,
+            "a failed handshake must remain cold"
+        );
+        assert_eq!(handle.query_outcome(), "skipped");
+        handle.record_query_outcome(QueryOutcome::Timeout);
+        assert_eq!(handle.query_outcome(), "timeout");
+        handle.record_latency(Duration::from_millis(10));
+        assert_eq!(handle.query_outcome(), "success");
     }
 
     #[tokio::test]
@@ -437,6 +722,8 @@ mod tests {
             mode: RoutingMode::Merge,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         // Cold start: no samples yet.
@@ -460,6 +747,8 @@ mod tests {
             mode: RoutingMode::Merge,
             timeout: "200ms".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         assert_eq!(handle.timeout, Duration::from_millis(200));
@@ -507,6 +796,8 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         assert_eq!(handle.name, "test");
@@ -526,6 +817,8 @@ mod tests {
             mode: RoutingMode::default(),
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&config).unwrap();
         assert!(handle.matches_repo("anything/at/all"));
@@ -665,5 +958,101 @@ mod tests {
         assert_eq!(normalize_url("grpcs://foo:9378"), "https://foo:9378");
         assert_eq!(normalize_url("grpc://foo:9378"), "http://foo:9378");
         assert_eq!(normalize_url("foo:9378"), "http://foo:9378");
+    }
+
+    #[tokio::test]
+    async fn record_timeout_widens_estimate_and_counts_only_ceiling_misses() {
+        // nw-905: a timeout is a censored sample; it raises the EWMA.
+        let cfg = UpstreamConfig {
+            name: Some("t".into()),
+            url: "http://127.0.0.1:19999".into(),
+            token: None,
+            repos: vec![],
+            mode: RoutingMode::Merge,
+            timeout: "1s".into(),
+            ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
+        };
+        let h = UpstreamHandle::from_config(&cfg).unwrap();
+        h.record_latency(Duration::from_millis(8));
+        assert_eq!(h.record_timeout(Duration::from_millis(50), false), 0);
+        assert_eq!(h.latency_ewma_ms(), Some(50.0));
+        // A later, smaller deadline never lowers the estimate.
+        h.record_timeout(Duration::from_millis(20), false);
+        assert_eq!(h.latency_ewma_ms(), Some(50.0));
+        assert_eq!(h.record_timeout(Duration::from_secs(1), true), 1);
+        assert_eq!(h.record_timeout(Duration::from_secs(1), true), 2);
+        // Any success clears the streak.
+        h.record_latency(Duration::from_millis(30));
+        assert_eq!(h.record_timeout(Duration::from_secs(1), true), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_cap_defaults_to_200ms_and_honors_fallback_timeout() {
+        // nw-834: "1s" is no longer a magic sentinel; the cap is its own key.
+        let mk = |timeout: &str, cap: Option<&str>| {
+            UpstreamHandle::from_config(&UpstreamConfig {
+                name: None,
+                url: "http://127.0.0.1:19999".into(),
+                token: None,
+                repos: vec![],
+                mode: RoutingMode::Fallback,
+                timeout: timeout.into(),
+                ca_cert: None,
+                fallback_timeout: cap.map(String::from),
+                vault_mappings: Default::default(),
+            })
+            .unwrap()
+            .fallback_cap()
+        };
+        assert_eq!(mk("1s", None), Duration::from_millis(200));
+        assert_eq!(mk("1000ms", None), Duration::from_millis(200));
+        assert_eq!(mk("100ms", None), Duration::from_millis(100));
+        assert_eq!(mk("1s", Some("750ms")), Duration::from_millis(750));
+        assert_eq!(mk("1s", Some("5s")), Duration::from_secs(1));
+        assert_eq!(mk("1s", Some("garbage")), Duration::from_millis(200));
+    }
+
+    // ── nw-833 TLS decision (host trust store is never read) ─────────────
+
+    fn some_ca() -> tonic::transport::Certificate {
+        tonic::transport::Certificate::from_pem("not a real pem; never parsed here")
+    }
+
+    #[test]
+    fn ca_cert_pins_even_when_no_system_roots_exist() {
+        assert!(build_tls(Some(some_ca()), false).is_ok());
+        assert!(build_tls(Some(some_ca()), true).is_ok());
+    }
+
+    #[test]
+    fn https_without_ca_cert_uses_system_roots_when_available() {
+        assert!(build_tls(None, true).is_ok());
+    }
+
+    #[test]
+    fn https_without_ca_cert_and_no_roots_names_the_fix() {
+        let err = build_tls(None, false).unwrap_err().to_string();
+        assert!(err.contains("--ca-cert"), "{err}");
+        assert!(err.contains("NESTWEAVER_CA_CERT"), "{err}");
+    }
+
+    #[test]
+    fn plain_http_without_ca_cert_leaves_endpoint_untouched() {
+        let endpoint = Channel::from_static("http://127.0.0.1:1");
+        assert!(configure_endpoint_tls(endpoint, "http://127.0.0.1:1", None).is_ok());
+    }
+
+    #[test]
+    fn unreadable_ca_cert_is_a_named_error() {
+        let endpoint = Channel::from_static("https://127.0.0.1:1");
+        let err = configure_endpoint_tls(
+            endpoint,
+            "https://127.0.0.1:1",
+            Some(std::path::Path::new("/nonexistent/ca.pem")),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("failed to read CA cert"));
     }
 }

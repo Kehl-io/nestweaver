@@ -169,6 +169,7 @@ export function KnowledgeCard({
           <h3 className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
             Evidence
           </h3>
+          {data?.type === "symbol" && data.sourceState === "unsupported" && <p role="status" className="mt-1 text-xs text-[var(--color-text-muted)]">Remote source evidence unsupported · {data.detail._federation?.source} · freshness unknown · read only.</p>}
           {isCode ? (
             <pre className="mt-1 max-h-28 overflow-auto rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] p-2 text-[11px] leading-5 text-[var(--color-text)]">
               <code>{excerpt}</code>
@@ -192,7 +193,7 @@ export function KnowledgeCard({
           <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
             Actions
           </h3>
-          <KnowledgeActionGrid node={nodeContext} compact />
+          <KnowledgeActionGrid node={nodeContext} compact remote={(data?.type === "symbol" || data?.type === "note") && Boolean(data.detail._federation)} />
         </section>
       </div>
 

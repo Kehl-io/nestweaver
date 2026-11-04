@@ -24,13 +24,10 @@ use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 
 use nestweaver_federation::dispatch::dispatch_json_rpc_authed_profile;
 use nestweaver_federation::health::{
-    MaintenanceProbe, code_is_down, effective_timeout, eject_with_cap, is_upstream_down,
-    local_sha_for_server_repo,
+    MaintenanceProbe, code_is_down, effective_timeout_for_tool, eject_with_cap,
+    handle_query_timeout_for_tool, is_upstream_down, local_entry_for_server_repo, log_tool_timeout,
 };
-use nestweaver_federation::results::{
-    concat_fanout, count_results, inject_or_wrap_provenance, merge_structured_results,
-    set_stale_repos,
-};
+use nestweaver_federation::results::{count_results, inject_or_wrap_provenance, set_stale_repos};
 
 use crate::DaemonClient;
 use crate::discovery::{RoutingMode, discover_upstreams_with_config};
@@ -65,6 +62,9 @@ pub struct UpstreamStatus {
     pub mode: String,
     pub repo_count: usize,
     pub stale_repos: Vec<String>,
+    pub last_query_outcome: String,
+    pub ejected: bool,
+    pub fallback_timeout_ms: u128,
 }
 
 /// Minimum result count before we consider querying the server in fallback mode.
@@ -142,6 +142,20 @@ impl HybridClient {
     ) -> Result<Self> {
         let local = DaemonClient::connect(db_path, config_path).await?;
         Self::finish_connect(local, config_path, start_dir)
+    }
+
+    /// Route reads through a verified incumbent without autostart. Reuse the
+    /// exact admitted client so an exit between admission and query cannot
+    /// create an empty database at a replica's absent logical anchor.
+    pub async fn connect_existing_verified_read(
+        db_path: &Path,
+        config_path: Option<&Path>,
+        start_dir: &Path,
+    ) -> Result<Option<Self>> {
+        DaemonClient::connect_existing_verified_read(db_path, config_path)
+            .await?
+            .map(|local| Self::finish_connect(local, config_path, start_dir))
+            .transpose()
     }
 
     /// Connect the way [`Self::connect`] does, but declare the CALLER as a
@@ -285,26 +299,15 @@ impl HybridClient {
             return Ok(result);
         }
 
+        for upstream in &self.upstreams {
+            upstream.record_query_outcome(nestweaver_federation::upstream::QueryOutcome::Skipped);
+        }
         let mut routing = tool_routing(tool_name);
         let mut fallback_mode = false;
         let repo_hint = extract_repo_hint(params);
 
-        // Let the upstream's RoutingMode override the per-tool default.
-        // LocalOnly and TwoTier are never overridden (they have tool-specific
-        // semantics), but Merge/LocalFirst/ServerPreferred can be promoted.
-        if routing != ToolRouting::LocalOnly
-            && routing != ToolRouting::TwoTier
-            && routing != ToolRouting::Combined
-            && let Some(upstream) = find_upstream_for_repo(&self.upstreams, repo_hint)
-        {
-            match upstream.mode {
-                RoutingMode::Primary => routing = ToolRouting::ServerPreferred,
-                RoutingMode::Merge => routing = ToolRouting::Merge,
-                RoutingMode::Fallback => {
-                    routing = ToolRouting::LocalFirst;
-                    fallback_mode = true;
-                }
-            }
+        if let Some(upstream) = find_upstream_for_repo(&self.upstreams, repo_hint) {
+            (routing, fallback_mode) = apply_mode_override(routing, upstream.mode);
         }
 
         // Populate `_meta.stale_repos` provenance from the background-computed
@@ -317,6 +320,17 @@ impl HybridClient {
             .route_query(routing, tool_name, params, force_fallback_server)
             .await?;
 
+        if let Some(obj) = result.as_object_mut() {
+            let meta = obj.entry("_meta").or_insert_with(|| serde_json::json!({}));
+            meta["upstream_attempts"] = serde_json::json!(
+                self.upstreams
+                    .iter()
+                    .map(|u| serde_json::json!({
+                        "name": u.name, "outcome": u.query_outcome(), "ejected": !u.is_healthy()
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
         if !stale.is_empty() {
             set_stale_repos(&mut result, &stale);
         }
@@ -347,7 +361,7 @@ impl HybridClient {
                 let mut result = self.query_local(tool_name, params).await?;
                 // Try to enrich with upstream status data (best-effort).
                 if self.has_upstreams() {
-                    let timeout = self.upstream_timeout(params);
+                    let timeout = self.upstream_timeout(tool_name, params);
                     if let Ok(server) = self.query_upstream(tool_name, params, timeout).await {
                         // Merge scalar/missing keys from server into local result.
                         if let (Some(local_obj), Some(server_obj)) =
@@ -389,16 +403,16 @@ impl HybridClient {
     /// See [`effective_timeout`] for the clamp formula and rationale. Falls
     /// back to [`UPSTREAM_TIMEOUT`] only when no upstream matches the query's
     /// repo hint.
-    fn upstream_timeout(&self, params: &Value) -> Duration {
+    fn upstream_timeout(&self, tool_name: &str, params: &Value) -> Duration {
         let repo_hint = extract_repo_hint(params);
         find_upstream_for_repo(&self.upstreams, repo_hint)
-            .map(|u| effective_timeout(u.mode, u))
+            .map(|u| effective_timeout_for_tool(u.mode, u, tool_name))
             .unwrap_or(UPSTREAM_TIMEOUT)
     }
 
     /// Server-preferred routing: query upstream first, fall back to local.
     async fn query_server_preferred(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
-        let timeout = self.upstream_timeout(params);
+        let timeout = self.upstream_timeout(tool_name, params);
         match self.query_upstream(tool_name, params, timeout).await {
             Ok(mut r) => {
                 inject_or_wrap_provenance(&mut r, &["server"], &[]);
@@ -450,10 +464,22 @@ impl HybridClient {
         force_server_for_stale_repo: bool,
     ) -> Result<Value> {
         // 1. Always query local first.
-        let mut local_result = self.query_local(tool_name, params).await?;
+        let mut local_result = match self.query_local(tool_name, params).await {
+            Ok(value) => value,
+            Err(error)
+                if classify_upstream_rejection(&error) == UpstreamRejection::TargetNotFound =>
+            {
+                serde_json::json!({"status":"not_found", "message":format!("{error:#}")})
+            }
+            Err(error) => return Err(error),
+        };
 
-        // 2. If no upstreams are configured, return local as-is.
-        if self.upstreams.is_empty() {
+        // A local ambiguity needs the caller's selection. A remote match must
+        // not silently choose a different entity with the same lookup name.
+        if nestweaver_federation::results::lookup_disposition(tool_name, &local_result)
+            == nestweaver_federation::results::LookupDisposition::Ambiguous
+            || self.upstreams.is_empty()
+        {
             inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
             return Ok(local_result);
         }
@@ -461,7 +487,9 @@ impl HybridClient {
         // 3. Check if local results are sufficient and fresh. When local
         // returns 0 results or the repo is stale, query the server.
         let local_count = count_results(&local_result);
-        if !fallback_should_query_server(local_count, force_server_for_stale_repo) {
+        if (!force_server_for_stale_repo && local_lookup_succeeded(tool_name, &local_result))
+            || !fallback_should_query_server(local_count, force_server_for_stale_repo)
+        {
             debug!(
                 tool = tool_name,
                 local_count, "fallback: local results sufficient, skipping server"
@@ -471,7 +499,7 @@ impl HybridClient {
         }
 
         // 4. Local results are sparse — query server with timeout.
-        let timeout = self.upstream_timeout(params);
+        let timeout = self.upstream_timeout(tool_name, params);
         debug!(
             tool = tool_name,
             local_count,
@@ -481,10 +509,15 @@ impl HybridClient {
         );
         match self.query_upstream(tool_name, params, timeout).await {
             Ok(server_result) => {
-                // Use the structured merge so brain_context / project_context
-                // responses keep their `connected` schema; it falls back to the
-                // flat envelope for non-structured tools internally.
-                let mut merged = merge_structured_results(&local_result, &server_result);
+                let mappings = find_upstream_for_repo(&self.upstreams, extract_repo_hint(params))
+                    .map(|u| u.vault_mappings.clone())
+                    .unwrap_or_default();
+                let mut merged = nestweaver_federation::results::compose_tool_results(
+                    tool_name,
+                    &local_result,
+                    &server_result,
+                    &mappings,
+                );
                 if tool_name == "brain_search" {
                     nestweaver_federation::results::cap_brain_search_results(
                         &mut merged,
@@ -499,12 +532,10 @@ impl HybridClient {
                 Ok(merged)
             }
             Err(e) => {
-                warn!(
-                    tool = tool_name,
-                    local_count,
-                    error = %e,
-                    "fallback: upstream query failed, returning local-only results"
-                );
+                if classify_upstream_rejection(&e) != UpstreamRejection::TargetNotFound {
+                    debug!(tool = tool_name, local_count, error = %e,
+                        "fallback: upstream query failed, returning local-only results");
+                }
                 inject_or_wrap_provenance(&mut local_result, &["local"], &[]);
                 Ok(local_result)
             }
@@ -529,18 +560,34 @@ impl HybridClient {
         let repo_hint = extract_repo_hint(params);
         let selected_idx = find_upstream_for_repo(&self.upstreams, repo_hint)
             .and_then(|u| self.upstreams.iter().position(|x| std::ptr::eq(x, u)));
-        let server_task = selected_idx.map(|idx| {
+        let Some(selected_index) = selected_idx else {
+            let mut result = self.query_local(tool_name, params).await?;
+            inject_or_wrap_provenance(&mut result, &["local"], &[]);
+            return Ok(result);
+        };
+        // The deadline the server future runs under, kept so a miss can be
+        // fed back into the latency estimate (nw-905).
+        let merge_deadline = selected_idx.map(|idx| {
             let u = &self.upstreams[idx];
-            let timeout = effective_timeout(u.mode, u);
+            effective_timeout_for_tool(u.mode, u, tool_name)
+        });
+        let server_fut = {
+            let u = &self.upstreams[selected_index];
+            let timeout = merge_deadline.unwrap_or(u.timeout);
             let mut client = u.client();
             let token = u.auth_token().map(|t| t.to_string());
             let tool = tool_name.to_string();
             let p = params.clone();
             let profile = self.delivery_profile;
-            // Clone the EWMA cell — the future can't borrow `u` because the
-            // local query borrows `self.local` mutably for `tokio::join!`.
-            let latency = u.latency_ewma_ref();
+            // The future borrows only upstreams; local dispatch borrows the
+            // disjoint local channel below.
             async move {
+                if let Err(e) = u.ensure_connected().await {
+                    u.record_query_outcome(
+                        nestweaver_federation::upstream::QueryOutcome::Unavailable,
+                    );
+                    return Ok(Err(e));
+                }
                 let started = Instant::now();
                 let res = tokio::time::timeout(
                     timeout,
@@ -553,17 +600,27 @@ impl HybridClient {
                     ),
                 )
                 .await;
-                if let Ok(Ok(_)) = &res {
-                    crate::upstream::record_latency_into(&latency, started.elapsed());
+                match &res {
+                    Ok(Ok(_)) => {
+                        u.record_query_outcome(
+                            nestweaver_federation::upstream::QueryOutcome::Success,
+                        );
+                        u.record_tool_latency(&tool, started.elapsed());
+                    }
+                    Ok(Err(e)) => u.record_query_outcome(if is_upstream_down(e) {
+                        nestweaver_federation::upstream::QueryOutcome::Unavailable
+                    } else {
+                        nestweaver_federation::upstream::QueryOutcome::Rejected
+                    }),
+                    Err(_) => {
+                        u.record_query_outcome(
+                            nestweaver_federation::upstream::QueryOutcome::Timeout,
+                        );
+                        log_tool_timeout(u, &tool, timeout, started.elapsed());
+                    }
                 }
                 res
             }
-        });
-
-        let Some(server_fut) = server_task else {
-            let mut result = self.query_local(tool_name, params).await?;
-            inject_or_wrap_provenance(&mut result, &["local"], &[]);
-            return Ok(result);
         };
 
         // Now borrow self.local mutably for the local query.
@@ -595,7 +652,13 @@ impl HybridClient {
 
         match server_result {
             Ok(Ok(server)) => {
-                let mut merged = merge_structured_results(&local, &server);
+                let mappings = selected_idx
+                    .map(|i| &self.upstreams[i].vault_mappings)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut merged = nestweaver_federation::results::compose_tool_results(
+                    tool_name, &local, &server, &mappings,
+                );
                 if tool_name == "brain_search" {
                     nestweaver_federation::results::cap_brain_search_results(
                         &mut merged,
@@ -620,11 +683,8 @@ impl HybridClient {
                             "merge query failed",
                         );
                     }
-                } else {
-                    warn!(
-                        error = %e,
-                        "merge: upstream rejected query (server healthy — not ejecting); check auth token / arguments"
-                    );
+                } else if let Some(idx) = selected_idx {
+                    log_upstream_rejection(&self.upstreams[idx].name, &e);
                 }
                 let mut result = local;
                 inject_or_wrap_provenance(&mut result, &["local"], &[]);
@@ -633,10 +693,15 @@ impl HybridClient {
             Err(_) => {
                 debug!("merge: server query timed out, using local only");
                 if let Some(idx) = selected_idx {
-                    eject_with_cap(
-                        &self.upstreams[idx],
+                    // `timeout` was captured when the server future was built.
+                    let u = &self.upstreams[idx];
+                    handle_query_timeout_for_tool(
+                        u.mode,
+                        u,
                         &self.upstreams,
                         &self.ejection_guard,
+                        tool_name,
+                        merge_deadline.unwrap_or(u.timeout),
                         "merge query timed out",
                     );
                 }
@@ -657,11 +722,13 @@ impl HybridClient {
             inject_or_wrap_provenance(&mut result, &["local"], &[]);
             return Ok(result);
         }
-        let timeout = self.upstream_timeout(params);
+        let timeout = self.upstream_timeout(tool_name, params);
         let local = self.query_local(tool_name, params).await?;
         match self.query_upstream(tool_name, params, timeout).await {
             Ok(server) => {
-                let mut merged = concat_fanout(&local, &server);
+                let mut merged = nestweaver_federation::results::compose_fanout_results(
+                    tool_name, &local, &server,
+                );
                 inject_or_wrap_provenance(&mut merged, &["local", "server"], &[]);
                 Ok(merged)
             }
@@ -712,16 +779,32 @@ impl HybridClient {
         let mut statuses = Vec::new();
 
         // Get local repo states for staleness comparison.
-        let local_states: std::collections::HashMap<String, String> = {
+        let (local_states, local_checkout_paths): (
+            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, String>,
+        ) = {
             let req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
-            match self.local.inner_mut().repo_states(req).await {
-                Ok(resp) => resp
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.local.inner_mut().repo_states(req),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => resp
                     .into_inner()
                     .repos
                     .into_iter()
-                    .map(|r| (r.repo_url.clone(), r.indexed_sha))
-                    .collect(),
-                Err(_) => std::collections::HashMap::new(),
+                    .map(|r| {
+                        (
+                            (r.repo_url.clone(), r.indexed_sha),
+                            (r.repo_url, r.local_checkout_path),
+                        )
+                    })
+                    .unzip(),
+                _ => (
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                ),
             }
         };
 
@@ -732,6 +815,9 @@ impl HybridClient {
                 mode: format!("{:?}", upstream.mode).to_lowercase(),
                 repo_count: 0,
                 stale_repos: vec![],
+                last_query_outcome: upstream.query_outcome().to_string(),
+                ejected: !upstream.is_healthy(),
+                fallback_timeout_ms: upstream.fallback_cap().as_millis(),
             };
 
             if upstream.is_healthy() {
@@ -743,15 +829,22 @@ impl HybridClient {
                 );
                 upstream.inject_auth(&mut req);
 
-                if let Ok(resp) = client.repo_states(req).await {
+                if let Ok(Ok(resp)) =
+                    tokio::time::timeout(Duration::from_secs(5), client.repo_states(req)).await
+                {
                     let server_repos = resp.into_inner().repos;
                     status.repo_count = server_repos.len();
 
                     for server_repo in &server_repos {
-                        if let Some(local_sha) =
-                            local_sha_for_server_repo(&local_states, &server_repo.repo_url)
-                            && local_sha != server_repo.indexed_sha.as_str()
-                            && !server_repo.indexed_sha.is_empty()
+                        if let Some((local_url, local_sha)) =
+                            local_entry_for_server_repo(&local_states, &server_repo.repo_url)
+                            && nestweaver_federation::health::local_is_behind_with_checkout_path(
+                                local_url,
+                                local_checkout_paths.get(local_url).map(String::as_str),
+                                local_sha,
+                                &server_repo.indexed_sha,
+                            )
+                            .await
                         {
                             status.stale_repos.push(server_repo.repo_url.clone());
                         }
@@ -822,6 +915,21 @@ impl HybridClient {
         let upstream = find_upstream_for_repo(&self.upstreams, repo_hint)
             .context("no healthy upstream servers")?;
 
+        if let Err(e) = upstream.ensure_connected().await {
+            upstream
+                .record_query_outcome(nestweaver_federation::upstream::QueryOutcome::Unavailable);
+            if is_upstream_down(&e) {
+                eject_with_cap(
+                    upstream,
+                    &self.upstreams,
+                    &self.ejection_guard,
+                    "cold connect failed",
+                );
+            } else {
+                log_upstream_rejection(&upstream.name, &e);
+            }
+            return Err(e);
+        }
         let mut client = upstream.client();
         let token = upstream.auth_token().map(|t| t.to_string());
         let started = Instant::now();
@@ -838,10 +946,15 @@ impl HybridClient {
         .await
         {
             Ok(Ok(result)) => {
-                upstream.record_latency(started.elapsed());
+                upstream.record_tool_latency(tool_name, started.elapsed());
                 Ok(result)
             }
             Ok(Err(e)) => {
+                upstream.record_query_outcome(if is_upstream_down(&e) {
+                    nestweaver_federation::upstream::QueryOutcome::Unavailable
+                } else {
+                    nestweaver_federation::upstream::QueryOutcome::Rejected
+                });
                 debug!(upstream = %upstream.name, error = %e, "upstream query failed");
                 // Only eject on a genuine outage. A healthy server that rejects the query
                 // (auth/bad-request/internal) must stay in rotation — ejecting it would
@@ -854,24 +967,21 @@ impl HybridClient {
                         "query failed",
                     );
                 } else {
-                    warn!(
-                        upstream = %upstream.name,
-                        error = %e,
-                        "upstream rejected query (server healthy — not ejecting); check auth token / arguments"
-                    );
+                    log_upstream_rejection(&upstream.name, &e);
                 }
                 Err(e)
             }
             Err(_) => {
-                debug!(
-                    upstream = %upstream.name,
-                    timeout_ms = timeout.as_millis() as u64,
-                    "upstream query timed out"
-                );
-                eject_with_cap(
+                upstream
+                    .record_query_outcome(nestweaver_federation::upstream::QueryOutcome::Timeout);
+                log_tool_timeout(upstream, tool_name, timeout, started.elapsed());
+                handle_query_timeout_for_tool(
+                    upstream.mode,
                     upstream,
                     &self.upstreams,
                     &self.ejection_guard,
+                    tool_name,
+                    timeout,
                     "query timed out",
                 );
                 anyhow::bail!("upstream query timed out after {}ms", timeout.as_millis())
@@ -978,19 +1088,32 @@ async fn compute_stale_repos(
     local: &mut NestWeaverDaemonClient<Channel>,
     probes: &[MaintenanceProbe],
 ) -> Vec<String> {
-    let local_states: std::collections::HashMap<String, String> = {
+    let (local_states, local_checkout_paths): (
+        std::collections::HashMap<String, String>,
+        std::collections::HashMap<String, String>,
+    ) = {
         let req = tonic::Request::new(nestweaver_proto::RepoStatesRequest {});
         match local.repo_states(req).await {
             Ok(resp) => resp
                 .into_inner()
                 .repos
                 .into_iter()
-                .map(|r| (r.repo_url.clone(), r.indexed_sha))
-                .collect(),
+                .map(|r| {
+                    (
+                        (r.repo_url.clone(), r.indexed_sha),
+                        (r.repo_url, r.local_checkout_path),
+                    )
+                })
+                .unzip(),
             Err(_) => return Vec::new(),
         }
     };
-    nestweaver_federation::health::compute_stale_repos(&local_states, probes).await
+    nestweaver_federation::health::compute_stale_repos_with_checkout_paths(
+        &local_states,
+        &local_checkout_paths,
+        probes,
+    )
+    .await
 }
 
 /// Re-probe every ejected upstream whose backoff window has elapsed and fold
@@ -1090,17 +1213,30 @@ pub async fn query_configured_upstreams_only_profile(
     let repo_hint = extract_repo_hint(params);
     let upstream =
         find_upstream_for_repo(&upstreams, repo_hint).context("no healthy upstream servers")?;
+    upstream.ensure_connected().await?;
     let mut client = upstream.client();
     let token = upstream.auth_token().map(|t| t.to_string());
-    let timeout = effective_timeout(upstream.mode, upstream);
+    let timeout = effective_timeout_for_tool(upstream.mode, upstream, tool_name);
     let started = Instant::now();
     let mut result = tokio::time::timeout(
         timeout,
         dispatch_json_rpc_authed_profile(&mut client, tool_name, params, token.as_deref(), profile),
     )
     .await
+    .inspect_err(|_| {
+        log_tool_timeout(upstream, tool_name, timeout, started.elapsed());
+        handle_query_timeout_for_tool(
+            upstream.mode,
+            upstream,
+            &upstreams,
+            &Mutex::new(()),
+            tool_name,
+            timeout,
+            "upstream-only query timed out",
+        );
+    })
     .with_context(|| format!("upstream query timed out after {}ms", timeout.as_millis()))??;
-    upstream.record_latency(started.elapsed());
+    upstream.record_tool_latency(tool_name, started.elapsed());
     inject_or_wrap_provenance(&mut result, &["server"], &[]);
     Ok(result)
 }
@@ -1124,6 +1260,88 @@ fn find_upstream_for_repo<'a>(
     upstreams.iter().find(|u| u.is_healthy())
 }
 
+/// Why a HEALTHY upstream answered a query with a gRPC error (nw-872).
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamRejection {
+    /// Missing/expired/insufficient credentials.
+    Auth,
+    /// The server is fine and simply has no such target (e.g. a note that
+    /// only exists in the local vault). Expected under federation.
+    TargetNotFound,
+    /// Anything else: the status code and message are logged verbatim.
+    Other,
+}
+
+use nestweaver_engine::node_scope::TOOL_TARGET_NOT_FOUND_CODE as TARGET_NOT_FOUND_CODE;
+
+fn classify_upstream_rejection(err: &anyhow::Error) -> UpstreamRejection {
+    let Some(status) = err.chain().find_map(|e| e.downcast_ref::<tonic::Status>()) else {
+        return UpstreamRejection::Other;
+    };
+    if matches!(
+        status.code(),
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+    ) {
+        return UpstreamRejection::Auth;
+    }
+    let stamped = status
+        .metadata()
+        .get(nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY)
+        .and_then(|v| v.to_str().ok());
+    if stamped == Some(TARGET_NOT_FOUND_CODE) {
+        return UpstreamRejection::TargetNotFound;
+    }
+    UpstreamRejection::Other
+}
+
+/// Log a rejection from a healthy upstream with its real gRPC status. The old
+/// text blamed "auth token / arguments" for every rejection and, formatting
+/// only the outermost context, dropped the status (nw-872: a `note_get` miss
+/// on a server that does not hold the note read as an auth failure).
+fn local_lookup_succeeded(tool: &str, result: &Value) -> bool {
+    nestweaver_federation::results::lookup_disposition(tool, result)
+        == nestweaver_federation::results::LookupDisposition::Found
+}
+
+fn log_upstream_rejection(upstream: &str, err: &anyhow::Error) {
+    match classify_upstream_rejection(err) {
+        UpstreamRejection::TargetNotFound => {
+            debug!(upstream, error = %format!("{err:#}"), "upstream has no match for this query (server healthy)");
+        }
+        UpstreamRejection::Auth => {
+            warn!(upstream, error = %format!("{err:#}"), "upstream rejected credentials (server healthy — not ejecting); check the auth token");
+        }
+        UpstreamRejection::Other => {
+            warn!(upstream, error = %format!("{err:#}"), "upstream rejected query (server healthy — not ejecting)");
+        }
+    }
+}
+
+/// Let the upstream's `RoutingMode` override the per-tool default category.
+/// Returns the (possibly rewritten) routing and whether Fallback mode applies.
+///
+/// Only Merge/LocalFirst/ServerPreferred tools are promoted. LocalOnly,
+/// TwoTier, Combined, Continuation and FanOut carry tool-specific semantics
+/// (response shape, truncation flags, stitching) that a generic merge /
+/// server-only route would break, so the mode never rewrites them (nw-904).
+fn apply_mode_override(routing: ToolRouting, mode: RoutingMode) -> (ToolRouting, bool) {
+    if matches!(
+        routing,
+        ToolRouting::LocalOnly
+            | ToolRouting::TwoTier
+            | ToolRouting::Combined
+            | ToolRouting::Continuation
+            | ToolRouting::FanOut
+    ) {
+        return (routing, false);
+    }
+    match mode {
+        RoutingMode::Primary => (ToolRouting::ServerPreferred, false),
+        RoutingMode::Merge => (ToolRouting::Merge, false),
+        RoutingMode::Fallback => (ToolRouting::LocalFirst, true),
+    }
+}
+
 /// Extract a repo hint from query params — checks `repos[0]`, `repo`, `repo_url`.
 fn extract_repo_hint(params: &Value) -> Option<&str> {
     params
@@ -1139,6 +1357,8 @@ fn query_targets_stale_repo(repo_hint: Option<&str>, stale_repos: &[String]) -> 
     if stale_repos.is_empty() {
         return false;
     }
+    // No hint: the query is not scoped to one repo, so any genuinely stale
+    // repo (staleness itself no longer false-positives, nw-906) may affect it.
     let Some(repo_hint) = repo_hint else {
         return true;
     };
@@ -1147,11 +1367,24 @@ fn query_targets_stale_repo(repo_hint: Option<&str>, stale_repos: &[String]) -> 
         .any(|stale| repo_urls_equivalent(stale, repo_hint))
 }
 
-fn repo_urls_equivalent(a: &str, b: &str) -> bool {
-    normalized_repo_key(a) == normalized_repo_key(b)
-        || repo_name(a)
-            .zip(repo_name(b))
-            .is_some_and(|(a_name, b_name)| a_name.eq_ignore_ascii_case(&b_name))
+/// Does a query's repo `hint` name the `stale` repo? Full canonical identity
+/// (`host/owner/name`) always matches. A hostless `owner/name` hint matches a
+/// stale repo whose key ends with that `owner/name` (segment-aligned), and a
+/// bare `name` matches by leaf. A hint that names a different owner never
+/// matches by leaf (nw-906).
+fn repo_urls_equivalent(stale: &str, hint: &str) -> bool {
+    let stale_key = normalized_repo_key(stale);
+    let hint_key = normalized_repo_key(hint);
+    if stale_key == hint_key {
+        return true;
+    }
+    if hint_key.is_empty() || hint.contains("://") || hint.contains('@') {
+        return false;
+    }
+    if !hint_key.contains('/') {
+        return repo_name(stale).is_some_and(|leaf| leaf.eq_ignore_ascii_case(&hint_key));
+    }
+    stale_key.ends_with(&format!("/{hint_key}"))
 }
 
 fn fallback_should_query_server(local_count: usize, stale_repo: bool) -> bool {
@@ -1244,9 +1477,14 @@ pub async fn flow_trace_with_stitching(
     let server_name = upstream.name.clone();
     // Route cross-boundary continuation through the adaptive resolver rather
     // than the static configured timeout, mirroring the other upstream paths.
-    let up_timeout = effective_timeout(upstream.mode, upstream);
+    let up_timeout = effective_timeout_for_tool(upstream.mode, upstream, "flow_trace_continue");
 
     for boundary in &boundaries {
+        if upstream.ensure_connected().await.is_err() {
+            upstream
+                .record_query_outcome(nestweaver_federation::upstream::QueryOutcome::Unavailable);
+            continue;
+        }
         let mut up_client = upstream.client();
         let mut req = tonic::Request::new(nestweaver_proto::FlowTraceContinueRequest {
             trace_id: trace_id.clone(),
@@ -1266,7 +1504,7 @@ pub async fn flow_trace_with_stitching(
         let started = Instant::now();
         match tokio::time::timeout(up_timeout, up_client.flow_trace_continue(req)).await {
             Ok(Ok(resp)) => {
-                upstream.record_latency(started.elapsed());
+                upstream.record_tool_latency("flow_trace_continue", started.elapsed());
                 let resp = resp.into_inner();
                 // Collect visited canonical_ids from server spans.
                 for span in &resp.spans {
@@ -1301,14 +1539,19 @@ pub async fn flow_trace_with_stitching(
                 }
             }
             Err(_) => {
-                debug!(
-                    boundary = %boundary.canonical_id,
-                    "FlowTraceContinue timed out"
+                log_tool_timeout(
+                    upstream,
+                    "flow_trace_continue",
+                    up_timeout,
+                    started.elapsed(),
                 );
-                eject_with_cap(
+                handle_query_timeout_for_tool(
+                    upstream.mode,
                     upstream,
                     &client.upstreams,
                     &client.ejection_guard,
+                    "flow_trace_continue",
+                    up_timeout,
                     "flow_trace continue timed out",
                 );
                 break;
@@ -1550,6 +1793,40 @@ fn degraded_local_impact_for_unresolved_repo_filter(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn found_lookups_are_sufficient_and_partial_symbol_sets_are_not() {
+        assert!(local_lookup_succeeded(
+            "note_get",
+            &serde_json::json!({"uid":"note:x", "title":"X"})
+        ));
+        assert!(local_lookup_succeeded(
+            "get_summary",
+            &serde_json::json!({"summaries":[{"text":"X"}],"returned":1,"total":1})
+        ));
+        assert!(!local_lookup_succeeded(
+            "note_get",
+            &serde_json::json!({"status":"not_found"})
+        ));
+        for status in ["ambiguous", "unsupported", "error"] {
+            assert!(!local_lookup_succeeded(
+                "note_get",
+                &serde_json::json!({"status":status, "candidates":[]})
+            ));
+        }
+        assert!(local_lookup_succeeded(
+            "read_symbols",
+            &serde_json::json!({"symbols":[{"uid":"sym:x"}],"not_found":[]})
+        ));
+        assert!(!local_lookup_succeeded(
+            "read_symbols",
+            &serde_json::json!({"symbols":[{"uid":"sym:x"}],"not_found":["y"]})
+        ));
+        assert!(!local_lookup_succeeded(
+            "brain_search",
+            &serde_json::json!({"results":[{}]})
+        ));
+    }
+
+    #[test]
     fn explicit_error_code_overrides_legacy_looking_text() {
         let text = "repo filter entry old message";
         for code in [None, Some("repo-filter-unresolved"), Some("another-code")] {
@@ -1790,6 +2067,8 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let cfg2 = UpstreamConfig {
             name: Some("partner".to_string()),
@@ -1799,6 +2078,8 @@ mod tests {
             mode: RoutingMode::Merge,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
 
         let h1 = UpstreamHandle::from_config(&cfg1).unwrap();
@@ -1912,6 +2193,8 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&cfg).unwrap();
         handle.mark_unhealthy();
@@ -1932,6 +2215,8 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let handle = UpstreamHandle::from_config(&cfg).unwrap();
         let health = handle.health_ref();
@@ -1969,6 +2254,8 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
         let cfg_partner = UpstreamConfig {
             name: Some("partner".to_string()),
@@ -1978,6 +2265,8 @@ mod tests {
             mode: RoutingMode::Merge,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
 
         let h1 = UpstreamHandle::from_config(&cfg_acme).unwrap();
@@ -2063,5 +2352,125 @@ mod tests {
             RoutingMode::Fallback => ToolRouting::LocalFirst,
         };
         assert_eq!(overridden, ToolRouting::Merge);
+    }
+
+    // ── nw-904: tool-specific routing survives the mode override ─────────
+
+    #[test]
+    fn fanout_and_continuation_tools_are_never_rewritten_by_mode() {
+        for tool in ["regex_search", "count_patterns"] {
+            assert_eq!(tool_routing(tool), ToolRouting::FanOut, "{tool}");
+            for mode in [
+                RoutingMode::Fallback,
+                RoutingMode::Merge,
+                RoutingMode::Primary,
+            ] {
+                assert_eq!(
+                    apply_mode_override(ToolRouting::FanOut, mode),
+                    (ToolRouting::FanOut, false),
+                    "{tool} under {mode:?}"
+                );
+            }
+        }
+        assert_eq!(
+            apply_mode_override(ToolRouting::Continuation, RoutingMode::Merge).0,
+            ToolRouting::Continuation
+        );
+    }
+
+    #[test]
+    fn mode_override_still_promotes_overridable_tools() {
+        assert_eq!(
+            apply_mode_override(ToolRouting::Merge, RoutingMode::Fallback),
+            (ToolRouting::LocalFirst, true)
+        );
+        assert_eq!(
+            apply_mode_override(ToolRouting::LocalFirst, RoutingMode::Primary),
+            (ToolRouting::ServerPreferred, false)
+        );
+        assert_eq!(
+            apply_mode_override(ToolRouting::ServerPreferred, RoutingMode::Merge),
+            (ToolRouting::Merge, false)
+        );
+        for fixed in [
+            ToolRouting::LocalOnly,
+            ToolRouting::TwoTier,
+            ToolRouting::Combined,
+        ] {
+            assert_eq!(apply_mode_override(fixed, RoutingMode::Primary).0, fixed);
+        }
+    }
+
+    // ── nw-872: honest rejection classification ──────────────────────────
+
+    #[test]
+    fn healthy_upstream_note_miss_is_not_blamed_on_auth() {
+        let mut status = tonic::Status::internal("tool note_get failed: no note found");
+        status.metadata_mut().insert(
+            nestweaver_engine::node_scope::NW_ERROR_CODE_METADATA_KEY,
+            TARGET_NOT_FOUND_CODE.parse().unwrap(),
+        );
+        let err = anyhow::Error::new(status).context("note_get RPC failed");
+        assert_eq!(
+            classify_upstream_rejection(&err),
+            UpstreamRejection::TargetNotFound
+        );
+        // The rendered form keeps the real status, not just the context.
+        assert!(format!("{err:#}").contains("no note found"));
+    }
+
+    #[test]
+    fn auth_and_other_rejections_are_distinguished() {
+        let auth = anyhow::Error::new(tonic::Status::unauthenticated("bad token"))
+            .context("note_get RPC failed");
+        assert_eq!(classify_upstream_rejection(&auth), UpstreamRejection::Auth);
+        let other = anyhow::Error::new(tonic::Status::invalid_argument("bad arg"));
+        assert_eq!(
+            classify_upstream_rejection(&other),
+            UpstreamRejection::Other
+        );
+        // An unstamped NotFound (e.g. an unknown RPC) is NOT a benign lookup
+        // miss; it stays a warning with its status.
+        let unstamped = anyhow::Error::new(tonic::Status::not_found("no such method"));
+        assert_eq!(
+            classify_upstream_rejection(&unstamped),
+            UpstreamRejection::Other
+        );
+        assert_eq!(
+            classify_upstream_rejection(&anyhow::anyhow!("plain")),
+            UpstreamRejection::Other
+        );
+    }
+
+    // ── nw-906: stale-repo targeting ─────────────────────────────────────
+
+    #[test]
+    fn unhinted_queries_are_forced_when_a_repo_is_stale_and_not_when_none_is() {
+        let stale = vec!["https://github.com/acme/api".to_string()];
+        assert!(query_targets_stale_repo(None, &stale));
+        assert!(!query_targets_stale_repo(None, &[]));
+        assert!(query_targets_stale_repo(
+            Some("git@github.com:acme/api.git"),
+            &stale
+        ));
+        assert!(query_targets_stale_repo(Some("api"), &stale));
+    }
+
+    #[test]
+    fn stale_hint_matches_by_owner_name_without_cross_org_leaf_matches() {
+        let stale = vec!["https://github.com/acme/api".to_string()];
+        assert!(query_targets_stale_repo(Some("acme/api"), &stale));
+        assert!(query_targets_stale_repo(Some("ACME/API"), &stale));
+        assert!(!query_targets_stale_repo(Some("other-org/api"), &stale));
+        assert!(!query_targets_stale_repo(
+            Some("https://github.com/other-org/api"),
+            &stale
+        ));
+        assert!(!query_targets_stale_repo(
+            Some("github.com/other/api"),
+            &stale
+        ));
+        // Segment-aligned: `me/api` must not match `acme/api`.
+        assert!(!query_targets_stale_repo(Some("me/api"), &stale));
     }
 }

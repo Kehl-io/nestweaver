@@ -85,7 +85,9 @@ embedding_model = "none"
 summary_model = "none"
 
 [git]
-credential_method = "none"
+# Render-only placeholder; it must still be a method the config loader
+# accepts (nw-828 rejects unknown values at load), and it carries no secret.
+credential_method = "ssh"
 "#;
 
 impl GuideConfigProjection {

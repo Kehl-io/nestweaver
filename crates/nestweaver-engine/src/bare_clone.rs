@@ -38,6 +38,120 @@ fn guard_clone_url(url: &str) -> Result<crate::ssrf::GitNetGuard, crate::ssrf::S
     crate::ssrf::guard_git_url(url)
 }
 
+/// A `git` command for a network operation: the `[git] credential_method`
+/// helper (nw-828) applied through the isolation env, then the SSRF pin args
+/// and the low-speed guards. Every bare clone/fetch/ls-remote builds its command
+/// here so the three can never differ in how they authenticate. Poll probes in
+/// the daemon use [`crate::git_cmd::apply_git_isolation_with_credentials`]
+/// directly — the same function this calls.
+pub fn net_git_command(
+    guard: &crate::ssrf::GitNetGuard,
+    credential_method: Option<&str>,
+) -> Command {
+    let mut cmd = Command::new("git");
+    crate::git_cmd::apply_git_isolation_with_credentials(&mut cmd, credential_method);
+    cmd.args(&guard.config_args);
+    cmd.args(HTTP_LOW_SPEED_ARGS);
+    cmd
+}
+
+/// Build a network-capable command with the same origin guard, IP pins and
+/// configured credentials for fetches and reads that may lazily fetch blobs.
+pub(crate) fn guarded_git_command(
+    url: &str,
+    credential_method: Option<&str>,
+) -> Result<std::process::Command> {
+    let guard = guard_clone_url(url)?;
+    Ok(net_git_command(&guard, credential_method))
+}
+
+/// Append the remedy to a git stderr that looks like missing credentials, so a
+/// private repo without auth points the operator at `[git] credential_method`
+/// (nw-828) instead of a bare "terminal prompts disabled".
+pub fn with_credential_hint(stderr: &str, credential_method: Option<&str>) -> String {
+    let lower = stderr.to_ascii_lowercase();
+    let auth_failure = [
+        "could not read username",
+        "could not read password",
+        "terminal prompts disabled",
+        "authentication failed",
+        "permission denied (publickey",
+        "invalid username or password",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !auth_failure {
+        return stderr.to_string();
+    }
+    let current = credential_method.unwrap_or("unset");
+    format!(
+        "{stderr} (hint: the remote needs credentials; set [git] credential_method in \
+         instance.toml — currently {current}; \"gh\" for private https repos, \"ssh\" with \
+         ssh:// URLs, \"env\" with GH_TOKEN)"
+    )
+}
+
+/// Root directory for a server's bare clones (nw-827): the instance's
+/// `[workspace] path` when it is set, else `<db dir>/workspace`.
+///
+/// `~` and `~/…` expand against the home directory (no home directory: warn and
+/// use the default). An absolute path is used as is; any other relative path is
+/// relative to the database directory (never the daemon's working directory),
+/// matching the default. Every consumer of the clone root must come through here
+/// (or [`effective_clone_root`]) so the worker, backup and recovery agree.
+pub fn bare_clone_root(db_path: &Path, workspace_path: Option<&str>) -> PathBuf {
+    let db_dir = db_path.parent().unwrap_or(Path::new("."));
+    let default = db_dir.join("workspace");
+    let Some(p) = workspace_path.map(str::trim).filter(|p| !p.is_empty()) else {
+        return default;
+    };
+    if p == "~" || p.starts_with("~/") {
+        return match crate::resolve_user_path(p) {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "[workspace] path cannot be expanded; using the default clone root"
+                );
+                default
+            }
+        };
+    }
+    if Path::new(p).is_absolute() {
+        PathBuf::from(p)
+    } else {
+        db_dir.join(p)
+    }
+}
+
+static CLONE_ROOTS: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, PathBuf>>> =
+    std::sync::Mutex::new(None);
+
+/// Record the clone root a server running over `db_path` uses, so code that only
+/// has the database path (cross-repo link inference reads bare clones through
+/// it) finds the same clones as the worker without threading the root through
+/// every public signature (nw-827).
+pub fn register_clone_root(db_path: &Path, root: PathBuf) {
+    if let Ok(mut roots) = CLONE_ROOTS.lock() {
+        roots
+            .get_or_insert_with(Default::default)
+            .insert(db_path.to_path_buf(), root);
+    }
+}
+
+/// The clone root for `db_path`: the registered root, else `<db dir>/workspace`.
+pub fn effective_clone_root(db_path: &Path) -> PathBuf {
+    CLONE_ROOTS
+        .lock()
+        .ok()
+        .and_then(|roots| roots.as_ref().and_then(|m| m.get(db_path).cloned()))
+        .unwrap_or_else(|| bare_clone_root(db_path, None))
+}
+
+/// `ls-remote` operands for the HEAD probe; `--` ends option parsing before the
+/// remote name so no operand can be read as an option.
+const LS_REMOTE_HEAD_OPERANDS: [&str; 4] = ["ls-remote", "--", "origin", "HEAD"];
+
 /// Build the `git fetch` operands (subcommand + `origin` + optional refspec).
 ///
 /// For a branch-specific fetch the `<branch>:refs/heads/<branch>` refspec is
@@ -55,6 +169,31 @@ fn fetch_operands(branch: Option<&str>) -> Vec<String> {
     args
 }
 
+/// Operands for fetching specific objects (by full oid) from `origin`.
+///
+/// This is what git's own lazy fetch of promisor blobs runs, minus the
+/// one-process-per-object cost: `-c fetch.negotiationAlgorithm=noop` skips
+/// negotiation (the clone has nothing these objects build on), `--filter` keeps
+/// the promisor semantics, and the oids come after `--` so none can be read as
+/// an option.
+fn fetch_objects_operands(oids: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-c",
+        "fetch.negotiationAlgorithm=noop",
+        "fetch",
+        "origin",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--filter=blob:none",
+        "--",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    args.extend(oids.iter().cloned());
+    args
+}
+
 /// A single blobless bare clone of a remote git repository.
 #[derive(Debug, Clone)]
 pub struct BareClone {
@@ -62,6 +201,8 @@ pub struct BareClone {
     pub path: PathBuf,
     /// The remote URL this clone tracks.
     pub url: String,
+    /// `[git] credential_method` applied to network operations (nw-828).
+    pub credential_method: Option<String>,
 }
 
 impl BareClone {
@@ -99,14 +240,32 @@ impl BareClone {
     /// bare repo. Without this, `git fetch origin <branch>` in a bare clone
     /// only updates FETCH_HEAD, and `rev-parse origin/<branch>` fails.
     pub fn fetch_branch(&self, branch: Option<&str>) -> Result<()> {
-        // SSRF guard: validate + resolve the remote immediately before fetching,
-        // pinning the connect IP for http(s) (DNS-rebinding defense). Non-remote
-        // schemes (file://, git://) are rejected here (see `guard_clone_url`).
-        let guard = guard_clone_url(&self.url)?;
-        let mut cmd = Command::new("git");
-        cmd.args(&guard.config_args);
-        cmd.args(HTTP_LOW_SPEED_ARGS);
-        cmd.arg("-C").arg(&self.path).args(fetch_operands(branch));
+        self.run_fetch(self.fetch_command(fetch_operands(branch))?)
+    }
+
+    /// Fetch specific objects (full oids) from origin in ONE `git fetch`
+    /// (nw-832). Goes through the same guarded, credentialed command as
+    /// [`Self::fetch_branch`] (SSRF guard + pinned IP, isolation,
+    /// `[git] credential_method` helper, low-speed guards, hard timeout), so a
+    /// batched blob prefetch authenticates exactly like the clone and fetch do.
+    pub fn fetch_objects(&self, oids: &[String]) -> Result<()> {
+        if oids.is_empty() {
+            return Ok(());
+        }
+        self.run_fetch(self.fetch_command(fetch_objects_operands(oids))?)
+    }
+
+    /// The `git -C <clone> <operands>` command every fetch runs: SSRF-guarded
+    /// immediately before use, pinning the connect IP for http(s) (DNS-rebinding
+    /// defense); non-remote schemes (file://, git://) are rejected here (see
+    /// `guard_clone_url`).
+    fn fetch_command(&self, operands: Vec<String>) -> Result<Command> {
+        let mut cmd = guarded_git_command(&self.url, self.credential_method.as_deref())?;
+        cmd.arg("-C").arg(&self.path).args(operands);
+        Ok(cmd)
+    }
+
+    fn run_fetch(&self, cmd: Command) -> Result<()> {
         // Hard timeout so a blackholed remote can't wedge the worker (and its
         // semaphore permit) forever — it kills+reaps the process group on timeout.
         let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
@@ -115,7 +274,10 @@ impl BareClone {
             anyhow::bail!(
                 "git fetch failed for {}: {}",
                 self.url,
-                String::from_utf8_lossy(&output.stderr).trim()
+                with_credential_hint(
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                    self.credential_method.as_deref()
+                )
             );
         }
         Ok(())
@@ -170,17 +332,17 @@ impl BareClone {
     pub fn ls_remote_head(&self) -> Result<String> {
         // SSRF guard before contacting the remote (see `fetch_branch`).
         let guard = guard_clone_url(&self.url)?;
-        let mut cmd = Command::new("git");
-        cmd.args(&guard.config_args);
-        cmd.arg("-C")
-            .arg(&self.path)
-            .args(["ls-remote", "origin", "HEAD"]);
+        let mut cmd = net_git_command(&guard, self.credential_method.as_deref());
+        cmd.arg("-C").arg(&self.path).args(LS_REMOTE_HEAD_OPERANDS);
         let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
             .context("failed to run git ls-remote")?;
         if !output.status.success() {
             anyhow::bail!(
                 "git ls-remote failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                with_credential_hint(
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                    self.credential_method.as_deref()
+                )
             );
         }
         let line = String::from_utf8_lossy(&output.stdout);
@@ -210,6 +372,9 @@ impl BareClone {
 pub struct BareCloneWorkspace {
     /// Root directory for all bare clones.
     pub root: PathBuf,
+    /// `[git] credential_method` handed to every clone this workspace makes
+    /// (nw-828). `None` keeps the isolated, credential-less behavior.
+    pub credential_method: Option<String>,
 }
 
 impl BareCloneWorkspace {
@@ -219,7 +384,15 @@ impl BareCloneWorkspace {
             .with_context(|| format!("failed to create workspace dir: {}", root.display()))?;
         Ok(Self {
             root: root.to_path_buf(),
+            credential_method: None,
         })
+    }
+
+    /// Apply the instance's `[git] credential_method` to every clone, fetch and
+    /// ls-remote made through this workspace (nw-828).
+    pub fn with_credential_method(mut self, method: Option<String>) -> Self {
+        self.credential_method = method;
+        self
     }
 
     /// Get or create a bare clone for a repo URL.
@@ -239,6 +412,7 @@ impl BareCloneWorkspace {
                 return Ok(BareClone {
                     path: dest,
                     url: url.to_string(),
+                    credential_method: self.credential_method.clone(),
                 });
             }
         }
@@ -255,9 +429,7 @@ impl BareCloneWorkspace {
             std::fs::remove_dir_all(&dest).ok();
         }
 
-        let mut cmd = Command::new("git");
-        cmd.args(&guard.config_args);
-        cmd.args(HTTP_LOW_SPEED_ARGS);
+        let mut cmd = net_git_command(&guard, self.credential_method.as_deref());
         cmd.args([
             "clone",
             "--filter=blob:none",
@@ -280,13 +452,17 @@ impl BareCloneWorkspace {
             anyhow::bail!(
                 "git clone --bare failed for {}: {}",
                 url,
-                String::from_utf8_lossy(&output.stderr).trim()
+                with_credential_hint(
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                    self.credential_method.as_deref()
+                )
             );
         }
 
         Ok(BareClone {
             path: dest,
             url: url.to_string(),
+            credential_method: self.credential_method.clone(),
         })
     }
 
@@ -319,7 +495,11 @@ impl BareCloneWorkspace {
             {
                 // Try to read the origin URL from git config.
                 let url = read_origin_url(&path).unwrap_or_default();
-                clones.push(BareClone { path, url });
+                clones.push(BareClone {
+                    path,
+                    url,
+                    credential_method: self.credential_method.clone(),
+                });
             }
         }
 
@@ -1394,5 +1574,177 @@ mod tests {
             origin_result.is_err(),
             "origin/develop should NOT resolve in a bare clone"
         );
+    }
+
+    /// nw-828: the command every bare clone/fetch/ls-remote runs carries the
+    /// configured helper, and a fake `gh` really answers through it under
+    /// full isolation.
+    #[cfg(unix)]
+    #[test]
+    fn bare_clone_net_command_invokes_gh_helper_nw_828() {
+        use std::io::Write;
+        use std::process::Stdio;
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::git_cmd::tests::fake_gh_path(dir.path());
+        let guard = crate::ssrf::GitNetGuard::default();
+        let fill = |method: Option<&str>| {
+            let mut cmd = net_git_command(&guard, method);
+            cmd.args(["credential", "fill"])
+                .current_dir(dir.path())
+                .env("PATH", &path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"protocol=https\nhost=example.invalid\n\n")
+                .unwrap();
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
+        };
+        assert!(fill(Some("gh")).contains("password=synthetic-test-token"));
+        assert!(!fill(None).contains("synthetic-test-token"));
+    }
+
+    /// nw-832: the batched object fetch is built by the same command path as
+    /// `fetch_branch`, so it carries the `[git] credential_method` helper,
+    /// the isolation env, and the object operands - and never a second
+    /// hand-built git invocation.
+    #[test]
+    fn fetch_objects_uses_the_credentialed_fetch_command_nw_832() {
+        let env_of = |cmd: &Command| -> Vec<String> {
+            cmd.get_envs()
+                .filter(|(k, _)| k.to_string_lossy().starts_with("GIT_CONFIG_VALUE_"))
+                .filter_map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+                .collect()
+        };
+        let clone = |method: Option<&str>| BareClone {
+            path: PathBuf::from("/nonexistent/repo.git"),
+            url: "file:///nonexistent/src".to_string(),
+            credential_method: method.map(str::to_string),
+        };
+        let oids = vec!["a".repeat(40), "b".repeat(40)];
+
+        let gh = clone(Some("gh"));
+        let cmd = gh.fetch_command(fetch_objects_operands(&oids)).unwrap();
+        assert!(
+            env_of(&cmd).contains(&"!gh auth git-credential".to_string()),
+            "the gh helper must reach the object fetch: {:?}",
+            env_of(&cmd)
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dash = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&args[dash + 1..], oids.as_slice());
+        assert!(args.contains(&"--filter=blob:none".to_string()));
+        assert!(args.contains(&"fetch".to_string()) && args.contains(&"origin".to_string()));
+
+        // Same helper table as fetch_branch for the same method, and none
+        // without one.
+        let branch_cmd = gh.fetch_command(fetch_operands(None)).unwrap();
+        assert_eq!(env_of(&branch_cmd), env_of(&cmd));
+        let plain = clone(None)
+            .fetch_command(fetch_objects_operands(&oids))
+            .unwrap();
+        assert!(!env_of(&plain).contains(&"!gh auth git-credential".to_string()));
+    }
+
+    /// nw-828: the workspace's method reaches every `BareClone` it hands out.
+    #[test]
+    fn workspace_credential_method_propagates_to_clones_nw_828() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        create_source_repo(&src, &[("a.txt", "a")]);
+        let ws = BareCloneWorkspace::new(&tmp.path().join("workspace"))
+            .unwrap()
+            .with_credential_method(Some("gh".to_string()));
+        let url = format!("file://{}", src.display());
+        let clone = ws.ensure_clone(&url).unwrap();
+        assert_eq!(clone.credential_method.as_deref(), Some("gh"));
+        let again = ws.ensure_clone(&url).unwrap();
+        assert_eq!(again.credential_method.as_deref(), Some("gh"));
+        assert!(
+            ws.list_clones()
+                .unwrap()
+                .iter()
+                .all(|c| c.credential_method.as_deref() == Some("gh"))
+        );
+    }
+
+    /// nw-828: an auth failure names `credential_method` as the remedy; other
+    /// errors are left alone.
+    #[test]
+    fn auth_failures_name_credential_method_nw_828() {
+        let hinted = with_credential_hint(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            None,
+        );
+        assert!(hinted.contains("credential_method"), "{hinted}");
+        assert!(hinted.contains("unset"));
+        assert_eq!(
+            with_credential_hint("fatal: repository not found", Some("gh")),
+            "fatal: repository not found"
+        );
+    }
+
+    /// nw-827: `[workspace] path` wins; the db-dir fallback applies otherwise.
+    #[test]
+    fn bare_clone_root_honors_workspace_path_nw_827() {
+        let db = Path::new("/data/nw/brain.lbug");
+        assert_eq!(
+            bare_clone_root(db, Some("/mnt/big/workspaces")),
+            PathBuf::from("/mnt/big/workspaces")
+        );
+        assert_eq!(
+            bare_clone_root(db, None),
+            PathBuf::from("/data/nw/workspace")
+        );
+        assert_eq!(
+            bare_clone_root(db, Some("  ")),
+            PathBuf::from("/data/nw/workspace")
+        );
+        assert_eq!(
+            bare_clone_root(db, Some("clones")),
+            PathBuf::from("/data/nw/clones")
+        );
+    }
+
+    /// nw-827: `~` in `[workspace] path` expands (documented config form) and
+    /// never becomes a literal `~` directory under the db dir.
+    #[test]
+    fn bare_clone_root_expands_tilde_nw_827() {
+        let Some(home) = dirs::home_dir() else { return };
+        let db = Path::new("/data/nw/brain.lbug");
+        assert_eq!(bare_clone_root(db, Some("~/x/y")), home.join("x/y"));
+        assert_eq!(bare_clone_root(db, Some("~")), home);
+        for p in ["~/x", "~"] {
+            let root = bare_clone_root(db, Some(p));
+            assert!(root.components().all(|c| c.as_os_str() != "~"), "{root:?}");
+            assert!(!root.starts_with("/data/nw"));
+        }
+    }
+
+    /// Operands that follow `--` can never be parsed as options.
+    #[test]
+    fn ls_remote_operands_end_options_before_operands() {
+        assert_eq!(LS_REMOTE_HEAD_OPERANDS[1], "--");
+        assert_eq!(LS_REMOTE_HEAD_OPERANDS[0], "ls-remote");
+    }
+
+    /// nw-827: a registered root is what db-path-only consumers see.
+    #[test]
+    fn registered_clone_root_is_effective_nw_827() {
+        let db = Path::new("/data/reg-test/brain.lbug");
+        assert_eq!(
+            effective_clone_root(db),
+            PathBuf::from("/data/reg-test/workspace")
+        );
+        register_clone_root(db, PathBuf::from("/mnt/custom"));
+        assert_eq!(effective_clone_root(db), PathBuf::from("/mnt/custom"));
     }
 }

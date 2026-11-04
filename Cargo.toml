@@ -46,7 +46,9 @@ nestweaver-federation = { path = "crates/nestweaver-federation" }
 nestweaver-daemon = { path = "crates/nestweaver-daemon" }
 nestweaver-client = { path = "crates/nestweaver-client" }
 nestweaver-embed = { path = "crates/nestweaver-embed" }
-tonic = { version = "0.14", features = ["tls-ring"] }
+# tls-native-roots: grpcs:// upstreams verify against the OS trust store when no
+# --ca-cert is given (nw-833); the dep is already in the lock via the AWS SDK.
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tonic-prost = "0.14"
 prost = "0.14"
 tonic-build = "0.14"
@@ -148,6 +150,7 @@ nestweaver-daemon = { workspace = true }
 nestweaver-proto = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
+tokio-stream = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 libc = "0.2"
 blake3 = { workspace = true }

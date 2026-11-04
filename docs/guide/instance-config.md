@@ -116,7 +116,16 @@ path = "/path/to/snapshots"
 
 #### `[workspace]`
 
-Where source code is pulled on demand.
+Where source code is pulled on demand. In server mode the same `path` is the
+root of the bare clones the worker keeps (`<path>/<name>_<hash>.git`); when it
+is empty the root falls back to `workspace/` beside the database. The daemon
+logs the effective clone root at startup (`bare clone root`). `~` and `~/...`
+expand to the home directory; an absolute path is used as is; any other
+relative path is relative to the database directory. The value is read at
+startup: a change takes effect at the next restart and does not move existing
+clones (the worker re-clones into the new root). A backup restore places clones
+under `workspace/` beside the database, so with a custom `path` either point
+`path` at that directory or let the worker re-clone after a restore.
 
 ```toml
 [workspace]
@@ -338,11 +347,23 @@ For a generated MCP registration to see any of this, it must be started with
 
 #### `[git]`
 
-How to authenticate git operations.
+How to authenticate git operations. In server mode the method applies to the
+bare clone, fetch and the poll `ls-remote` as well as to pulls, even though
+those commands ignore the host's global git config and credential helpers. A
+failed private-repo clone names `credential_method` as the remedy. The value
+is read at startup; changing it takes effect at the next restart.
+
+- `gh` uses `gh auth git-credential` (the GitHub CLI must be logged in).
+- `env` answers with `GH_TOKEN` (or defers to `GIT_ASKPASS`), only for
+  `github.com` and the host in `GH_HOST`, never other hosts.
+- `ssh` uses SSH keys; use `ssh://` repo URLs.
+- `credential-helper` means the ambient git config. Server mode withholds the
+  ambient config on purpose, so in server mode this method authenticates
+  nothing; choose `gh`, `env` or `ssh`.
 
 ```toml
 [git]
-credential_method = "gh"   # "gh" | "ssh" | "credential-helper"
+credential_method = "gh"   # "gh" | "env" | "ssh" | "credential-helper"
 ```
 
 #### `[[repos]]`
@@ -437,6 +458,12 @@ Notes:
   first-index fallback — so every route indexes the same files.
 - **Changing `exclude` needs a re-index** of that repo. Previously-indexed files
   are not retroactively removed by editing the config alone.
+- **Server mode honours `exclude` and `unskip` too.** Repos the server clones and
+  indexes (blobless bare clones) apply them exactly as a local index does. A
+  change takes effect at that repo's next indexed commit, or immediately if you
+  force a re-index; the next index after the change is a full one. Source files
+  that are not valid UTF-8 are indexed with the invalid bytes replaced, as they
+  are locally, rather than failing the repo.
 
 ### Optional sections
 

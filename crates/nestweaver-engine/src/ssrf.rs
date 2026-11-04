@@ -13,17 +13,34 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// True if a V4 address is an internal/non-routable target we must never reach
-/// (loopback, RFC1918 private, link-local, CGNAT/RFC 6598 `100.64.0.0/10`, or
-/// the unspecified `0.0.0.0`, which routes to loopback on some platforms).
+/// True if a V4 address is an internal/non-routable target we must never reach:
+/// loopback, RFC1918 private, link-local, CGNAT/RFC 6598 `100.64.0.0/10`, the
+/// "this network" block `0.0.0.0/8` (which routes to loopback on some
+/// platforms), the IETF protocol block `192.0.0.0/24` (includes the Oracle
+/// Cloud legacy metadata address `192.0.0.192`), benchmarking `198.18.0.0/15`,
+/// documentation ranges, multicast `224.0.0.0/4`, reserved `240.0.0.0/4`
+/// (includes broadcast), and the Azure WireServer `168.63.129.16` (nw-877).
 pub fn v4_is_internal(v4: Ipv4Addr) -> bool {
     let octets = v4.octets();
     v4.is_loopback()
         || v4.is_private()
         || v4.is_link_local()
         || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_multicast()
+        // 0.0.0.0/8 "this network"
+        || octets[0] == 0
+        // 240.0.0.0/4 reserved (incl. 255.255.255.255)
+        || octets[0] >= 240
         // CGNAT / Shared Address Space (RFC 6598): 100.64.0.0/10
         || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        // IETF protocol assignments 192.0.0.0/24 (Oracle IMDS legacy 192.0.0.192)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        // Benchmarking 198.18.0.0/15
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+        // Azure WireServer / platform endpoint
+        || v4 == Ipv4Addr::new(168, 63, 129, 16)
 }
 
 /// Extract an embedded IPv4 from the IPv6 transition forms that can smuggle an
@@ -72,6 +89,23 @@ pub fn ip_is_internal(ip: IpAddr) -> bool {
             }
             // Link-local fe80::/10 (is_unicast_link_local is nightly-only).
             if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // Deprecated site-local fec0::/10 (nw-877).
+            if (v6.segments()[0] & 0xffc0) == 0xfec0 {
+                return true;
+            }
+            // Multicast ff00::/8 (nw-877).
+            if (v6.segments()[0] & 0xff00) == 0xff00 {
+                return true;
+            }
+            // Documentation 2001:db8::/32 (nw-877).
+            if v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8 {
+                return true;
+            }
+            // Local-use NAT64 64:ff9b:1::/48 (RFC 8215; not the well-known
+            // /96 handled by `embedded_ipv4`) (nw-877).
+            if v6.segments()[0] == 0x0064 && v6.segments()[1] == 0xff9b && v6.segments()[2] == 1 {
                 return true;
             }
             // NAT64 / 6to4 / v4-compatible embedding an internal V4 target.
@@ -224,6 +258,20 @@ pub fn validate_repo_url(url: &str) -> Result<(), String> {
         ));
     }
 
+    // nw-876: the guard validates the host the `url` crate (WHATWG rules, where
+    // `\` is a `/`) extracts, but git hands the SAME raw string to libcurl,
+    // which treats `\` as ordinary userinfo. `http://github.com\@127.0.0.1/x`
+    // therefore validates as `github.com` while git dials `127.0.0.1`. No
+    // legitimate remote URL contains a backslash (or its percent-encoding), so
+    // reject them outright: the string git receives is then parsed identically
+    // by both parsers. (We reject rather than re-serialize so every caller that
+    // passes the original string on to git stays correct without changes.)
+    if url.contains('\\') || url.to_ascii_lowercase().contains("%5c") {
+        return Err(format!(
+            "invalid URL '{url}': backslashes (or %5c) are not allowed"
+        ));
+    }
+
     // Validate URL scheme to prevent SSRF via file:// or other unexpected schemes.
     let allowed_schemes = ["https", "http", "ssh"];
     let parsed = match url::Url::parse(url) {
@@ -239,6 +287,23 @@ pub fn validate_repo_url(url: &str) -> Result<(), String> {
             return Err(format!("invalid URL '{url}': {e}"));
         }
     };
+
+    // A network remote needs a host. `ssh:foo` parses with no host, but git
+    // reads it as scp-form `ssh:foo` (host "ssh"): the guard would validate
+    // nothing while git dials something.
+    if parsed.host_str().is_none() {
+        return Err(format!("invalid URL '{url}': missing host"));
+    }
+    // More than one `@` in the authority is a userinfo/host ambiguity no
+    // legitimate remote needs (nw-876 hardening).
+    if let Some(rest) = url.split_once("://").map(|(_, r)| r) {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.matches('@').count() > 1 {
+            return Err(format!(
+                "invalid URL '{url}': ambiguous userinfo (multiple '@' in authority)"
+            ));
+        }
+    }
 
     // SSRF prevention: reject internal/private targets (OWASP SSRF Prevention
     // Cheat Sheet). `parse_host_as_ip` also catches alternate IPv4 encodings
@@ -757,5 +822,83 @@ mod tests {
             resolve_config_arg("example.com", 443, v6),
             "http.curloptResolve=example.com:443:[2606:2800:220:1::1]"
         );
+    }
+
+    /// nw-876: `\` is a path separator to the `url` crate but userinfo to
+    /// libcurl, so `host\@internal` validated as `host` while git dialed
+    /// `internal`. Both parsers must see the same host, so such URLs are
+    /// rejected for http, https and ssh, in raw and percent-encoded form.
+    #[test]
+    fn backslash_userinfo_url_is_rejected_nw_876() {
+        for url in [
+            "http://github.com\\@127.0.0.1:18599/x.git",
+            "https://github.com\\@127.0.0.1/x.git",
+            "https://github.com%5c@127.0.0.1/x.git",
+            "https://github.com%5C@169.254.169.254/x.git",
+            "ssh://git\\@127.0.0.1/x.git",
+            "https://github.com/a\\b.git",
+        ] {
+            assert!(validate_repo_url(url).is_err(), "{url} must be rejected");
+            assert!(!config_repo_url_allowed(url), "{url} config gate");
+            assert!(guard_git_url(url).is_err(), "{url} must fail the guard");
+        }
+        // Ordinary userinfo is untouched.
+        assert!(validate_repo_url("https://user@github.com/acme/api.git").is_ok());
+        assert!(validate_repo_url("https://user@github.com/x").is_ok());
+        // Hostless and multi-`@` forms are refused.
+        for url in [
+            "ssh:foo",
+            "https://a@b@127.0.0.1/x",
+            "https://github.com@127.0.0.1@evil.example/x",
+        ] {
+            assert!(validate_repo_url(url).is_err(), "{url} must be rejected");
+        }
+    }
+
+    /// nw-877: ranges the original table missed (cloud metadata, benchmarking,
+    /// "this network", reserved/multicast/documentation, IPv6 site-local etc.).
+    #[test]
+    fn denylist_covers_metadata_and_special_use_ranges_nw_877() {
+        for s in [
+            "192.0.0.192",
+            "168.63.129.16",
+            "198.18.0.1",
+            "198.19.255.254",
+            "0.1.2.3",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.5",
+            "224.0.0.1",
+            "239.255.255.255",
+            "240.0.0.1",
+            "255.255.255.255",
+            "fec0::1",
+            "ff02::1",
+            "64:ff9b:1::1",
+            "2001:db8::1",
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(ip_is_internal(ip), "{s} must be internal");
+            let host = if ip.is_ipv6() {
+                format!("[{s}]")
+            } else {
+                s.to_string()
+            };
+            assert!(
+                validate_repo_url(&format!("http://{host}/")).is_err(),
+                "{s} must be rejected as a repo host"
+            );
+        }
+        // Neighbours of the new ranges stay public.
+        for s in [
+            "168.63.129.17",
+            "198.17.255.255",
+            "198.20.0.1",
+            "192.0.1.1",
+            "1.2.3.4",
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!ip_is_internal(ip), "{s} must stay public");
+        }
     }
 }

@@ -39,8 +39,114 @@ nestweaver daemon --db ./brain.lbug run \
 | `--acme-production` | Use the Let's Encrypt **production** directory. The default is **staging** (untrusted certs, high rate limits), so issuance can be debugged without a rate-limit ban. Pass this only once the staging flow works end to end |
 | `--port-file <path>` | Write the actual bound port to this file — the way to read an ephemeral `--bind …:0` port programmatically |
 
+For a snapshot replica, keep using the original `--db` path for `daemon status`,
+`daemon stop` and `ui`. The daemon manages its private materialized copy; its
+endpoint identity remains bound to the selected path.
+Reads such as `brain status` and `brain search` can use that anchor while the
+verified replica is running. With no live local endpoint, an absent anchor
+uses configured upstreams or reports a missing database; it never starts a
+daemon that creates an empty store.
+
+Snapshots can include verified Markdown derivation proof and its captured
+graph generation when all vaults have complete current filesystem coverage.
+Such replicas can serve `brain orphans`, `brain topic-clusters`,
+`brain tag-graph` and `brain doc-stats` without mounting the producer's paths,
+provided the configured note-size and ignore policy matches. Managed bare
+providers are not certified by this portable proof. Older or uncertified
+snapshots remain searchable; derived reads report that an upstream refresh is
+required. A declared but invalid proof or generation rejects verification.
+Readers must support the `markdown-derivation-proof-v1` capability to import
+snapshots carrying it; older readers reject these snapshots.
+
+A `--bind` that is not a literal socket address (`localhost:9378`, `0:9378`,
+`myhost:9378`) is resolved once at startup, and both the gRPC and MCP HTTP
+listeners bind exactly that validated address set (MCP on port + 1). If every resolved address is loopback it
+is treated as loopback; if any is not, or the name cannot be resolved, it is
+treated as non-loopback and requires both `--auth-token` and TLS.
+
 `--acme-*` is a third TLS option alongside self-signed (`server init-tls`) and
 bring-your-own (`--tls-cert`/`--tls-key`); see [TLS Setup](#tls-setup).
+
+### Runtime directory and systemd
+
+The daemon's socket, pidfile, and lock live in
+`$XDG_RUNTIME_DIR/nestweaver/<instance>/`. When `XDG_RUNTIME_DIR` is unset
+(a systemd **system** unit, cron, a sanitized launcher) on Linux, the daemon
+uses `/run/user/<uid>/nestweaver/<instance>/` if that directory exists and is
+owned by the same user (it is where an interactive session of that user
+resolves `XDG_RUNTIME_DIR`), and otherwise
+`~/.local/state/nestweaver/<instance>/`.
+
+The daemon, CLI, and MCP stdio server share this resolution. On Linux, clients
+probe the resolved runtime directory, the state directory, and the owned
+`/run/user/<uid>/nestweaver/<instance>/` directory, without duplicates. A caller's
+different `XDG_RUNTIME_DIR` therefore does not hide a system unit's socket. The
+daemon binds only its primary directory; `daemon status` reports the actual
+selected socket.
+
+This system-unit example deliberately leaves `XDG_RUNTIME_DIR` unset. A
+dedicated service account that never logs in has no `/run/user/<uid>`, so the
+daemon uses the state fallback and needs no login session or lingering. If the
+account can log in interactively, `/run/user/<uid>` exists while a session is
+open, the daemon binds there, and logind removes that directory when the last
+session ends unless lingering is enabled: run `loginctl enable-linger <user>`
+for such an account, or the socket, pidfile and lock vanish under a running
+daemon and clients fall through to the state directory and autostart a second
+writer. Create the `nestweaver` user/group and configure Git credentials for
+that account. Provide
+the instance config and readable TLS files; put `NESTWEAVER_AUTH_TOKEN` and any
+admin token in a root-owned, mode-0600 `/etc/nestweaver/server.env`:
+
+```ini
+# /etc/systemd/system/nestweaver-server.service
+[Unit]
+Description=NestWeaver server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nestweaver
+Group=nestweaver
+Environment=HOME=/var/lib/nestweaver
+EnvironmentFile=/etc/nestweaver/server.env
+UnsetEnvironment=XDG_RUNTIME_DIR XDG_STATE_HOME
+StateDirectory=nestweaver
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/nestweaver
+UMask=0077
+ExecStart=/usr/local/bin/nestweaver daemon --db /var/lib/nestweaver/brain.lbug run --config /etc/nestweaver/instance.toml --server --bind 0.0.0.0:9378 --tls-cert /etc/nestweaver/tls/server.pem --tls-key /etc/nestweaver/tls/server.key
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=infinity
+SendSIGKILL=no
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+```
+
+systemd creates the state directory with the configured ownership before
+`ExecStart`. NestWeaver accepts `/run/user/<uid>` only when it is a real
+directory owned by the service UID; let logind manage that directory. If an
+operator instead pins that user runtime path explicitly, enable lingering for
+the account and add `Requires=user@<uid>.service` and
+`After=user@<uid>.service`, using its actual numeric UID. The default-fallback
+example above needs neither dependency.
+
+Run local clients as the same account with the same HOME/state configuration.
+If the daemon started in the state directory before a user runtime directory
+existed, later clients still find it through the state candidate. A deliberately
+custom daemon runtime path outside these candidates must also be configured in
+its clients.
+
+There is no `ExecStop` wrapper: `systemctl stop nestweaver-server` sends SIGTERM
+to the foreground daemon and waits for its drain. Merely queued/deferred jobs
+persist for the next start and do not delay an otherwise idle stop. Genuine
+in-flight writes or index jobs are allowed to finish without an automatic kill
+deadline, even if the unit stays deactivating indefinitely. See
+[Daemon shutdown](guide/daemon-shutdown.md) before changing this stop policy; a
+finite 690 s or 720 s timeout is not a safe completion guarantee.
 
 ### Environment variables
 
@@ -67,6 +173,12 @@ workers = 8
 min_poll = "45s"
 max_poll = "8h"
 ```
+
+Durations accept only the units `ms`, `s`, `m` and `h` (for example `45s`, `5m`,
+`8h`) — no `d`/`w`, fractions or bare numbers. An unparseable duration logs a
+warning and the default is used. `workers` must be between 1 and 1024, and
+`min_poll`/`max_poll` must each be greater than zero with `min_poll <= max_poll`;
+otherwise config load (startup and reload) fails with an error.
 
 ### Embedding backend and readiness
 
@@ -252,6 +364,16 @@ load stays failed until an operator acts.
 
 ### Write-path visibility
 
+During indexing, JSON `brain status` can return the last completed graph
+observation instead of waiting behind an atomic write. `status_observation`
+reports its age, generation and whether it is stale or busy; the text command
+labels those counts. Graph changes or a 30-second age limit trigger a refresh;
+configuration annotations can lag until that refresh. Authorization and
+operation-time configuration checks remain current. Owner, write queue, dirty
+publication, derivation progress and reconciliation debt remain live. The
+typed `BrainStatus` RPC returns retryable `Unavailable` when it cannot provide
+current counts; use `BrainStatusJson` for disclosed last-observed counts.
+
 `brain status` reports two different queues, and they are not
 interchangeable:
 
@@ -313,6 +435,18 @@ The server listens on two ports: gRPC (:9378) and MCP-over-HTTP (:9379). The web
 The MCP HTTP listener inherits the `--bind` IP and is **gRPC port + 1** for fixed binds. So `--bind 0.0.0.0:9378` exposes MCP-over-HTTP (with `/webhook`, `/admin/api/*`, and `/metrics`) on `0.0.0.0:9379` — relevant when publishing ports from Docker. Exception: with an ephemeral `--bind 127.0.0.1:0` the gRPC port is OS-assigned at runtime, so the MCP listener binds its own ephemeral port (`:0`) instead of gRPC + 1; read both actual ports from the daemon's port file or startup log.
 
 The MCP endpoint is **`POST /mcp`** on the HTTP port.
+
+Rate limits are per principal, not per `mcp-session-id`: the bucket is keyed by
+the bearer token and its role (admin or query), so minting additional sessions,
+or changing source address, does not add request budget. **All clients sharing
+one query token share its 120 requests/minute**; a session is additionally
+capped on its own. Admin-token requests are not rate limited.
+
+Tool calls are bounded to 30 seconds. A read-only tool past the deadline is
+cancelled and reports `exceeded 30s timeout`. A **mutating** tool cannot be
+aborted mid-write: past the deadline the response says it is still running and
+may still commit. Check the result (for example with `brain_status`) before
+re-issuing it.
 
 ### MCP request IDs and cancellation
 
@@ -552,7 +686,7 @@ When TLS is enabled:
 
 ## Repo Configuration
 
-Repos are declared in the instance config. The server clones them as blobless bare repos (~90% smaller than full clones) and indexes them automatically. Each `[[repos]]` entry requires `url`; `name` is an optional display alias, and `type` is optional (`code` is the default, `vault` indexes Markdown).
+Repos are declared in the instance config. The server clones them as blobless bare repos (~90% smaller than full clones) and indexes them automatically. Each `[[repos]]` entry requires `url`; `name` is an optional display alias, and `type` is optional (`code` is the default, `vault` indexes Markdown). `exclude` and `unskip` apply to server-side indexing as they do locally (see [Excludes](guide/instance-config.md)); a change takes effect at the next indexed commit or a forced re-index.
 
 ```toml
 [[repos]]
@@ -568,6 +702,12 @@ poll = "2m"              # optional: override adaptive polling interval
 url = "https://github.com/acme/shared-vault"
 type = "vault"           # index as markdown vault, not code
 ```
+
+
+### How config changes are applied
+
+- **Persistence.** Admin add/remove rewrite the instance config atomically (temp file, fsync, rename) under an in-process lock and a cross-process sidecar lock, so concurrent admin calls all persist and readers never see a partial file. A symlinked config is followed and stays a symlink. Because the write is a rename, the config's directory must be writable, and a single-file bind mount of the config cannot be updated (mount the directory instead). Only the file mode is preserved (not owner, ACLs or xattrs). Cooperating CLI and daemon writers also use a stable `<config>.lock` beside the canonical target; a competing process is refused with “config is being edited by another process” and can retry, rather than overwriting an acknowledged edit. External editors that ignore this lock are not serialized.
+- **Reload and restart.** Newly declared repos are queued; a changed `branch` re-queues the repo; jobs (including dead letters) for repos no longer declared are cancelled, at reload and at startup. A dead-lettered repo stays quarantined across reload and restart until retried via `/admin/api/dead-letter/{id}/retry`; a corrected `branch` is recorded for that retry. A changed `type`, `exclude` or `unskip` policy takes effect on reload and queues a full repair even when the indexed Git SHA is unchanged. Code/vault strategy transitions replace the old graph and publish the new repo SHA/policy in one transaction; failed replacement preserves the prior graph. Other boot settings, such as worker count, credentials and workspace root, still need a restart.
 
 ### Vault repos
 
@@ -589,10 +729,22 @@ Configure how the server authenticates to Git remotes:
 
 ```toml
 [git]
-credential_method = "gh"    # use `gh auth token` (GitHub CLI)
-# credential_method = "env" # use GIT_ASKPASS or GH_TOKEN env var
-# credential_method = "ssh" # use SSH keys
+credential_method = "gh"    # use `gh auth git-credential` (GitHub CLI)
+# credential_method = "env" # use GIT_ASKPASS, or GH_TOKEN for github.com / $GH_HOST only
+# credential_method = "ssh" # use SSH keys (ssh:// repo URLs)
 ```
+
+The method applies to the bare clone, fetch and the poll `ls-remote`, and is read at
+startup (restart to change it). `credential-helper` means ambient git config, which
+server mode withholds on purpose, so it authenticates nothing there.
+
+### Clone root
+
+Bare clones live under `[workspace] path` when set (`~` expands; a relative path is
+relative to the database directory), else `workspace/` beside the database. The
+daemon logs the effective root at startup (`bare clone root`). A backup restore puts
+clones under `workspace/` beside the database; with a custom `path`, the worker
+re-clones into the configured root after a restore.
 
 ---
 
@@ -624,6 +776,8 @@ Webhooks provide near-instant re-indexing when code is pushed. The server also r
 
 Gitea signs the payload with its own `X-Gitea-Signature` header, carrying a raw hex HMAC-SHA256 of the body — without the `sha256=` prefix that GitHub's `X-Hub-Signature-256` uses. The server accepts a request that bears *either* a valid GitHub *or* a valid Gitea signature (it tries both), using the same `--webhook-secret` / `--webhook-secret-old` rotation pair. The repo URL is read from `repository.clone_url`, just like GitHub.
 
+A webhook is matched to a configured repo by its normalized `host/path` across ssh, scp-like and https spellings (scheme, userinfo, `.git`, trailing slash and case are ignored): the `https://` clone URL a forge sends reaches a repo configured as `ssh://git@host/org/repo` or `git@host:org/repo`. A non-default port is part of the identity, so `ssh://git@host:2222/org/repo` does not match an `https://host/org/repo` payload. Only configured repos match (payloads with backslashes, percent-escapes, dot-segments or an ambiguous host are ignored), and the job is queued with the configured URL and branch, never the payload's.
+
 ### Webhook configuration
 
 The webhook secret is set via CLI flag or environment variable (not the config file):
@@ -653,7 +807,14 @@ During rotation, the server checks the new secret first, falls back to the old s
 
 ## Adaptive Polling
 
-The server automatically polls repos for changes using `git ls-remote`. The polling interval adapts based on repo activity:
+The server automatically polls repos for changes using `git ls-remote`. Probes
+run concurrently, at most eight at a time. Each read-only probe holds its slot
+through DNS resolution and the bounded git command. A stalled resolver can
+occupy a slot until the operating system returns, but does not retain Tokio's
+blocking pool during foreground shutdown. Cancellation prevents a late DNS
+result from starting git, and an active git probe is cancelled and reaped.
+Scheduler commands and other available probe slots remain responsive. The
+polling interval adapts based on repo activity:
 
 ```
 base     = time_since_last_commit / 2
@@ -673,7 +834,8 @@ not say:
 | unhealthy / not configured | `min_poll` (default 45s) |
 
 So configuring `min_poll = "45s"` does **not** give you 45-second polling while
-webhooks are working; you will see ~5 minutes as the floor, jittered.
+webhooks are working; you will see ~5 minutes as the floor, jittered. If the
+floor exceeds `max_poll`, `max_poll` wins.
 
 ```toml
 [server.indexing]
@@ -724,6 +886,13 @@ one: `POST /admin/api/repos/{id}/reindex`, or `nestweaver index --repo <path>
 nestweaver connect grpcs://nestweaver.internal:9378 --device
 ```
 
+The verification URI is built from the request `Host` (or the HTTP/2
+`:authority`) and `X-Forwarded-Proto`. Only `http`/`https` schemes and a valid
+`host[:port]` are honored; anything else falls back to the address the server
+itself serves on. The client opens the URL in your browser only when it is
+`http(s)` and its host is the server you connected to; otherwise it just prints
+it.
+
 This runs the OAuth 2.0 Device Authorization Grant (RFC 8628): the client prints a short user code, opens your browser to the verification page, and waits while an admin approves the request. On approval the issued token is written to your client config automatically — no token needs to be shared out-of-band. `--device` is implied when you omit `--token`, so `nestweaver connect <url>` alone triggers the same flow.
 
 **Alternative — explicit token:**
@@ -744,7 +913,7 @@ nestweaver brain status
 
 The client discovers upstream servers from (highest priority first):
 
-1. `NESTWEAVER_UPSTREAM` and `NESTWEAVER_TOKEN` environment variables
+1. `NESTWEAVER_UPSTREAM`, `NESTWEAVER_TOKEN` and `NESTWEAVER_CA_CERT` environment variables (`NESTWEAVER_CA_CERT` is the path to a CA PEM, for CI thin clients that must trust a private CA from `server init-tls` without a config file in the checkout)
 2. `.nestweaver/server.toml` in the current repo (checked into source)
 3. `~/.config/nestweaver/upstreams.toml` (user config, written by `nestweaver connect`)
 4. `instance.toml` `[[upstream]]` section
@@ -758,6 +927,7 @@ Check this file into your repo so every developer auto-connects:
 url = "grpcs://nestweaver.internal:9378"
 token = "${NESTWEAVER_TOKEN}"
 mode = "fallback"
+# ca_cert = "/path/to/ca.crt"   # optional, same as the other config files
 ```
 
 ### User-level config (~/.config/nestweaver/upstreams.toml)
@@ -781,13 +951,20 @@ url = "grpcs://nestweaver.internal:9378"
 token = "${NESTWEAVER_TOKEN}"
 mode = "fallback"
 timeout = "1s"                # optional: upstream request ceiling (default 1s)
+fallback_timeout = "200ms"    # optional: fallback-mode deadline cap (default 200ms, never above timeout)
 ca_cert = "/path/to/ca.crt"   # optional: for self-signed certificates
 ```
 
 When connecting to a server using self-signed TLS certificates (e.g., generated
-by `nestweaver server init-tls`), set `ca_cert` to the path of the CA certificate
-PEM file. This tells the client to trust the server's certificate even though it
-is not signed by a public CA.
+by `nestweaver server init-tls`), set `ca_cert` (or `--ca-cert` on
+`nestweaver connect`, or `NESTWEAVER_CA_CERT` for env discovery) to the path of
+the CA certificate PEM file. When `ca_cert` is set, **only that CA** is trusted for the upstream
+(it pins the server). With no `ca_cert`, a `grpcs://` URL verifies against the
+operating system's trust store, so a server behind a publicly trusted
+certificate (for example a reverse proxy with a Let's Encrypt certificate)
+needs no extra configuration. If the host has no system CA roots and no
+`ca_cert` is given, the connection fails with an error that names `--ca-cert`
+and `NESTWEAVER_CA_CERT`.
 
 ---
 
@@ -839,8 +1016,9 @@ alongside the returned rows:
 - `truncated` is true whenever the total is a lower bound or fewer rows were
   returned than the exact total.
 - Every row, including `response_format: "concise"`, carries its canonical
-  domain-qualified `uid`. Hybrid deduplication uses that identity rather than
-  presentation fields such as title or location.
+  domain-qualified `uid`. Hybrid deduplication keys on that uid rather than on
+  presentation fields such as title or location; the only use of a note's title
+  is as a merge guard inside a corroborated cross-tier vault pair (see below).
 - `semantic_applied` is always `false` and `degraded_components` always empty.
   `brain_search` is keyword/BM25-only and never requests a semantic leg, so
   neither can it be degraded. Both are reported rather than omitted so a
@@ -869,12 +1047,61 @@ bound derived from trustworthy source totals and proven distinct UIDs, never
 from the raw merged-row length. Source totals are not summed because local and
 server data can overlap.
 
+The structured `brain_context` / `code_context` / `project_context` merge
+follows the same rule for `total`: it is the exact union only when both tiers
+sent every row they counted (not truncated, `total` equal to the rows sent)
+and every row carries a unique canonical `uid`; otherwise it is the largest
+tier total or the deduplicated merged-row count, whichever is greater (a lower
+bound), never the sum. A seed resolved on both tiers counts once in
+`seeds_expanded`.
+
+Cross-tier identity for vault notes: a vault UID includes the instance and a
+hash of its machine-local root path. Matching titles, relative paths or section
+content do not prove that two vaults are the same: unrelated vaults can share a
+template. To reconcile a local vault with its upstream copy, explicitly bind
+their full vault UIDs in that upstream's configuration:
+
+```toml
+[[upstream]]
+url = "grpcs://nestweaver.internal:9378"
+vault_mappings = { "vlt:laptop:aaaaaaaaaaaa" = "vlt:server:bbbbbbbbbbbb" }
+```
+
+Use the actual vault UIDs reported by each graph. Bindings must be one-to-one;
+invalid or ambiguous bindings cannot merge rows. The same setting is accepted
+in instance.toml, upstreams.toml and .nestweaver/server.toml. Inside an authorized
+pair, notes, headings, sections and tags use their canonical vault-relative
+identity. The original result UIDs are preserved. Without a binding, distinct
+vault scopes stay separate even when their root paths or contents coincide.
+Their union cardinality is uncertain: search reports a `gte` lower bound from
+the tier totals, which can be smaller than the number of returned copies. This
+configuration does not change persisted UIDs or require an identity migration.
+
+Upgrade note (12.2.5): earlier releases treated two vaults as the same when
+their root paths matched, instance aside, so a mirrored vault at the same path
+on a laptop and a server deduplicated by accident. That shortcut is gone: until
+`vault_mappings` binds the pair, a merge returns the local copy and the
+upstream copy of each note side by side, and the merged total is reported as a
+`gte` lower bound so the duplication is visible rather than hidden. Add the
+binding for every vault you mirror before relying on merged note counts.
+
+A row whose `uid` is not a recognised canonical shape (for example `proj:` or
+`contract:` rows) is keyed by its raw uid string, never by title, and never
+counts as proof of a distinct set. On the structured merge the lower-bound
+`total` carries no relation marker; `truncated` is the only signal that it is
+not the exact union.
+
 ### Staleness detection
 
-The client compares local `indexed_sha` against server `RepoStates` using `git ls-remote`. When local state is behind:
+The client compares local `indexed_sha` against the server's `RepoStates` in a background task, matching repos by full canonical identity (`host/owner/name`; a same-named repo in another org never matches, and a path-only local checkout pairs with a server repo by unique directory name). A repo is stale only when the local index is **behind**:
+- a local checkout that is ahead of (or already contains) the server's indexed commit is not stale. This is checked with a bounded (2 s), non-blocking `git merge-base --is-ancestor`; if it cannot be checked (git missing, commit not in the checkout, timeout), a differing SHA is conservatively treated as stale
+- repositories registered by remote URL use the checkout path advertised by the **local** daemon for ancestry checks. Paths from upstream servers are never used as local paths. Older local daemons without this field retain the conservative differing-SHA verdict
+- a non-git directory (SHA `local`) or an empty SHA is unknown, not stale
+
+When a repo is stale:
 - `brain_status` shows `stale_repos` in the response
 - Results include `_meta.sources` indicating which data sources contributed
-- Fallback mode automatically routes stale repos to the server
+- Fallback mode routes the query to the server when any repo is genuinely stale; a query that names a repo (`repo`, `repos[0]`, `repo_url`) is matched to the stale list by canonical identity, `owner/name`, or bare name
 
 ### Upstream timeout
 
@@ -886,14 +1113,49 @@ url = "grpcs://nestweaver.internal:9378"
 timeout = "1s"    # ceiling; the live deadline is adaptive (see below)
 ```
 
-The live per-query deadline is **adaptive and mode-aware**, not a fixed value. The client scales off a rolling EWMA of observed upstream latencies and clamps the result per routing mode:
+The live per-query deadline is **adaptive and mode-aware**, not a fixed value. The client learns a separate rolling latency estimate for each tool on each upstream and clamps its deadline per routing mode. A fast search cannot shorten the first detail, note or impact query; a tool without observations starts at the mode ceiling:
 
-- **`fallback`** keeps the deadline tight — capped at **200ms** (`FALLBACK_MODE_CAP` in `crates/nestweaver-federation/src/health.rs`, pinned by `effective_timeout_fallback_capped_at_200ms`) — so the local fast path is never blocked waiting on the server.
+- **`fallback`** keeps the deadline tight — the deadline is capped at **200ms** by default (`DEFAULT_FALLBACK_CAP` in `crates/nestweaver-federation/src/upstream.rs`, pinned by `effective_timeout_fallback_capped_at_200ms`) for the query after connection establishment. Set `fallback_timeout` on the upstream to raise or lower that cap (it is always bounded by `timeout`): with `timeout = "1s"` and `fallback_timeout = "750ms"` fallback mode waits up to 750ms. Use this when the upstream query itself needs more than 200ms. `fallback_timeout` is accepted in `upstreams.toml`, `.nestweaver/server.toml` and `instance.toml` `[[upstream]]`.
 - **`merge`** and **`primary`** allow up to the configured `timeout` ceiling (default 1s) — the richer org-wide answer is the whole point of those modes.
 
-On a cold start (no latency samples yet) the mode ceiling is used directly. Raising `timeout` only affects `merge`/`primary`; the fallback cap is fixed.
+A cold lazy channel is established with an authenticated health check under a
+separate bounded five-second connection budget. The query deadline and latency
+sample start after that check, so TLS setup does not consume the warm query
+budget. An unreachable cold upstream can therefore add up to five seconds to
+the first request; subsequent calls use the warm query deadline. With no query
+latency samples yet, the mode ceiling is used directly. Query provenance includes
+`_meta.upstream_attempts` with the outcome and ejection state; upstream status
+includes `last_query_outcome`, `ejected` and effective `fallback_timeout_ms`.
+
+A timeout does not by itself eject the upstream. A timed-out call raises that tool's latency estimate (so the next deadline widens instead of staying near the 50ms floor), and the upstream is passively ejected only after **two consecutive timeouts at the full mode ceiling**; any successful call resets the count. Connection failures and `Unavailable`/`DeadlineExceeded` statuses returned by the server still eject immediately; the client's own deadline always fires first (the transport backstop is above both the query and cold-connect ceilings), so a plain slow response is a timeout, not a `DeadlineExceeded` status. An upstream that rejects a query with some other status (for example a `note_get` for a note the server does not hold) is healthy and is not ejected; its real gRPC status is logged.
+
+Tools with their own response shape (`regex_search`, `count_patterns`, `flow_trace`, and the other local-only, two-tier and combined tools) keep their tool-specific routing in every mode.
 
 ---
+
+## Federated web UI
+
+The optional web UI uses the daemon's startup `instance.toml` `[[upstream]]`
+entries for symbol and note search, read-only symbol details, note bodies and
+metadata, and the all-workspace impact lens. CLI environment or user connection
+discovery alone does not configure web federation. Restart the daemon to change
+these upstreams. Search shows source, freshness and partial-result notices.
+The impact lens keeps local
+and org-wide impact, affected tests and blast radius in separate tiers.
+
+An unavailable upstream is reported as unavailable, rather than as a missing
+symbol or note. A missing detail is reported only after the relevant sources
+have answered; ambiguous lookups remain ambiguous. Remote symbol details can
+show graph relationships, but remote file bytes, source editing and local-file
+navigation are unavailable. Remote note headings, sections, backlinks and
+wikilink navigation are not composed. Org-wide layered edges and uncommitted
+overlays are also unsupported.
+
+Workspace-scoped views use local workspace membership. Remote workspace
+membership, overview and context views are not composed across upstreams; the
+UI capability response describes these limits. Configure explicit vault
+bindings as described above when the local and remote vaults represent the
+same material.
 
 ## Impact Analysis
 
@@ -957,7 +1219,7 @@ the `source_server` it came from. Provenance is carried in `_meta.sources`.
   },
   "_meta": {
     "scope": "hybrid",
-    "sources": ["local", "server"],
+    "sources": ["local", "<upstream name>"],
     "stale_repos": []
   }
 }
@@ -1128,6 +1390,18 @@ nestweaver backup restore /backups/brain-2026-06-25T10-30-00.nwsnap.zst \
   --data-dir ./restored-brain --force
 ```
 
+`--data-dir` must be the real directory, not a symlink to one (a trailing `/`
+does not change that): restore replaces the directory itself, so a symlinked
+path is refused with the target to use instead.
+
+Recovering from an earlier failed restore into a symlinked path (a real
+directory now sits where the link was, `<dir>.restoring` is the old link, and
+`<dir>.restoring.journal` exists, so every retry is refused): confirm the
+link's real target holds no data you need, remove the new real directory, move
+`<dir>.restoring` back to `<dir>` (restoring the link), delete
+`<dir>.restoring.journal`, then re-run the restore against the link's real
+target path.
+
 `--force` requires a physically bound NestWeaver graph and a recognized layout.
 A database filename, copied marker or `publication.json` alone does not
 authorize deletion. Restore
@@ -1183,9 +1457,9 @@ The admin API is mounted on the MCP HTTP server (`:9379`) under `/admin/api/` an
 |----------|--------|-------------|
 | `/admin/api/repos` | GET | List all indexed repos with status |
 | `/admin/api/repos` | POST | Add a new repo to the index |
-| `/admin/api/repos/{id}` | DELETE | Remove a repo from the index |
+| `/admin/api/repos/{id}` | DELETE | Remove a repo from the index and config. `{id}` is the graph uid, its config `name`, or its canonical URL (as shown in the dead-letter listing), which also works for a repo that never finished indexing. `{id}` may also name an indexed repo by name or URL (graph data is removed too). Unknown ids return 404; an id matching several repos returns 409 with the candidates |
 | `/admin/api/repos/{id}/reindex` | POST | Force reindex of a specific repo |
-| `/admin/api/reload` | POST | Reload server configuration |
+| `/admin/api/reload` | POST | Reload server configuration. Newly declared repos are queued; jobs, including dead letters, for repos removed from config are cancelled; a changed `branch` re-queues the repo; dead-lettered repos stay quarantined until retried explicitly; branch/type/exclude/unskip changes are applied through one live repo snapshot and unchanged-SHA indexes heal |
 | `/admin/api/queue` | GET | View the indexing job queue |
 | `/admin/api/drain` | POST | Pause job processing |
 | `/admin/api/resume` | POST | Resume job processing |

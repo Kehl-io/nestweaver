@@ -14,7 +14,7 @@ use crate::rank_events::with_rank_event;
 use crate::routes::workspaces::{self, P1Meta, P1Provenance, ResolvedWorkspace, WorkspaceKind};
 use crate::state::AppState;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ImpactParams {
     pub depth: Option<u32>,
     pub confidence: Option<f32>,
@@ -82,15 +82,158 @@ pub async fn impact(
     Path(uid): Path<String>,
     Query(params): Query<ImpactParams>,
 ) -> Result<Response, ApiError> {
-    // The impact computation fans out into many sequential store queries
-    // (BFS traversal, layered edge reconstruction, affected-test hints), so
-    // run it off the async runtime instead of blocking a worker thread. Route
-    // through `with_rank_event` for consistency with the other blocking store
-    // handlers — if a store call happens to trigger a lazy PageRank compute,
-    // the SSE event is emitted; otherwise the wrapper is transparent.
     let state2 = state.clone();
-    let response = with_rank_event(&state, move || impact_response(&state2, &uid, &params)).await?;
-    Ok(Json(response).into_response())
+    let uid2 = uid.clone();
+    let params2 = params.clone();
+    let local = with_rank_event(&state, move || impact_response(&state2, &uid2, &params2)).await;
+    let Some(fed) = state.federation.get().filter(|f| f.is_configured()) else {
+        return Ok(Json(local?).into_response());
+    };
+    let selected =
+        workspaces::workspace_param(params.workspace.as_deref(), params.scope.as_deref());
+    if selected.is_some_and(|id| id != "all") {
+        return Ok(Json(local?).into_response());
+    }
+    let local_available = local.is_ok();
+    let mut value = match local {
+        Ok(local) => serde_json::to_value(local)?,
+        Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => {
+            let workspace = workspaces::resolve_workspace(&state.store, Some("all"))?;
+            let meta = workspaces::p1_meta_for_result_set(
+                &workspace,
+                "partial",
+                vec!["remote-source-file"],
+                Vec::new(),
+                params.limit,
+                0,
+                None,
+            );
+            serde_json::json!({"target":null,"nodes":[],"edges":[],"affected_tests":empty_affected_tests(Vec::new(),"Local target unavailable; inspect the org-wide tier."),"states":{},"_meta":meta})
+        }
+        Err(error) => return Err(error),
+    };
+    // Ownership established by search/detail is retained even during an
+    // outage: another peer's clean miss cannot stand in for the owning peer.
+    let mut owner = fed.owner(&uid);
+    if value["target"].is_null() {
+        match fed
+            .lookup("symbol_lookup", &serde_json::json!({"name_or_uid":uid}))
+            .await
+        {
+            crate::federation::LookupOutcome::Found {
+                source,
+                value: detail,
+            } => {
+                owner = Some(source);
+                if let Ok(symbol) =
+                    serde_json::from_value::<Symbol>(detail["detail"]["symbol"].clone())
+                {
+                    value["target"] = serde_json::to_value(target_graph_node(&symbol))?;
+                    value["nodes"] = serde_json::json!([target_graph_node(&symbol)]);
+                }
+            }
+            crate::federation::LookupOutcome::Ambiguous { source, value } => {
+                return Err(
+                    crate::federation::LookupOutcome::Ambiguous { source, value }.into_error(),
+                );
+            }
+            crate::federation::LookupOutcome::Missing => {
+                return Err(ApiError::not_found(format!("symbol '{uid}' not found")));
+            }
+            crate::federation::LookupOutcome::Unavailable { sources } => {
+                if owner.is_none() && sources.len() == 1 {
+                    owner = sources.first().cloned();
+                }
+            }
+        }
+    }
+    let args = serde_json::json!({"symbol":uid,"depth":params.depth.unwrap_or(3).min(15),"confidence":params.confidence.unwrap_or(0.3).clamp(0.0,1.0),"limit":params.limit.unwrap_or(250).clamp(1,1000)});
+    let impact = fed.analysis("brain_impact", &args, owner.as_deref()).await;
+    let file = value["target"]["file_path"].as_str().map(str::to_owned);
+    let (tests, blast) = if let Some(file) = file {
+        // affected_tests rejects unknown fields; traversal controls belong
+        // only to blast_radius, not to the test-selection request.
+        let test_args = serde_json::json!({"changed_files":[file]});
+        let blast_args = serde_json::json!({"changed_files":[file],"limit":params.limit.unwrap_or(250).clamp(1,1000),"max_depth":params.depth.unwrap_or(3).min(15)});
+        tokio::join!(
+            fed.analysis("affected_tests", &test_args, owner.as_deref()),
+            fed.analysis("blast_radius", &blast_args, owner.as_deref())
+        )
+    } else {
+        let unavailable =
+            serde_json::json!({"status":"unavailable","recommendation":"run-full-suite"});
+        (unavailable.clone(), unavailable)
+    };
+    // Keep graph node presentation in this adapter. Shared two-tier composition
+    // retains the authoritative local/org separation and repo reconciliation.
+    if let Some(rows) = impact["org_wide_impact"]["results"]["impact_nodes"].as_array() {
+        let nodes = value["nodes"]
+            .as_array_mut()
+            .expect("impact nodes are an array");
+        for row in rows {
+            if let (Some(uid), Some(name), Some(path)) = (
+                row["uid"].as_str(),
+                row["name"].as_str(),
+                row["file_path"].as_str(),
+            ) {
+                let mut node = ImpactGraphNode {
+                    uid: uid.into(),
+                    name: name.into(),
+                    file_path: path.into(),
+                    start_line: row["start_line"].as_u64().unwrap_or(1) as u32,
+                    layer: row["depth"].as_u64().unwrap_or(1) as u32,
+                    role: String::new(),
+                    confidence: row["confidence"].as_f64().unwrap_or(0.0) as f32,
+                    impact_score: row["impact_score"].as_f64().unwrap_or(0.0),
+                    edge_type: row["edge_type"].as_str().map(str::to_owned),
+                    source: source_evidence(
+                        path,
+                        row["start_line"].as_u64().unwrap_or(1) as u32,
+                        uid,
+                    ),
+                };
+                node.role = "org-impact".into();
+                if !nodes.iter().any(|existing| existing["uid"] == node.uid) {
+                    nodes.push(serde_json::to_value(node)?);
+                }
+            }
+        }
+    }
+    let available = impact["org_wide_impact"]
+        .get("results")
+        .is_some_and(|result| {
+            !matches!(
+                result["status"].as_str(),
+                Some("not_found" | "unavailable" | "ambiguous")
+            )
+        });
+    if let Some(org_tests) = tests["org_wide_impact"].get("results") {
+        // The local field remains local. Org tests are rendered separately by
+        // the UI; a missing local target never claims an empty safe test set.
+        value["org_affected_tests"] = org_tests.clone();
+    }
+    value["org_impact"] = impact.clone();
+    value["blast_radius"] = blast;
+    value["affected_test_tiers"] = tests;
+    value["states"] = serde_json::json!({"tier":"two-tier","local":if local_available {"available"} else {"unavailable"},"org":if available {"available"} else {"org-unavailable"},"freshness":"unknown","timeout":"unknown","permission":"unknown","read_only":if fed.read_only {"read-only"} else {"local-writes-only"},"result":"partial"});
+    value["_meta"]["trust"]["federation"] = serde_json::json!("two-tier");
+    value["_meta"]["trust"]["data_scope"] = serde_json::json!("local-and-org");
+    value["_meta"]["trust"]["freshness"] = serde_json::json!("unknown");
+    value["_meta"]["trust"]["partial"] = serde_json::json!(true);
+    value["_meta"]["trust"]["result"] = serde_json::json!("partial");
+    value["_meta"]["trust"]["capability"] =
+        serde_json::json!(if fed.read_only { "read-only" } else { "read" });
+    value["_meta"]["trust"]["unsupported"] =
+        serde_json::json!(["remote-source-file", "remote-edits", "remote-layered-edges"]);
+    value["_meta"]["trust"]["message"] = serde_json::json!(if available {
+        "Local and org impact are shown separately. Freshness is unknown; remote source files, edits and layered edges are unsupported. Inspect blast radius and both affected-test tiers before narrowing tests."
+    } else {
+        "Org impact is unavailable or permission-rejected. Local results are partial; run the full test suite. Freshness is unknown."
+    });
+    if available && let Some(provenance) = value["_meta"]["provenance"].as_array_mut() {
+        provenance.push(serde_json::json!({"source":impact["org_wide_impact"]["source_server"],"detail":"org-wide reverse impact; freshness unknown"}));
+    }
+    Ok(Json(value).into_response())
 }
 
 fn impact_response(

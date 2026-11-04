@@ -69,6 +69,8 @@ export interface ImpactLensResponse {
   nodes: ImpactLensNode[];
   edges: ImpactLensEdge[];
   affected_tests: AffectedTestsResult;
+  org_affected_tests?: AffectedTestsResult;
+  blast_radius?: { local_impact?: { status?: string; affected_symbols?: unknown[] }; org_wide_impact?: { status?: string; source_server?: string; results?: { status?: string; affected_symbols?: unknown[] } } };
   states: ImpactLensStates;
   _meta: SceneMetadata;
 }

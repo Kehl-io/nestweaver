@@ -8,8 +8,8 @@ use nestweaver_engine::index_limits::NoteLimits;
 use nestweaver_engine::index_md::MarkdownRefreshResult;
 use nestweaver_engine::markdown_derivation::{
     self, CoverageIdentity, CoverageScope, DerivationPhase, DerivationRecords, RecordError,
-    VaultDerivationRecord, admit_all_vaults, coverage_identity, expectation, filesystem_source,
-    load_records, requires_current_derivation, save_records,
+    VaultDerivationRecord, coverage_identity, expectation, filesystem_source, load_records,
+    requires_current_derivation, save_records,
 };
 use nestweaver_schema::Vault;
 use std::path::Path;
@@ -189,7 +189,7 @@ impl Drop for InProgressGuard {
 }
 
 /// The `vault_derivation.in_progress` object, or null when nothing runs.
-fn in_progress_json(state: &DaemonState) -> serde_json::Value {
+pub(super) fn in_progress_json(state: &DaemonState) -> serde_json::Value {
     let entry = IN_PROGRESS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -639,13 +639,14 @@ pub(super) fn admit_tool(state: &DaemonState, tool: &str) -> Result<(), Status> 
     if state.db_path == Path::new(":memory:") {
         return Ok(());
     }
-    admit_all_vaults(
+    markdown_derivation::admit_all_vaults_with_snapshot(
         &state.store,
         &state.db_path,
         &record_instance(state),
         &extra_ignore(state),
         note_limits(state).max_note_bytes(),
         state.read_only,
+        state.snapshot_derivation.as_deref(),
     )
     .map_err(|error| Status::failed_precondition(error.to_string()))
 }

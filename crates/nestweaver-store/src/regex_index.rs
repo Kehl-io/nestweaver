@@ -20,8 +20,10 @@ use crate::error::StoreError;
 /// Version 5 indexes the heading line with each section. Version 4 shards
 /// stored only `Section.text_content`, which starts after the heading, so a
 /// ready index missed `## Blockers` (nw-738). Search distrusts those shards
-/// and scans them until `index --with-trigrams` rebuilds them.
-pub const REGEX_INDEX_SCHEMA_VERSION: u32 = 5;
+/// and scans them until `index --with-trigrams` rebuilds them. Version 6 also
+/// stores distinct trigrams so incremental telemetry reads changed documents
+/// rather than traversing the full inverted index.
+pub const REGEX_INDEX_SCHEMA_VERSION: u32 = 6;
 pub const REGEX_TOKENIZER_FINGERPRINT: &str =
     "nestweaver-unicode-scalar-lowercase-distinct-trigram-v1";
 const METADATA_KIND: &str = "__nestweaver_regex_metadata__";
@@ -71,6 +73,42 @@ impl RegexShardMetadata {
             "regex-v{}:{}",
             self.schema_version, self.tokenizer_fingerprint
         )
+    }
+}
+
+/// Internal candidate identity. A note title and its frontmatter share a
+/// public UID but are distinct documents in the regex shard.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RegexDocumentIdentity {
+    pub kind: String,
+    pub uid: String,
+}
+
+impl RegexDocumentIdentity {
+    pub fn new(kind: &str, uid: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    fn query(&self, fields: Fields) -> Box<dyn Query> {
+        Box::new(BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(fields.uid, &self.uid),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(fields.kind, &self.kind),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]))
     }
 }
 
@@ -168,11 +206,13 @@ struct CachedShard {
 /// same directory and is cleared before generation garbage collection.
 pub(crate) struct RegexReaderPool {
     shards: Mutex<lru::LruCache<String, CachedShard>>,
+    maintenance: Mutex<()>,
 }
 
 impl Default for RegexReaderPool {
     fn default() -> Self {
         Self {
+            maintenance: Mutex::new(()),
             shards: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(32).expect("non-zero regex reader pool capacity"),
             )),
@@ -202,7 +242,7 @@ fn build_schema() -> (Schema, Fields) {
     let uid = builder.add_text_field("uid", STRING | STORED);
     let kind = builder.add_text_field("kind", STRING | STORED);
     let path = builder.add_text_field("path", STRING | STORED);
-    let trigram = builder.add_text_field("trigram", STRING);
+    let trigram = builder.add_text_field("trigram", STRING | STORED);
     let text_hash = builder.add_text_field("text_hash", STORED);
     let metadata = builder.add_text_field("metadata", STORED);
     let schema = builder.build();
@@ -284,6 +324,13 @@ fn read_metadata(index: &Index, fields: Fields) -> Result<(RegexShardMetadata, u
 pub struct RegexIndex {
     root: PathBuf,
     readers: Arc<RegexReaderPool>,
+}
+
+/// Private generation outside scopes/: a concurrent retirement/GC cannot
+/// reclaim it. Dropping a superseded preparation removes only this directory.
+pub(crate) struct PreparedRegexScope {
+    staging: tempfile::TempDir,
+    pointer: CurrentPointer,
 }
 
 impl RegexIndex {
@@ -391,11 +438,25 @@ impl RegexIndex {
     }
 
     /// Build and validate a complete sibling generation, then durably select it.
+    #[cfg(test)]
     pub fn replace_scope(
         &self,
         metadata: RegexShardMetadata,
         documents: &[RegexShardDocument<'_>],
     ) -> Result<(), StoreError> {
+        let prepared = self.prepare_replace_scope(metadata, documents)?;
+        if self.publish_prepared(prepared)? {
+            Ok(())
+        } else {
+            Err(StoreError::Query("regex maintenance is busy".into()))
+        }
+    }
+
+    pub(crate) fn prepare_replace_scope(
+        &self,
+        metadata: RegexShardMetadata,
+        documents: &[RegexShardDocument<'_>],
+    ) -> Result<PreparedRegexScope, StoreError> {
         if metadata.schema_version != REGEX_INDEX_SCHEMA_VERSION
             || metadata.tokenizer_fingerprint != REGEX_TOKENIZER_FINGERPRINT
             || metadata.candidate_count != documents.len()
@@ -405,17 +466,11 @@ impl RegexIndex {
             ));
         }
 
-        let scope_root = self.scope_root(&metadata.scope_uid);
-        let generations = scope_root.join("generations");
-        std::fs::create_dir_all(&generations).map_err(|error| {
-            StoreError::Query(format!(
-                "create regex shard directory {}: {error}",
-                generations.display()
-            ))
-        })?;
+        std::fs::create_dir_all(&self.root)
+            .map_err(|error| StoreError::Query(format!("create regex root: {error}")))?;
         let staging = tempfile::Builder::new()
             .prefix(".building-")
-            .tempdir_in(&generations)
+            .tempdir_in(&self.root)
             .map_err(|error| StoreError::Query(format!("create regex shard staging: {error}")))?;
         let (schema, fields) = build_schema();
         let index = Index::create_in_dir(staging.path(), schema)
@@ -476,26 +531,43 @@ impl RegexIndex {
             &metadata.candidate_digest[..metadata.candidate_digest.len().min(16)],
             uuid::Uuid::new_v4()
         );
-        let generation_path = generations.join(&generation);
-        if generation_path.exists() {
-            std::fs::remove_dir_all(&generation_path).map_err(|error| {
-                StoreError::Query(format!("retire incomplete regex generation: {error}"))
-            })?;
-        }
-        let staging_path = staging.keep();
-        std::fs::rename(&staging_path, &generation_path).map_err(|error| {
-            StoreError::Query(format!("publish regex shard generation: {error}"))
-        })?;
-        crate::durable_sidecar::sync_parent_directory_durable(&generation_path)
-            .map_err(|error| StoreError::Query(format!("sync regex shard generation: {error}")))?;
+        Ok(PreparedRegexScope {
+            staging,
+            pointer: CurrentPointer::new(generation, metadata)?,
+        })
+    }
 
-        let pointer = CurrentPointer::new(generation, metadata)?;
-        let pointer_path = scope_root.join("CURRENT");
-        let bytes = serde_json::to_vec_pretty(&pointer)
+    /// Bounded selector publication. Never wait behind an unbounded sweep
+    /// while holding the daemon gate; the unacknowledged scope stays queued.
+    pub(crate) fn publish_prepared(
+        &self,
+        prepared: PreparedRegexScope,
+    ) -> Result<bool, StoreError> {
+        let _maintenance = match self.readers.maintenance.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+        };
+        let scope_root = self.scope_root(&prepared.pointer.metadata.scope_uid);
+        let generations = scope_root.join("generations");
+        std::fs::create_dir_all(&generations).map_err(|error| {
+            StoreError::Query(format!("create regex generation parent: {error}"))
+        })?;
+        let path = generations.join(&prepared.pointer.generation);
+        std::fs::rename(prepared.staging.path(), &path)
+            .map_err(|error| StoreError::Query(format!("publish regex generation: {error}")))?;
+        crate::durable_sidecar::sync_parent_directory_durable(&path)
+            .map_err(|error| StoreError::Query(format!("sync regex generation: {error}")))?;
+        // A recreated active scope supersedes its old retirement tombstone.
+        crate::durable_sidecar::remove_file_durable_if_exists(&scope_root.join(RETIRED_MARKER))
+            .map_err(|error| StoreError::Query(format!("clear regex retirement: {error}")))?;
+        let bytes = serde_json::to_vec_pretty(&prepared.pointer)
             .map_err(|error| StoreError::Query(format!("serialize regex pointer: {error}")))?;
-        crate::durable_sidecar::atomic_replace_file(&pointer_path, |file| file.write_all(&bytes))
-            .map_err(|error| StoreError::Query(format!("publish regex pointer: {error}")))?;
-        Ok(())
+        crate::durable_sidecar::atomic_replace_file(&scope_root.join("CURRENT"), |file| {
+            file.write_all(&bytes)
+        })
+        .map_err(|error| StoreError::Query(format!("publish regex pointer: {error}")))?;
+        Ok(true)
     }
 
     /// Apply an exact document delta to the currently selected scope.
@@ -505,13 +577,29 @@ impl RegexIndex {
     /// that short interval the graph/sidecar metadata mismatch makes callers
     /// scan this scope. A crash can therefore make the disposable shard stale,
     /// but can never make search trust a partial update.
+    #[cfg(test)]
     pub fn update_scope(
         &self,
         previous: &RegexShardMetadata,
         metadata: RegexShardMetadata,
         upserts: &[RegexShardDocument<'_>],
-        deletes: &[String],
+        deletes: &[RegexDocumentIdentity],
     ) -> Result<(), StoreError> {
+        let prepared = self.prepare_update_scope(previous, metadata, upserts, deletes)?;
+        if self.publish_prepared(prepared)? {
+            Ok(())
+        } else {
+            Err(StoreError::Query("regex maintenance is busy".into()))
+        }
+    }
+
+    pub(crate) fn prepare_update_scope(
+        &self,
+        previous: &RegexShardMetadata,
+        metadata: RegexShardMetadata,
+        upserts: &[RegexShardDocument<'_>],
+        deletes: &[RegexDocumentIdentity],
+    ) -> Result<PreparedRegexScope, StoreError> {
         if metadata.schema_version != REGEX_INDEX_SCHEMA_VERSION
             || metadata.tokenizer_fingerprint != REGEX_TOKENIZER_FINGERPRINT
             || metadata.scope_uid != previous.scope_uid
@@ -520,6 +608,11 @@ impl RegexIndex {
                 "invalid incremental regex shard metadata".to_string(),
             ));
         }
+        let maintenance = self
+            .readers
+            .maintenance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let pointer = self
             .current_pointer(&metadata.scope_uid)?
             .ok_or_else(|| StoreError::Query("regex shard CURRENT is missing".to_string()))?;
@@ -533,6 +626,29 @@ impl RegexIndex {
             .scope_root(&metadata.scope_uid)
             .join("generations")
             .join(&pointer.generation);
+        let staging = tempfile::Builder::new()
+            .prefix(".building-")
+            .tempdir_in(&self.root)
+            .map_err(|error| StoreError::Query(format!("create regex delta staging: {error}")))?;
+        for entry in std::fs::read_dir(&path)
+            .map_err(|error| StoreError::Query(format!("list regex generation: {error}")))?
+        {
+            let entry = entry.map_err(|error| {
+                StoreError::Query(format!("read regex generation entry: {error}"))
+            })?;
+            if entry
+                .file_type()
+                .map_err(|error| StoreError::Query(error.to_string()))?
+                .is_file()
+                && !entry.file_name().to_string_lossy().ends_with(".lock")
+            {
+                std::fs::copy(entry.path(), staging.path().join(entry.file_name())).map_err(
+                    |error| StoreError::Query(format!("snapshot regex generation: {error}")),
+                )?;
+            }
+        }
+        drop(maintenance);
+        let path = staging.path().to_path_buf();
         let index = Index::open_in_dir(&path).map_err(|error| {
             StoreError::Query(format!("open regex shard {}: {error}", path.display()))
         })?;
@@ -548,12 +664,16 @@ impl RegexIndex {
         let mut writer = index
             .writer(50_000_000)
             .map_err(|error| StoreError::Query(format!("open regex shard writer: {error}")))?;
-        for uid in deletes
-            .iter()
-            .map(String::as_str)
-            .chain(upserts.iter().map(|document| document.uid))
-        {
-            writer.delete_term(Term::from_field_text(fields.uid, uid));
+        for identity in deletes.iter().cloned().chain(
+            upserts
+                .iter()
+                .map(|document| RegexDocumentIdentity::new(document.kind, document.uid)),
+        ) {
+            writer
+                .delete_query(identity.query(fields))
+                .map_err(|error| {
+                    StoreError::Query(format!("delete regex candidate {}: {error}", identity.uid))
+                })?;
         }
         writer.delete_term(Term::from_field_text(
             fields.uid,
@@ -600,13 +720,16 @@ impl RegexIndex {
         }
         drop(verification);
 
-        let pointer = CurrentPointer::new(pointer.generation, metadata)?;
-        let pointer_path = self.scope_root(&pointer.metadata.scope_uid).join("CURRENT");
-        let bytes = serde_json::to_vec_pretty(&pointer)
-            .map_err(|error| StoreError::Query(format!("serialize regex pointer: {error}")))?;
-        crate::durable_sidecar::atomic_replace_file(&pointer_path, |file| file.write_all(&bytes))
-            .map_err(|error| StoreError::Query(format!("publish regex pointer: {error}")))?;
-        Ok(())
+        let generation = format!(
+            "{}-{}-{}",
+            metadata.scope_epoch,
+            &metadata.candidate_digest[..metadata.candidate_digest.len().min(16)],
+            uuid::Uuid::new_v4()
+        );
+        Ok(PreparedRegexScope {
+            staging,
+            pointer: CurrentPointer::new(generation, metadata)?,
+        })
     }
 
     /// Return exact candidate UIDs from a trusted shard. Metadata mismatch is
@@ -762,7 +885,7 @@ impl RegexIndex {
     pub fn document_hashes(
         &self,
         scope_uid: &str,
-    ) -> Result<Option<std::collections::HashMap<String, String>>, StoreError> {
+    ) -> Result<Option<std::collections::HashMap<RegexDocumentIdentity, String>>, StoreError> {
         let Some((index, fields, metadata)) = self.open_current(scope_uid)? else {
             return Ok(None);
         };
@@ -787,8 +910,14 @@ impl RegexIndex {
                 continue;
             }
             let uid = extract_text(&document, fields.uid);
+            let kind = extract_text(&document, fields.kind);
             let text_hash = extract_text(&document, fields.text_hash);
-            if uid.is_empty() || text_hash.is_empty() || hashes.insert(uid, text_hash).is_some() {
+            let identity = RegexDocumentIdentity::new(&kind, &uid);
+            if uid.is_empty()
+                || kind.is_empty()
+                || text_hash.is_empty()
+                || hashes.insert(identity, text_hash).is_some()
+            {
                 return Err(StoreError::Query(format!(
                     "regex shard {scope_uid} has malformed or duplicate document identity"
                 )));
@@ -802,6 +931,66 @@ impl RegexIndex {
         Ok(Some(hashes))
     }
 
+    /// Delta for the changed/deleted documents only. Version 6 stores each
+    /// document's distinct trigrams, so UID term lookups avoid streaming every
+    /// posting in the corpus for a one-note edit.
+    pub(crate) fn changed_posting_delta(
+        &self,
+        scope_uid: &str,
+        changed: &[RegexShardDocument<'_>],
+        deleted: &[RegexDocumentIdentity],
+    ) -> Result<(usize, usize), StoreError> {
+        let Some((index, fields, _)) = self.open_current(scope_uid)? else {
+            return Ok((changed.iter().map(|doc| doc.trigrams.len()).sum(), 0));
+        };
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|e| StoreError::Query(format!("read changed postings: {e}")))?;
+        let searcher = reader.searcher();
+        let desired: std::collections::HashMap<_, _> = changed
+            .iter()
+            .map(|doc| (RegexDocumentIdentity::new(doc.kind, doc.uid), doc.trigrams))
+            .collect();
+        let mut added = changed.iter().map(|doc| doc.trigrams.len()).sum::<usize>();
+        let mut removed = 0;
+        for identity in changed
+            .iter()
+            .map(|doc| RegexDocumentIdentity::new(doc.kind, doc.uid))
+            .chain(deleted.iter().cloned())
+        {
+            let query = identity.query(fields);
+            let hits = searcher
+                .search(query.as_ref(), &TopDocs::with_limit(2).order_by_score())
+                .map_err(|e| StoreError::Query(format!("find changed posting document: {e}")))?;
+            if hits.len() > 1 {
+                return Err(StoreError::Query(
+                    "duplicate live regex document identity".into(),
+                ));
+            }
+            for (_, address) in hits {
+                let document: TantivyDocument = searcher.doc(address).map_err(|e| {
+                    StoreError::Query(format!("read changed posting document: {e}"))
+                })?;
+                for trigram in document
+                    .get_all(fields.trigram)
+                    .filter_map(|value| value.as_str())
+                {
+                    if desired
+                        .get(&identity)
+                        .is_some_and(|set| set.contains(trigram))
+                    {
+                        added -= 1;
+                    } else {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        Ok((added, removed))
+    }
+
     /// Logical live (UID, trigram) set difference, independent of segment
     /// tombstones and reader-cache state. Stream postings instead of retaining
     /// a second corpus-sized set of pairs. Missing first-publication shards
@@ -812,8 +1001,10 @@ impl RegexIndex {
         desired: &[RegexShardDocument<'_>],
     ) -> Result<(usize, usize), StoreError> {
         let desired_count: usize = desired.iter().map(|doc| doc.trigrams.len()).sum();
-        let desired: std::collections::HashMap<_, _> =
-            desired.iter().map(|doc| (doc.uid, doc.trigrams)).collect();
+        let desired: std::collections::HashMap<_, _> = desired
+            .iter()
+            .map(|doc| (RegexDocumentIdentity::new(doc.kind, doc.uid), doc.trigrams))
+            .collect();
         let Some((index, fields, _)) = self.open_current(scope_uid)? else {
             let root = self.scope_root(scope_uid);
             if root
@@ -861,14 +1052,14 @@ impl RegexIndex {
                                     .map_err(|e| {
                                         StoreError::Query(format!("decode regex posting UID: {e}"))
                                     })?;
-                                entry.insert(extract_text(&document, fields.uid))
+                                entry.insert(RegexDocumentIdentity::new(
+                                    &extract_text(&document, fields.kind),
+                                    &extract_text(&document, fields.uid),
+                                ))
                             }
                         };
                         previous += 1;
-                        if desired
-                            .get(uid.as_str())
-                            .is_some_and(|set| set.contains(term))
-                        {
+                        if desired.get(&*uid).is_some_and(|set| set.contains(term)) {
                             shared += 1;
                         }
                     }
@@ -904,11 +1095,22 @@ impl RegexIndex {
     /// A caller that receives an error from this function has an
     /// incompletely retired scope on disk and MUST retry until it succeeds;
     /// do not call this for a scope that should remain live.
+    #[cfg(test)]
     pub fn retire_scope(&self, scope_uid: &str) -> Result<bool, StoreError> {
+        self.try_retire_scope(scope_uid)?
+            .ok_or_else(|| StoreError::Query("regex maintenance is busy".into()))
+    }
+
+    pub(crate) fn try_retire_scope(&self, scope_uid: &str) -> Result<Option<bool>, StoreError> {
+        let _maintenance = match self.readers.maintenance.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        };
         self.readers.clear();
         let scope_root = self.scope_root(scope_uid);
         if !scope_root.exists() {
-            return Ok(false);
+            return Ok(Some(false));
         }
         let tombstone = scope_root.join(RETIRED_MARKER);
         crate::durable_sidecar::atomic_replace_file(&tombstone, |file| {
@@ -922,7 +1124,7 @@ impl RegexIndex {
             .map_err(|error| {
                 StoreError::Query(format!("retire regex scope {scope_uid}: {error}"))
             })?;
-        Ok(selector_removed)
+        Ok(Some(selector_removed))
     }
 
     /// Remove unselected generations and durably-tombstoned retired scopes.
@@ -942,6 +1144,11 @@ impl RegexIndex {
     /// [`Self::recover_missing_current`]) rather than discarding it, closing
     /// the crash window by construction instead of by luck of timing.
     pub fn garbage_collect(&self) -> Result<RegexGarbageCollectionReport, StoreError> {
+        let _maintenance = self
+            .readers
+            .maintenance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.readers.clear();
         let scopes = self.root.join("scopes");
         let entries = match std::fs::read_dir(&scopes) {
@@ -1604,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_delta_updates_current_generation_without_rebuilding_the_scope() {
+    fn exact_delta_selects_immutable_sibling_without_retokenizing_the_scope() {
         let temp = tempfile::tempdir().unwrap();
         let index = RegexIndex::new(temp.path());
         let first_trigrams = HashSet::from(["alp".to_string(), "lph".to_string()]);
@@ -1632,21 +1839,48 @@ mod tests {
             trigrams: &second_trigrams,
         };
         let updated = metadata(2, 1, "digest-two");
-        index
-            .update_scope(
+        let prepared = index
+            .prepare_update_scope(
                 &initial,
                 updated.clone(),
                 &[second],
-                &["sym:one".to_string()],
+                &[RegexDocumentIdentity::new("Symbol", "sym:one")],
             )
             .unwrap();
+        assert_eq!(
+            index
+                .current_pointer("repo:test")
+                .unwrap()
+                .unwrap()
+                .generation,
+            generation
+        );
+        assert_eq!(
+            index.document_hashes("repo:test").unwrap().unwrap(),
+            std::collections::HashMap::from([(
+                RegexDocumentIdentity::new("Symbol", "sym:one"),
+                "hash-one".to_string()
+            )]),
+            "preparation must not mutate the served generation"
+        );
+        index.garbage_collect().unwrap();
+        assert!(
+            index.publish_prepared(prepared).unwrap(),
+            "GC must not reclaim private preparation"
+        );
 
         let pointer = index.current_pointer("repo:test").unwrap().unwrap();
-        assert_eq!(pointer.generation, generation);
+        assert_ne!(
+            pointer.generation, generation,
+            "delta publication must select an immutable sibling"
+        );
         assert_eq!(pointer.metadata, updated);
         assert_eq!(
             index.document_hashes("repo:test").unwrap().unwrap(),
-            std::collections::HashMap::from([("sym:two".to_string(), "hash-two".to_string())])
+            std::collections::HashMap::from([(
+                RegexDocumentIdentity::new("Symbol", "sym:two"),
+                "hash-two".to_string()
+            )])
         );
         assert_eq!(
             index

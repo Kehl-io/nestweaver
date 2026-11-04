@@ -1,7 +1,8 @@
 //! Upstream server discovery and configuration.
 //!
 //! Discovery order (first match wins):
-//! 1. `NESTWEAVER_UPSTREAM` env var (simple URL)
+//! 1. `NESTWEAVER_UPSTREAM` env var (simple URL; `NESTWEAVER_TOKEN` and
+//!    `NESTWEAVER_CA_CERT` supply the bearer token and CA PEM path)
 //! 2. `.nestweaver/server.toml` (walk up from working directory)
 //! 3. `~/.config/nestweaver/upstreams.toml` (user-level config)
 
@@ -47,6 +48,13 @@ pub struct UpstreamConfig {
     /// Path to CA certificate PEM file for self-signed TLS.
     #[serde(default)]
     pub ca_cert: Option<String>,
+    /// Cap on the upstream deadline in `fallback` mode (e.g. "750ms"), bounded
+    /// by `timeout`. Default 200ms keeps the local fast path unblocked; raise
+    /// it for an off-site server (nw-834).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_timeout: Option<String>,
+    #[serde(default)]
+    pub vault_mappings: crate::dedup::VaultMappings,
 }
 
 fn default_timeout() -> String {
@@ -94,6 +102,13 @@ struct UpstreamSection {
     /// by `UpstreamHandle::from_config` via `parse_duration`.
     #[serde(default = "default_timeout")]
     timeout: String,
+    /// Path to a CA certificate PEM file (nw-831: parity with upstreams.toml).
+    #[serde(default)]
+    ca_cert: Option<String>,
+    #[serde(default)]
+    fallback_timeout: Option<String>,
+    #[serde(default)]
+    vault_mappings: crate::dedup::VaultMappings,
 }
 
 /// Parsed content of `~/.config/nestweaver/upstreams.toml`.
@@ -119,6 +134,10 @@ pub fn discover_upstreams(start_dir: &Path) -> Vec<UpstreamConfig> {
     // 1. Env var
     if let Ok(url) = std::env::var("NESTWEAVER_UPSTREAM") {
         let token = std::env::var("NESTWEAVER_TOKEN").ok();
+        // nw-831: let env-only (CI) thin clients trust a private CA.
+        let ca_cert = std::env::var("NESTWEAVER_CA_CERT")
+            .ok()
+            .filter(|p| !p.trim().is_empty());
         return vec![UpstreamConfig {
             name: Some("env".to_string()),
             url,
@@ -126,7 +145,9 @@ pub fn discover_upstreams(start_dir: &Path) -> Vec<UpstreamConfig> {
             repos: vec![],
             mode: RoutingMode::default(),
             timeout: default_timeout(),
-            ca_cert: None,
+            ca_cert,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         }];
     }
 
@@ -269,7 +290,9 @@ fn find_server_toml(start_dir: &Path) -> Option<UpstreamConfig> {
                 repos: vec![],
                 mode: parsed.upstream.mode,
                 timeout: parsed.upstream.timeout,
-                ca_cert: None,
+                ca_cert: parsed.upstream.ca_cert,
+                fallback_timeout: parsed.upstream.fallback_timeout,
+                vault_mappings: parsed.upstream.vault_mappings,
             };
             expand_config_token(&mut cfg);
             return Some(cfg);
@@ -310,6 +333,10 @@ struct InstanceUpstreamEntry {
     timeout: String,
     #[serde(default)]
     ca_cert: Option<String>,
+    #[serde(default)]
+    fallback_timeout: Option<String>,
+    #[serde(default)]
+    vault_mappings: crate::dedup::VaultMappings,
 }
 
 fn default_mode_string() -> String {
@@ -331,6 +358,8 @@ impl InstanceUpstreamEntry {
             repos: self.repos,
             timeout: self.timeout,
             ca_cert: self.ca_cert,
+            fallback_timeout: self.fallback_timeout,
+            vault_mappings: self.vault_mappings,
         }
     }
 }
@@ -378,6 +407,33 @@ mod tests {
     /// world-readable.
     #[cfg(unix)]
     #[test]
+    fn explicit_vault_mappings_survive_all_file_config_shapes() {
+        let mapping = "vault_mappings = { 'vlt:local:aaaaaaaaaaaa' = 'vlt:server:bbbbbbbbbbbb' }";
+        let instance: InstanceUpstreamsOnly = toml::from_str(&format!(
+            "[[upstream]]\nurl = 'http://localhost:9378'\n{mapping}\n"
+        ))
+        .unwrap();
+        let config = instance
+            .upstream
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_upstream_config();
+        assert_eq!(
+            config.vault_mappings["vlt:local:aaaaaaaaaaaa"],
+            "vlt:server:bbbbbbbbbbbb"
+        );
+        let server: ServerToml = toml::from_str(&format!(
+            "[upstream]\nurl = 'http://localhost:9378'\n{mapping}\n"
+        ))
+        .unwrap();
+        assert_eq!(server.upstream.vault_mappings, config.vault_mappings);
+        let serialized = toml::to_string(&config).unwrap();
+        let user: UpstreamConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(user.vault_mappings, config.vault_mappings);
+    }
+
+    #[test]
     fn upstreams_toml_written_0600() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -390,6 +446,8 @@ mod tests {
             mode: RoutingMode::Fallback,
             timeout: "1s".to_string(),
             ca_cert: None,
+            fallback_timeout: None,
+            vault_mappings: Default::default(),
         };
 
         let path = save_upstream_in(dir.path(), &config).unwrap();
@@ -597,5 +655,74 @@ timeout = "500ms"
         // The server.toml [upstream] timeout flows into the UpstreamConfig
         // instead of being hardcoded to the default.
         assert_eq!(upstreams[0].timeout, "500ms");
+    }
+
+    #[test]
+    fn env_discovery_carries_ca_cert() {
+        // nw-831: NESTWEAVER_CA_CERT reaches the env-discovered upstream.
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("NESTWEAVER_UPSTREAM", "grpcs://ci.example.com:9378");
+            std::env::set_var("NESTWEAVER_CA_CERT", "/tmp/ci-ca.pem");
+        }
+        let upstreams = discover_upstreams(Path::new("/nonexistent"));
+        unsafe {
+            std::env::remove_var("NESTWEAVER_UPSTREAM");
+            std::env::remove_var("NESTWEAVER_CA_CERT");
+        }
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].ca_cert.as_deref(), Some("/tmp/ci-ca.pem"));
+    }
+
+    #[test]
+    fn env_discovery_without_ca_cert_env_has_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("NESTWEAVER_UPSTREAM", "grpcs://ci.example.com:9378");
+            std::env::remove_var("NESTWEAVER_CA_CERT");
+        }
+        let upstreams = discover_upstreams(Path::new("/nonexistent"));
+        unsafe { std::env::remove_var("NESTWEAVER_UPSTREAM") };
+        assert_eq!(upstreams[0].ca_cert, None);
+    }
+
+    #[test]
+    fn server_toml_carries_ca_cert() {
+        // nw-831: server.toml accepts ca_cert like upstreams.toml.
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("NESTWEAVER_UPSTREAM") };
+        let tmp = tempfile::tempdir().unwrap();
+        let nw_dir = tmp.path().join(".nestweaver");
+        fs::create_dir_all(&nw_dir).unwrap();
+        fs::write(
+            nw_dir.join("server.toml"),
+            "[upstream]\nurl = \"grpcs://a.example.com:9378\"\nca_cert = \"/etc/nw/ca.pem\"\n",
+        )
+        .unwrap();
+        let upstreams = discover_upstreams(tmp.path());
+        assert_eq!(upstreams[0].ca_cert.as_deref(), Some("/etc/nw/ca.pem"));
+    }
+
+    #[test]
+    fn fallback_timeout_is_read_from_server_toml_and_instance_config() {
+        // nw-834
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("NESTWEAVER_UPSTREAM") };
+        let tmp = tempfile::tempdir().unwrap();
+        let nw_dir = tmp.path().join(".nestweaver");
+        fs::create_dir_all(&nw_dir).unwrap();
+        fs::write(
+            nw_dir.join("server.toml"),
+            "[upstream]\nurl = \"grpcs://a.example.com:9378\"\nfallback_timeout = \"750ms\"\n",
+        )
+        .unwrap();
+        let upstreams = discover_upstreams(tmp.path());
+        assert_eq!(upstreams[0].fallback_timeout.as_deref(), Some("750ms"));
+
+        let cfg: UpstreamsToml = toml::from_str(
+            "[[upstream]]\nurl = \"grpcs://b.example.com:9378\"\nfallback_timeout = \"1s\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.upstream[0].fallback_timeout.as_deref(), Some("1s"));
     }
 }

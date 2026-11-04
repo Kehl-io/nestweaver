@@ -2910,6 +2910,30 @@ fn acquire_restore_authority(data_dir: &Path) -> anyhow::Result<RestoreAuthority
 /// is recognized rather than fought; a caller that does not gets it taken out
 /// from under it here, by construction, rather than never at all (nw-375).
 pub fn backup_restore(config: &RestoreConfig) -> anyhow::Result<RestoreResult> {
+    // nw-885: the cutover renames `data_dir` aside and installs a NEW real
+    // directory at that path. If `data_dir` is itself a symlink (for example to
+    // a separate volume) that renames the link, drops the data on the wrong
+    // filesystem, trips the aside-content proof at cleanup, and leaves a
+    // `.restoring` + journal pair that wedges every later restore. Refuse up
+    // front, before any lease, staging, or journal is created, and tell the
+    // operator the real path to use.
+    //
+    // `components()` drops a trailing separator: `lstat("link/")` follows the
+    // link (POSIX), which would let `--data-dir link/` slip past this check.
+    let data_dir_lexical: PathBuf = config.data_dir.components().collect();
+    if let Ok(metadata) = std::fs::symlink_metadata(&data_dir_lexical)
+        && metadata.file_type().is_symlink()
+    {
+        let target = std::fs::canonicalize(&config.data_dir)
+            .map(|p| format!(" Restore into its target {} instead.", p.display()))
+            .unwrap_or_default();
+        refuse_backup!(
+            "backup restore refused: {} is a symlink. Restore replaces the data directory \
+             itself, which would replace the link rather than the directory it points to.{target} \
+             Nothing was changed.",
+            data_dir_lexical.display()
+        );
+    }
     let _authority = acquire_restore_authority(&config.data_dir)?;
     let start = Instant::now();
 
@@ -5463,6 +5487,56 @@ mod tests {
         .expect("replace restores over the existing directory");
         assert!(data_dir.join("graph.lbug").exists());
         assert!(!data_dir.join("sentinel.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_symlinked_data_dir_without_side_effects() {
+        // nw-885: restoring into a symlinked (even empty) data dir must refuse
+        // cleanly instead of replacing the link and wedging later restores.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("volume").join("data");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("data");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = backup_restore(&RestoreConfig {
+            snapshot_path: dir.path().join("missing.tar.zst"),
+            data_dir: link.clone(),
+            replace: false,
+        })
+        .expect_err("a symlinked data dir must be refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("is a symlink"), "{message}");
+        // The message names the canonical target, not just the link.
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        assert!(
+            message.contains(&format!("Restore into its target {}", canonical.display())),
+            "{message}"
+        );
+        // A trailing separator must not bypass the check.
+        let mut slashed = link.clone().into_os_string();
+        slashed.push("/");
+        let slashed_error = backup_restore(&RestoreConfig {
+            snapshot_path: dir.path().join("missing.tar.zst"),
+            data_dir: PathBuf::from(slashed),
+            replace: false,
+        })
+        .expect_err("a trailing slash must not bypass the symlink refusal");
+        assert!(
+            format!("{slashed_error:#}").contains("is a symlink"),
+            "{slashed_error:#}"
+        );
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+        assert!(!restoring_dir_for(&link).exists());
+        assert!(!restore_journal_path(&link).exists());
     }
 
     /// A retry of an interrupted restore reconciles the aside copy before it

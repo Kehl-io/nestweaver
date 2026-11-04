@@ -4,11 +4,14 @@ pub mod confidence;
 pub mod edges;
 pub mod embedding;
 pub mod env;
+pub mod http_auth;
 pub mod limits;
 pub mod nodes;
 pub mod provenance;
 pub mod repo_url;
 pub mod responses;
+#[cfg(unix)]
+pub mod runtime_paths;
 pub mod uid;
 pub mod version;
 

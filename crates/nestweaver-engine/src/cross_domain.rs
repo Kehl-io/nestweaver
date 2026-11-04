@@ -172,7 +172,7 @@ pub const CROSS_DOMAIN_RULES_VERSION: u32 = 3; // nw-685: scope before preferenc
 /// (an fsync) over many notes. nw-668: the watcher also takes its write lease
 /// once per chunk of this size, so a large replayed batch releases the gate
 /// between chunks for FIFO-queued reconcilers.
-pub(crate) const NOTES_PER_TXN: usize = 100;
+pub(crate) const NOTES_PER_TXN: usize = 16;
 
 /// What one cross-domain flush cost the store (nw-668): write transactions
 /// opened and statements executed. The statement count is independent of how
@@ -274,6 +274,7 @@ pub(crate) fn flush_scanned_notes(
     if batch.is_empty() {
         return Ok(CrossDomainFlushStats::default());
     }
+    let started = std::time::Instant::now();
     let conn = store
         .begin_transaction()
         .map_err(|e| anyhow::anyhow!("begin_transaction for cross-domain flush: {e}"))?;
@@ -294,6 +295,12 @@ pub(crate) fn flush_scanned_notes(
         result.note_to_symbol_edges += scanned.note_edges.len();
         result.section_to_symbol_edges += scanned.section_edges.len();
     }
+    tracing::info!(
+        notes = batch.len(),
+        statements,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "cross-domain sidecar chunk committed"
+    );
     Ok(CrossDomainFlushStats {
         transactions: 1,
         statements,
@@ -306,14 +313,50 @@ fn flush_on(
     conn: &nestweaver_store::DbConnection<'_>,
     batch: &[ScannedNote],
 ) -> Result<usize, anyhow::Error> {
-    let note_uids: Vec<&str> = batch.iter().map(|s| s.note_uid.as_str()).collect();
-    let mut statements = GraphStore::delete_cross_domain_edges_for_notes_on(conn, &note_uids)
-        .map_err(|e| anyhow::anyhow!("delete_cross_domain_edges_for_notes_on: {e}"))?;
-
-    let note_edges: Vec<_> = batch
-        .iter()
-        .flat_map(|s| edge_refs(&s.note_edges))
-        .collect();
+    // Compare on this transaction, under the caller's write lease. Only
+    // changed relationships are written, including confidence/source changes.
+    let mut statements = 0;
+    let mut note_edges = Vec::new();
+    let mut section_edges = Vec::new();
+    let mut actual_reader = GraphStore::cross_domain_edge_reader_on(conn)?;
+    for scanned in batch {
+        let actual = actual_reader.read(&scanned.note_uid)?;
+        let key = |from: &str, to: &str, confidence: f32, source: &str| {
+            (
+                from.to_string(),
+                to.to_string(),
+                confidence.to_bits(),
+                source.to_string(),
+            )
+        };
+        let actual_keys: HashSet<_> = actual.iter().map(|(a, b, c, d)| key(a, b, *c, d)).collect();
+        let desired: HashSet<_> = scanned
+            .note_edges
+            .iter()
+            .chain(&scanned.section_edges)
+            .map(|(a, b, c, d)| key(a, b, *c, d))
+            .collect();
+        for (from, to, confidence, source) in &actual {
+            if !desired.contains(&key(from, to, *confidence, source)) {
+                statements += GraphStore::delete_cross_domain_edge_on(
+                    conn,
+                    from == &scanned.note_uid,
+                    from,
+                    to,
+                    *confidence,
+                    source,
+                )?;
+            }
+        }
+        note_edges.extend(
+            edge_refs(&scanned.note_edges)
+                .filter(|(a, b, c, d)| !actual_keys.contains(&key(a, b, *c, d))),
+        );
+        section_edges.extend(
+            edge_refs(&scanned.section_edges)
+                .filter(|(a, b, c, d)| !actual_keys.contains(&key(a, b, *c, d))),
+        );
+    }
     statements += GraphStore::batch_insert_note_to_symbol_edges_on(conn, &note_edges)
         .map_err(|e| anyhow::anyhow!("batch_insert_note_to_symbol_edges_on: {e}"))?;
     #[cfg(test)]
@@ -324,10 +367,6 @@ fn flush_on(
     }) {
         anyhow::bail!("injected cross-domain flush failure");
     }
-    let section_edges: Vec<_> = batch
-        .iter()
-        .flat_map(|s| edge_refs(&s.section_edges))
-        .collect();
     statements += GraphStore::batch_insert_section_to_symbol_edges_on(conn, &section_edges)
         .map_err(|e| anyhow::anyhow!("batch_insert_section_to_symbol_edges_on: {e}"))?;
     Ok(statements)
@@ -1807,7 +1846,7 @@ mod tests {
             .expect_err("discovery against a read-only store must fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("delete_cross_domain_edges_for_notes_on"),
+            msg.contains("batch_insert_note_to_symbol_edges_on"),
             "the failing operation must be named, got: {msg}"
         );
         assert!(
@@ -2061,7 +2100,13 @@ mod tests {
         let r1 = discover_cross_domain_links(&store).unwrap();
         let count1 = store.count_references_code_edges().unwrap();
 
+        let writes_before = nestweaver_store::write::parameterized_writes_on_this_thread();
         let r2 = discover_cross_domain_links(&store).unwrap();
+        assert_eq!(
+            nestweaver_store::write::parameterized_writes_on_this_thread(),
+            writes_before,
+            "unchanged mentions must perform zero sidecar writes"
+        );
         let count2 = store.count_references_code_edges().unwrap();
 
         assert_eq!(
@@ -2168,7 +2213,272 @@ mod tests {
         );
 
         // Counterweight: the same refresh without the failure replaces them.
+        let writes_before = nestweaver_store::write::parameterized_writes_on_this_thread();
         assert_eq!(refresh_one_note(&store, &note.uid).unwrap(), (2, 2));
+        assert_eq!(
+            nestweaver_store::write::parameterized_writes_on_this_thread() - writes_before,
+            2,
+            "adding one mention inserts its note and section edges without rewriting existing links"
+        );
         assert_eq!(store.list_references_code_edges().unwrap().len(), 4);
+    }
+    /// nw-874: the primary incremental transaction precedes the differential
+    /// sidecar. Stable Note/Section identities must retain their actual edges.
+    #[test]
+    fn incremental_primary_refresh_preserves_stable_code_edges_and_rolls_back() {
+        let dir = tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        std::fs::write(
+            vault_root.join("a.md"),
+            "# Mention\n\nuses AlphaWidget\n\n## Other\n\nold body\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("test.lbug");
+        crate::index_md::index_markdown_directory(&vault_root, &db_path, "default", "vault")
+            .unwrap();
+        let store = GraphStore::open_or_create(&db_path).unwrap();
+        let r_uid = repo_uid("default", "https://example.com/r");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: r_uid.clone(),
+                url: "https://example.com/r".to_string(),
+                indexed_sha: "abc".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        for (line, name) in ["AlphaWidget", "BravoWidget"].into_iter().enumerate() {
+            store
+                .insert_symbol(&Symbol {
+                    uid: symbol_uid(&r_uid, "src/w.rs", name, line as u32 + 1),
+                    name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    repo_uid: r_uid.clone(),
+                    file_path: "src/w.rs".to_string(),
+                    start_line: line as u32 + 1,
+                    end_line: line as u32 + 1,
+                    signature: format!("fn {name}()"),
+                    summary: None,
+                    content_hash: "h".to_string(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Inferred,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+
+        fn edge_ids(store: &GraphStore) -> Vec<String> {
+            let conn = store.begin_transaction().unwrap();
+            let mut result = Vec::new();
+            for relation in [
+                "REFERENCES_CODE_NOTE_TO_SYMBOL",
+                "REFERENCES_CODE_SECTION_TO_SYMBOL",
+            ] {
+                let rows = conn
+                    .query(&format!(
+                        "MATCH (n)-[r:{relation}]->(s:Symbol) RETURN n.uid, s.uid, id(r)"
+                    ))
+                    .unwrap();
+                result.extend(rows.map(|row| format!("{relation}:{row:?}")));
+            }
+            store.rollback_transaction(&conn).unwrap();
+            result.sort();
+            result
+        }
+        fn flush(store: &GraphStore, uid: &str) -> CrossDomainFlushStats {
+            let index = build_symbol_index(store).unwrap();
+            let note = store.lookup_note(uid).unwrap();
+            let ScanOutcome::Scanned(scanned) =
+                scan_one_note(store, &note, &index, &VaultReaders::new()).unwrap()
+            else {
+                panic!("note must scan")
+            };
+            flush_scanned_notes(store, &[scanned], &mut CrossDomainResult::default()).unwrap()
+        }
+        let refresh = || {
+            crate::index_md::index_markdown_directory_since_with_store_and_ignore(
+                &store,
+                &vault_root,
+                "default",
+                "vault",
+                std::time::UNIX_EPOCH,
+                &[],
+            )
+            .unwrap()
+        };
+        discover_cross_domain_links(&store).unwrap();
+        let note = store.list_notes(None).unwrap().remove(0);
+        let before = edge_ids(&store);
+        assert_eq!(before.len(), 2, "note and mention-section links");
+
+        // Force a genuine CREATE error after retained scalar updates. The
+        // complete primary transaction, including edge identities, must revert.
+        let mut replacement = note.clone();
+        replacement.title = "must roll back".to_string();
+        replacement.content_hash = "must roll back".to_string();
+        let headings = store.headings_in_note(&note.uid).unwrap();
+        let sections = store.sections_in_note(&note.uid).unwrap();
+        let vault = store.lookup_vault(&note.vault_uid).unwrap();
+        let replace = |incoming: nestweaver_schema::Note,
+                       incoming_sections: &[nestweaver_schema::Section],
+                       incoming_headings: &[nestweaver_schema::Heading]| {
+            let uid = incoming.uid.clone();
+            store.incremental_vault_refresh_atomically(
+                &vault,
+                &[uid],
+                &[],
+                &[incoming],
+                incoming_headings,
+                incoming_sections,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+        };
+        let mut stolen_note = note.clone();
+        stolen_note.vault_uid = "vlt:another-owner".to_string();
+        assert!(
+            replace(stolen_note, &sections, &headings)
+                .unwrap_err()
+                .to_string()
+                .contains("another vault_uid")
+        );
+        assert_eq!(edge_ids(&store), before);
+        assert_eq!(
+            store.lookup_note(&note.uid).unwrap().vault_uid,
+            note.vault_uid
+        );
+        let mut other_note = note.clone();
+        other_note.uid = format!("{}:other-owner", note.uid);
+        other_note.file_path = "other.md".to_string();
+        store.insert_note(&other_note).unwrap();
+        let mut stolen_section = sections[0].clone();
+        stolen_section.note_uid = other_note.uid.clone();
+        assert!(
+            replace(other_note.clone(), &[stolen_section], &[])
+                .unwrap_err()
+                .to_string()
+                .contains("another note_uid")
+        );
+        assert_eq!(edge_ids(&store), before);
+        assert_eq!(
+            store.lookup_section(&sections[0].uid).unwrap().note_uid,
+            note.uid
+        );
+        store.delete_note_cascade_atomic(&other_note.uid).unwrap();
+        let error = store
+            .incremental_vault_refresh_atomically(
+                &vault,
+                std::slice::from_ref(&note.uid),
+                &[],
+                &[replacement],
+                &[headings[0].clone(), headings[0].clone()],
+                &sections,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!(store.lookup_note(&note.uid).unwrap().title, note.title);
+        assert_eq!(
+            store.lookup_note(&note.uid).unwrap().content_hash,
+            note.content_hash
+        );
+        assert_eq!(
+            edge_ids(&store),
+            before,
+            "primary rollback retains original relationship IDs"
+        );
+
+        std::fs::write(
+            vault_root.join("a.md"),
+            "# Mention\n\nuses AlphaWidget\n\n## Other\n\nnew body with extra words\n",
+        )
+        .unwrap();
+        refresh();
+        assert_eq!(
+            edge_ids(&store),
+            before,
+            "primary refresh must not DETACH stable code references"
+        );
+        assert_eq!(
+            flush(&store, &note.uid).statements,
+            0,
+            "unchanged mentions and stable source identities need no sidecar writes"
+        );
+        assert_eq!(edge_ids(&store), before);
+
+        // Changing the mentioning section changes its content-hash UID. Its
+        // obsolete edge must go; the stable Note is rebound by the sidecar.
+        std::fs::write(
+            vault_root.join("a.md"),
+            "# Mention\n\nuses BravoWidget\n\n## Other\n\nnew body with extra words\n",
+        )
+        .unwrap();
+        refresh();
+        assert!(flush(&store, &note.uid).statements > 0);
+        let changed = store.list_references_code_edges().unwrap();
+        assert_eq!(changed.len(), 2);
+        assert!(
+            changed
+                .iter()
+                .all(|edge| edge.1 == symbol_uid(&r_uid, "src/w.rs", "BravoWidget", 2))
+        );
+        std::fs::write(
+            vault_root.join("a.md"),
+            "# Mention\n\nno code mentions\n\n## Other\n\nnew body\n",
+        )
+        .unwrap();
+        refresh();
+        flush(&store, &note.uid);
+        assert!(edge_ids(&store).is_empty());
+        std::fs::write(vault_root.join("a.md"), "# Mention\n\nuses AlphaWidget\n").unwrap();
+        refresh();
+        flush(&store, &note.uid);
+        assert_eq!(edge_ids(&store).len(), 2);
+        // Keep the vault nonempty so this exercises deletion rather than the
+        // intentional empty-scan safety refusal.
+        std::fs::write(
+            vault_root.join("keeper.md"),
+            "# Keeper\n\nNo controlled names here\n",
+        )
+        .unwrap();
+        refresh();
+        assert_eq!(edge_ids(&store).len(), 2);
+        std::fs::remove_file(vault_root.join("a.md")).unwrap();
+        refresh();
+        assert!(
+            edge_ids(&store).is_empty(),
+            "deleting the note still cascades all references"
+        );
     }
 }

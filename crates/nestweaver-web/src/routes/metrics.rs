@@ -278,7 +278,7 @@ pub async fn metrics_authenticated(
         let provided = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
+            .and_then(nestweaver_schema::http_auth::bearer_token);
         let ok = match provided {
             Some(t) => {
                 let query_match = bool::from(t.as_bytes().ct_eq(expected.as_bytes()));
