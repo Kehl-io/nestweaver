@@ -421,8 +421,17 @@ impl<'a> PhpClasses<'a> {
             };
         let (owner, method, symbol) = self.method(class, &reference.name)?;
         // Late-static binding can select an overriding descendant. Resolve it
-        // only when class/method finality proves a single implementation.
-        if receiver.eq_ignore_ascii_case("static") && !class.facts.is_final && !method.is_final {
+        // only when class/method finality proves a single implementation. PHP 8
+        // permits descendants to redeclare final private methods: finality has
+        // no effect on them except for constructors.
+        use nestweaver_schema::Visibility;
+        let method_is_effectively_final = method.is_final
+            && (symbol.visibility != Visibility::Private
+                || method.name.eq_ignore_ascii_case("__construct"));
+        if receiver.eq_ignore_ascii_case("static")
+            && !class.facts.is_final
+            && !method_is_effectively_final
+        {
             return None;
         }
         if !method.is_static {
@@ -441,7 +450,6 @@ impl<'a> PhpClasses<'a> {
                 return None;
             }
         }
-        use nestweaver_schema::Visibility;
         match symbol.visibility {
             Visibility::Private
                 if !lexical.is_some_and(|c| c.name.eq_ignore_ascii_case(owner.name)) =>

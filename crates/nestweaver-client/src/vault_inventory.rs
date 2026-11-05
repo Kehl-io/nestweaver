@@ -121,6 +121,26 @@ fn source_result(name: &str, result: Result<Value>) -> Value {
             else {
                 return failed_source(name, "invalid_response");
             };
+            // JsonResponse is an untyped transport envelope. Validate before
+            // projecting fields: malformed rows must not become counted vaults,
+            // and nested diagnostics must not pass through a public field.
+            if rows.iter().any(|row| {
+                !row.is_object()
+                    || !row
+                        .get("uid")
+                        .and_then(Value::as_str)
+                        .is_some_and(|uid| !uid.is_empty())
+                    || !row.get("name").is_some_and(Value::is_string)
+                    || !row.get("root_path").is_some_and(Value::is_string)
+                    || row
+                        .get("notes")
+                        .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
+                    || row
+                        .get("last_indexed")
+                        .is_some_and(|value| !value.is_null() && !value.is_string())
+            }) {
+                return failed_source(name, "invalid_response");
+            }
             // Keep only public inventory fields; never propagate arbitrary
             // upstream diagnostics, metadata, or error strings.
             let rows: Vec<Value> = rows
@@ -313,6 +333,75 @@ mod tests {
         );
         assert!(peer["unmapped_vault_count"].is_null());
         assert_eq!(peer["vaults"][0]["mapping_status"], "local_unavailable");
+    }
+
+    #[test]
+    fn malformed_rows_refuse_the_whole_source_without_counting_or_disclosing_them() {
+        let valid =
+            json!({"uid":"vlt:peer:aaaaaaaaaaaa", "name":"peer", "root_path":"/peer", "notes":0});
+        let mut malformed = vec![
+            json!(7),
+            json!({}),
+            json!({"name":"peer","root_path":"/peer"}),
+        ];
+        for field in ["uid", "name", "root_path"] {
+            let mut row = valid.clone();
+            row.as_object_mut().unwrap().remove(field);
+            malformed.push(row);
+        }
+        for (field, values) in [
+            (
+                "uid",
+                vec![Value::Null, json!(""), json!({"token":"SECRET"})],
+            ),
+            ("name", vec![Value::Null, json!(["SECRET"])]),
+            ("root_path", vec![Value::Null, json!({"error":"SECRET"})]),
+            (
+                "notes",
+                vec![
+                    json!(-1),
+                    json!(1.5),
+                    json!(true),
+                    json!("SECRET"),
+                    json!({"token":"SECRET"}),
+                    json!([]),
+                ],
+            ),
+            ("last_indexed", vec![json!(0), json!({"token":"SECRET"})]),
+        ] {
+            for value in values {
+                let mut row = valid.clone();
+                row[field] = value;
+                malformed.push(row);
+            }
+        }
+        for row in malformed {
+            for value in [json!([row.clone()]), json!({"results":[valid.clone(),row]})] {
+                let result = source_result("peer", Ok(value));
+                assert_eq!(result["status"], "invalid_response");
+                assert!(result["vault_count"].is_null());
+                assert_eq!(result["vaults"], json!([]));
+                assert!(!result.to_string().contains("SECRET"));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_raw_vault_rows_keep_unknown_counts_and_noncanonical_identity_visible() {
+        let value = json!({"results":[
+            {"uid":"vlt:legacy", "name":"", "root_path":"", "diagnostic":{"token":"SECRET"}},
+            {"uid":"vlt:other-legacy", "name":"peer", "root_path":"/peer", "notes":null, "last_indexed":null}
+        ]});
+        let mut peer = source_result("peer", Ok(value));
+        assert_eq!(peer["status"], "available");
+        assert_eq!(peer["vault_count"], 2);
+        for row in peer["vaults"].as_array().unwrap() {
+            assert!(row["notes"].is_null());
+            assert!(row["last_indexed"].is_null());
+        }
+        assert!(!peer.to_string().contains("SECRET"));
+        annotate_mappings(&source(&[]), &mut peer, &VaultMappings::new());
+        assert_eq!(peer["vaults"][0]["mapping_status"], "invalid_uid");
     }
 
     // A real tonic HTTP/2 peer verifies dispatch and bearer metadata. No

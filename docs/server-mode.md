@@ -1084,6 +1084,8 @@ upstreams run concurrently. Endpoint URLs, bearer tokens and remote error
 messages are omitted from the inventory. Listing still prints all available
 sources when another fails and exits 1 for a partial inventory. `brain status`
 retains its `upstreams` name/mode metadata; endpoint URLs are omitted there too.
+Malformed vault rows make that source an invalid response, with an unknown
+count. Older peers may omit note counts and timestamps; those remain unknown.
 
 `brain status` includes the same per-source `vault_sources` inventory when
 upstreams are configured and names unmapped upstream vaults in text output.
@@ -1872,3 +1874,13 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
   http://localhost:9379/admin/api/repos | jq '.[].name'
 ```
+
+### Local code watcher configuration changes
+
+Live TypeScript configuration and custom extends-file events revisit affected
+callers, including when an extends file has a source-code suffix. Package
+manifest events retain their separate update policy.
+
+After configuration-only edits made while a local code watcher was stopped,
+run `nestweaver index --repo <checkout> --db <db> --force`. Restarting the
+watcher alone does not refresh those saved configuration dependencies.

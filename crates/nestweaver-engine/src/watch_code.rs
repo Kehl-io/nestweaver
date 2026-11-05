@@ -1,7 +1,11 @@
 //! File watcher for live incremental code re-indexing.
 //!
-//! Watches a repository directory for changes to supported source files
-//! (any extension recognised by `nestweaver_parser::detect_language`).
+//! Watches supported source files and the exact config/extends paths probed by
+//! resolver workspace discovery. Config-only live edits revisit eligible callers;
+//! unrelated JSON is not a source input. Config-only drift while stopped remains
+//! outside source-hash startup reconciliation; after such a change run
+//! `index --repo <repo> --db <db> --force`. Manifest events retain their separate
+//! derivation/debt policy rather than this source-config replay policy.
 //! Uses a 2-second debounce window to batch rapid saves into a single
 //! re-index pass. On each trigger the changed files are re-parsed: new
 //! or modified files get their symbols replaced via delete + re-insert;
@@ -127,6 +131,11 @@ impl BatchInputSnapshot {
     fn get(&self, path: &Path) -> Option<&String> {
         self.signatures.get(path)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESOLVER_PROBE_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Hash-bound preparation reads. Every string consumed by parsing/resolution
@@ -1094,6 +1103,7 @@ impl CodeWatcher {
     /// kept when the graph holds it (to be retracted), a vanished path only
     /// when the graph holds it (to be deleted), and a stop request abandons
     /// the batch before publication.
+    #[cfg(test)]
     fn expand_event_paths(
         &self,
         store: &GraphStore,
@@ -1102,6 +1112,24 @@ impl CodeWatcher {
         repo_url: &str,
         events: &[PathBuf],
     ) -> anyhow::Result<Vec<PathBuf>> {
+        let paths = self.event_snapshot_paths(store, r_uid, events)?;
+        let (initial, probes) = self.batch_input_snapshot_with_probes(reader, &paths)?;
+        self.expand_event_paths_with_snapshot(
+            store, r_uid, reader, repo_url, events, &initial, &probes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_event_paths_with_snapshot(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        reader: &crate::content_reader::FilesystemReader,
+        repo_url: &str,
+        events: &[PathBuf],
+        initial: &BatchInputSnapshot,
+        probes: &HashSet<PathBuf>,
+    ) -> anyhow::Result<Vec<PathBuf>> {
         let mut paths = HashSet::new();
         let mut incumbent_paths = HashSet::new();
         let mut subtrees = Vec::new();
@@ -1109,6 +1137,26 @@ impl CodeWatcher {
         let mut event_files = Vec::new();
         // Directories whose ignore rules changed: re-evaluated for visibility.
         let mut ignore_roots = Vec::new();
+        // A consumed config is authoritative regardless of its filename suffix.
+        // Reuse the initial snapshot's discovery and signatures: no extra walk,
+        // cached facts or context pass is introduced for source-only batches.
+        if events.iter().any(|event| {
+            event.strip_prefix(&self.repo_root).is_ok_and(|relative| {
+                preparation_relative_path(relative).is_some()
+                    && probes.iter().any(|probe| probe.starts_with(event))
+            })
+        }) {
+            for path in initial
+                .signatures
+                .keys()
+                .filter(|path| is_watcher_input(path))
+            {
+                paths.insert(path.clone());
+                // Includes vanished/excluded graph incumbents explicitly
+                // captured before expansion, not just visible current files.
+                incumbent_paths.insert(path.clone());
+            }
+        }
         for (seen, path) in events
             .iter()
             .collect::<HashSet<_>>()
@@ -1534,17 +1582,28 @@ impl CodeWatcher {
             })
             .cloned()
             .collect();
-        let relevant = match self.expand_event_paths(store, r_uid, &reader, repo_url, &code_events)
-        {
+        // Capture all existing and graphed source extents before expansion.
+        // A deleted/excluded incumbent must have an explicit initial signature;
+        // adding a missing signature after discovery would admit an ABA gap.
+        let snapshot_paths = match self.event_snapshot_paths(store, r_uid, &event_paths) {
             Ok(paths) => paths,
             Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
         };
-        let mut snapshot_paths = relevant.clone();
-        snapshot_paths.extend(event_paths);
-        snapshot_paths.sort();
-        snapshot_paths.dedup();
-        let source_snapshot = match self.batch_input_snapshot(&reader, &snapshot_paths) {
-            Ok(snapshot) => snapshot,
+        let (source_snapshot, resolver_probes) =
+            match self.batch_input_snapshot_with_probes(&reader, &snapshot_paths) {
+                Ok(snapshot) => snapshot,
+                Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+            };
+        let relevant = match self.expand_event_paths_with_snapshot(
+            store,
+            r_uid,
+            &reader,
+            repo_url,
+            &code_events,
+            &source_snapshot,
+            &resolver_probes,
+        ) {
+            Ok(paths) => paths,
             Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
         };
         let preparation_reader = PreparationReader {
@@ -2192,11 +2251,71 @@ impl CodeWatcher {
         Ok(true)
     }
 
+    /// Exact optional config reads used by workspace/alias discovery, including
+    /// missing root configs and extends targets. This is event selection only;
+    /// never publish resolver facts from this unguarded discovery pass.
+    fn resolver_probe_paths(
+        &self,
+        reader: &crate::content_reader::FilesystemReader,
+        files: &[PathBuf],
+    ) -> anyhow::Result<HashSet<PathBuf>> {
+        #[cfg(test)]
+        RESOLVER_PROBE_PASSES.with(|passes| passes.set(passes.get() + 1));
+        self.ensure_not_stopping()?;
+        let probed = std::cell::RefCell::new(HashSet::new());
+        let _ = nestweaver_resolver::discover_workspace_context_with_files(files, |relative| {
+            let normalized = preparation_relative_path(relative).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "workspace input escapes watcher root",
+                )
+            })?;
+            self.ensure_not_stopping().map_err(std::io::Error::other)?;
+            probed.borrow_mut().insert(self.repo_root.join(normalized));
+            reader.read_file(relative).map_err(std::io::Error::other)
+        });
+        self.ensure_not_stopping()?;
+        Ok(probed.into_inner())
+    }
+
+    fn event_snapshot_paths(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        events: &[PathBuf],
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let mut paths = events.to_vec();
+        paths.extend(
+            store
+                .list_files_by_repo(r_uid)?
+                .into_iter()
+                .map(|(_, path)| self.repo_root.join(path)),
+        );
+        paths.extend(
+            store
+                .list_contracts(Some(r_uid))?
+                .into_iter()
+                .map(|contract| self.repo_root.join(contract.source_path)),
+        );
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     fn batch_input_snapshot(
         &self,
         reader: &crate::content_reader::FilesystemReader,
         paths: &[PathBuf],
     ) -> anyhow::Result<BatchInputSnapshot> {
+        self.batch_input_snapshot_with_probes(reader, paths)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    fn batch_input_snapshot_with_probes(
+        &self,
+        reader: &crate::content_reader::FilesystemReader,
+        paths: &[PathBuf],
+    ) -> anyhow::Result<(BatchInputSnapshot, HashSet<PathBuf>)> {
         use std::io::Read;
         // Resolution/type environments can depend on unchanged peers in any
         // supported language. Freeze the complete eligible input set as well
@@ -2216,19 +2335,7 @@ impl CodeWatcher {
         // including nested Go modules and custom tsconfig extends filenames.
         // This context is discarded: only later hash-bound reads may supply
         // preparation facts. Absent probes are recorded as inputs too.
-        let probed = std::cell::RefCell::new(Vec::new());
-        let _ = nestweaver_resolver::discover_workspace_context_with_files(&listed, |relative| {
-            let normalized = preparation_relative_path(relative).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "workspace input escapes watcher root",
-                )
-            })?;
-            self.ensure_not_stopping().map_err(std::io::Error::other)?;
-            probed.borrow_mut().push(self.repo_root.join(normalized));
-            reader.read_file(relative).map_err(std::io::Error::other)
-        });
-        let probed: HashSet<_> = probed.into_inner().into_iter().collect();
+        let probed = self.resolver_probe_paths(reader, &listed)?;
         paths.extend(probed.iter().cloned());
         self.ensure_not_stopping()?;
         paths.sort();
@@ -2335,10 +2442,13 @@ impl CodeWatcher {
             };
             inputs.insert(path.clone(), value);
         }
-        Ok(BatchInputSnapshot {
-            signatures: inputs,
-            files: listed,
-        })
+        Ok((
+            BatchInputSnapshot {
+                signatures: inputs,
+                files: listed,
+            },
+            probed,
+        ))
     }
 
     fn validate_prepared_batch(
@@ -5567,6 +5677,200 @@ mod tests {
                 &crate::index::FileSystemIndexEpilogueIo,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn resolver_config_only_events_match_full_graph_through_missing_and_ancestor_changes() {
+        for filename in ["custom.settings", "custom.ts", "custom.js"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::create_dir_all(root.join("a")).unwrap();
+            std::fs::create_dir_all(root.join("b")).unwrap();
+            std::fs::create_dir_all(root.join("config")).unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            std::fs::write(root.join("src/main.ts"), "import { selected } from '@choice/target';\nexport function caller() { return selected(); }\n").unwrap();
+            for name in ["a", "b"] {
+                std::fs::write(
+                    root.join(format!("{name}/target.ts")),
+                    "export function selected() {}\n",
+                )
+                .unwrap();
+            }
+            let root_config = root.join("tsconfig.json");
+            let custom = root.join(format!("config/{filename}"));
+            let config = |name: &str| {
+                format!(r#"{{"compilerOptions":{{"paths":{{"@choice/*":["{name}/*"]}}}}}}"#)
+            };
+            std::fs::write(
+                &root_config,
+                format!(r#"{{"extends":"./config/{filename}"}}"#),
+            )
+            .unwrap();
+            std::fs::write(&custom, config("a")).unwrap();
+            let url = format!("file://{}", root.display());
+            let uid = nestweaver_schema::repo_uid("test", &url);
+            let (_, store) =
+                crate::index::index_directory_in_memory(&root, "test", &url, "sha").unwrap();
+            let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), &root, "test");
+            let caller = nestweaver_schema::symbol_uid(&uid, "src/main.ts", "caller", 2);
+            let assert_oracle = |phase: &str, selected: Option<&str>| {
+                let actual: Vec<_> = store
+                    .callees_of(&caller)
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.file_path)
+                    .collect();
+                let expected: Vec<_> = selected
+                    .into_iter()
+                    .map(|name| format!("{name}/target.ts"))
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "{phase}: unchanged caller must select exact config owner"
+                );
+                let (_, full) =
+                    crate::index::index_directory_in_memory(&root, "test", &url, "sha").unwrap();
+                let edges = |graph: &GraphStore| {
+                    let mut rows: Vec<_> = graph
+                        .load_typed_edges()
+                        .unwrap()
+                        .into_iter()
+                        .map(|row| format!("{row:?}"))
+                        .collect();
+                    rows.sort();
+                    rows
+                };
+                assert_eq!(
+                    edges(&store),
+                    edges(&full),
+                    "{phase}: exact edge/property/multiplicity parity"
+                );
+            };
+            let apply = |phase: &str, path: &Path, selected| {
+                assert!(
+                    matches!(
+                        process_fixture_batch(&watcher, &store, &uid, &root, &[path.to_path_buf()]),
+                        WatchBatchOutcome::Published { .. }
+                    ),
+                    "{phase}: config-only event must publish"
+                );
+                assert_oracle(phase, selected);
+            };
+            assert_oracle("initial", Some("a"));
+            std::fs::write(&custom, config("b")).unwrap();
+            apply("custom extends remapped", &custom, Some("b"));
+            std::fs::remove_file(&custom).unwrap();
+            apply("custom extends deleted", &custom, None);
+            std::fs::write(&custom, config("a")).unwrap();
+            apply("custom extends recreated", &custom, Some("a"));
+            std::fs::remove_dir_all(root.join("config")).unwrap();
+            apply("config ancestor deleted", &root.join("config"), None);
+            std::fs::create_dir_all(root.join("config")).unwrap();
+            std::fs::write(&custom, config("b")).unwrap();
+            apply("config ancestor recreated", &root.join("config"), Some("b"));
+            std::fs::remove_file(&root_config).unwrap();
+            apply("root config deleted", &root_config, None);
+            std::fs::write(&root_config, r#"{"extends":"./config/later.settings"}"#).unwrap();
+            apply("root config selects absent probe", &root_config, None);
+            let later = root.join("config/later.settings");
+            std::fs::write(&later, config("a")).unwrap();
+            apply("absent extends probe created", &later, Some("a"));
+            std::fs::write(&root_config, config("b")).unwrap();
+            apply("root aliases remapped", &root_config, Some("b"));
+            let unrelated = root.join("unrelated.json");
+            std::fs::write(&unrelated, config("a")).unwrap();
+            let generation = store.graph_generation();
+            assert!(matches!(
+                process_fixture_batch(&watcher, &store, &uid, &root, &[unrelated]),
+                WatchBatchOutcome::Unchanged
+            ));
+            assert_eq!(
+                store.graph_generation(),
+                generation,
+                "unprobed JSON must not publish"
+            );
+            assert_oracle("unprobed JSON ignored", Some("b"));
+            let source = root.join("src/main.ts");
+            std::fs::write(&source, "import { selected } from '@choice/target';\nexport function caller() { return selected(); }\n// source-only event\n").unwrap();
+            let probe_passes = RESOLVER_PROBE_PASSES.with(std::cell::Cell::get);
+            apply("ordinary source-only edit", &source, Some("b"));
+            assert_eq!(
+                RESOLVER_PROBE_PASSES.with(std::cell::Cell::get) - probe_passes,
+                2,
+                "one initial discovery plus final validation; expansion must reuse supplied probes"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_notify_delivers_custom_resolver_config_without_a_source_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.ts"), "import { selected } from '@choice/target';\nexport function caller() { selected(); }\n").unwrap();
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(
+                root.join(format!("{name}/target.ts")),
+                "export function selected() {}\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"extends":"./custom.settings"}"#,
+        )
+        .unwrap();
+        let custom = root.join("custom.settings");
+        std::fs::write(
+            &custom,
+            r#"{"compilerOptions":{"paths":{"@choice/*":["a/*"]}}}"#,
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        let db = dir.path().join("graph.lbug");
+        crate::index::index_directory(&root, &db, "test", &url, "sha").unwrap();
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let (stop, handle) = spawn_live_code_watcher(watcher, Arc::clone(&store));
+        struct JoinWatcher(
+            ShutdownHandle,
+            Option<std::thread::JoinHandle<Result<(), anyhow::Error>>>,
+        );
+        impl Drop for JoinWatcher {
+            fn drop(&mut self) {
+                self.0.stop();
+                if let Some(handle) = self.1.take() {
+                    let result = handle.join();
+                    if !std::thread::panicking() {
+                        result.unwrap().unwrap();
+                    }
+                }
+            }
+        }
+        let _watcher = JoinWatcher(stop, Some(handle));
+        let caller = nestweaver_schema::symbol_uid(&uid, "main.ts", "caller", 2);
+        assert_eq!(
+            store.callees_of(&caller).unwrap()[0].file_path,
+            "a/target.ts"
+        );
+        std::fs::write(
+            &custom,
+            r#"{"compilerOptions":{"paths":{"@choice/*":["b/*"]}}}"#,
+        )
+        .unwrap();
+        wait_until("config-only live event changes exact caller target", || {
+            let callees = store.callees_of(&caller).unwrap();
+            callees.len() == 1 && callees[0].file_path == "b/target.ts"
+        });
+        // No supported source bytes changed; actual notify/debounce/admission
+        // delivered the custom config through the existing publication route.
+        let source = std::fs::read_to_string(root.join("main.ts")).unwrap();
+        assert!(!source.contains("b/target"));
     }
 
     #[test]

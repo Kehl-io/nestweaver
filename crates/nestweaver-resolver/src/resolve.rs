@@ -11847,6 +11847,64 @@ export function readIt() { return value(); }
     }
 
     #[test]
+    fn php8_private_final_methods_do_not_close_late_static_dispatch() {
+        let base = r#"<?php
+class Base {
+ final private static function privateStaticTarget() {}
+ final private function privateInstanceTarget() {}
+ final public static function publicTarget() {}
+ final protected static function protectedTarget() {}
+ public static function privateStaticCaller() { static::privateStaticTarget(); }
+ public function privateInstanceCaller() { static::privateInstanceTarget(); }
+ public static function lexicalCaller() { self::privateStaticTarget(); }
+ public static function publicCaller() { static::publicTarget(); }
+ public static function protectedCaller() { static::protectedTarget(); }
+}
+"#;
+        let child = r#"<?php
+class Child extends Base {
+ public static function privateStaticTarget() {}
+ public function privateInstanceTarget() {}
+}
+final class Closed {
+ final private static function closedTarget() {}
+ public static function closedCaller() { static::closedTarget(); }
+}
+class Constructor {
+ final private function __construct() {}
+ public function constructorCaller() { static::__construct(); }
+}
+"#;
+        for inputs in [
+            vec![("base.php", base), ("child.php", child)],
+            vec![("child.php", child), ("base.php", base)],
+        ] {
+            let (files, edges) = review_edges(&inputs, Language::Php);
+            for caller in ["privateStaticCaller", "privateInstanceCaller"] {
+                assert!(
+                    call_targets(&files, &edges, "base.php", caller)
+                        .iter()
+                        .all(|target| target.starts_with("unresolved:")),
+                    "PHP 8 private final methods can be redeclared: {caller}: {edges:#?}"
+                );
+            }
+            for (path, caller, target) in [
+                ("base.php", "lexicalCaller", "privateStaticTarget"),
+                ("base.php", "publicCaller", "publicTarget"),
+                ("base.php", "protectedCaller", "protectedTarget"),
+                ("child.php", "closedCaller", "closedTarget"),
+                ("child.php", "constructorCaller", "__construct"),
+            ] {
+                assert_eq!(
+                    call_targets(&files, &edges, path, caller),
+                    vec![uid(&files, path, target)],
+                    "{caller}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn php_static_dispatch_refuses_duplicate_classes_traits_and_anonymous_owners() {
         let caller = "<?php\nuse Lib\\X;\nfunction caller() { X::m(); }\n";
         let definition = "<?php\nnamespace Lib;\nclass X { public static function m() {} }\n";
