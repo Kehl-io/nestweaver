@@ -6,11 +6,19 @@
 //! function used by the stdio server.
 //! HTTP accepts one JSON-RPC request per POST. Batch arrays are intentionally
 //! unsupported and return `-32600` rather than being partially dispatched.
+//!
+//! Sessions are bound to the authenticated token fingerprint and role, with
+//! limits of 128 per principal and 4,096 total (including administrators).
+//! Anonymous listeners share one namespace. Unknown, expired and wrong-owner
+//! IDs return HTTP 404 and require re-initialization; sessionless POST clients
+//! remain supported. Owners can reclaim capacity with `DELETE /mcp` and their
+//! `Mcp-Session-Id`; deletion never aborts an already-admitted mutation.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -137,14 +145,195 @@ const MAX_RESULTS: u64 = 5_000;
 /// Requests allowed per session per minute before rate limiting kicks in.
 const RATE_LIMIT_PER_MIN: u64 = 120;
 
-/// Per-client MCP session metadata.
-#[derive(Debug)]
+/// Maximum live MCP sessions, including administrators. Capacity is separate
+/// from request-rate limiting: an administrator may issue requests without a
+/// rate cap, but cannot exhaust the session registry. Anonymous clients share
+/// one explicit principal namespace, including listeners without peer metadata.
+const MAX_SESSIONS: usize = 4_096;
+const MAX_SESSIONS_PER_PRINCIPAL: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionPrincipal(String);
+
+impl SessionPrincipal {
+    fn authenticated(bearer: Option<&str>, admin: bool, auth_enabled: bool) -> Self {
+        if !auth_enabled {
+            // Unverified Authorization headers cannot mint principal budgets.
+            return Self("anonymous".into());
+        }
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bearer.unwrap_or_default().as_bytes());
+        let fingerprint: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        Self(format!(
+            "{}:{fingerprint}",
+            if admin { "admin" } else { "query" }
+        ))
+    }
+
+    fn cancellation_prefix(&self, session: &str) -> String {
+        format!("{}:{session}:", self.0)
+    }
+}
+
+/// Per-client MCP session metadata. Raw bearer tokens are never retained.
+#[derive(Debug, Clone)]
 pub struct McpSession {
     pub id: String,
+    principal: SessionPrincipal,
+    active_requests: usize,
     pub created_at: Instant,
     pub last_active: Instant,
     pub request_count: u64,
     pub rate_window_start: Instant,
+}
+
+/// Bounded registry whose membership changes are serialized together. A
+/// separate len/check/insert over DashMap shards cannot enforce either cap.
+/// The public handle is shared with the daemon sweeper, not a writable map.
+pub struct McpSessions {
+    entries: Mutex<HashMap<String, McpSession>>,
+    max_sessions: usize,
+    max_per_principal: usize,
+}
+
+impl McpSessions {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            max_sessions: MAX_SESSIONS,
+            max_per_principal: MAX_SESSIONS_PER_PRINCIPAL,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn retain_live(entries: &mut HashMap<String, McpSession>, now: Instant) {
+        entries.retain(|_, session| {
+            session.active_requests != 0
+                || now.saturating_duration_since(session.last_active)
+                    < Duration::from_secs(SESSION_TTL_SECS)
+        });
+    }
+
+    fn sweep_idle(&self, now: Instant, gauge: &AtomicU32) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        Self::retain_live(&mut entries, now);
+        gauge.store(entries.len() as u32, Ordering::Relaxed);
+    }
+
+    fn initialize(&self, principal: SessionPrincipal, gauge: &AtomicU32) -> Option<String> {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        // Reclaim idle capacity even if the five-minute sweeper has not run.
+        Self::retain_live(&mut entries, now);
+        gauge.store(entries.len() as u32, Ordering::Relaxed);
+        if entries.len() >= self.max_sessions
+            || entries
+                .values()
+                .filter(|s| s.principal == principal)
+                .count()
+                >= self.max_per_principal
+        {
+            return None;
+        }
+        let mut id = Uuid::new_v4().to_string();
+        while entries.contains_key(&id) {
+            id = Uuid::new_v4().to_string();
+        }
+        entries.insert(
+            id.clone(),
+            McpSession {
+                id: id.clone(),
+                principal,
+                active_requests: 0,
+                created_at: now,
+                last_active: now,
+                request_count: 1,
+                rate_window_start: now,
+            },
+        );
+        gauge.store(entries.len() as u32, Ordering::Relaxed);
+        Some(id)
+    }
+
+    fn admit(
+        self: &Arc<Self>,
+        id: &str,
+        principal: &SessionPrincipal,
+        gauge: &AtomicU32,
+    ) -> Option<SessionRequest> {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        Self::retain_live(&mut entries, now);
+        gauge.store(entries.len() as u32, Ordering::Relaxed);
+        let session = entries.get_mut(id)?;
+        if session.principal != *principal {
+            return None;
+        }
+        session.active_requests += 1;
+        session.last_active = now;
+        Some(SessionRequest {
+            _inner: Arc::new(ActiveSessionRequest {
+                sessions: Arc::clone(self),
+                id: id.to_owned(),
+            }),
+        })
+    }
+
+    fn close(&self, id: &str, principal: &SessionPrincipal, gauge: &AtomicU32) -> bool {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        Self::retain_live(&mut entries, Instant::now());
+        let owned = entries.get(id).is_some_and(|s| s.principal == *principal);
+        if owned {
+            // Membership removal only. Already-admitted dispatch/mutation
+            // workers retain their own ownership and are never aborted here.
+            entries.remove(id);
+        }
+        gauge.store(entries.len() as u32, Ordering::Relaxed);
+        owned
+    }
+
+    #[cfg(test)]
+    fn insert(&self, id: String, session: McpSession) {
+        self.entries.lock().unwrap().insert(id, session);
+    }
+
+    #[cfg(test)]
+    fn get(&self, id: &str) -> Option<McpSession> {
+        self.entries.lock().unwrap().get(id).cloned()
+    }
+}
+
+/// Retain session liveness across an async request, without holding the
+/// registry mutex during dispatch. Idle expiry must not evict an active call.
+#[derive(Clone)]
+struct SessionRequest {
+    _inner: Arc<ActiveSessionRequest>,
+}
+
+struct ActiveSessionRequest {
+    sessions: Arc<McpSessions>,
+    id: String,
+}
+
+impl Drop for ActiveSessionRequest {
+    fn drop(&mut self) {
+        let mut entries = self
+            .sessions
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = entries.get_mut(&self.id) {
+            session.active_requests = session.active_requests.saturating_sub(1);
+            session.last_active = Instant::now();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -250,7 +439,7 @@ pub struct McpHttpState {
     pub tantivy: Option<Arc<TantivyIndex>>,
     pub db_path: PathBuf,
     pub instance_cfg: Option<Arc<nestweaver_engine::InstanceConfig>>,
-    pub sessions: Arc<DashMap<String, McpSession>>,
+    pub sessions: Arc<McpSessions>,
     /// Cancellation keys include both established session and authenticated
     /// role; equal request IDs in different clients cannot cancel each other.
     in_flight: Arc<DashMap<String, crate::session::CancelFlag>>,
@@ -290,6 +479,10 @@ pub struct McpHttpState {
     /// so a test can drive the timeout arm deterministically.
     #[cfg(test)]
     test_dispatch_delay: Option<Duration>,
+    /// Test-only barrier for proving retained worker lifetime after an HTTP
+    /// timeout/disconnect, without inferring progress from a timed sleep.
+    #[cfg(test)]
+    test_dispatch_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Lazily-loaded embedding model for semantic search, shared with the
     /// daemon's gRPC path. Populated by a background task when the `embed`
     /// feature is enabled.
@@ -396,7 +589,7 @@ impl McpHttpState {
             tantivy,
             db_path,
             instance_cfg,
-            sessions: Arc::new(DashMap::new()),
+            sessions: Arc::new(McpSessions::new()),
             in_flight: Arc::new(DashMap::new()),
             mcp_session_gauge: Arc::new(AtomicU32::new(0)),
             server_mode,
@@ -408,6 +601,8 @@ impl McpHttpState {
             tool_timeout: Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS),
             #[cfg(test)]
             test_dispatch_delay: None,
+            #[cfg(test)]
+            test_dispatch_hook: None,
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             brain_status_provider: None,
             embed_model_provider: None,
@@ -436,7 +631,7 @@ impl McpHttpState {
             tantivy,
             db_path,
             instance_cfg,
-            sessions: Arc::new(DashMap::new()),
+            sessions: Arc::new(McpSessions::new()),
             in_flight: Arc::new(DashMap::new()),
             mcp_session_gauge: Arc::new(AtomicU32::new(0)),
             server_mode,
@@ -448,6 +643,8 @@ impl McpHttpState {
             tool_timeout: Duration::from_secs(DEFAULT_TOOL_TIMEOUT_SECS),
             #[cfg(test)]
             test_dispatch_delay: None,
+            #[cfg(test)]
+            test_dispatch_hook: None,
             embed_model: Arc::new(tokio::sync::RwLock::new(None)),
             brain_status_provider: None,
             embed_model_provider: None,
@@ -461,20 +658,16 @@ impl McpHttpState {
 /// Spawn a background task that removes sessions idle longer than `SESSION_TTL_SECS`.
 /// Accepts a shutdown receiver; the loop exits when the shutdown signal fires.
 pub fn spawn_session_sweeper(
-    sessions: Arc<DashMap<String, McpSession>>,
+    sessions: Arc<McpSessions>,
     gauge: Arc<AtomicU32>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(SWEEP_INTERVAL_SECS);
-        let ttl = std::time::Duration::from_secs(SESSION_TTL_SECS);
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    let now = Instant::now();
-                    sessions.retain(|_id, session| now.duration_since(session.last_active) < ttl);
-                    // Republish the live count so an expiry is reflected too.
-                    gauge.store(sessions.len() as u32, Ordering::Relaxed);
+                    sessions.sweep_idle(Instant::now(), &gauge);
                 }
                 _ = shutdown_rx.changed() => break,
             }
@@ -645,8 +838,9 @@ fn tool_timeout_message(name: &str, mutation: bool) -> String {
 }
 
 /// Check per-session rate limit. Returns `true` if the request is allowed.
-fn check_session_rate_limit(sessions: &DashMap<String, McpSession>, session_id: &str) -> bool {
-    if let Some(mut entry) = sessions.get_mut(session_id) {
+fn check_session_rate_limit(sessions: &McpSessions, session_id: &str) -> bool {
+    let mut entries = sessions.entries.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = entries.get_mut(session_id) {
         let now = Instant::now();
         let elapsed = now.duration_since(entry.rate_window_start);
         if elapsed >= Duration::from_secs(60) {
@@ -662,8 +856,8 @@ fn check_session_rate_limit(sessions: &DashMap<String, McpSession>, session_id: 
         entry.last_active = now;
         true
     } else {
-        // Unknown session — allow (session tracking will create one on initialize).
-        true
+        // A concurrent explicit close must not become a stateless dispatch.
+        false
     }
 }
 
@@ -704,10 +898,10 @@ fn http_client_rate_limit_key(
     "anonymous-stateless".to_string()
 }
 
-/// Build an axum [`Router`] that serves `POST /mcp`.
+/// Build an axum [`Router`] for MCP requests and owner-validated termination.
 pub fn router(state: Arc<McpHttpState>) -> Router {
     Router::new()
-        .route("/mcp", post(handle_mcp))
+        .route("/mcp", post(handle_mcp).delete(close_mcp_session))
         .with_state(state)
 }
 
@@ -782,6 +976,46 @@ fn jsonrpc_http_error(
     }
 }
 
+/// Return the authenticated admin role using exactly the same query/admin
+/// bearer rules for POST and DELETE. Absent query auth keeps anonymous mode.
+fn authenticate_bearer(state: &McpHttpState, provided: Option<&str>) -> Option<bool> {
+    use subtle::ConstantTimeEq;
+    let Some(query) = &state.auth_token else {
+        return Some(false);
+    };
+    let bearer = provided?;
+    let query_matches = bool::from(bearer.as_bytes().ct_eq(query.as_bytes()));
+    let admin_matches = state
+        .admin_token
+        .as_ref()
+        .is_some_and(|admin| bool::from(bearer.as_bytes().ct_eq(admin.as_bytes())));
+    (query_matches || admin_matches).then_some(admin_matches)
+}
+
+/// Explicit session termination (MCP Streamable HTTP session management).
+/// Closing registry membership does not cancel or abort an admitted mutation.
+async fn close_mcp_session(State(state): State<Arc<McpHttpState>>, headers: HeaderMap) -> Response {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(nestweaver_schema::http_auth::bearer_token);
+    let Some(admin) = authenticate_bearer(&state, bearer) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(id) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) else {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    };
+    let principal = SessionPrincipal::authenticated(bearer, admin, state.auth_token.is_some());
+    if state
+        .sessions
+        .close(id, &principal, &state.mcp_session_gauge)
+    {
+        axum::http::StatusCode::NO_CONTENT.into_response()
+    } else {
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 async fn handle_mcp(
     State(state): State<Arc<McpHttpState>>,
     // Peer address, populated by `into_make_service_with_connect_info` on the
@@ -797,39 +1031,28 @@ async fn handle_mcp(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(nestweaver_schema::http_auth::bearer_token);
-    let mut admin_bypass_rate_limit = false;
-
-    // Validate bearer token when auth is configured.
-    if let Some(ref expected) = state.auth_token {
-        match provided_bearer {
-            Some(t)
-                if {
-                    use subtle::ConstantTimeEq;
-                    let query_match = bool::from(t.as_bytes().ct_eq(expected.as_bytes()));
-                    let admin_match = state
-                        .admin_token
-                        .as_ref()
-                        .map(|admin| bool::from(t.as_bytes().ct_eq(admin.as_bytes())))
-                        .unwrap_or(false);
-                    admin_bypass_rate_limit = admin_match;
-                    query_match || admin_match
-                } => {}
-            _ => {
-                let notification = raw_request
-                    .as_ref()
-                    .ok()
-                    .and_then(|Json(value)| crate::protocol::validate_request(value.clone()).ok())
-                    .is_some_and(|request| request.id.is_none());
-                return jsonrpc_http_error(
-                    notification,
-                    axum::http::StatusCode::UNAUTHORIZED,
-                    Value::Null,
-                    error_code::INVALID_REQUEST,
-                    "unauthorized: valid Bearer token required",
-                );
-            }
+    let admin_bypass_rate_limit = match authenticate_bearer(&state, provided_bearer) {
+        Some(admin) => admin,
+        None => {
+            let notification = raw_request
+                .as_ref()
+                .ok()
+                .and_then(|Json(value)| crate::protocol::validate_request(value.clone()).ok())
+                .is_some_and(|request| request.id.is_none());
+            return jsonrpc_http_error(
+                notification,
+                axum::http::StatusCode::UNAUTHORIZED,
+                Value::Null,
+                error_code::INVALID_REQUEST,
+                "unauthorized: valid Bearer token required",
+            );
         }
-    }
+    };
+    let principal = SessionPrincipal::authenticated(
+        provided_bearer,
+        admin_bypass_rate_limit,
+        state.auth_token.is_some(),
+    );
 
     let apply_untrusted_rate_limit = || {
         if !state.server_mode || admin_bypass_rate_limit {
@@ -897,21 +1120,32 @@ async fn handle_mcp(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // Reject unknown session IDs (except for `initialize` which creates one).
-    // If a client sends a session ID that isn't in our DashMap, it likely
-    // expired or belongs to a previous server instance — ask it to re-init.
-    if let Some(ref sid) = session_id
-        && req.method != "initialize"
-        && !state.sessions.contains_key(sid)
-    {
-        return jsonrpc_http_error(
-            notification,
-            axum::http::StatusCode::OK,
-            id.clone(),
-            error_code::INVALID_REQUEST,
-            "unknown or expired session ID — please re-initialize",
-        );
-    }
+    // Ownership is checked before bookkeeping, rate limits, cancellation or
+    // dispatch. Unknown, expired and other-principal IDs share the same 404,
+    // including notifications, so the endpoint is not a session-existence oracle.
+    let _session_request = if req.method != "initialize" {
+        if let Some(ref sid) = session_id {
+            match state
+                .sessions
+                .admit(sid, &principal, &state.mcp_session_gauge)
+            {
+                Some(request) => Some(request),
+                None => {
+                    return jsonrpc_http_error(
+                        notification,
+                        axum::http::StatusCode::NOT_FOUND,
+                        id.clone(),
+                        error_code::INVALID_REQUEST,
+                        "unknown or expired session ID — please re-initialize",
+                    );
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Per-session rate limiting (server mode only).
     if state.server_mode {
@@ -934,7 +1168,8 @@ async fn handle_mcp(
         // still runs so `last_active`/`request_count` bookkeeping stays fresh
         // for the session sweeper — only the rejection is skipped. Without
         // the bypass an admin client got 429 at request RATE_LIMIT_PER_MIN+1.
-        if let Some(ref sid) = session_id
+        if req.method != "initialize"
+            && let Some(ref sid) = session_id
             && !check_session_rate_limit(&state.sessions, sid)
             && !admin_bypass_rate_limit
         {
@@ -946,30 +1181,23 @@ async fn handle_mcp(
                 "rate limit exceeded: too many requests per session per minute",
             );
         }
-    } else {
-        // Non-server mode: just update last_active / request_count.
-        if let Some(ref sid) = session_id
-            && let Some(mut entry) = state.sessions.get_mut(sid)
-        {
-            entry.last_active = Instant::now();
+    } else if req.method != "initialize"
+        && let Some(ref sid) = session_id
+    {
+        let mut entries = state
+            .sessions
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.get_mut(sid) {
             entry.request_count += 1;
         }
     }
 
-    // Cancellation requires an established session. A stateless HTTP request
-    // has no correlation namespace; never guess which client's equal ID it is.
-    let cancellation_prefix = session_id.as_ref().map(|sid| {
-        format!(
-            "{}:{sid}:",
-            if admin_bypass_rate_limit {
-                "admin"
-            } else if state.auth_token.is_some() {
-                "query"
-            } else {
-                "anonymous"
-            }
-        )
-    });
+    // Fingerprints separate equal request IDs even after a token rotation.
+    let cancellation_prefix = session_id
+        .as_ref()
+        .map(|sid| principal.cancellation_prefix(sid));
     if req.method == "notifications/cancelled" {
         if let (Some(prefix), Some(request_id)) = (
             &cancellation_prefix,
@@ -985,22 +1213,22 @@ async fn handle_mcp(
 
     let response = match req.method.as_str() {
         "initialize" => {
-            // Always create a fresh session on initialize.
-            let new_id = Uuid::new_v4().to_string();
-            let now = Instant::now();
-            state.sessions.insert(
-                new_id.clone(),
-                McpSession {
-                    id: new_id.clone(),
-                    created_at: now,
-                    last_active: now,
-                    request_count: 1,
-                    rate_window_start: now,
-                },
-            );
-            state
-                .mcp_session_gauge
-                .store(state.sessions.len() as u32, Ordering::Relaxed);
+            let Some(new_id) = state
+                .sessions
+                .initialize(principal, &state.mcp_session_gauge)
+            else {
+                let mut response = jsonrpc_http_error(
+                    notification,
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    id.clone(),
+                    error_code::INVALID_REQUEST,
+                    "session capacity reached — close an unused session or retry after expiry",
+                );
+                response
+                    .headers_mut()
+                    .insert("retry-after", "60".parse().unwrap());
+                return response;
+            };
 
             let mut resp_headers = HeaderMap::new();
             resp_headers.insert("mcp-session-id", new_id.parse().unwrap());
@@ -1265,10 +1493,17 @@ async fn handle_mcp(
             let timeout = state.tool_timeout;
             #[cfg(test)]
             let test_dispatch_delay = state.test_dispatch_delay;
+            #[cfg(test)]
+            let test_dispatch_hook = state.test_dispatch_hook.clone();
             let tool_name = name.clone();
             let dispatch_cancel = std::sync::Arc::clone(&cancel_flag);
+            // The worker, not its HTTP waiter, is the lifetime authority.
+            // Dropping a JoinHandle on timeout/disconnect cannot abort an
+            // already-running blocking query or mutation.
+            let dispatch_session = _session_request.clone();
             let work = tokio::time::timeout(timeout, async move {
                 if let Some(provider) = status_provider {
+                    let _active_session = dispatch_session;
                     return Ok(async {
                         tools::enforce_lite_tool_allowed(&tool_name, lite)?;
                         let arguments =
@@ -1283,6 +1518,11 @@ async fn handle_mcp(
                     .await);
                 }
                 tokio::task::spawn_blocking(move || {
+                    let _active_session = dispatch_session;
+                    #[cfg(test)]
+                    if let Some(hook) = test_dispatch_hook {
+                        hook();
+                    }
                     #[cfg(test)]
                     if let Some(delay) = test_dispatch_delay {
                         std::thread::sleep(delay);
@@ -1599,11 +1839,17 @@ mod tests {
             Arc::new(move || frozen),
         ));
         let state = Arc::new(state);
-        for sid in ["session-a", "session-b"] {
+        for (sid, token, admin) in [
+            ("session-a", "shared-query-token", false),
+            ("session-b", "shared-query-token", false),
+            ("admin-session", "admin-token", true),
+        ] {
             state.sessions.insert(
                 sid.to_string(),
                 McpSession {
                     id: sid.to_string(),
+                    principal: SessionPrincipal::authenticated(Some(token), admin, true),
+                    active_requests: 0,
                     created_at: frozen,
                     last_active: frozen,
                     request_count: 0,
@@ -1683,12 +1929,14 @@ mod tests {
 
     #[test]
     fn rate_limit_rejects_at_limit_within_window() {
-        let sessions = DashMap::new();
+        let sessions = McpSessions::new();
         let now = Instant::now();
         sessions.insert(
             "sid".to_string(),
             McpSession {
                 id: "sid".to_string(),
+                principal: SessionPrincipal::authenticated(None, false, false),
+                active_requests: 0,
                 created_at: now,
                 last_active: now,
                 request_count: RATE_LIMIT_PER_MIN,
@@ -1701,12 +1949,14 @@ mod tests {
 
     #[test]
     fn rate_limit_resets_by_window_start_not_last_activity() {
-        let sessions = DashMap::new();
+        let sessions = McpSessions::new();
         let now = Instant::now();
         sessions.insert(
             "sid".to_string(),
             McpSession {
                 id: "sid".to_string(),
+                principal: SessionPrincipal::authenticated(None, false, false),
+                active_requests: 0,
                 created_at: now - Duration::from_secs(120),
                 last_active: now,
                 request_count: RATE_LIMIT_PER_MIN,
@@ -2237,11 +2487,19 @@ mod tests {
                 .unwrap()
         };
 
-        // Admin: RATE_LIMIT_PER_MIN+1 requests on one session, never a 429.
+        // Bypassing rate limits never bypasses session ownership.
+        let wrong_owner = app
+            .clone()
+            .oneshot(call("admin-token", "session-a", 0))
+            .await
+            .unwrap();
+        assert_eq!(wrong_owner.status(), StatusCode::NOT_FOUND);
+
+        // Admin: RATE_LIMIT_PER_MIN+1 requests on its own session, never a 429.
         for i in 0..=RATE_LIMIT_PER_MIN {
             let resp = app
                 .clone()
-                .oneshot(call("admin-token", "session-a", i))
+                .oneshot(call("admin-token", "admin-session", i))
                 .await
                 .unwrap();
             assert_eq!(
@@ -2508,7 +2766,7 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -2719,6 +2977,8 @@ mod admission_regression_tests {
                 sid.into(),
                 McpSession {
                     id: sid.into(),
+                    principal: SessionPrincipal::authenticated(Some("query"), false, true),
+                    active_requests: 0,
                     created_at: now,
                     last_active: now,
                     request_count: 0,
@@ -2729,15 +2989,20 @@ mod admission_regression_tests {
         let first = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let second = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let admin = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        state
-            .in_flight
-            .insert("query:first:1".into(), first.clone());
-        state
-            .in_flight
-            .insert("query:second:1".into(), second.clone());
-        state
-            .in_flight
-            .insert("admin:first:1".into(), admin.clone());
+        let query_owner = SessionPrincipal::authenticated(Some("query"), false, true);
+        let admin_owner = SessionPrincipal::authenticated(Some("admin"), true, true);
+        state.in_flight.insert(
+            format!("{}1", query_owner.cancellation_prefix("first")),
+            first.clone(),
+        );
+        state.in_flight.insert(
+            format!("{}1", query_owner.cancellation_prefix("second")),
+            second.clone(),
+        );
+        state.in_flight.insert(
+            format!("{}1", admin_owner.cancellation_prefix("first")),
+            admin.clone(),
+        );
         let cancel =
             json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
                 .to_string();
@@ -2806,6 +3071,8 @@ timeout="60s"
             "session".into(),
             McpSession {
                 id: "session".into(),
+                principal: SessionPrincipal::authenticated(None, false, false),
+                active_requests: 0,
                 created_at: now,
                 last_active: now,
                 request_count: 0,
@@ -2838,5 +3105,679 @@ timeout="60s"
         assert_eq!(body, Value::Null);
         let _ = release_tx.send(());
         peer.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod session_ownership_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::collections::HashSet;
+    use tower::ServiceExt;
+
+    fn state(auth: bool, total: usize, per_principal: usize) -> Arc<McpHttpState> {
+        let store = Arc::new(GraphStore::in_memory().unwrap());
+        let mut state = if auth {
+            McpHttpState::with_auth(
+                false,
+                store,
+                None,
+                "unused-session-fixture".into(),
+                None,
+                true,
+                "query-token".into(),
+                Some("admin-token".into()),
+            )
+        } else {
+            McpHttpState::new(
+                false,
+                store,
+                None,
+                "unused-session-fixture".into(),
+                None,
+                false,
+            )
+        };
+        state.sessions = Arc::new(McpSessions {
+            entries: Mutex::new(HashMap::new()),
+            max_sessions: total,
+            max_per_principal: per_principal,
+        });
+        Arc::new(state)
+    }
+
+    async fn send(
+        app: Router,
+        method: &str,
+        bearer: Option<&str>,
+        session: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, Option<String>, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/mcp")
+            .header("content-type", "application/json");
+        if let Some(token) = bearer {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        if let Some(id) = session {
+            request = request.header("mcp-session-id", id);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .map(|id| id.to_str().unwrap().to_owned());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, session, body)
+    }
+
+    fn initialize() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":PROTOCOL_VERSION,"capabilities":{},
+                "clientInfo":{"name":"session-regression","version":"1"}}})
+    }
+
+    fn ping() -> Value {
+        json!({"jsonrpc":"2.0","id":2,"method":"ping"})
+    }
+
+    #[tokio::test]
+    async fn session_owner_precedes_activity_cancellation_and_termination() {
+        let state = state(true, 4, 2);
+        let app = router(state.clone());
+        let (status, id, _) =
+            send(app.clone(), "POST", Some("admin-token"), None, initialize()).await;
+        assert_eq!(status, StatusCode::OK);
+        let id = id.unwrap();
+        let before = state.sessions.get(&id).unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.in_flight.insert(
+            format!("{}7", before.principal.cancellation_prefix(&id)),
+            cancel.clone(),
+        );
+
+        let unauthorized = send(app.clone(), "POST", Some("query-token"), Some(&id), ping()).await;
+        let unknown = send(
+            app.clone(),
+            "POST",
+            Some("query-token"),
+            Some("unknown"),
+            ping(),
+        )
+        .await;
+        assert_eq!(
+            unauthorized, unknown,
+            "ownership refusal disclosed session existence"
+        );
+        assert_eq!(unauthorized.0, StatusCode::NOT_FOUND);
+        assert!(unauthorized.2.get("error").is_some());
+        assert_eq!(
+            state.sessions.get(&id).unwrap().last_active,
+            before.last_active
+        );
+        assert_eq!(
+            state.sessions.get(&id).unwrap().request_count,
+            before.request_count
+        );
+        let notification =
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}});
+        let refused = send(
+            app.clone(),
+            "POST",
+            Some("query-token"),
+            Some(&id),
+            notification,
+        )
+        .await;
+        assert_eq!(refused.0, StatusCode::NOT_FOUND);
+        assert_eq!(refused.2, Value::Null);
+        assert!(!cancel.load(Ordering::Acquire));
+        assert_eq!(
+            send(
+                app.clone(),
+                "DELETE",
+                Some("query-token"),
+                Some(&id),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(app.clone(), "DELETE", None, Some(&id), Value::Null)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(
+                app.clone(),
+                "DELETE",
+                Some("admin-token"),
+                None,
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            send(app.clone(), "POST", Some("admin-token"), Some(&id), ping())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                app.clone(),
+                "DELETE",
+                Some("admin-token"),
+                Some(&id),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 0);
+        assert!(
+            !cancel.load(Ordering::Acquire),
+            "termination cancelled an admitted worker"
+        );
+        assert_eq!(
+            send(app.clone(), "POST", Some("admin-token"), Some(&id), ping())
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, replacement, _) =
+            send(app, "POST", Some("admin-token"), None, initialize()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(replacement.as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn session_owner_includes_token_fingerprint_and_not_just_role() {
+        let original = state(true, 4, 2);
+        let (status, id, _) = send(
+            router(original.clone()),
+            "POST",
+            Some("query-token"),
+            None,
+            initialize(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = id.unwrap();
+        let owner = original.sessions.get(&id).unwrap();
+        assert!(!format!("{owner:?}").contains("query-token"));
+        let mut rotated = McpHttpState::with_auth(
+            false,
+            original.store.clone(),
+            None,
+            "unused-session-fixture".into(),
+            None,
+            true,
+            "new-query-token".into(),
+            Some("admin-token".into()),
+        );
+        rotated.sessions = original.sessions.clone();
+        rotated.mcp_session_gauge = original.mcp_session_gauge.clone();
+        assert_eq!(
+            send(
+                router(Arc::new(rotated)),
+                "POST",
+                Some("new-query-token"),
+                Some(&id),
+                ping()
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            original.sessions.get(&id).unwrap().request_count,
+            owner.request_count
+        );
+        assert_eq!(
+            send(
+                router(original),
+                "POST",
+                Some("query-token"),
+                Some(&id),
+                ping()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn global_and_principal_capacity_include_admin_and_preserve_incumbents() {
+        let state = state(true, 3, 2);
+        let app = router(state.clone());
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (status, id, _) =
+                send(app.clone(), "POST", Some("admin-token"), None, initialize()).await;
+            assert_eq!(status, StatusCode::OK);
+            ids.push(id.unwrap());
+        }
+        let refused = send(app.clone(), "POST", Some("admin-token"), None, initialize()).await;
+        assert_eq!(refused.0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(refused.1.is_none());
+        assert!(
+            refused.2["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("session capacity")
+        );
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            send(app.clone(), "POST", Some("query-token"), None, initialize())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(app.clone(), "POST", Some("query-token"), None, initialize())
+                .await
+                .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 3);
+        assert!(ids.iter().all(|id| state.sessions.get(id).is_some()));
+        assert_eq!(
+            send(
+                app.clone(),
+                "DELETE",
+                Some("admin-token"),
+                Some(&ids[0]),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            send(app, "POST", Some("admin-token"), None, initialize())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_initialization_cannot_overbook_capacity() {
+        // One principal hits its own cap; two admitted principals contend for
+        // the global cap. Both exercise real concurrent HTTP initialization.
+        for (total, per_principal, two_principals) in [(8, 3, false), (3, 2, true)] {
+            let state = state(true, total, per_principal);
+            let app = router(state.clone());
+            let barrier = Arc::new(tokio::sync::Barrier::new(32));
+            let mut tasks = tokio::task::JoinSet::new();
+            for i in 0..32 {
+                let app = app.clone();
+                let barrier = barrier.clone();
+                tasks.spawn(async move {
+                    barrier.wait().await;
+                    let token = if two_principals && i % 2 == 0 {
+                        "query-token"
+                    } else {
+                        "admin-token"
+                    };
+                    send(app, "POST", Some(token), None, initialize()).await
+                });
+            }
+            let mut ids = HashSet::new();
+            while let Some(result) = tasks.join_next().await {
+                let (status, id, body) = result.unwrap();
+                if status == StatusCode::OK {
+                    assert!(ids.insert(id.unwrap()));
+                } else {
+                    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+                    assert!(id.is_none());
+                }
+            }
+            assert_eq!(ids.len(), 3);
+            assert_eq!(state.sessions.len(), 3);
+            assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 3);
+            let entries = state.sessions.entries.lock().unwrap();
+            let mut counts = HashMap::new();
+            for session in entries.values() {
+                *counts.entry(session.principal.0.clone()).or_insert(0) += 1;
+            }
+            assert!(counts.values().all(|count| *count <= per_principal));
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_namespace_ignores_unverified_bearers_and_sessionless_posts_still_work() {
+        let state = state(false, 4, 1);
+        let app = router(state.clone());
+        let (status, id, _) = send(
+            app.clone(),
+            "POST",
+            Some("unverified-a"),
+            None,
+            initialize(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = id.unwrap();
+        assert_eq!(state.sessions.get(&id).unwrap().principal.0, "anonymous");
+        assert_eq!(
+            send(app.clone(), "POST", Some("unverified-b"), Some(&id), ping())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                app.clone(),
+                "POST",
+                Some("unverified-b"),
+                None,
+                initialize()
+            )
+            .await
+            .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            send(app, "POST", None, None, ping()).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_session_refuses_before_dispatch_and_releases_capacity_without_a_sweep_tick() {
+        let state = state(true, 1, 1);
+        let app = router(state.clone());
+        let (_, id, _) = send(app.clone(), "POST", Some("admin-token"), None, initialize()).await;
+        let id = id.unwrap();
+        state
+            .sessions
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .last_active = Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 1);
+        let result = send(app.clone(), "POST", Some("admin-token"), Some(&id), ping()).await;
+        assert_eq!(result.0, StatusCode::NOT_FOUND);
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            send(app, "POST", Some("admin-token"), None, initialize())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sweeper_and_admission_preserve_an_active_session_then_reclaim_idle_capacity() {
+        let state = state(true, 1, 1);
+        let principal = SessionPrincipal::authenticated(Some("admin-token"), true, true);
+        let id = state
+            .sessions
+            .initialize(principal.clone(), &state.mcp_session_gauge)
+            .unwrap();
+        let active = state
+            .sessions
+            .admit(&id, &principal, &state.mcp_session_gauge)
+            .unwrap();
+        state
+            .sessions
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .last_active = Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 1);
+        state
+            .sessions
+            .sweep_idle(Instant::now(), &state.mcp_session_gauge);
+        assert_eq!(state.sessions.len(), 1);
+        assert!(
+            state
+                .sessions
+                .initialize(principal.clone(), &state.mcp_session_gauge)
+                .is_none()
+        );
+        drop(active);
+        assert!(
+            state
+                .sessions
+                .admit(&id, &principal, &state.mcp_session_gauge)
+                .is_some(),
+            "request completion must start a fresh idle interval"
+        );
+        state
+            .sessions
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .last_active = Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 1);
+        state
+            .sessions
+            .sweep_idle(Instant::now(), &state.mcp_session_gauge);
+        assert!(state.sessions.is_empty());
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 0);
+        assert!(
+            state
+                .sessions
+                .initialize(principal, &state.mcp_session_gauge)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_close_does_not_abort_an_already_admitted_worker() {
+        let mut state = Arc::try_unwrap(state(true, 2, 2)).ok().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider_entered = entered.clone();
+        let provider_release = release.clone();
+        state.brain_status_provider = Some(Arc::new(move |_args, _identity, _delivery| {
+            let entered = provider_entered.clone();
+            let release = provider_release.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(json!({"counts_complete":true,"status":"owned-worker-completed"}))
+            })
+        }));
+        let state = Arc::new(state);
+        let app = router(state.clone());
+        let (_, id, _) = send(app.clone(), "POST", Some("admin-token"), None, initialize()).await;
+        let id = id.unwrap();
+        let request_app = app.clone();
+        let request_id = id.clone();
+        let request = tokio::spawn(async move {
+            send(request_app, "POST", Some("admin-token"), Some(&request_id),
+                json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"brain_status","arguments":{}}})).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(state.sessions.get(&id).unwrap().active_requests, 1);
+        assert_eq!(
+            send(app, "DELETE", Some("admin-token"), Some(&id), Value::Null)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        assert!(state.sessions.is_empty());
+        assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 0);
+        assert!(
+            !request.is_finished(),
+            "closing a session aborted its existing worker"
+        );
+        release.notify_one();
+        let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("result").is_some(), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod session_worker_lifetime_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[derive(Default)]
+    struct DispatchGate {
+        entered: tokio::sync::Notify,
+        released: Mutex<bool>,
+        release: std::sync::Condvar,
+    }
+
+    impl DispatchGate {
+        fn block(&self) {
+            self.entered.notify_one();
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.release.wait(released).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.release.notify_all();
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<DispatchGate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_and_disconnect_retain_session_until_blocking_worker_really_finishes() {
+        for disconnect in [false, true] {
+            let mut state = McpHttpState::new(
+                false,
+                Arc::new(GraphStore::in_memory().unwrap()),
+                None,
+                "unused-session-fixture".into(),
+                None,
+                false,
+            );
+            state.tool_timeout = if disconnect {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_millis(20)
+            };
+            let gate = Arc::new(DispatchGate::default());
+            let _release_on_drop = ReleaseOnDrop(gate.clone());
+            let dispatch_gate = gate.clone();
+            state.test_dispatch_hook = Some(Arc::new(move || dispatch_gate.block()));
+            let state = Arc::new(state);
+            let principal = SessionPrincipal::authenticated(None, false, false);
+            let id = state
+                .sessions
+                .initialize(principal, &state.mcp_session_gauge)
+                .unwrap();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("mcp-session-id", &id)
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"brain_status","arguments":{}}})
+                    .to_string(),
+                ))
+                .unwrap();
+            let app = router(state.clone());
+            let pending = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+            tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+            if disconnect {
+                pending.abort();
+                assert!(pending.await.unwrap_err().is_cancelled());
+            } else {
+                let response = tokio::time::timeout(Duration::from_secs(5), pending)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["result"]["isError"], true, "{body}");
+            }
+            // The HTTP waiter is gone but the actual blocking worker is still
+            // inside our gate. Idle expiry cannot reclaim its session.
+            state
+                .sessions
+                .entries
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .last_active = Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 1);
+            state
+                .sessions
+                .sweep_idle(Instant::now(), &state.mcp_session_gauge);
+            assert_eq!(state.sessions.get(&id).unwrap().active_requests, 1);
+            assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 1);
+            gate.release();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if state.sessions.get(&id).unwrap().active_requests == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            state
+                .sessions
+                .entries
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .last_active = Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 1);
+            state
+                .sessions
+                .sweep_idle(Instant::now(), &state.mcp_session_gauge);
+            assert!(state.sessions.is_empty());
+            assert_eq!(state.mcp_session_gauge.load(Ordering::Relaxed), 0);
+        }
     }
 }

@@ -198,6 +198,12 @@ pub enum ReferenceKind {
     /// Metadata identifying a PHP named function call, alongside its ordinary Call.
     /// Distinguishes it from constructors and methods without changing Call consumers.
     PhpFunctionCall,
+    /// PHP scoped-call metadata alongside Call; the direct scope receiver and
+    /// exact call position distinguish static dispatch from an instance call.
+    PhpStaticCall,
+    /// Exact PHP class identity, lexical extent and parent/method facts.
+    /// Metadata only; context is a serialized php::PhpClassFacts record.
+    PhpClassDefinition,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2234,6 +2240,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                     "import" => ReferenceKind::Import,
                     "package" => ReferenceKind::PackageBinding,
                     "php_function" => ReferenceKind::PhpFunctionCall,
+                    "php_static" => ReferenceKind::PhpStaticCall,
                     "extends" => ReferenceKind::Extends,
                     "implements" => ReferenceKind::Implements,
                     "includes" => ReferenceKind::Includes,
@@ -2323,7 +2330,8 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 //   Kotlin:    call_expression > navigation_expression > navigation_suffix
                 //   Ruby:      call > receiver (direct field)
                 //   PHP:       member_call_expression > object
-                let receiver = if kind == ReferenceKind::Call {
+                let receiver = if matches!(kind, ReferenceKind::Call | ReferenceKind::PhpStaticCall)
+                {
                     // A Rust turbofish (`x.parse::<T>()`, `Type::f::<T>()`)
                     // wraps the callee in a `generic_function`; the receiver
                     // lives on the wrapped node, exactly as without the
@@ -2402,6 +2410,18 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         None
                     };
 
+                    // PHP puts the scope directly on scoped_call_expression,
+                    // not inside a function child. Preserve even dynamic scope
+                    // text: the PHP resolver must refuse it authoritatively.
+                    let from_php_scope =
+                        if lang == Language::Php && node.kind() == "scoped_call_expression" {
+                            node.child_by_field_name("scope")
+                                .and_then(|scope| scope.utf8_text(source_bytes).ok())
+                                .map(|text| arena.alloc_str(text) as &str)
+                        } else {
+                            None
+                        };
+
                     // Swift has no `function` field on call_expression. The
                     // navigation target is its first child, before the suffix.
                     let from_swift_navigation = if lang == Language::Swift {
@@ -2425,6 +2445,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                         .or(from_direct_object)
                         .or(from_receiver_field)
                         .or(from_scoped_path)
+                        .or(from_php_scope)
                         .or(from_swift_navigation)
                         .map(|s| s.to_string())
                 } else if matches!(kind, ReferenceKind::ReadAccess | ReferenceKind::WriteAccess) {
@@ -2462,16 +2483,23 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 };
 
                 references.push(RawReference {
-                    // Only actual named PHP free calls use positional namespace
-                    // identity. Member/static/constructor calls keep their
-                    // baseline unscoped TypeEnvironment lookup: PHP parameters
-                    // and constructor bindings are not lexical declarations.
+                    // Named free and scoped static calls retain exact PHP
+                    // namespace positions. Ordinary instance/constructor calls
+                    // keep their established unscoped TypeEnvironment lookup.
                     scope: if lang == Language::Php
-                        && matches!(kind, ReferenceKind::Call | ReferenceKind::PhpFunctionCall)
-                        && node.kind() == "function_call_expression"
-                        && node.child_by_field_name("function").is_some_and(|callee| {
-                            matches!(callee.kind(), "name" | "qualified_name" | "relative_name")
-                        }) {
+                        && ((node.kind() == "scoped_call_expression"
+                            && matches!(kind, ReferenceKind::Call | ReferenceKind::PhpStaticCall))
+                            || (matches!(
+                                kind,
+                                ReferenceKind::Call | ReferenceKind::PhpFunctionCall
+                            ) && node.kind() == "function_call_expression"
+                                && node.child_by_field_name("function").is_some_and(|callee| {
+                                    matches!(
+                                        callee.kind(),
+                                        "name" | "qualified_name" | "relative_name"
+                                    )
+                                })))
+                    {
                         Some(LexicalScope {
                             start: 0,
                             end: source_bytes.len(),
@@ -2502,6 +2530,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
     if lang == Language::Php {
         crate::php::collect_namespace_bindings(tree.root_node(), source_bytes, &mut references);
+        crate::php::collect_class_facts(tree.root_node(), source_bytes, &mut references);
     }
 
     // Preserve exact import bindings as well as package exclusions.
@@ -12002,6 +12031,50 @@ void run() {
             let parsed = parse_source(Path::new(name), &source).unwrap();
             let lines: Vec<&str> = source.lines().collect();
             for reference in &parsed.references {
+                // Class-definition records are typed resolver metadata, whose
+                // context carries JSON rather than a source-line excerpt.
+                // Validate that separate contract without relaxing the line
+                // invariant for ordinary references (including static Calls).
+                if reference.kind == ReferenceKind::PhpClassDefinition {
+                    assert_eq!(name, "simple.php");
+                    let facts: crate::php::PhpClassFacts =
+                        serde_json::from_str(&reference.context).expect("valid PHP class facts");
+                    let scope = reference.scope.expect("exact PHP class extent");
+                    assert!(scope.start < scope.end && scope.end <= source.len());
+                    assert_eq!(scope.position, scope.start);
+                    assert_eq!(
+                        reference.start_line,
+                        source[..scope.start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count() as u32
+                            + 1
+                    );
+                    assert!(reference.receiver.is_none());
+                    for method in &facts.methods {
+                        assert!(scope.start <= method.scope.start);
+                        assert!(method.scope.start < method.scope.end);
+                        assert!(method.scope.end <= scope.end);
+                        assert_eq!(method.scope.position, method.scope.start);
+                        assert_eq!(
+                            method.start_line,
+                            source[..method.scope.start]
+                                .bytes()
+                                .filter(|byte| *byte == b'\n')
+                                .count() as u32
+                                + 1
+                        );
+                        assert_eq!(
+                            method.end_line,
+                            source[..method.scope.end]
+                                .bytes()
+                                .filter(|byte| *byte == b'\n')
+                                .count() as u32
+                                + 1
+                        );
+                    }
+                    continue;
+                }
                 if reference.context.is_empty() {
                     continue;
                 }

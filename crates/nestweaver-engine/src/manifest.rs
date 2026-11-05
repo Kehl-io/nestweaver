@@ -898,15 +898,16 @@ impl<'a> GraphMutationPublicationGuard<'a> {
         // D1 review: a non-code publication keeps a warm code-only PageRank
         // cache but removed its generation-bound sidecar, so after a relink
         // `.pagerank.json` stayed missing until something recomputed. Re-save
-        // it at the new generation once the marker is retired: the save is
-        // refused while the publication is dirty, so it cannot happen inside
-        // `finalize_graph_mutation`. A cold cache saves nothing.
+        // it at the new generation once the marker is retired. Canonical save
+        // first restores unified scope if a retained explicit code-only cache
+        // is present. Dirty publications still skip the write; a cold cache
+        // saves nothing.
         if retired
             && changed
             && self.non_code
             && let Some(db_path) = store.db_path()
             && let Err(error) =
-                store.save_pagerank_cache(&crate::sidecar_path(db_path, ".pagerank.json"))
+                store.save_canonical_pagerank_cache(&crate::sidecar_path(db_path, ".pagerank.json"))
         {
             tracing::warn!(
                 operation = %self.operation,

@@ -535,6 +535,8 @@ mod planning_allocation_witness {
 }
 
 struct TrigramPrefilterPlan {
+    /// Completed posting work survives a planning deadline; it is not an empty plan.
+    deadline_reached: bool,
     scope_population_complete: bool,
     candidate_cap_reached: bool,
     matching_ready_uids: HashSet<String>,
@@ -2178,6 +2180,7 @@ impl GraphStore {
             }
             return Ok(Some(TrigramPrefilterPlan {
                 matching_ready_uids: HashSet::new(),
+                deadline_reached: false,
                 candidate_cap_reached: !scope_population_complete,
                 scope_population_complete,
                 ready_scopes: HashSet::new(),
@@ -2201,6 +2204,7 @@ impl GraphStore {
         let mut error_scopes = HashSet::new();
         let mut matching_ready_uids = HashSet::new();
         let mut candidate_cap_reached = !scope_population_complete;
+        let mut deadline_reached = false;
         for scope_uid in active_scopes {
             if bounded_prefix && matching_ready_uids.len() >= candidate_cap {
                 scope_population_complete = false;
@@ -2208,7 +2212,9 @@ impl GraphStore {
                 break;
             }
             if interrupted()? {
-                return Ok(None);
+                deadline_reached = true;
+                scope_population_complete = false;
+                break;
             }
             let Some(state) = states.get(&scope_uid) else {
                 dirty_scopes.insert(scope_uid);
@@ -2258,6 +2264,8 @@ impl GraphStore {
                     ready_scopes.insert(scope_uid);
                     matching_ready_uids.extend(uids);
                     candidate_cap_reached |= cut;
+                    #[cfg(test)]
+                    deadline_witness::at("posting", start, deadline_ms);
                 }
                 Ok(None) => {
                     dirty_scopes.insert(scope_uid);
@@ -2286,10 +2294,14 @@ impl GraphStore {
         // before handing a seemingly usable plan to hydration; otherwise a
         // one-scope corpus can overrun during planning and still launch the
         // most expensive phase.
-        if interrupted()? {
-            return Ok(None);
+        deadline_reached |= interrupted()?;
+        // A deadline cannot turn completed posting work into “no candidates”.
+        // Unvisited scopes remain unknown, never implicitly ready or empty.
+        if deadline_reached {
+            scope_population_complete = false;
         }
         Ok(Some(TrigramPrefilterPlan {
+            deadline_reached,
             matching_ready_uids,
             scope_population_complete,
             candidate_cap_reached,
@@ -2391,7 +2403,10 @@ impl GraphStore {
                     path_prefix,
                     kinds,
                 )? {
-                    Some(plan) => (Some(plan), false),
+                    Some(plan) => {
+                        let deadline = plan.deadline_reached;
+                        (Some(plan), deadline)
+                    }
                     None => (None, true),
                 }
             }
@@ -2481,6 +2496,8 @@ impl GraphStore {
         check_cancel()?;
         candidates.sort_by(|left, right| left.uid.cmp(&right.uid));
         let hydration_ms = elapsed_millis(hydration_started);
+        #[cfg(test)]
+        deadline_witness::at("hydration", start, deadline_ms);
 
         // Scan the full candidate set collection managed to gather, bounded by
         // a phase-local wall-clock budget (and a high safety ceiling) — NOT a
@@ -2507,18 +2524,16 @@ impl GraphStore {
         // the graph lookups that produced it, and this crate's regex engine is
         // finite-automata/linear-time (see `compile_pattern`), so scanning a
         // `candidate_cap`-bounded, already-collected set cannot itself blow
-        // up. Only `planning_deadline` gates the loop's entry below, because
-        // it is the one case where `candidates` is guaranteed empty (`if
-        // planning_deadline { (Vec::new(), 0) }` above) — there is nothing to
-        // lose by skipping it. Whether collection was complete is folded back
-        // in AFTER the loop runs, not before.
+        // up. Planning/hydration deadline flags describe incompleteness;
+        // none may suppress verification of candidates already in memory.
         if plan.as_ref().is_some_and(|plan| plan.candidate_cap_reached) {
             hydration_stop =
                 stronger_truncation(hydration_stop, Some(RegexTruncationReason::CandidateCap));
         }
-        let collection_incomplete = hydration_stop.is_some() || elapsed_deadline;
-        let mut truncated = planning_deadline;
-        let mut truncation_reason = planning_deadline.then_some(RegexTruncationReason::Deadline);
+        let collection_incomplete =
+            planning_deadline || hydration_stop.is_some() || elapsed_deadline;
+        let mut truncated = false;
+        let mut truncation_reason = None;
         let mut results = Vec::new();
         let mut scanned_candidates = 0usize;
         // Verification's own ceiling is the budget REMAINING after collection,
@@ -2558,7 +2573,7 @@ impl GraphStore {
             // allows, then truncate honestly," never "discard everything"
             // (the pre-nw-427 bug) and never "keep scanning past the
             // caller's stated budget" (this regression).
-            if verification_started.elapsed().as_millis() as u64 > verification_budget_ms {
+            if i > 0 && verification_started.elapsed().as_millis() as u64 > verification_budget_ms {
                 truncated = true;
                 truncation_reason = Some(RegexTruncationReason::Deadline);
                 break;
@@ -2650,7 +2665,7 @@ impl GraphStore {
             // the more actionable reason to surface (the caller can raise
             // `--max-millis`), even when `hydration_stop` independently named
             // a different cause such as `CandidateCap`.
-            truncation_reason = Some(if elapsed_deadline {
+            truncation_reason = Some(if elapsed_deadline || planning_deadline {
                 RegexTruncationReason::Deadline
             } else {
                 hydration_stop.unwrap_or(RegexTruncationReason::Deadline)
@@ -2688,6 +2703,19 @@ impl GraphStore {
             note: None,
         }
         .with_scan_budget_note();
+        if response.truncated && response.truncation_reason == Some(RegexTruncationReason::Deadline)
+        {
+            let stage = if planning_deadline {
+                "planning"
+            } else if elapsed_deadline || hydration_stop == Some(RegexTruncationReason::Deadline) {
+                "hydration"
+            } else {
+                "verification"
+            };
+            response.note = Some(format!(
+                "Regex {stage} deadline reached: {posting_hits} posting candidates, {hydrated_candidates} hydrated candidates and {scanned_candidates} verified candidates. Returned matches are partial; retry with a larger time budget."
+            ));
+        }
         // QA #3: `stale_index: false` beside `ready_scopes: 0` read as "the
         // index is fine". With no index at all it is merely inapplicable, so
         // say what actually happened.
@@ -2822,8 +2850,10 @@ impl GraphStore {
             check_cancel()?;
             // A planner that ran out of budget returns no plan; that must not
             // silently become an unbudgeted full scan below.
-            let mut deadline_hit =
-                clauses.is_some() && plan.is_none() && elapsed_millis(call_started) >= deadline_ms;
+            let mut deadline_hit = plan.as_ref().is_some_and(|plan| plan.deadline_reached)
+                || (clauses.is_some()
+                    && plan.is_none()
+                    && elapsed_millis(call_started) >= deadline_ms);
             let planning_ms = elapsed_millis(planning_started);
             let stale_index = plan
                 .as_ref()
@@ -2964,7 +2994,52 @@ fn stops_on_deadline(stop: Option<RegexTruncationReason>) -> bool {
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    #[cfg(test)]
+    let elapsed = elapsed.saturating_add(deadline_witness::offset(started));
+    elapsed
+}
+
+/// A thread-local virtual deadline makes stage-boundary regressions exact,
+/// without sleeps, global environment changes or timing-dependent assertions.
+#[cfg(test)]
+mod deadline_witness {
+    use std::{cell::RefCell, time::Instant};
+    type ActiveDeadlineWitness = (&'static str, Option<(Instant, u64)>);
+    thread_local! { static ACTIVE: RefCell<Option<ActiveDeadlineWitness>> = const { RefCell::new(None) }; }
+    pub struct Guard;
+    impl Guard {
+        pub fn new(stage: &'static str) -> Self {
+            ACTIVE.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some((stage, None));
+            });
+            Self
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    pub fn at(stage: &'static str, start: Instant, deadline: u64) {
+        ACTIVE.with(|slot| {
+            if let Some((wanted, offset)) = slot.borrow_mut().as_mut()
+                && *wanted == stage
+            {
+                *offset = Some((start, deadline));
+            }
+        });
+    }
+    pub fn offset(start: Instant) -> u64 {
+        ACTIVE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|(_, value)| *value)
+                .filter(|(origin, _)| *origin == start)
+                .map_or(0, |(_, offset)| offset)
+        })
+    }
 }
 
 /// The verification phase's own wall-clock ceiling: the caller's `deadline_ms`
@@ -3059,6 +3134,56 @@ mod tests {
         );
         assert_eq!(result.hydrated_candidates, 0);
         assert_eq!(result.scanned_candidates, 0);
+    }
+
+    #[test]
+    fn planning_deadline_preserves_completed_posting_work_and_truthful_stage() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = correction_many_scope_fixture();
+        let _deadline = deadline_witness::Guard::new("posting");
+        let result = store
+            .regex_search("authenticateUser", None, None, None, Some(60_000))
+            .unwrap();
+        assert!(result.truncated, "{result:?}");
+        assert_eq!(
+            result.truncation_reason,
+            Some(RegexTruncationReason::Deadline)
+        );
+        assert!(
+            result.ready_scopes > 0 && result.posting_hits > 0,
+            "completed posting work was lost: {result:?}"
+        );
+        assert_eq!(
+            result.hydrated_candidates, 0,
+            "an exhausted budget must not launch native hydration"
+        );
+        let note = result.note.unwrap();
+        assert!(note.contains("planning deadline"), "{note}");
+        assert!(!note.contains("matched no candidates"), "{note}");
+    }
+
+    #[test]
+    fn deadline_after_hydration_verifies_already_collected_matches() {
+        let _latch_guard = LATCH_TEST_LOCK.lock().unwrap();
+        let store = store_with_text();
+        store.build_trigram_index().unwrap();
+        let _deadline = deadline_witness::Guard::new("hydration");
+        let result = store
+            .regex_search("authenticateUser", None, None, None, Some(60_000))
+            .unwrap();
+        assert!(result.truncated, "{result:?}");
+        assert_eq!(
+            result.truncation_reason,
+            Some(RegexTruncationReason::Deadline)
+        );
+        assert!(
+            result.hydrated_candidates > 0 && result.scanned_candidates > 0,
+            "{result:?}"
+        );
+        assert!(
+            !result.results.is_empty(),
+            "already hydrated matches were discarded: {result:?}"
+        );
     }
 
     /// The verification phase's ceiling must be the budget REMAINING after

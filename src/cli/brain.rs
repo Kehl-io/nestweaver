@@ -396,8 +396,22 @@ pub(crate) fn run_brain(
             Ok((EXIT_SUCCESS, Some(stats)))
         }
 
-        BrainCommands::List { json, db, config } => {
+        BrainCommands::List {
+            json,
+            upstreams,
+            db,
+            config,
+        } => {
             let db_path = resolve_db_with_config(db, config.as_deref())?;
+            if upstreams {
+                let value = collect_vault_sources(&db_path, config.as_deref())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    print_vault_sources(&value);
+                }
+                return Ok((vault_sources_exit_code(&value), None));
+            }
             // `_checked`: this caller passes an explicit `--config`, which the
             // unchecked wrapper debug-asserts against (a debug build panicked
             // on `brain list --config` whenever a daemon served it).
@@ -484,26 +498,29 @@ pub(crate) fn run_brain(
                 "brain_status",
                 serde_json::json!({}),
             )? {
+                let mut value = value;
+                let start_dir = std::env::current_dir()?;
+                let effective = nestweaver_client::RestartConfig::for_automatic_cold_start(
+                    db_path,
+                    config.as_deref(),
+                )?;
+                let upstream_configs = nestweaver_client::discovery::discover_upstreams_with_config(
+                    &start_dir,
+                    effective.as_path(),
+                );
+                let vault_sources = if upstream_configs.is_empty() {
+                    None
+                } else {
+                    Some(collect_vault_sources(db_path, config.as_deref())?)
+                };
                 if json {
-                    // Inject upstream info into JSON output.
-                    let mut value = value;
-                    let upstream_configs = nestweaver_client::discovery::discover_upstreams(
-                        db_path.parent().unwrap_or(std::path::Path::new(".")),
-                    );
                     if !upstream_configs.is_empty() {
-                        let upstreams_json: Vec<_> = upstream_configs
-                            .iter()
-                            .map(|ucfg| {
-                                serde_json::json!({
-                                    "name": ucfg.name.as_deref().unwrap_or("upstream"),
-                                    "url": ucfg.url,
-                                    "mode": format!("{:?}", ucfg.mode).to_lowercase(),
-                                })
-                            })
-                            .collect();
-                        if let Some(obj) = value.as_object_mut() {
-                            obj.insert("upstreams".to_string(), serde_json::json!(upstreams_json));
-                        }
+                        // Retain the established metadata key without exposing
+                        // credential-bearing endpoint URLs.
+                        value["upstreams"] = serde_json::json!(upstream_configs.iter().map(|peer| serde_json::json!({"name":peer.name.as_deref().unwrap_or("upstream"), "mode":peer.mode})).collect::<Vec<_>>());
+                    }
+                    if let Some(inventory) = &vault_sources {
+                        value["vault_sources"] = inventory.clone();
                     }
                     println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
@@ -801,70 +818,9 @@ pub(crate) fn run_brain(
                     if let Some(warnings) = value.get("warnings").and_then(|v| v.as_array()) {
                         eprint!("{}", format_brain_status_warnings(warnings));
                     }
-                    // ── Upstream server info ─────────────────────────────
-                    let upstream_configs = nestweaver_client::discovery::discover_upstreams(
-                        db_path.parent().unwrap_or(std::path::Path::new(".")),
-                    );
-                    if !upstream_configs.is_empty() {
+                    if let Some(inventory) = &vault_sources {
                         println!();
-                        for ucfg in &upstream_configs {
-                            let name = ucfg.name.as_deref().unwrap_or("upstream");
-                            let mode = format!("{:?}", ucfg.mode).to_lowercase();
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()?;
-                            // Lazy tonic channels spawn their transport task during
-                            // construction, before the first RPC is polled.
-                            let handle = {
-                                let _entered = rt.enter();
-                                nestweaver_client::upstream::UpstreamHandle::from_config(ucfg)
-                            };
-                            match handle {
-                                Ok(handle) => {
-                                    // Try a quick HealthCheck to determine reachability.
-                                    let health_result = rt.block_on(async {
-                                        let mut client = handle.client();
-                                        let mut req = tonic::Request::new(
-                                            nestweaver_proto::HealthCheckRequest {},
-                                        );
-                                        handle.inject_auth(&mut req);
-                                        tokio::time::timeout(
-                                            std::time::Duration::from_secs(2),
-                                            client.health_check(req),
-                                        )
-                                        .await
-                                    });
-
-                                    match health_result {
-                                        Ok(Ok(resp)) => {
-                                            let version = resp.into_inner().version;
-                                            // Try to get repo count.
-                                            let repo_count = rt.block_on(async {
-                                                let mut client = handle.client();
-                                                let mut req = tonic::Request::new(
-                                                    nestweaver_proto::RepoStatesRequest {},
-                                                );
-                                                handle.inject_auth(&mut req);
-                                                client
-                                                    .repo_states(req)
-                                                    .await
-                                                    .map(|r| format!("{} repos", r.into_inner().repos.len()))
-                                                    .unwrap_or_else(|_| "repository inventory unavailable; check upstream authorization and retry".to_string())
-                                            });
-                                            println!(
-                                                "  Server: {name} (v{version}, {mode} mode, healthy, {repo_count})"
-                                            );
-                                        }
-                                        _ => {
-                                            println!("  Server: {name} ({mode} mode, unreachable)");
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    println!("  Server: {name} ({mode} mode, config error)");
-                                }
-                            }
-                        }
+                        print_vault_sources(inventory);
                     }
                 }
                 return Ok((EXIT_SUCCESS, None));
@@ -4484,5 +4440,105 @@ mod direct_vault_derivation_tests {
         assert_eq!(std::fs::read(&sidecar).unwrap(), foreign);
         let store = GraphStore::open_read_only(&db).unwrap();
         assert_eq!(store.list_notes(None).unwrap()[0].content_hash, note_hash);
+    }
+}
+
+/// Collect without opening a native graph or using LocalFirst fallback.
+fn collect_vault_sources(
+    db: &std::path::Path,
+    config: Option<&std::path::Path>,
+) -> anyhow::Result<serde_json::Value> {
+    let start = std::env::current_dir()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(nestweaver_client::vault_inventory::discover(
+        db, config, &start,
+    ))
+}
+
+fn print_vault_sources(inventory: &serde_json::Value) {
+    let peers = inventory["upstreams"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for source in std::iter::once(&inventory["local"]).chain(peers.iter()) {
+        println!(
+            "Vault source: {} ({})",
+            source["source"].as_str().unwrap_or("unknown"),
+            source["status"].as_str().unwrap_or("unavailable")
+        );
+        if let Some(rows) = source["vaults"].as_array() {
+            for row in rows {
+                println!(
+                    "  {}\n    UID: {}\n    Root: {}",
+                    row["name"].as_str().unwrap_or("unknown"),
+                    row["uid"].as_str().unwrap_or("unknown"),
+                    row["root_path"].as_str().unwrap_or("unknown")
+                );
+                if let Some(status) = row["mapping_status"].as_str() {
+                    println!("    Mapping: {status}");
+                    if matches!(status, "unmapped" | "mapping_rejected") {
+                        println!(
+                            "    Unmapped upstream vault; choose the corresponding local UID explicitly."
+                        );
+                        if let Some(uid) = row["uid"].as_str() {
+                            println!(
+                                "    vault_mappings = {{ \"<LOCAL_VAULT_UID>\" = {} }}",
+                                serde_json::to_string(uid).unwrap_or_default()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "Inspect with: nestweaver brain list --upstreams --json. Matching roots or titles never create a binding."
+    );
+}
+
+fn vault_sources_exit_code(inventory: &serde_json::Value) -> i32 {
+    let peers = inventory["upstreams"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if std::iter::once(&inventory["local"])
+        .chain(peers.iter())
+        .any(|source| source["status"] != "available")
+    {
+        EXIT_ERROR
+    } else {
+        EXIT_SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod vault_source_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_or_forbidden_sources_make_listing_partial_and_nonzero() {
+        for status in [
+            "unavailable",
+            "forbidden",
+            "configuration_error",
+            "invalid_response",
+        ] {
+            let inventory = serde_json::json!({"local":{"status":"available"}, "upstreams":[{"status":status,"vault_count":null}]});
+            assert_eq!(vault_sources_exit_code(&inventory), EXIT_ERROR);
+        }
+        assert_eq!(
+            vault_sources_exit_code(
+                &serde_json::json!({"local":{"status":"unavailable"},"upstreams":[{"status":"available"}]})
+            ),
+            EXIT_ERROR
+        );
+        assert_eq!(
+            vault_sources_exit_code(
+                &serde_json::json!({"local":{"status":"available"},"upstreams":[{"status":"available"}]})
+            ),
+            EXIT_SUCCESS
+        );
     }
 }

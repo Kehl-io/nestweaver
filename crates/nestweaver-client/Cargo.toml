@@ -28,4 +28,6 @@ reqwest = { version = "0.13", features = ["json"] }
 open = { workspace = true }
 
 [dev-dependencies]
+tonic-prost = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 tempfile = { workspace = true }

@@ -64,6 +64,8 @@ pub struct CodeWatcher {
     emulate_inotify_watch: bool,
     #[cfg(test)]
     contract_plan_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    batch_plan_observer: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Told when a batch or reconciliation fails to publish (`Some(error)`)
     /// and when one publishes again (`None`), so a supervisor can report a
     /// watcher that is alive but not indexing.
@@ -115,6 +117,195 @@ enum PreparedPath {
     Delete { rel_path: String },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct BatchInputSnapshot {
+    signatures: std::collections::BTreeMap<PathBuf, String>,
+    files: Vec<PathBuf>,
+}
+
+impl BatchInputSnapshot {
+    fn get(&self, path: &Path) -> Option<&String> {
+        self.signatures.get(path)
+    }
+}
+
+/// Hash-bound preparation reads. Every string consumed by parsing/resolution
+/// belongs to the initial input signature; a swallowed mismatch still poisons
+/// the plan, so A -> B -> A cannot regain publication authority.
+struct PreparationReader<'a> {
+    inner: &'a crate::content_reader::FilesystemReader,
+    signatures: &'a BatchInputSnapshot,
+    invalidated: AtomicBool,
+}
+
+fn preparation_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => relative.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if relative.pop() => {}
+            _ => return None,
+        }
+    }
+    Some(relative)
+}
+
+fn readable_signature(signature: &str) -> Option<(&str, &str, u64)> {
+    let mut fields = signature.strip_prefix("readable:")?.split(':');
+    Some((fields.next()?, fields.next()?, fields.next()?.parse().ok()?))
+}
+
+impl PreparationReader<'_> {
+    fn signature(&self, relative: &Path) -> Option<&str> {
+        let relative = preparation_relative_path(relative)?;
+        self.signatures
+            .get(&self.inner.root().join(relative))
+            .map(String::as_str)
+    }
+
+    fn reject(&self, relative: &Path) -> anyhow::Error {
+        self.invalidated.store(true, Ordering::Release);
+        anyhow::anyhow!(
+            "watcher preparation read differs from initial input: {}",
+            relative.display()
+        )
+    }
+
+    fn verify(&self, relative: &Path, source: &str, raw: bool) -> anyhow::Result<()> {
+        let expected = self
+            .signature(relative)
+            .and_then(readable_signature)
+            .map(|(raw_hash, source_hash, _)| if raw { raw_hash } else { source_hash });
+        anyhow::ensure!(
+            expected == Some(crate::hash::blake3_hex(source).as_str()),
+            "{}",
+            self.reject(relative)
+        );
+        Ok(())
+    }
+
+    fn record_error(&self, relative: &Path, error: &anyhow::Error) {
+        let signature = self.signature(relative);
+        let same = if let Some(io) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        {
+            signature
+                == Some(format!("inaccessible:{:?}:{:?}", io.kind(), io.raw_os_error()).as_str())
+                || (matches!(signature, None | Some("absent"))
+                    && io.kind() == std::io::ErrorKind::NotFound)
+        } else {
+            (signature.is_some_and(|value| value.starts_with("oversized"))
+                && error.is::<crate::content_reader::SourceTooLarge>())
+                || (signature.is_some_and(|value| value.starts_with("binary:"))
+                    && error.is::<crate::content_reader::BinarySource>())
+        };
+        if !same {
+            self.invalidated.store(true, Ordering::Release);
+        }
+    }
+
+    fn ensure_valid(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.invalidated.load(Ordering::Acquire),
+            "watcher preparation consumed inputs outside its initial snapshot; batch must retry"
+        );
+        Ok(())
+    }
+}
+
+impl ContentReader for PreparationReader<'_> {
+    fn read_file(&self, relative: &Path) -> anyhow::Result<String> {
+        match self.inner.read_file(relative) {
+            Ok(source) => {
+                self.verify(relative, &source, false)?;
+                Ok(source)
+            }
+            Err(error) => {
+                self.record_error(relative, &error);
+                Err(error)
+            }
+        }
+    }
+    fn read_optional_file(&self, relative: &Path) -> anyhow::Result<Option<String>> {
+        match self.inner.read_optional_file(relative) {
+            Ok(Some(source)) => {
+                self.verify(relative, &source, true)?;
+                Ok(Some(source))
+            }
+            Ok(None) if matches!(self.signature(relative), None | Some("absent")) => Ok(None),
+            Ok(None) => Err(self.reject(relative)),
+            Err(error) => {
+                self.record_error(relative, &error);
+                Err(error)
+            }
+        }
+    }
+    fn list_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+        Ok(self.signatures.files.clone())
+    }
+    fn file_meta_nanos(&self, relative: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+        let signature = self.signature(relative);
+        if let Some((_, _, bytes)) = signature.and_then(readable_signature) {
+            return Ok(Some((0, bytes)));
+        }
+        if let Some(bytes) = signature.and_then(|value| value.strip_prefix("oversized:")) {
+            return Ok(Some((0, bytes.parse()?)));
+        }
+        match signature {
+            Some(signature) if signature.starts_with("inaccessible:") => Err(anyhow::anyhow!(
+                "initial watcher input is inaccessible: {}",
+                relative.display()
+            )),
+            Some(signature) if signature.starts_with("binary:") => Ok(Some((0, 0))),
+            _ => Ok(None),
+        }
+    }
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn version_id(&self) -> &str {
+        self.inner.version_id()
+    }
+    fn max_source_file_bytes(&self) -> u64 {
+        self.inner.max_source_file_bytes()
+    }
+    fn accepts_path(&self, relative: &Path) -> bool {
+        self.inner.accepts_path(relative)
+    }
+    fn eligibility_fingerprint(&self) -> String {
+        self.inner.eligibility_fingerprint()
+    }
+    fn unskipped_skip_dirs(&self) -> &HashSet<String> {
+        self.inner.unskipped_skip_dirs()
+    }
+    fn skips_path(&self, relative: &Path) -> bool {
+        self.inner.skips_path(relative)
+    }
+    fn has_file(&self, relative: &Path) -> bool {
+        self.signature(relative)
+            .is_some_and(|value| !matches!(value, "absent" | "excluded" | "not-file"))
+    }
+}
+
+struct BatchMutationTimings {
+    prepare_ms: u64,
+    lease_wait_ms: u64,
+    publication_started: Instant,
+}
+
+impl Drop for BatchMutationTimings {
+    fn drop(&mut self) {
+        tracing::info!(
+            prepare_ms = self.prepare_ms,
+            lease_wait_ms = self.lease_wait_ms,
+            publication_ms = self.publication_started.elapsed().as_millis() as u64,
+            "code watcher batch phase timings"
+        );
+    }
+}
+
 impl CodeWatcher {
     fn establish_graph_publication_with_io<'a>(
         &self,
@@ -124,8 +315,17 @@ impl CodeWatcher {
         nestweaver_store::IndexPublicationLease<'a>,
         crate::index::DeletionReconciliationError,
     > {
-        crate::index::establish_index_publication_marker_with_io(
-            store,
+        let lease = store.try_acquire_index_publication_lease()
+            .map_err(|error| crate::index::DeletionReconciliationError::single(
+                "code watcher batch", crate::index::DeletionReconciliationStage::IndexPublicationMarker,
+                format!("try watcher publication lease: {error}"),
+            ))?
+            .ok_or_else(|| crate::index::DeletionReconciliationError::single(
+                "code watcher batch", crate::index::DeletionReconciliationStage::IndexPublicationMarker,
+                "another publisher owns the publication lease; watcher must retry without holding mutation ownership",
+            ))?;
+        crate::index::establish_index_publication_marker_on_lease(
+            lease,
             Some(&self.db_path),
             "code watcher batch",
             io,
@@ -142,7 +342,7 @@ impl CodeWatcher {
             Some(&self.db_path),
             "code watcher batch",
             io,
-            Some(&GraphScope::code_only()),
+            Some(&GraphScope::unified()),
             true,
         )
     }
@@ -174,6 +374,8 @@ impl CodeWatcher {
             emulate_inotify_watch: false,
             #[cfg(test)]
             contract_plan_observer: None,
+            #[cfg(test)]
+            batch_plan_observer: None,
             batch_failure_reporter: None,
         }
     }
@@ -508,29 +710,21 @@ impl CodeWatcher {
                     .map(|path| self.repo_root.join(path))
                     .filter(|path| is_watcher_input(path))
                     .collect();
-                let _mutation_lease = match self.acquire_mutation_lease("watch_code_initial") {
-                    Ok(lease) => lease,
-                    Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
-                        tracing::info!("CodeWatcher startup refused during shutdown; exiting");
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        return Err(error.context("acquire code watcher startup lease"));
-                    }
-                };
-                // Another admitted writer may have completed the authoritative
-                // snapshot while this watcher waited for the gate.
-                if store.lookup_repo(&r_uid)?.is_some() {
-                    break;
-                }
-                match self.process_batch_and_notify(
+                let outcome = match self.process_batch_and_notify(
                     &store,
                     &r_uid,
                     &repo_url,
                     &initial_paths,
                     &crate::index::FileSystemIndexEpilogueIo,
                     on_change.as_deref().map(|callback| callback as &dyn Fn()),
-                )? {
+                ) {
+                    Err(error) if error.is::<WatchMutationRefused>() => {
+                        tracing::info!("CodeWatcher startup refused during shutdown; exiting");
+                        return Ok(());
+                    }
+                    outcome => outcome?,
+                };
+                match outcome {
                     WatchBatchOutcome::Published { .. }
                     | WatchBatchOutcome::Unchanged
                     | WatchBatchOutcome::ManifestPending => break,
@@ -744,23 +938,21 @@ impl CodeWatcher {
                 }
                 continue;
             }
-            let mut mutation_lease = match self.acquire_mutation_lease("watch_code_batch") {
-                Ok(lease) => Some(lease),
-                Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
-                    tracing::info!("CodeWatcher batch refused during shutdown; exiting");
-                    return Ok(());
-                }
-                Err(error) => return Err(error.context("acquire code watcher batch lease")),
-            };
             let start = Instant::now();
-            let outcome = self.process_batch_and_notify(
+            let outcome = match self.process_batch_and_notify(
                 &store,
                 &r_uid,
                 &repo_url,
                 &source_events,
                 &crate::index::FileSystemIndexEpilogueIo,
                 on_change.as_deref().map(|callback| callback as &dyn Fn()),
-            )?;
+            ) {
+                Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
+                    tracing::info!("CodeWatcher batch refused during shutdown; exiting");
+                    return Ok(());
+                }
+                result => result?,
+            };
             let files_processed = match outcome {
                 WatchBatchOutcome::Published { files_processed } => {
                     self.report_batch(None);
@@ -786,7 +978,6 @@ impl CodeWatcher {
                     files_processed
                 }
                 WatchBatchOutcome::Unchanged | WatchBatchOutcome::ManifestPending => {
-                    drop(mutation_lease.take());
                     if head_moved
                         && self.record_applied_head_quietly(
                             &store,
@@ -853,7 +1044,6 @@ impl CodeWatcher {
                             next_attempt: Instant::now(),
                         });
                     }
-                    drop(mutation_lease.take());
                     if head_moved
                         && self.record_applied_head_quietly(
                             &store,
@@ -867,7 +1057,6 @@ impl CodeWatcher {
                     continue;
                 }
             };
-            drop(mutation_lease.take());
             if head_moved
                 && self.record_applied_head_quietly(
                     &store,
@@ -1220,6 +1409,7 @@ impl CodeWatcher {
     /// commit preserves the previously committed graph; because finalization
     /// is deliberately skipped, `.index-dirty` remains as the durable
     /// fail-closed signal and callers cannot report success.
+    #[cfg(test)]
     fn process_batch_with_io(
         &self,
         store: &GraphStore,
@@ -1231,6 +1421,7 @@ impl CodeWatcher {
         self.process_batch_with_io_and_hook(store, r_uid, repo_url, relevant, epilogue_io, || {})
     }
 
+    #[cfg(test)]
     fn process_batch_with_io_and_hook<F>(
         &self,
         store: &GraphStore,
@@ -1257,6 +1448,7 @@ impl CodeWatcher {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn process_batch_with_plan<F>(
         &self,
         store: &GraphStore,
@@ -1272,6 +1464,47 @@ impl CodeWatcher {
     where
         F: FnOnce(),
     {
+        let mut mutation_lease = None;
+        let outcome = self.process_batch_with_plan_and_admission(
+            store,
+            r_uid,
+            repo_url,
+            relevant,
+            epilogue_io,
+            prepared_contracts,
+            publish_contracts,
+            validate_known_specs,
+            after_plan,
+            || {
+                mutation_lease = self.acquire_mutation_lease("watch_code_batch")?;
+                Ok(true)
+            },
+        );
+        drop(mutation_lease);
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_batch_with_plan_and_admission<F, G>(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+        repo_url: &str,
+        relevant: &[PathBuf],
+        epilogue_io: &dyn crate::index::IndexEpilogueIo,
+        prepared_contracts: Option<&crate::index::ContractDerivationPlan>,
+        publish_contracts: bool,
+        validate_known_specs: bool,
+        after_plan: F,
+        admit: G,
+    ) -> Result<WatchBatchOutcome, anyhow::Error>
+    where
+        F: FnOnce(),
+        G: FnOnce() -> anyhow::Result<bool>,
+    {
+        let prepare_started = Instant::now();
+        let base = (store.graph_generation(), store.index_publication_revision());
+        let event_paths = relevant.to_vec();
         let insert_initial_repo = store.lookup_repo(r_uid)?.is_none();
         let reader = self.reader_for(repo_url)?;
         // Manifest edits do not require source parsing or symbol writes. Debt
@@ -1290,23 +1523,6 @@ impl CodeWatcher {
                 manifest_changed = true;
             }
         }
-        if manifest_changed {
-            crate::manifest::mark_manifest_reconciliation_pending(
-                &self.db_path,
-                "code watcher manifest edit",
-            )?;
-            let publication = crate::manifest::begin_graph_mutation_publication(
-                store,
-                "manifest watcher invalidation",
-            )?;
-            let outcome = publication.finish(true)?;
-            anyhow::ensure!(
-                !outcome.is_degraded(),
-                "manifest source edit committed with degraded generation publication: {:?}",
-                outcome.warnings
-            );
-            tracing::info!(repo = %r_uid, "manifest source changed; complete daemon derivation pending");
-        }
         let code_events: Vec<_> = relevant
             .iter()
             .filter(|path| {
@@ -1323,12 +1539,44 @@ impl CodeWatcher {
             Ok(paths) => paths,
             Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
         };
+        let mut snapshot_paths = relevant.clone();
+        snapshot_paths.extend(event_paths);
+        snapshot_paths.sort();
+        snapshot_paths.dedup();
+        let source_snapshot = match self.batch_input_snapshot(&reader, &snapshot_paths) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+        };
+        let preparation_reader = PreparationReader {
+            inner: &reader,
+            signatures: &source_snapshot,
+            invalidated: AtomicBool::new(false),
+        };
         if relevant.is_empty() && !insert_initial_repo && prepared_contracts.is_none() {
-            return Ok(if manifest_changed {
-                WatchBatchOutcome::ManifestPending
-            } else {
-                WatchBatchOutcome::Unchanged
-            });
+            if !manifest_changed {
+                return Ok(WatchBatchOutcome::Unchanged);
+            }
+            if let Err(reason) = self.ensure_not_stopping() {
+                return Ok(WatchBatchOutcome::Skipped { reason });
+            }
+            if !admit()? {
+                return Ok(WatchBatchOutcome::Unchanged);
+            }
+            if let Err(reason) = self.validate_prepared_batch(
+                store,
+                &reader,
+                base,
+                &snapshot_paths,
+                &source_snapshot,
+            ) {
+                return Ok(WatchBatchOutcome::Skipped { reason });
+            }
+            if !self.publish_manifest_invalidation(store, r_uid)? {
+                return Ok(WatchBatchOutcome::Skipped {
+                    reason: anyhow::anyhow!("publication busy; manifest watcher batch must retry"),
+                });
+            }
+            return Ok(WatchBatchOutcome::ManifestPending);
         }
         // A partial walk cannot silently retract a known unreadable spec.
         let known_specs: HashSet<String> = if validate_known_specs {
@@ -1375,7 +1623,7 @@ impl CodeWatcher {
                     }
                     #[cfg(test)]
                     known_spec_guard_witness::record(&source_path, true);
-                    if let Err(reason) = reader.read_file(relative) {
+                    if let Err(reason) = preparation_reader.read_file(relative) {
                         if reason
                             .downcast_ref::<crate::content_reader::SourceTooLarge>()
                             .is_some()
@@ -1399,7 +1647,9 @@ impl CodeWatcher {
                     observer();
                 }
                 owned_contract_plan = match crate::index::prepare_watcher_contract_derivation(
-                    &reader, r_uid, repo_url,
+                    &preparation_reader,
+                    r_uid,
+                    repo_url,
                 ) {
                     Ok(plan) => plan,
                     Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
@@ -1407,6 +1657,23 @@ impl CodeWatcher {
                 &owned_contract_plan
             }
         };
+        for (path, expected) in contract_plan
+            .input_hashes
+            .iter()
+            .chain(&contract_plan.observed_input_hashes)
+        {
+            let actual = source_snapshot
+                .get(&self.repo_root.join(path))
+                .and_then(|signature| readable_signature(signature))
+                .map(|(_, source, _)| source);
+            if actual != Some(expected.as_str()) {
+                return Ok(WatchBatchOutcome::Skipped {
+                    reason: anyhow::anyhow!(
+                        "contract plan differs from initial watcher input: {path}"
+                    ),
+                });
+            }
+        }
         for skipped in &contract_plan.skipped_files {
             tracing::warn!(
                 path = %skipped.path,
@@ -1417,6 +1684,7 @@ impl CodeWatcher {
         }
         after_plan();
         let mut prepared_paths = Vec::new();
+        let mut parse_skipped = HashSet::new();
         let mut changed: HashSet<String> = HashSet::new();
         let mut removed: HashSet<String> = HashSet::new();
         // Startup drift enumerates through the walk, which already drops
@@ -1476,7 +1744,12 @@ impl CodeWatcher {
             }
             match std::fs::metadata(path) {
                 Ok(metadata) if metadata.is_file() => {
-                    let prepared = match prepare_code_file(&reader, rel_path, r_uid, repo_url) {
+                    let prepared = match prepare_code_file(
+                        &preparation_reader,
+                        rel_path,
+                        r_uid,
+                        repo_url,
+                    ) {
                         Ok(prepared) => prepared,
                         Err(reason)
                             if reason
@@ -1489,6 +1762,9 @@ impl CodeWatcher {
                                 %reason,
                                 "watched source is policy-skipped; removing stale graph coverage"
                             );
+                            if reason.is::<UnparsableSource>() {
+                                parse_skipped.insert(rel_str.clone());
+                            }
                             removed.insert(rel_str.clone());
                             prepared_paths.push(PreparedPath::Delete { rel_path: rel_str });
                             continue;
@@ -1531,10 +1807,11 @@ impl CodeWatcher {
             }
         }
 
-        let final_contract_snapshot = match crate::index::watcher_contract_input_snapshot(&reader) {
-            Ok(snapshot) => snapshot,
-            Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
-        };
+        let final_contract_snapshot =
+            match crate::index::watcher_contract_input_snapshot(&preparation_reader) {
+                Ok(snapshot) => snapshot,
+                Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+            };
         if final_contract_snapshot != contract_plan.observed_input_hashes {
             return Ok(WatchBatchOutcome::Skipped {
                 reason: anyhow::anyhow!(
@@ -1572,7 +1849,7 @@ impl CodeWatcher {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             parsed_cache.refresh(&cache_path);
             crate::index::prepare_watcher_batch_resolution(
-                &reader,
+                &preparation_reader,
                 store,
                 &self.db_path,
                 r_uid,
@@ -1590,13 +1867,89 @@ impl CodeWatcher {
             Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
         };
 
-        // No graph mutation, including a failure marker, occurs before the
-        // complete plan above exists. Once publication starts, every failure
-        // intentionally leaves the dirty marker for reopen reconciliation.
+        for path in &prepared_paths {
+            let valid = match path {
+                PreparedPath::Replace(file) => source_snapshot
+                    .get(&self.repo_root.join(&file.rel_path))
+                    .and_then(|signature| readable_signature(signature))
+                    .is_some_and(|(_, hash, _)| hash == file.file.content_hash),
+                PreparedPath::Delete { rel_path } => source_snapshot
+                    .get(&self.repo_root.join(rel_path))
+                    .is_some_and(|signature| {
+                        matches!(signature.as_str(), "absent" | "excluded" | "not-file")
+                            || signature.starts_with("oversized:")
+                            || (parse_skipped.contains(rel_path)
+                                && readable_signature(signature).is_some())
+                    }),
+            };
+            if !valid {
+                return Ok(WatchBatchOutcome::Skipped {
+                    reason: anyhow::anyhow!(
+                        "watcher mutation lacks initial input authority; batch must retry"
+                    ),
+                });
+            }
+        }
+        #[cfg(test)]
+        if let Some(observer) = &self.batch_plan_observer {
+            observer();
+        }
+        if let Err(reason) = preparation_reader.ensure_valid() {
+            return Ok(WatchBatchOutcome::Skipped { reason });
+        }
+        let prepare_ms = prepare_started.elapsed().as_millis() as u64;
+        if let Err(reason) = self.ensure_not_stopping() {
+            return Ok(WatchBatchOutcome::Skipped { reason });
+        }
+        let wait_started = Instant::now();
+        if !admit()? {
+            return Ok(WatchBatchOutcome::Unchanged);
+        }
+        let _timings = BatchMutationTimings {
+            prepare_ms,
+            lease_wait_ms: wait_started.elapsed().as_millis() as u64,
+            publication_started: Instant::now(),
+        };
+        if let Err(reason) =
+            self.validate_prepared_batch(store, &reader, base, &snapshot_paths, &source_snapshot)
+        {
+            return Ok(WatchBatchOutcome::Skipped { reason });
+        }
+        match crate::index::watcher_contract_input_snapshot(&reader) {
+            Ok(snapshot) if snapshot == contract_plan.observed_input_hashes => {}
+            Ok(_) => {
+                return Ok(WatchBatchOutcome::Skipped {
+                    reason: anyhow::anyhow!(
+                        "contract inputs changed while watcher waited for mutation ownership"
+                    ),
+                });
+            }
+            Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
+        }
+        // Never wait for publication while owning the write gate: the
+        // incumbent may need that gate to finish. A skipped batch is retained
+        // by the ordinary reconciliation/backoff path and prepared afresh.
         crate::bare_clone::ensure_repo_root_matches_identity(store, r_uid, &self.repo_root)?;
-        let publication = self
-            .establish_graph_publication_with_io(store, epilogue_io)
-            .map_err(anyhow::Error::from)?;
+        let Some(lease) = store.try_acquire_index_publication_lease()? else {
+            return Ok(WatchBatchOutcome::Skipped {
+                reason: anyhow::anyhow!("publication busy; code watcher batch must retry"),
+            });
+        };
+        if manifest_changed {
+            // The source publication below already advances the generation.
+            // Record manifest debt before it; do not nest another publication.
+            crate::manifest::mark_manifest_reconciliation_pending(
+                &self.db_path,
+                "code watcher manifest edit",
+            )?;
+        }
+        let publication = crate::index::establish_index_publication_marker_on_lease(
+            lease,
+            Some(&self.db_path),
+            "code watcher batch",
+            epilogue_io,
+        )
+        .map_err(anyhow::Error::from)?;
         reject_recovered_publication(&publication)?;
         let txn = store
             .begin_transaction()
@@ -1810,6 +2163,204 @@ impl CodeWatcher {
         Ok(WatchBatchOutcome::Published { files_processed })
     }
 
+    fn publish_manifest_invalidation(
+        &self,
+        store: &GraphStore,
+        r_uid: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(lease) = store.try_acquire_index_publication_lease()? else {
+            return Ok(false);
+        };
+        crate::manifest::mark_manifest_reconciliation_pending(
+            &self.db_path,
+            "code watcher manifest edit",
+        )?;
+        let publication = crate::manifest::begin_graph_mutation_publication_on_lease(
+            store,
+            lease,
+            "manifest watcher invalidation".to_owned(),
+            None,
+            false,
+        )?;
+        let outcome = publication.finish(true)?;
+        anyhow::ensure!(
+            !outcome.is_degraded(),
+            "manifest source edit committed with degraded generation publication: {:?}",
+            outcome.warnings
+        );
+        tracing::info!(repo = %r_uid, "manifest source changed; complete daemon derivation pending");
+        Ok(true)
+    }
+
+    fn batch_input_snapshot(
+        &self,
+        reader: &crate::content_reader::FilesystemReader,
+        paths: &[PathBuf],
+    ) -> anyhow::Result<BatchInputSnapshot> {
+        use std::io::Read;
+        // Resolution/type environments can depend on unchanged peers in any
+        // supported language. Freeze the complete eligible input set as well
+        // as event paths (including absent/excluded events), and enumerate it
+        // again after admission to detect new peers or changed ignore policy.
+        let mut paths = paths.to_vec();
+        let mut listed = reader.list_files()?;
+        listed.sort();
+        listed.dedup();
+        paths.extend(
+            listed
+                .iter()
+                .filter(|path| is_watcher_input(path) || crate::manifest::is_manifest_input(path))
+                .map(|path| self.repo_root.join(path)),
+        );
+        // Discover precisely the workspace files/probes the real resolver uses,
+        // including nested Go modules and custom tsconfig extends filenames.
+        // This context is discarded: only later hash-bound reads may supply
+        // preparation facts. Absent probes are recorded as inputs too.
+        let probed = std::cell::RefCell::new(Vec::new());
+        let _ = nestweaver_resolver::discover_workspace_context_with_files(&listed, |relative| {
+            let normalized = preparation_relative_path(relative).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "workspace input escapes watcher root",
+                )
+            })?;
+            self.ensure_not_stopping().map_err(std::io::Error::other)?;
+            probed.borrow_mut().push(self.repo_root.join(normalized));
+            reader.read_file(relative).map_err(std::io::Error::other)
+        });
+        let probed: HashSet<_> = probed.into_inner().into_iter().collect();
+        paths.extend(probed.iter().cloned());
+        self.ensure_not_stopping()?;
+        paths.sort();
+        paths.dedup();
+        let hidden = sources_hidden_from_walk(
+            &self.repo_root,
+            paths
+                .iter()
+                .filter(|path| path.is_file())
+                .filter_map(|path| path.strip_prefix(&self.repo_root).ok()),
+        );
+        let mut inputs = std::collections::BTreeMap::new();
+        for path in &paths {
+            self.ensure_not_stopping()?;
+            let Ok(relative) = path.strip_prefix(&self.repo_root) else {
+                continue;
+            };
+            let observed = (|| -> anyhow::Result<String> {
+                Ok(
+                    if !probed.contains(path)
+                        && (source_policy_exclusion(reader, &self.repo_root, path)?.is_some()
+                            || hidden.contains(relative))
+                    {
+                        "excluded".to_owned()
+                    } else {
+                        // Explicit workspace config reads have always followed
+                        // contained paths even when the source walk excludes
+                        // them (for example node_modules/shared/tsconfig).
+                        let observed_path = if probed.contains(path) {
+                            reader.contained_path(relative)?
+                        } else {
+                            path.clone()
+                        };
+                        match std::fs::symlink_metadata(&observed_path) {
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::NotFound
+                                        | std::io::ErrorKind::NotADirectory
+                                ) =>
+                            {
+                                "absent".to_owned()
+                            }
+                            Err(error) => return Err(error.into()),
+                            Ok(meta) if !meta.is_file() => "not-file".to_owned(),
+                            Ok(meta) if meta.len() > reader.max_source_file_bytes() => {
+                                format!("oversized:{}", meta.len())
+                            }
+                            Ok(_) => {
+                                let mut bytes = Vec::new();
+                                std::fs::File::open(&observed_path)?
+                                    .take(reader.max_source_file_bytes().saturating_add(1))
+                                    .read_to_end(&mut bytes)?;
+                                if bytes.len() as u64 > reader.max_source_file_bytes() {
+                                    format!("oversized:{}", bytes.len())
+                                } else {
+                                    let raw_hash = crate::hash::blake3_hex_bytes(&bytes);
+                                    let raw_len = bytes.len();
+                                    match crate::content_reader::decode_source_bytes(
+                                        relative, bytes,
+                                    ) {
+                                        Ok(source)
+                                            if source.len() as u64
+                                                <= reader.max_source_file_bytes() =>
+                                        {
+                                            format!(
+                                                "readable:{raw_hash}:{}:{raw_len}",
+                                                crate::hash::blake3_hex(&source)
+                                            )
+                                        }
+                                        Ok(source) => format!("oversized:{}", source.len()),
+                                        Err(error)
+                                            if error
+                                                .is::<crate::content_reader::BinarySource>() =>
+                                        {
+                                            format!("binary:{raw_hash}")
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+            })();
+            let value = match observed {
+                Ok(value) => value,
+                Err(error) => {
+                    // Best-effort startup deliberately retains/discloses
+                    // inaccessible peers instead of treating them as deletes
+                    // or blocking unrelated source updates. Resolution uses
+                    // cached graphed parses/protected graph symbols for them.
+                    // Freeze the inaccessible state too: a readability change
+                    // while waiting still invalidates the prepared batch.
+                    if let Some(io) = error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    {
+                        format!("inaccessible:{:?}:{:?}", io.kind(), io.raw_os_error())
+                    } else {
+                        return Err(error);
+                    }
+                }
+            };
+            inputs.insert(path.clone(), value);
+        }
+        Ok(BatchInputSnapshot {
+            signatures: inputs,
+            files: listed,
+        })
+    }
+
+    fn validate_prepared_batch(
+        &self,
+        store: &GraphStore,
+        reader: &crate::content_reader::FilesystemReader,
+        base: (u64, u64),
+        paths: &[PathBuf],
+        expected: &BatchInputSnapshot,
+    ) -> anyhow::Result<()> {
+        self.ensure_not_stopping()?;
+        anyhow::ensure!(
+            base == (store.graph_generation(), store.index_publication_revision()),
+            "graph changed while code watcher prepared or waited; batch must be prepared again"
+        );
+        anyhow::ensure!(
+            *expected == self.batch_input_snapshot(reader, paths)?,
+            "source or eligibility changed while code watcher prepared or waited; batch must be prepared again"
+        );
+        Ok(())
+    }
+
     fn process_batch_and_notify(
         &self,
         store: &GraphStore,
@@ -1819,7 +2370,22 @@ impl CodeWatcher {
         epilogue_io: &dyn crate::index::IndexEpilogueIo,
         on_change: Option<&dyn Fn()>,
     ) -> Result<WatchBatchOutcome, anyhow::Error> {
-        let outcome = self.process_batch_with_io(store, r_uid, repo_url, relevant, epilogue_io)?;
+        let mut mutation_lease = None;
+        let outcome = self.process_batch_with_plan_and_admission(
+            store,
+            r_uid,
+            repo_url,
+            relevant,
+            epilogue_io,
+            None,
+            true,
+            true,
+            || {},
+            || {
+                mutation_lease = self.acquire_mutation_lease("watch_code_batch")?;
+                Ok(true)
+            },
+        )?;
         if matches!(
             outcome,
             WatchBatchOutcome::Published { .. } | WatchBatchOutcome::PublishedPending { .. }
@@ -1827,6 +2393,7 @@ impl CodeWatcher {
         {
             callback();
         }
+        drop(mutation_lease);
         Ok(outcome)
     }
 
@@ -2375,23 +2942,12 @@ impl CodeWatcher {
             if self.stop_flag.load(Ordering::Acquire) {
                 return Err(WatchMutationRefused.into());
             }
-            let _lease = self.acquire_mutation_lease("watch_code_batch")?;
-            // A removed repository must never be recreated by a queued replay.
-            if store.lookup_repo(r_uid)?.is_none() {
-                return Ok(WatchBatchOutcome::Unchanged);
-            }
+            let mut mutation_lease = None;
             let last = index + 1 == total_chunks;
-            if index == 0 && chunks > 1 && contract_plan.is_some() {
-                self.save_resolution_debt(r_uid, &drift.replay)?;
-                store.set_contract_derivation_failed(
-                    r_uid,
-                    "bounded startup source replay is in progress",
-                )?;
-            }
             if let Some(plan) = &contract_plan {
                 let start = ((index % chunks) * 128).min(drift.replay.len());
                 let end = (start + 128).min(drift.replay.len());
-                match self.process_batch_with_plan(
+                match self.process_batch_with_plan_and_admission(
                     store,
                     r_uid,
                     repo_url,
@@ -2401,6 +2957,21 @@ impl CodeWatcher {
                     last,
                     index == 0,
                     || {},
+                    || {
+                        mutation_lease = self.acquire_mutation_lease("watch_code_batch")?;
+                        // Re-check after waiting; a queued replay cannot recreate a removed repo.
+                        if store.lookup_repo(r_uid)?.is_none() {
+                            return Ok(false);
+                        }
+                        if index == 0 && chunks > 1 {
+                            self.save_resolution_debt(r_uid, &drift.replay)?;
+                            store.set_contract_derivation_failed(
+                                r_uid,
+                                "bounded startup source replay is in progress",
+                            )?;
+                        }
+                        Ok(true)
+                    },
                 )? {
                     WatchBatchOutcome::Published { files_processed } => {
                         processed += files_processed
@@ -2417,6 +2988,10 @@ impl CodeWatcher {
                     other => return Ok(other),
                 }
             } else {
+                mutation_lease = self.acquire_mutation_lease("watch_code_batch")?;
+                if store.lookup_repo(r_uid)?.is_none() {
+                    return Ok(WatchBatchOutcome::Unchanged);
+                }
                 let io = crate::index::FileSystemIndexEpilogueIo;
                 let publication = self.establish_graph_publication_with_io(store, &io)?;
                 reject_recovered_publication(&publication)?;
@@ -2471,7 +3046,8 @@ impl CodeWatcher {
                     )?;
                 }
             }
-            // The lease drops here; shutdown is checked before the next chunk.
+            drop(mutation_lease);
+            // Shutdown is checked before the next chunk.
         }
         nestweaver_store::durable_sidecar::remove_file_durable_if_exists(
             &self.resolution_debt_path(r_uid),
@@ -3296,7 +3872,7 @@ struct PreparedCodeFile {
 /// the read/delete/re-read race that could otherwise erase a transiently
 /// malformed half-save.
 fn prepare_code_file(
-    reader: &crate::content_reader::FilesystemReader,
+    reader: &dyn crate::content_reader::ContentReader,
     rel_path: &Path,
     r_uid: &str,
     repo_url: &str,
@@ -3740,6 +4316,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(members(&store).len(), 2);
+    }
+
+    #[test]
+    fn code_watcher_finalization_retains_note_ranks_after_last_code_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = GraphStore::create(&db).unwrap();
+        store
+            .insert_note(&nestweaver_schema::Note {
+                uid: "note:survivor".into(),
+                vault_uid: "vlt:test".into(),
+                file_path: "survivor.md".into(),
+                title: "Survivor".into(),
+                note_kind: nestweaver_schema::NoteKind::General,
+                word_count: 1,
+                content_hash: "h".into(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        let watcher = CodeWatcher::new(&db, &repo, "test");
+        let publication = watcher
+            .establish_graph_publication_with_io(&store, &crate::index::FileSystemIndexEpilogueIo)
+            .unwrap();
+        watcher
+            .finalize_graph_publication_with_io(
+                publication,
+                &crate::index::FileSystemIndexEpilogueIo,
+            )
+            .unwrap();
+        assert_eq!(
+            store.pagerank_scores().unwrap().get("note:survivor"),
+            Some(&1.0)
+        );
+        drop(store);
+        let store = GraphStore::open(&db).unwrap();
+        let fingerprint = nestweaver_store::ranking::pagerank_algorithm_fingerprint(
+            0.85,
+            20,
+            &GraphScope::unified(),
+        );
+        store
+            .load_pagerank_cache_expecting(
+                &crate::sidecar_path(&db, ".pagerank.json"),
+                Some(&fingerprint),
+            )
+            .unwrap();
+        assert_eq!(
+            store.pagerank_scores().unwrap().get("note:survivor"),
+            Some(&1.0)
+        );
     }
 
     #[test]
@@ -7484,6 +8117,669 @@ mod tests {
             root,
             nestweaver_schema::repo_uid("test", &repo_url),
         )
+    }
+
+    #[test]
+    fn cold_watcher_takes_one_real_mutation_lease_and_reaches_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.js"), "export function initial() {}\n").unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let db = dir.path().join("graph.lbug");
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let gate = crate::write_gate::WriteGate::new();
+        let batch_gate = gate.clone();
+        let acquisitions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&acquisitions);
+        let watcher = CodeWatcher::new(&db, &root, "test").with_mutation_lease_factory(Arc::new(
+            move |label| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                // Fails immediately on recursive acquisition, rather than
+                // leaving the regression's watchdog thread deadlocked.
+                let lease = batch_gate
+                    .mutex()
+                    .try_lock_owned()
+                    .unwrap_or_else(|_| panic!("nested mutation lease: {label}"));
+                Ok(Box::new(lease))
+            },
+        ));
+        let stop = watcher.shutdown_handle();
+        let watcher = watcher.with_ready_callback(move || stop.stop());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_store = Arc::clone(&store);
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(watcher.run_with_store(worker_store, None))
+                .unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("cold watcher must reach readiness without nested writer admission")
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(acquisitions.load(Ordering::SeqCst), 1);
+        assert!(gate.mutex().try_lock_owned().is_ok());
+        assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+    }
+
+    #[test]
+    fn watcher_preparation_releases_writer_and_rejects_concurrent_graph_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let gate = crate::write_gate::WriteGate::new();
+        let batch_gate = gate.clone();
+        let mut watcher = CodeWatcher::new(&db, &root, "test").with_mutation_lease_factory(
+            Arc::new(move |label| Ok(Box::new(batch_gate.blocking_lock(label)))),
+        );
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        watcher.batch_plan_observer = Some(Arc::new(move || {
+            ready_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap();
+        }));
+        let changed = root.join("src/a.js");
+        std::fs::write(&changed, "export function replacement() { return 9; }\n").unwrap();
+        let worker_store = Arc::clone(&store);
+        let worker_uid = uid.clone();
+        let worker_root = root.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = process_fixture_batch(
+                &watcher,
+                &worker_store,
+                &worker_uid,
+                &worker_root,
+                &[changed],
+            );
+            done_tx.send(outcome).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let other_writer = gate
+            .mutex()
+            .try_lock_owned()
+            .expect("complete parse/resolution preparation must not hold mutation ownership");
+        store.update_repo_sha(&uid, "concurrent-writer").unwrap();
+        store.bump_graph_generation();
+        drop(other_writer);
+        resume_tx.send(()).unwrap();
+        let outcome = done_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(
+            matches!(outcome, WatchBatchOutcome::Skipped { reason } if reason.to_string().contains("graph changed"))
+        );
+        worker.join().unwrap();
+        assert!(repo_symbol_names(&store, &uid).contains("helper"));
+        assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+        let retry = CodeWatcher::new(&db, &root, "test");
+        assert!(matches!(
+            process_fixture_batch(&retry, &store, &uid, &root, &[root.join("src/a.js")]),
+            WatchBatchOutcome::Published { .. }
+        ));
+        let names = repo_symbol_names(&store, &uid);
+        assert!(names.contains("replacement") && !names.contains("helper"));
+        let fresh_db = dir.path().join("fresh.lbug");
+        crate::index::index_directory(
+            &root,
+            &fresh_db,
+            "test",
+            &format!("file://{}", root.display()),
+            "fresh",
+        )
+        .unwrap();
+        let fresh = GraphStore::open_or_create(&fresh_db).unwrap();
+        let edges = |db: &GraphStore| {
+            let mut rows = db.load_typed_edges().unwrap();
+            rows.sort_by_key(|row| format!("{row:?}"));
+            rows
+        };
+        assert_eq!(
+            edges(&store),
+            edges(&fresh),
+            "late admission/retry must retain full-index edge parity"
+        );
+    }
+
+    #[test]
+    fn watcher_admission_revalidates_edit_delete_parse_failure_and_recreation() {
+        for (before, after) in [
+            (
+                Some("export function planned() {}\n"),
+                Some("export function latest() {}\n"),
+            ),
+            (Some("export function planned() {}\n"), None),
+            (
+                Some("export function planned() {}\n"),
+                Some("export function {{{"),
+            ),
+            (
+                Some("export function {{{"),
+                Some("export function latest() {}\n"),
+            ),
+            (None, Some("export function latest() {}\n")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let changed = root.join("src/a.js");
+            match before {
+                Some(body) => std::fs::write(&changed, body).unwrap(),
+                None => std::fs::remove_file(&changed).unwrap(),
+            }
+            let admission_path = changed.clone();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let admission_calls = Arc::clone(&calls);
+            let watcher = CodeWatcher::new(&db, &root, "test").with_mutation_lease_factory(
+                Arc::new(move |_| {
+                    admission_calls.fetch_add(1, Ordering::SeqCst);
+                    match after {
+                        Some(body) => std::fs::write(&admission_path, body).unwrap(),
+                        None => std::fs::remove_file(&admission_path).unwrap(),
+                    }
+                    Ok(Box::new(()))
+                }),
+            );
+            let outcome = process_fixture_batch(&watcher, &store, &uid, &root, &[changed]);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                matches!(outcome, WatchBatchOutcome::Skipped { reason } if reason.to_string().contains("source or eligibility changed"))
+            );
+            assert!(repo_symbol_names(&store, &uid).contains("helper"));
+            assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+        }
+    }
+
+    #[test]
+    fn watcher_admission_revalidates_non_event_resolution_peers_and_new_inputs() {
+        for create in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let changed = root.join("src/a.js");
+            std::fs::write(&changed, "export function replacement() {}\n").unwrap();
+            let peer = root.join(if create {
+                "src/brand_new.py"
+            } else {
+                "src/b.js"
+            });
+            let watcher = CodeWatcher::new(&db, &root, "test").with_mutation_lease_factory(
+                Arc::new(move |_| {
+                    std::fs::write(
+                        &peer,
+                        if create {
+                            "def new_peer():\n    return 1\n"
+                        } else {
+                            "export function changedPeer() {}\n"
+                        },
+                    )
+                    .unwrap();
+                    Ok(Box::new(()))
+                }),
+            );
+            let outcome = process_fixture_batch(&watcher, &store, &uid, &root, &[changed]);
+            assert!(
+                matches!(outcome, WatchBatchOutcome::Skipped { reason } if reason.to_string().contains("source or eligibility changed"))
+            );
+            assert!(repo_symbol_names(&store, &uid).contains("helper"));
+            assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_admission_rejects_non_event_peer_readability_transitions() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        for initially_readable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, root, uid) = index_fixture_repo_on_disk(
+                &dir,
+                &[("tools/util.py", "def util():\n    return 1\n")],
+            );
+            let store = GraphStore::open_or_create(&db).unwrap();
+            let generation = store.graph_generation();
+            let changed = root.join("src/a.js");
+            std::fs::write(&changed, "export function replacement() {}\n").unwrap();
+            let peer = root.join("tools/util.py");
+            if !initially_readable {
+                std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            let admission_peer = peer.clone();
+            let admissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&admissions);
+            let watcher = CodeWatcher::new(&db, &root, "test").with_mutation_lease_factory(
+                Arc::new(move |_| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    std::fs::set_permissions(
+                        &admission_peer,
+                        std::fs::Permissions::from_mode(if initially_readable {
+                            0o000
+                        } else {
+                            0o644
+                        }),
+                    )
+                    .unwrap();
+                    Ok(Box::new(()))
+                }),
+            );
+            let outcome = process_fixture_batch(&watcher, &store, &uid, &root, &[changed]);
+            std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                admissions.load(Ordering::SeqCst),
+                1,
+                "preparation must reach late admission with a protected inaccessible peer"
+            );
+            assert!(
+                matches!(outcome, WatchBatchOutcome::Skipped { reason } if reason.to_string().contains("source or eligibility changed"))
+            );
+            let names = repo_symbol_names(&store, &uid);
+            assert!(
+                names.contains("helper")
+                    && names.contains("util")
+                    && !names.contains("replacement")
+            );
+            assert_eq!(store.graph_generation(), generation);
+            assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+        }
+    }
+
+    #[test]
+    fn watcher_unrelated_runtime_output_does_not_invalidate_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[("runtime.log", "before\n")]);
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let output = root.join("runtime.log");
+        let watcher =
+            CodeWatcher::new(&db, &root, "test").with_mutation_lease_factory(Arc::new(move |_| {
+                std::fs::write(&output, "unrelated runtime output changed\n").unwrap();
+                Ok(Box::new(()))
+            }));
+        let changed = root.join("src/a.js");
+        std::fs::write(&changed, "export function replacement() { return 9; }\n").unwrap();
+        let outcome = process_fixture_batch(&watcher, &store, &uid, &root, &[changed]);
+        assert!(
+            matches!(outcome, WatchBatchOutcome::Published { .. }),
+            "{outcome:?}"
+        );
+        assert!(repo_symbol_names(&store, &uid).contains("replacement"));
+    }
+
+    #[test]
+    fn preparation_reader_binds_custom_tsconfig_extends_and_absent_workspace_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, _) = index_fixture_repo_on_disk(
+            &dir,
+            &[
+                (
+                    "tsconfig.json",
+                    "{\"extends\":\"./config/../config/custom.settings\"}",
+                ),
+                (
+                    "config/custom.settings",
+                    "{\"compilerOptions\":{\"paths\":{\"@owned/*\":[\"src/*\"]}}}",
+                ),
+            ],
+        );
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let filesystem = watcher
+            .reader_for(&format!("file://{}", root.display()))
+            .unwrap();
+        let initial = watcher.batch_input_snapshot(&filesystem, &[]).unwrap();
+        assert_eq!(
+            initial.get(&root.join("go.work")).map(String::as_str),
+            Some("absent")
+        );
+        assert!(
+            initial
+                .get(&root.join("config/custom.settings"))
+                .and_then(|value| readable_signature(value))
+                .is_some()
+        );
+        let reader = PreparationReader {
+            inner: &filesystem,
+            signatures: &initial,
+            invalidated: AtomicBool::new(false),
+        };
+        let discover = || {
+            nestweaver_resolver::discover_workspace_context_with_files(
+                &reader.list_files().unwrap(),
+                |path| reader.read_file(path).map_err(std::io::Error::other),
+            )
+        };
+        assert!(
+            !discover().aliases.is_empty(),
+            "valid custom extends must remain usable"
+        );
+        reader.ensure_valid().unwrap();
+        let settings = root.join("config/custom.settings");
+        let original = std::fs::read(&settings).unwrap();
+        std::fs::write(
+            &settings,
+            "{\"compilerOptions\":{\"paths\":{\"@owned/*\":[\"other/*\"]}}}",
+        )
+        .unwrap();
+        assert_ne!(
+            watcher.batch_input_snapshot(&filesystem, &[]).unwrap(),
+            initial
+        );
+        let _ = discover(); // Workspace discovery deliberately swallows failed reads.
+        std::fs::write(&settings, original).unwrap();
+        assert_eq!(
+            watcher.batch_input_snapshot(&filesystem, &[]).unwrap(),
+            initial
+        );
+        assert!(
+            reader.ensure_valid().is_err(),
+            "custom-extends A -> B -> A must poison the prepared plan"
+        );
+        std::fs::write(root.join("go.work"), "go 1.22\nuse ./module\n").unwrap();
+        assert_ne!(
+            watcher.batch_input_snapshot(&filesystem, &[]).unwrap(),
+            initial,
+            "creating a formerly absent workspace probe must invalidate final publication"
+        );
+    }
+
+    #[test]
+    fn preparation_reader_binds_explicit_workspace_config_outside_source_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, _) = index_fixture_repo_on_disk(
+            &dir,
+            &[
+                (
+                    "tsconfig.json",
+                    "{\"extends\":\"./node_modules/shared/custom.settings\"}",
+                ),
+                (
+                    "node_modules/shared/custom.settings",
+                    "{\"compilerOptions\":{\"paths\":{\"@owned/*\":[\"src/*\"]}}}",
+                ),
+            ],
+        );
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let filesystem = watcher
+            .reader_for(&format!("file://{}", root.display()))
+            .unwrap();
+        let initial = watcher.batch_input_snapshot(&filesystem, &[]).unwrap();
+        let config = Path::new("node_modules/shared/custom.settings");
+        assert!(!initial.files.contains(&config.to_path_buf()));
+        assert!(
+            initial
+                .get(&root.join(config))
+                .and_then(|value| readable_signature(value))
+                .is_some()
+        );
+        let reader = PreparationReader {
+            inner: &filesystem,
+            signatures: &initial,
+            invalidated: AtomicBool::new(false),
+        };
+        let context = nestweaver_resolver::discover_workspace_context_with_files(
+            &reader.list_files().unwrap(),
+            |path| reader.read_file(path).map_err(std::io::Error::other),
+        );
+        assert!(!context.aliases.is_empty());
+        reader.ensure_valid().unwrap();
+        let original = std::fs::read(root.join(config)).unwrap();
+        std::fs::write(
+            root.join(config),
+            "{\"compilerOptions\":{\"paths\":{\"@owned/*\":[\"changed/*\"]}}}",
+        )
+        .unwrap();
+        assert!(reader.read_file(config).is_err());
+        std::fs::write(root.join(config), original).unwrap();
+        assert_eq!(
+            watcher.batch_input_snapshot(&filesystem, &[]).unwrap(),
+            initial
+        );
+        assert!(reader.ensure_valid().is_err());
+    }
+
+    #[test]
+    fn preparation_reader_latches_source_aba_and_swallowed_non_event_peer_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, _) = index_fixture_repo_on_disk(&dir, &[]);
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let filesystem = watcher
+            .reader_for(&format!("file://{}", root.display()))
+            .unwrap();
+        let initial = watcher.batch_input_snapshot(&filesystem, &[]).unwrap();
+        let peer = Path::new("src/a.js");
+        let original = std::fs::read(root.join(peer)).unwrap();
+        let reader = PreparationReader {
+            inner: &filesystem,
+            signatures: &initial,
+            invalidated: AtomicBool::new(false),
+        };
+        std::fs::write(
+            root.join(peer),
+            "export function helper() { return 'different type'; }\n",
+        )
+        .unwrap();
+        // Helpers may intentionally swallow a peer read error and retain its
+        // graph-only facts. The latch must still reject the aggregate plan.
+        assert!(reader.read_file(peer).is_err());
+        std::fs::write(root.join(peer), original).unwrap();
+        assert_eq!(
+            watcher.batch_input_snapshot(&filesystem, &[]).unwrap(),
+            initial,
+            "the final bytes alone cannot reveal this A -> B -> A read"
+        );
+        assert!(reader.ensure_valid().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparation_reader_cannot_turn_inaccessible_aba_into_source_authority() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, _) =
+            index_fixture_repo_on_disk(&dir, &[("tools/util.py", "def util():\n    return 1\n")]);
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let filesystem = watcher
+            .reader_for(&format!("file://{}", root.display()))
+            .unwrap();
+        let peer = root.join("tools/util.py");
+        std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let initial = watcher.batch_input_snapshot(&filesystem, &[]).unwrap();
+        let reader = PreparationReader {
+            inner: &filesystem,
+            signatures: &initial,
+            invalidated: AtomicBool::new(false),
+        };
+        std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&peer, "def unauthorized_new_fact():\n    return 2\n").unwrap();
+        assert!(reader.read_file(Path::new("tools/util.py")).is_err());
+        std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let final_snapshot = watcher.batch_input_snapshot(&filesystem, &[]).unwrap();
+        std::fs::set_permissions(&peer, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(initial, final_snapshot);
+        assert!(
+            reader.ensure_valid().is_err(),
+            "stable inaccessible state may retain graph facts, never authorize newly read facts"
+        );
+    }
+
+    #[test]
+    fn watcher_rejects_requested_source_aba_before_mutation_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) =
+            index_fixture_repo_on_disk(&dir, &[("tools/util.py", "def util():\n    return 1\n")]);
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let path = root.join("tools/util.py");
+        let original = std::fs::read(&path).unwrap();
+        let restored = original.clone();
+        let admission_path = path.clone();
+        let watcher =
+            CodeWatcher::new(&db, &root, "test").with_mutation_lease_factory(Arc::new(move |_| {
+                std::fs::write(&admission_path, &restored).unwrap();
+                Ok(Box::new(()))
+            }));
+        let outcome = watcher
+            .process_batch_with_io_and_hook(
+                &store,
+                &uid,
+                &format!("file://{}", root.display()),
+                std::slice::from_ref(&path),
+                &crate::index::FileSystemIndexEpilogueIo,
+                || {
+                    std::fs::write(&path, "def unauthorized_new_fact():\n    return 2\n").unwrap();
+                },
+            )
+            .unwrap();
+        std::fs::write(&path, original).unwrap();
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+        let names = repo_symbol_names(&store, &uid);
+        assert!(names.contains("util") && !names.contains("unauthorized_new_fact"));
+        assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_cannot_delete_an_initially_inaccessible_source_after_absence_aba() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) =
+            index_fixture_repo_on_disk(&dir, &[("tools/util.py", "def util():\n    return 1\n")]);
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let path = root.join("tools/util.py");
+        let backup = root.join("tools/util.py.backup");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let restored_path = path.clone();
+        let restored_backup = backup.clone();
+        let watcher =
+            CodeWatcher::new(&db, &root, "test").with_mutation_lease_factory(Arc::new(move |_| {
+                std::fs::rename(&restored_backup, &restored_path).unwrap();
+                Ok(Box::new(()))
+            }));
+        let outcome = watcher
+            .process_batch_with_io_and_hook(
+                &store,
+                &uid,
+                &format!("file://{}", root.display()),
+                std::slice::from_ref(&path),
+                &crate::index::FileSystemIndexEpilogueIo,
+                || {
+                    std::fs::rename(&path, &backup).unwrap();
+                },
+            )
+            .unwrap();
+        if backup.exists() {
+            std::fs::rename(&backup, &path).unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(outcome, WatchBatchOutcome::Skipped { .. }));
+        assert!(repo_symbol_names(&store, &uid).contains("util"));
+        assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+    }
+
+    #[test]
+    fn preparation_reader_preserves_canonical_non_utf8_and_cr_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join("legacy.js"),
+            b"// latin \xe9\rexport function legacy() {}\r",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("graph.lbug"), &root, "test");
+        let filesystem = watcher
+            .reader_for(&format!("file://{}", root.display()))
+            .unwrap();
+        let initial = watcher.batch_input_snapshot(&filesystem, &[]).unwrap();
+        let reader = PreparationReader {
+            inner: &filesystem,
+            signatures: &initial,
+            invalidated: AtomicBool::new(false),
+        };
+        assert_eq!(
+            reader.read_file(Path::new("legacy.js")).unwrap(),
+            filesystem.read_file(Path::new("legacy.js")).unwrap()
+        );
+        reader.ensure_valid().unwrap();
+    }
+
+    #[test]
+    fn watcher_cancellation_at_admission_leaves_no_dirty_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let store = GraphStore::open_or_create(&db).unwrap();
+        let watcher = CodeWatcher::new(&db, &root, "test");
+        let shutdown = watcher.shutdown_handle();
+        let watcher = watcher.with_mutation_lease_factory(Arc::new(move |_| {
+            shutdown.stop();
+            Ok(Box::new(()))
+        }));
+        let changed = root.join("src/a.js");
+        std::fs::write(&changed, "export function replacement() {}\n").unwrap();
+        assert!(
+            matches!(process_fixture_batch(&watcher, &store, &uid, &root, &[changed]), WatchBatchOutcome::Skipped { reason } if reason.is::<WatchBatchStopped>())
+        );
+        assert!(repo_symbol_names(&store, &uid).contains("helper"));
+        assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+    }
+
+    #[test]
+    fn watcher_busy_publication_returns_without_holding_writer_or_dropping_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, root, uid) = index_fixture_repo_on_disk(&dir, &[]);
+        let store = Arc::new(GraphStore::open_or_create(&db).unwrap());
+        let gate = crate::write_gate::WriteGate::new();
+        let worker_gate = gate.clone();
+        let watcher = CodeWatcher::new(&db, &root, "test").with_mutation_lease_factory(Arc::new(
+            move |label| Ok(Box::new(worker_gate.blocking_lock(label))),
+        ));
+        let changed = root.join("src/a.js");
+        std::fs::write(&changed, "export function replacement() {}\n").unwrap();
+        let publication = store.acquire_index_publication_lease().unwrap();
+        let worker_store = Arc::clone(&store);
+        let worker_uid = uid.clone();
+        let worker_root = root.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(process_fixture_batch(
+                &watcher,
+                &worker_store,
+                &worker_uid,
+                &worker_root,
+                &[changed],
+            ))
+            .unwrap();
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("watcher must not wait on publication while owning the writer gate");
+        assert!(
+            matches!(outcome, WatchBatchOutcome::Skipped { reason } if reason.to_string().contains("publication busy"))
+        );
+        worker.join().unwrap();
+        let writer = gate.mutex().try_lock_owned().unwrap();
+        drop(writer);
+        drop(publication);
+        assert!(!crate::sidecar_path(&db, ".index-dirty").exists());
+        let retry = CodeWatcher::new(&db, &root, "test");
+        assert!(matches!(
+            process_fixture_batch(&retry, &store, &uid, &root, &[root.join("src/a.js")]),
+            WatchBatchOutcome::Published { .. }
+        ));
     }
 
     /// A watcher batch adds its fresh parses to the parse cache, so the

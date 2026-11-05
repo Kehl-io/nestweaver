@@ -843,6 +843,169 @@ fn write_edge_pair_csv(edges: &[(&str, &str)], path: &Path) -> Result<(), StoreE
     Ok(())
 }
 
+// Keep tiny incremental writes on prepared CREATE. Larger groups amortize
+// dispatch through bounded parameterized UNWIND statements. The crossover is
+// measured on this actual path, including its binding and transaction costs.
+const RESOLVED_EDGE_BATCH_THRESHOLD: usize = 1024;
+const RESOLVED_EDGE_ROWS_PER_STATEMENT: usize = 512;
+
+fn resolved_edge_labels(edge_type: EdgeType) -> Result<(&'static str, &'static str), StoreError> {
+    match edge_type {
+        EdgeType::Calls | EdgeType::Imports | EdgeType::Extends | EdgeType::Implements
+        | EdgeType::Includes | EdgeType::Uses | EdgeType::Accesses | EdgeType::MemberOf
+        | EdgeType::CrossRepoLink => Ok(("Symbol", "Symbol")),
+        EdgeType::ImplementsContract => Ok(("Symbol", "Contract")),
+        EdgeType::Supersedes | EdgeType::DependsOn | EdgeType::CausedBy | EdgeType::RelatesTo => Ok(("Note", "Note")),
+        EdgeType::Contains => Err(StoreError::Query(
+            "Use insert_repo_file_edge / insert_file_symbol_edge for CONTAINS edges".to_owned(),
+        )),
+        EdgeType::ProjectIncludesSymbol | EdgeType::ProjectIncludesNote
+        | EdgeType::ProjectHasComponent | EdgeType::ProjectHasParent => Err(StoreError::Query(
+            "Use batch_insert_project_symbol_edges / batch_insert_project_note_edges / insert_project_component_edge / insert_project_parent_edge for Project edges".to_owned(),
+        )),
+    }
+}
+
+/// Vectorize the existing MATCH/CREATE semantics without changing transaction
+/// authority. Do not use native relationship COPY here: in pinned Ladybug,
+/// rolling back an append to a nonempty in-memory CSR group truncates its rows
+/// but retains the unversioned CSR index ranges. A later scan can then address
+/// rows past the restored group. Normal CREATE stays transaction-local until
+/// commit and retains the existing caller-owned rollback behavior.
+fn batch_resolved_edges_on(
+    conn: &crate::db::StoreConnection<'_>,
+    edges: &[ResolvedEdge],
+) -> Result<(), StoreError> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<(&str, &str, &str), Vec<&ResolvedEdge>> = BTreeMap::new();
+    // Validate every family before preparing or executing the first mutation.
+    for edge in edges {
+        let (source, target) = resolved_edge_labels(edge.edge_type)?;
+        groups
+            .entry((edge.edge_type.rel_table_name(), source, target))
+            .or_default()
+            .push(edge);
+    }
+    let mut prepared = Vec::new();
+    for ((relationship, source, target), group) in groups {
+        let properties = if relationship == "CROSS_REPO_LINK" {
+            "confidence: row.conf, link_type: row.lt, evidence: row.ev"
+        } else {
+            "confidence: row.conf, evidence: row.ev"
+        };
+        // MATCH resolves against the caller's database transaction, including
+        // uncommitted nodes and other repositories. Missing/wrong-label UIDs
+        // yield zero rows, exactly as the original per-edge prepared path.
+        // The WITH boundary keeps each endpoint in a single-node query
+        // graph, enabling the pinned planner's correlated primary-key lookup.
+        // A combined MATCH becomes full endpoint scans/cartesian work.
+        let query = format!(
+            "UNWIND $rows AS row MATCH (a:{source} {{uid: row.src}}) WITH row,a \
+            MATCH (b:{target} {{uid: row.dst}}) CREATE (a)-[:{relationship} {{{properties}}}]->(b)"
+        );
+        let statement = conn.prepare(&query).map_err(|error| {
+            StoreError::Query(format!("prepare resolved edge {relationship}: {error}"))
+        })?;
+        // Prepare all groups before writing: a missing schema family cannot
+        // fail only after another family's rows have already been inserted.
+        prepared.push((relationship, statement, group, query));
+    }
+    let row_type = lbug::LogicalType::Struct {
+        fields: vec![
+            ("src".to_owned(), lbug::LogicalType::String),
+            ("dst".to_owned(), lbug::LogicalType::String),
+            ("conf".to_owned(), lbug::LogicalType::Double),
+            ("lt".to_owned(), lbug::LogicalType::String),
+            ("ev".to_owned(), lbug::LogicalType::String),
+        ],
+    };
+    for (relationship, mut statement, group, _query) in prepared {
+        for chunk in group.chunks(RESOLVED_EDGE_ROWS_PER_STATEMENT) {
+            let rows = chunk
+                .iter()
+                .map(|edge| {
+                    let evidence = if edge.evidence.is_empty() {
+                        String::new()
+                    } else {
+                        serde_json::to_string(&edge.evidence).unwrap_or_default()
+                    };
+                    lbug::Value::Struct(vec![
+                        (
+                            "src".to_owned(),
+                            lbug::Value::String(edge.source_uid.clone()),
+                        ),
+                        (
+                            "dst".to_owned(),
+                            lbug::Value::String(edge.target_uid.clone()),
+                        ),
+                        (
+                            "conf".to_owned(),
+                            lbug::Value::Double(edge.confidence as f64),
+                        ),
+                        (
+                            "lt".to_owned(),
+                            lbug::Value::String(
+                                edge.link_type
+                                    .map(|kind| format!("{kind:?}"))
+                                    .unwrap_or_default(),
+                            ),
+                        ),
+                        ("ev".to_owned(), lbug::Value::String(evidence)),
+                    ])
+                })
+                .collect();
+            let bound_rows = lbug::Value::List(row_type.clone(), rows);
+            #[cfg(test)]
+            capture_resolved_edge_batch_plan(conn, &_query, &bound_rows)?;
+            count_parameterized_write();
+            conn.execute(&mut statement, vec![("rows", bound_rows)])
+                .map_err(|error| {
+                    StoreError::Query(format!("insert resolved edge {relationship}: {error}"))
+                })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESOLVED_EDGE_BATCH_PLANS: std::cell::RefCell<Option<Vec<(usize, String)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn capture_resolved_edge_batch_plan(
+    conn: &crate::db::StoreConnection<'_>,
+    query: &str,
+    rows: &lbug::Value,
+) -> Result<(), StoreError> {
+    if !RESOLVED_EDGE_BATCH_PLANS.with(|capture| capture.borrow().is_some()) {
+        return Ok(());
+    }
+    let mut explain = conn
+        .prepare(&format!("EXPLAIN {query}"))
+        .map_err(|error| StoreError::Query(format!("prepare resolved-edge plan: {error}")))?;
+    let output = conn
+        .execute(&mut explain, vec![("rows", rows.clone())])
+        .map_err(|error| StoreError::Query(format!("explain resolved-edge plan: {error}")))?;
+    let mut plan = String::new();
+    for row in output {
+        for value in row {
+            if let lbug::Value::String(text) = value {
+                plan.push_str(&text);
+                plan.push('\n');
+            }
+        }
+    }
+    let count = match rows {
+        lbug::Value::List(_, values) => values.len(),
+        _ => unreachable!(),
+    };
+    RESOLVED_EDGE_BATCH_PLANS.with(|capture| {
+        capture.borrow_mut().as_mut().unwrap().push((count, plan));
+    });
+    Ok(())
+}
+
 /// Write relationship rows `(from_pk, to_pk, confidence)` to a CSV file.
 fn write_project_edge_csv(
     edges: &[(String, String)],
@@ -2480,6 +2643,18 @@ impl GraphStore {
 
     /// Insert resolved edges using an externally-provided connection (for transaction batching).
     pub fn batch_insert_edges_on(
+        conn: &crate::db::StoreConnection<'_>,
+        edges: &[ResolvedEdge],
+    ) -> Result<(), StoreError> {
+        if edges.len() >= RESOLVED_EDGE_BATCH_THRESHOLD
+            && edges.iter().all(|edge| edge.confidence.is_finite())
+        {
+            return batch_resolved_edges_on(conn, edges);
+        }
+        Self::batch_insert_edges_prepared_on(conn, edges)
+    }
+
+    fn batch_insert_edges_prepared_on(
         conn: &crate::db::StoreConnection<'_>,
         edges: &[ResolvedEdge],
     ) -> Result<(), StoreError> {
@@ -4784,8 +4959,10 @@ impl GraphStore {
         Self::delete_resolved_edges_for_file_on(&conn, repo_uid, file_path)
     }
 
-    /// Clear function CALLS for an explicit source-file set in the caller's
-    /// transaction. Constructors and methods retain their existing edges.
+    /// Clear function CALLS and parser-proven PHP static-method CALLS for an
+    /// explicit source-file set in the caller's transaction. Ordinary instance
+    /// methods and constructors retain their edges. The only caller supplies
+    /// PHP peer files; canonical compact evidence JSON distinguishes static calls.
     pub fn delete_function_calls_for_files_on(
         conn: &crate::db::StoreConnection<'_>,
         repo_uid: &str,
@@ -4796,7 +4973,7 @@ impl GraphStore {
         }
         exec_params(
             conn,
-            "MATCH (s:Symbol)-[r:CALLS]->(t:Symbol) WHERE s.repo_uid = $repo AND s.file_path IN $paths AND t.kind = $kind DELETE r",
+            "MATCH (s:Symbol)-[r:CALLS]->(t:Symbol) WHERE s.repo_uid = $repo AND s.file_path IN $paths AND (t.kind = $kind OR r.evidence CONTAINS $static_kind) DELETE r",
             vec![
                 ("repo", repo_uid.to_string().into()),
                 (
@@ -4812,6 +4989,10 @@ impl GraphStore {
                 (
                     "kind",
                     nestweaver_schema::SymbolKind::Function.to_string().into(),
+                ),
+                (
+                    "static_kind",
+                    r#""kind":"php_static_method""#.to_string().into(),
                 ),
             ],
         )
@@ -10135,6 +10316,393 @@ mod tests {
     use super::copy_from_tests::{DIALECT_SAMPLE_ROWS, assert_fixture_shape, plain_symbol};
     use super::*;
 
+    fn resolved_batch_fixture() -> GraphStore {
+        let store = GraphStore::in_memory().unwrap();
+        let mut symbols: Vec<_> = (0..4).map(plain_symbol).collect();
+        symbols[3].repo_uid = "repo:peer".to_owned();
+        store.batch_insert_symbols(&symbols).unwrap();
+        let conn = store.conn().unwrap();
+        conn.query("CREATE (:Contract {uid: 'contract:bulk'})")
+            .unwrap();
+        conn.query("CREATE (:Note {uid: 'note:bulk:a'})").unwrap();
+        conn.query("CREATE (:Note {uid: 'note:bulk:b'})").unwrap();
+        drop(conn);
+        store
+    }
+
+    fn resolved_batch_rows(store: &GraphStore, families: &[EdgeType]) -> Vec<String> {
+        let conn = store.conn().unwrap();
+        let mut rows = Vec::new();
+        for family in families {
+            let (source, target) = resolved_edge_labels(*family).unwrap();
+            let relationship = family.rel_table_name();
+            let extra = if *family == EdgeType::CrossRepoLink {
+                ", r.link_type"
+            } else {
+                ""
+            };
+            for row in conn.query(&format!(
+                "MATCH (a:{source})-[r:{relationship}]->(b:{target}) RETURN a.uid, b.uid, r.confidence, r.evidence{extra}"
+            )).unwrap() {
+                rows.push(format!("{relationship}:{row:?}"));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn resolved_edge_batch_actual_plan_uses_two_correlated_primary_key_lookups() {
+        struct CaptureGuard;
+        impl Drop for CaptureGuard {
+            fn drop(&mut self) {
+                RESOLVED_EDGE_BATCH_PLANS.with(|capture| {
+                    capture.borrow_mut().take();
+                });
+            }
+        }
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .batch_insert_symbols(&(0..4000).map(plain_symbol).collect::<Vec<_>>())
+            .unwrap();
+        let edges: Vec<_> = (0..1024)
+            .map(|i| ResolvedEdge {
+                source_uid: plain_symbol(i).uid,
+                target_uid: plain_symbol((i * 17 + 1) % 4000).uid,
+                edge_type: EdgeType::Calls,
+                confidence: 0.75,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .collect();
+        RESOLVED_EDGE_BATCH_PLANS.with(|capture| {
+            *capture.borrow_mut() = Some(Vec::new());
+        });
+        let guard = CaptureGuard;
+        // Capture EXPLAIN from the actual production query and bound rows,
+        // without reconstructing either in a test-only copy of the query.
+        store.batch_insert_edges(&edges).unwrap();
+        let plans = RESOLVED_EDGE_BATCH_PLANS.with(|capture| capture.borrow_mut().take().unwrap());
+        drop(guard);
+        assert_eq!(plans.iter().map(|(rows, _)| rows).sum::<usize>(), 1024);
+        assert_eq!(
+            plans.len(),
+            1024_usize.div_ceil(RESOLVED_EDGE_ROWS_PER_STATEMENT)
+        );
+        for (rows, plan) in plans {
+            assert!(rows <= RESOLVED_EDGE_ROWS_PER_STATEMENT);
+            assert_eq!(
+                plan.matches("QUERY_PRIMARY_KEY_LOOKUP").count(),
+                2,
+                "{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN_NODE_TABLE"),
+                "endpoint full scan: {plan}"
+            );
+            assert!(
+                !plan.contains("CROSS_PRODUCT"),
+                "endpoint cartesian product: {plan}"
+            );
+        }
+        assert_eq!(store.load_typed_edges().unwrap().len(), 1024);
+    }
+
+    #[test]
+    fn resolved_edge_batch_matches_prepared_all_families_duplicates_and_db_endpoints() {
+        let prepared = resolved_batch_fixture();
+        let batched = resolved_batch_fixture();
+        let families = [
+            EdgeType::Calls,
+            EdgeType::Imports,
+            EdgeType::Extends,
+            EdgeType::Implements,
+            EdgeType::Includes,
+            EdgeType::Uses,
+            EdgeType::Accesses,
+            EdgeType::MemberOf,
+            EdgeType::CrossRepoLink,
+            EdgeType::ImplementsContract,
+            EdgeType::Supersedes,
+            EdgeType::DependsOn,
+            EdgeType::CausedBy,
+            EdgeType::RelatesTo,
+        ];
+        let mut edges = Vec::new();
+        for family in families {
+            let (source, target) = resolved_edge_labels(family).unwrap();
+            for i in 0..80 {
+                edges.push(ResolvedEdge {
+                    source_uid: if source == "Note" {
+                        "note:bulk:a".into()
+                    } else {
+                        plain_symbol(i % 2).uid
+                    },
+                    // Includes a DB-resident peer outside the source repo and
+                    // outside the set of nodes created by this edge batch.
+                    target_uid: match target {
+                        "Note" => "note:bulk:b".into(),
+                        "Contract" => "contract:bulk".into(),
+                        _ => plain_symbol(3).uid,
+                    },
+                    edge_type: family,
+                    confidence: if i % 2 == 0 { 0.37 } else { 1.0 },
+                    link_type: if family == EdgeType::CrossRepoLink {
+                        match i % 3 {
+                            0 => Some(nestweaver_schema::CrossRepoLinkType::SharedImport),
+                            1 => Some(nestweaver_schema::CrossRepoLinkType::ContractMatch),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    },
+                    evidence: if i == 79 {
+                        vec![nestweaver_schema::EdgeEvidence {
+                            kind: "quoted, \"evidence\"\nλ".into(),
+                            weight: 0.625,
+                            note: Some("Unicode 日本語\r\nsecond line".into()),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                });
+            }
+        }
+        // Missing and wrong-label endpoints have MATCH's zero-row semantics.
+        for (source, target) in [
+            ("missing".to_owned(), plain_symbol(3).uid),
+            ("note:bulk:a".to_owned(), "contract:bulk".to_owned()),
+        ] {
+            edges.push(ResolvedEdge {
+                source_uid: source,
+                target_uid: target,
+                edge_type: EdgeType::Calls,
+                confidence: 0.5,
+                link_type: None,
+                evidence: Vec::new(),
+            });
+        }
+        assert!(edges.len() >= RESOLVED_EDGE_BATCH_THRESHOLD);
+        let conn = prepared.begin_transaction().unwrap();
+        GraphStore::batch_insert_edges_prepared_on(&conn, &edges).unwrap();
+        prepared.commit_transaction(&conn).unwrap();
+        batched.batch_insert_edges(&edges).unwrap();
+        let expected = resolved_batch_rows(&prepared, &families);
+        let actual = resolved_batch_rows(&batched, &families);
+        assert_eq!(expected.len(), actual.len());
+        for (i, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+            assert_eq!(
+                expected, actual,
+                "exact native property mismatch at row {i}"
+            );
+        }
+        assert_eq!(
+            resolved_batch_rows(&batched, &families).len(),
+            80 * families.len()
+        );
+        // Append semantics preserve duplicate evidence-bearing edges too.
+        batched.batch_insert_edges(&edges).unwrap();
+        assert_eq!(
+            resolved_batch_rows(&batched, &families).len(),
+            160 * families.len()
+        );
+    }
+
+    #[test]
+    fn resolved_edge_batch_preserves_absent_evidence_and_link_type_as_empty_strings() {
+        let store = resolved_batch_fixture();
+        let edges = vec![
+            ResolvedEdge {
+                source_uid: plain_symbol(0).uid,
+                target_uid: plain_symbol(1).uid,
+                edge_type: EdgeType::CrossRepoLink,
+                confidence: 0.8,
+                link_type: None,
+                evidence: Vec::new(),
+            };
+            RESOLVED_EDGE_BATCH_THRESHOLD
+        ];
+        store.batch_insert_edges(&edges).unwrap();
+        let conn = store.conn().unwrap();
+        let rows: Vec<_> = conn
+            .query("MATCH ()-[r:CROSS_REPO_LINK]->() RETURN r.evidence, r.link_type")
+            .unwrap()
+            .collect();
+        assert_eq!(rows.len(), RESOLVED_EDGE_BATCH_THRESHOLD);
+        for row in rows {
+            assert_eq!(
+                row[0],
+                lbug::Value::String(String::new()),
+                "evidence must be STRING, never NULL"
+            );
+            assert_eq!(
+                row[1],
+                lbug::Value::String(String::new()),
+                "link_type must be STRING, never NULL"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_edge_batch_sees_uncommitted_endpoints_and_rolls_back_with_owner() {
+        let store = resolved_batch_fixture();
+        let conn = store.begin_transaction().unwrap();
+        conn.query("CREATE (:Symbol {uid: 'symbol:uncommitted'})")
+            .unwrap();
+        let edges = vec![
+            ResolvedEdge {
+                source_uid: plain_symbol(0).uid,
+                target_uid: "symbol:uncommitted".into(),
+                edge_type: EdgeType::Calls,
+                confidence: 0.8,
+                link_type: None,
+                evidence: Vec::new()
+            };
+            RESOLVED_EDGE_BATCH_THRESHOLD
+        ];
+        GraphStore::batch_insert_edges_on(&conn, &edges).unwrap();
+        let row = conn
+            .query("MATCH ()-[r:CALLS]->() RETURN count(r)")
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_eq!(
+            row[0],
+            lbug::Value::Int64(RESOLVED_EDGE_BATCH_THRESHOLD as i64)
+        );
+        store.rollback_transaction(&conn).unwrap();
+        assert!(resolved_batch_rows(&store, &[EdgeType::Calls]).is_empty());
+    }
+
+    #[test]
+    fn resolved_edge_batch_validates_unsupported_tail_before_mutation_and_rolls_back_late_failure()
+    {
+        for size in [1, RESOLVED_EDGE_BATCH_THRESHOLD] {
+            let store = resolved_batch_fixture();
+            let mut edges = vec![
+                ResolvedEdge {
+                    source_uid: plain_symbol(0).uid,
+                    target_uid: plain_symbol(1).uid,
+                    edge_type: EdgeType::Calls,
+                    confidence: 0.8,
+                    link_type: None,
+                    evidence: Vec::new()
+                };
+                size
+            ];
+            let mut invalid = edges[0].clone();
+            invalid.edge_type = EdgeType::Contains;
+            edges.push(invalid);
+            let conn = store.begin_transaction().unwrap();
+            assert!(GraphStore::batch_insert_edges_on(&conn, &edges).is_err());
+            store.rollback_transaction(&conn).unwrap();
+            assert!(resolved_batch_rows(&store, &[EdgeType::Calls]).is_empty());
+        }
+        let store = resolved_batch_fixture();
+        // Retain an incumbent while removing every large-batch row after a
+        // later caller query fails and the engine aborts the transaction.
+        store
+            .insert_edge(&ResolvedEdge {
+                source_uid: plain_symbol(0).uid,
+                target_uid: plain_symbol(1).uid,
+                edge_type: EdgeType::Calls,
+                confidence: 0.25,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        let before = resolved_batch_rows(&store, &[EdgeType::Calls]);
+        assert_eq!(before.len(), 1);
+        let edges = vec![
+            ResolvedEdge {
+                source_uid: plain_symbol(0).uid,
+                target_uid: plain_symbol(1).uid,
+                edge_type: EdgeType::Calls,
+                confidence: 0.8,
+                link_type: None,
+                evidence: Vec::new(),
+            };
+            RESOLVED_EDGE_BATCH_THRESHOLD
+        ];
+        // Explicit rollback must restore the same live handle, even when the
+        // relationship already had committed in-memory rows.
+        let conn = store.begin_transaction().unwrap();
+        GraphStore::batch_insert_edges_on(&conn, &edges).unwrap();
+        store.rollback_transaction(&conn).unwrap();
+        drop(conn);
+        assert_eq!(resolved_batch_rows(&store, &[EdgeType::Calls]), before);
+
+        let conn = store.begin_transaction().unwrap();
+        GraphStore::batch_insert_edges_on(&conn, &edges).unwrap();
+        let row = conn
+            .query("MATCH ()-[r:CALLS]->() RETURN count(r)")
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_eq!(
+            row[0],
+            lbug::Value::Int64((RESOLVED_EDGE_BATCH_THRESHOLD + 1) as i64)
+        );
+        let Err(error) = conn.query("CREATE (:MissingResolvedEdgeBatchNode {uid: 'late-failure'})")
+        else {
+            panic!("the late caller query must fail after successful batched insertion");
+        };
+        assert!(
+            error.to_string().contains("MissingResolvedEdgeBatchNode"),
+            "{error}"
+        );
+        if let Err(rollback) = store.rollback_transaction(&conn) {
+            assert!(
+                rollback
+                    .to_string()
+                    .contains("No active transaction for ROLLBACK"),
+                "{rollback}"
+            );
+        }
+        drop(conn);
+        assert_eq!(
+            resolved_batch_rows(&store, &[EdgeType::Calls]),
+            before,
+            "late caller failure must remove all batched rows and retain the incumbent on the live handle"
+        );
+    }
+
+    #[test]
+    fn resolved_edge_batch_prepares_all_schema_families_before_writing() {
+        let store = resolved_batch_fixture();
+        store.conn().unwrap().query("DROP TABLE USES").unwrap();
+        let mut edges = vec![
+            ResolvedEdge {
+                source_uid: plain_symbol(0).uid,
+                target_uid: plain_symbol(1).uid,
+                edge_type: EdgeType::Calls,
+                confidence: 0.8,
+                link_type: None,
+                evidence: Vec::new(),
+            };
+            RESOLVED_EDGE_BATCH_THRESHOLD
+        ];
+        let mut missing = edges[0].clone();
+        missing.edge_type = EdgeType::Uses;
+        edges.push(missing);
+        let conn = store.begin_transaction().unwrap();
+        let error = GraphStore::batch_insert_edges_on(&conn, &edges).unwrap_err();
+        assert!(
+            error.to_string().contains("prepare resolved edge USES"),
+            "{error}"
+        );
+        if let Err(rollback) = store.rollback_transaction(&conn) {
+            assert!(
+                rollback
+                    .to_string()
+                    .contains("No active transaction for ROLLBACK"),
+                "{rollback}"
+            );
+        }
+        drop(conn);
+        assert!(resolved_batch_rows(&store, &[EdgeType::Calls]).is_empty());
+    }
+
     fn seed_classified_vault(store: &GraphStore, vault_uid: &str) {
         store
             .insert_vault(&Vault {
@@ -14001,6 +14569,98 @@ mod references_code_plan_tests {
         assert!(
             ratio <= 2.0,
             "canonical 2x scaling bound failed: {ratio:.4}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod php_static_call_cleanup_tests {
+    use super::*;
+    use nestweaver_schema::{EdgeEvidence, EdgeType, ResolvedEdge, Symbol, SymbolKind, Visibility};
+
+    #[test]
+    fn php_peer_cleanup_preserves_instance_constructor_and_escaped_marker_evidence() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, kind, file, repo) in [
+            ("caller", SymbolKind::Function, "main.php", "repo:php"),
+            ("other", SymbolKind::Function, "other.php", "repo:other"),
+            ("free", SymbolKind::Function, "lib.php", "repo:php"),
+            ("static", SymbolKind::Method, "lib.php", "repo:php"),
+            ("instance", SymbolKind::Method, "lib.php", "repo:php"),
+            ("constructor", SymbolKind::Class, "lib.php", "repo:php"),
+            ("escaped", SymbolKind::Method, "lib.php", "repo:php"),
+        ] {
+            store
+                .insert_symbol(&Symbol {
+                    uid: uid.into(),
+                    name: uid.into(),
+                    kind,
+                    repo_uid: repo.into(),
+                    file_path: file.into(),
+                    start_line: 1,
+                    end_line: 1,
+                    signature: String::new(),
+                    summary: None,
+                    content_hash: uid.into(),
+                    embedding: None,
+                    pagerank_score: None,
+                    is_entry_point: false,
+                    entry_point_kind: None,
+                    visibility: Visibility::Public,
+                    type_info: None,
+                    framework_hint: None,
+                    canonical_id: None,
+                })
+                .unwrap();
+        }
+        for (source, target, kind, note) in [
+            ("caller", "free", "php_namespace_function", None),
+            ("caller", "static", "php_static_method", None),
+            ("caller", "instance", "type_lookup", None),
+            ("caller", "constructor", "type_lookup", None),
+            (
+                "caller",
+                "escaped",
+                "type_lookup",
+                Some(r#""kind":"php_static_method""#),
+            ),
+            ("other", "static", "php_static_method", None),
+        ] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source.into(),
+                    target_uid: target.into(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: vec![EdgeEvidence {
+                        kind: kind.into(),
+                        weight: 1.0,
+                        note: note.map(str::to_owned),
+                    }],
+                })
+                .unwrap();
+        }
+        {
+            let conn = store.conn().unwrap();
+            GraphStore::delete_function_calls_for_files_on(&conn, "repo:php", &["main.php"])
+                .unwrap();
+        }
+        let mut remaining: Vec<_> = store
+            .load_typed_edges()
+            .unwrap()
+            .into_iter()
+            .map(|edge| (edge.0, edge.1))
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec![
+                ("caller".into(), "constructor".into()),
+                ("caller".into(), "escaped".into()),
+                ("caller".into(), "instance".into()),
+                ("other".into(), "static".into()),
+            ]
         );
     }
 }

@@ -724,6 +724,8 @@ fn resolve_single_reference(
         | ReferenceKind::PhpFunctionImport
         | ReferenceKind::PhpNamespaceAlias
         | ReferenceKind::PhpFunctionCall
+        | ReferenceKind::PhpStaticCall
+        | ReferenceKind::PhpClassDefinition
         | ReferenceKind::ExportAlias => return None,
     };
 
@@ -762,7 +764,7 @@ fn resolve_single_reference(
     let source_uid = symbol_uid(repo_uid, file_path, &source_sym.name, source_sym.start_line);
 
     if language == Language::Php
-        && let Some(target) = php_functions.resolve(file_path, reference)
+        && let Some(target) = php_functions.resolve(file_path, reference, source_sym)
     {
         return Some(match target {
             Some((target_file, symbol)) => {
@@ -781,7 +783,12 @@ fn resolve_single_reference(
                     confidence,
                     link_type: None,
                     evidence: vec![EdgeEvidence {
-                        kind: "php_namespace_function".into(),
+                        kind: if reference.receiver.is_some() {
+                            "php_static_method"
+                        } else {
+                            "php_namespace_function"
+                        }
+                        .into(),
                         weight: confidence,
                         note: None,
                     }],
@@ -11741,14 +11748,9 @@ export function readIt() { return value(); }
         );
     }
 
-    /// nw-113 final review Minor 7: the receiver rule in PHP. `X::m()` after
-    /// `use Lib\X;` must not bind the same-file `m`, but it does: the parser
-    /// records no receiver for a `scoped_call_expression`, so the rule never
-    /// sees one. Fixing it changes parser output (a parsed-cache bump) and
-    /// every PHP static call's resolution (`self::`, `static::`, `parent::`),
-    /// so it is reported rather than fixed in nw-113.
+    /// nw-813: an imported static receiver selects its actual class, including
+    /// when the caller itself is a homonymous free function.
     #[test]
-    #[ignore = "PHP static calls carry no receiver; see the doc comment"]
     fn a_receiver_call_never_binds_a_same_file_name_in_php() {
         let (files, edges) = review_edges(
             &[
@@ -11763,11 +11765,170 @@ export function readIt() { return value(); }
             ],
             Language::Php,
         );
+        assert_eq!(
+            call_targets(&files, &edges, "src/main.php", "m"),
+            vec![uid(&files, "src/Lib/X.php", "m")],
+            "{edges:#?}"
+        );
         let same_file = uid(&files, "src/main.php", "m");
         assert!(
             !edges.iter().any(|edge| edge.target_uid == same_file),
             "{edges:#?}"
         );
+    }
+
+    #[test]
+    fn php_static_receivers_resolve_alias_prefix_absolute_and_namespace_relative() {
+        let vendor = "<?php\nnamespace Vendor;\nclass X { public static function m() {} }\nclass Wrong { public static function m() {} }\n";
+        let main = "<?php\nnamespace App;\nuse Vendor\\X as Chosen;\nuse Vendor as Prefix;\nfunction m() {}\nfunction alias_call() { Chosen::m(); }\nfunction prefix_call() { Prefix\\X::M(); }\nfunction absolute_call() { \\Vendor\\X::m(); }\nfunction relative_call() { namespace\\Local::m(); }\nclass Local { public static function m() {} }\nfunction missing() { X::m(); }\nfunction dynamic($class) { $class::m(); }\n";
+        for inputs in [
+            vec![("vendor.php", vendor), ("main.php", main)],
+            vec![("main.php", main), ("vendor.php", vendor)],
+        ] {
+            let (files, edges) = review_edges(&inputs, Language::Php);
+            let intended = uid_at(&files, "vendor.php", "m", 3);
+            for caller in ["alias_call", "prefix_call", "absolute_call"] {
+                assert_eq!(
+                    call_targets(&files, &edges, "main.php", caller),
+                    vec![intended.clone()],
+                    "{caller}: {edges:#?}"
+                );
+            }
+            assert_eq!(
+                call_targets(&files, &edges, "main.php", "relative_call"),
+                vec![uid_at(&files, "main.php", "m", 10)]
+            );
+            for caller in ["missing", "dynamic"] {
+                assert!(
+                    call_targets(&files, &edges, "main.php", caller)
+                        .iter()
+                        .all(|target| target.starts_with("unresolved:")),
+                    "{caller}: {edges:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn php_relative_static_receivers_obey_inheritance_and_late_binding() {
+        let base = "<?php\nnamespace BaseSpace;\nclass Base {\n public static function inherited() {}\n final public static function sealed() {}\n protected static function guarded() {}\n private static function hidden() {}\n public function instance() {}\n}\n";
+        let child = "<?php\nnamespace App;\nuse BaseSpace\\Base as Ancestor;\nclass Child extends Ancestor {\n public static function local() {}\n public static function self_call() { self::local(); }\n public static function parent_call() { parent::inherited(); }\n public static function inherited_call() { self::inherited(); }\n public static function late_unknown() { static::local(); }\n public static function late_final_method() { static::sealed(); }\n public static function protected_call() { parent::guarded(); }\n public static function private_refusal() { parent::hidden(); }\n public function instance_call() { parent::instance(); }\n}\nfinal class Closed extends Child {\n public static function late_final_class() { static::local(); }\n}\nfunction outside_protected() { Child::guarded(); }\nfunction outside_instance() { Child::instance(); }\nfunction outside_parent() { parent::inherited(); }\n";
+        let (files, edges) =
+            review_edges(&[("base.php", base), ("child.php", child)], Language::Php);
+        for (caller, path, method) in [
+            ("self_call", "child.php", "local"),
+            ("parent_call", "base.php", "inherited"),
+            ("inherited_call", "base.php", "inherited"),
+            ("late_final_method", "base.php", "sealed"),
+            ("protected_call", "base.php", "guarded"),
+            ("instance_call", "base.php", "instance"),
+            ("late_final_class", "child.php", "local"),
+        ] {
+            assert_eq!(
+                call_targets(&files, &edges, "child.php", caller),
+                vec![uid(&files, path, method)],
+                "{caller}: {edges:#?}"
+            );
+        }
+        for caller in [
+            "late_unknown",
+            "private_refusal",
+            "outside_protected",
+            "outside_instance",
+            "outside_parent",
+        ] {
+            assert!(
+                call_targets(&files, &edges, "child.php", caller)
+                    .iter()
+                    .all(|target| target.starts_with("unresolved:")),
+                "{caller}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn php_static_dispatch_refuses_duplicate_classes_traits_and_anonymous_owners() {
+        let caller = "<?php\nuse Lib\\X;\nfunction caller() { X::m(); }\n";
+        let definition = "<?php\nnamespace Lib;\nclass X { public static function m() {} }\n";
+        let (files, edges) = review_edges(
+            &[
+                ("main.php", caller),
+                ("first.php", definition),
+                ("second.php", definition),
+            ],
+            Language::Php,
+        );
+        assert!(
+            call_targets(&files, &edges, "main.php", "caller")
+                .iter()
+                .all(|target| target.starts_with("unresolved:")),
+            "{edges:#?}"
+        );
+        let source = "<?php\nclass Base { public static function m() {} }\nclass Child extends Base {\n use UnknownTrait;\n public static function trait_refusal() { self::m(); }\n}\nclass Outer {\n public static function m() {}\n public static function create() { return new class { public static function anonymous_refusal() { self::m(); } }; }\n}\n";
+        let (files, edges) = review_edges(&[("main.php", source)], Language::Php);
+        for caller in ["trait_refusal", "anonymous_refusal"] {
+            assert!(
+                call_targets(&files, &edges, "main.php", caller)
+                    .iter()
+                    .all(|target| target.starts_with("unresolved:")),
+                "{caller}: {edges:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn php_static_calls_refuse_graph_stubs_without_class_facts() {
+        let mut files = parsed_files(&[
+            (
+                "main.php",
+                "<?php\nuse Lib\\X;\nfunction caller() { X::m(); }\n",
+            ),
+            (
+                "target.php",
+                "<?php\nnamespace Lib;\nclass X { public static function m() {} }\n",
+            ),
+        ]);
+        // Graph Symbol stubs intentionally cannot assert a PHP namespace,
+        // class parent, method flags or exact declaration byte range.
+        files[1].2.clear();
+        for symbol in &mut files[1].1 {
+            symbol.scope_chain = None;
+            symbol.parent_name = None;
+        }
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Php,
+            "repo:test:abc",
+            &WorkspaceContext::default(),
+            None,
+            None,
+        );
+        assert!(
+            call_targets(&files, &edges, "main.php", "caller")
+                .iter()
+                .all(|target| target.starts_with("unresolved:")),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn php_class_identity_is_scoped_by_namespace_region() {
+        for source in [
+            "<?php\nnamespace One {\nclass X { public static function m() {} }\nfunction first() { X::m(); }\n}\nnamespace Two {\nclass X { public static function m() {} }\nfunction second() { X::m(); }\n}\n",
+            "<?php\nnamespace One;\nclass X { public static function m() {} }\nfunction first() { X::m(); }\n\nnamespace Two;\nclass X { public static function m() {} }\nfunction second() { X::m(); }\n",
+        ] {
+            let (files, edges) = review_edges(&[("main.php", source)], Language::Php);
+            assert_eq!(
+                call_targets(&files, &edges, "main.php", "first"),
+                vec![uid_at(&files, "main.php", "m", 3)],
+                "{edges:#?}"
+            );
+            assert_eq!(
+                call_targets(&files, &edges, "main.php", "second"),
+                vec![uid_at(&files, "main.php", "m", 7)],
+                "{edges:#?}"
+            );
+        }
     }
 
     /// nw-113 final watch parity O3: a member access with a receiver

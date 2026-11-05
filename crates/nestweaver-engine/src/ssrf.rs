@@ -353,6 +353,9 @@ pub enum SsrfError {
     Rejected(String),
     /// The host resolved (or is a literal) to an internal/private address.
     ResolvesInternal(String),
+    /// DNS could not answer. Kept distinct from a successful resolution to a
+    /// forbidden address so per-host breakers can count actual DNS outages.
+    ResolutionFailed(String),
 }
 
 impl std::fmt::Display for SsrfError {
@@ -364,6 +367,9 @@ impl std::fmt::Display for SsrfError {
                 "unsupported URL scheme '{s}': only https/http/ssh remotes may be cloned"
             ),
             SsrfError::Rejected(m) => write!(f, "{m}"),
+            SsrfError::ResolutionFailed(h) => {
+                write!(f, "rejected host '{h}': DNS resolution failed")
+            }
             SsrfError::ResolvesInternal(h) => write!(
                 f,
                 "rejected host '{h}': resolves to an internal/private address"
@@ -450,7 +456,7 @@ pub fn guard_git_url(url: &str) -> Result<GitNetGuard, SsrfError> {
     // reject if anything it points at is internal. DNS failure = fail closed.
     let resolved: Vec<IpAddr> = match parse_host_as_ip(host) {
         Some(ip) => vec![ip],
-        None => resolve_host(host).map_err(|_| SsrfError::ResolvesInternal(host.to_string()))?,
+        None => resolve_host(host).map_err(|_| SsrfError::ResolutionFailed(host.to_string()))?,
     };
     if any_resolved_ip_is_internal(&resolved) {
         return Err(SsrfError::ResolvesInternal(host.to_string()));

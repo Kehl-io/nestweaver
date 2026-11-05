@@ -1067,6 +1067,35 @@ url = "grpcs://nestweaver.internal:9378"
 vault_mappings = { "vlt:laptop:aaaaaaaaaaaa" = "vlt:server:bbbbbbbbbbbb" }
 ```
 
+Discover the actual IDs before editing a binding:
+
+```sh
+nestweaver brain list --upstreams --config instance.toml
+nestweaver brain list --upstreams --config instance.toml --json
+```
+
+This read-only command lists the verified existing local owner and **every**
+configured upstream separately, regardless of routing mode. Each authenticated
+peer supplies its own UID, name, root and note count. A forbidden, unavailable,
+misconfigured or invalid-response source has no claimed vault count; it is not
+an empty vault inventory. Discovery does not start a local daemon or read its
+native database directly. Each source request has a five-second ceiling and
+upstreams run concurrently. Endpoint URLs, bearer tokens and remote error
+messages are omitted from the inventory. Listing still prints all available
+sources when another fails and exits 1 for a partial inventory. `brain status`
+retains its `upstreams` name/mode metadata; endpoint URLs are omitted there too.
+
+`brain status` includes the same per-source `vault_sources` inventory when
+upstreams are configured and names unmapped upstream vaults in text output.
+`mapping_status` distinguishes explicit accepted bindings, identical full UIDs,
+unmapped vaults, rejected mappings and an unavailable local inventory. Copy the
+upstream UID from the suggested `vault_mappings` example, then replace
+`<LOCAL_VAULT_UID>` with the chosen local UID. The placeholder is intentionally
+not a working binding: matching roots, titles or content never select a vault
+for you. Ambiguous bindings and destination collisions remain rejected under
+the same rules used by merged queries. Counts remain per source; the command
+never adds them into an asserted cross-tier union.
+
 Use the actual vault UIDs reported by each graph. Bindings must be one-to-one;
 invalid or ambiguous bindings cannot merge rows. The same setting is accepted
 in instance.toml, upstreams.toml and .nestweaver/server.toml. Inside an authorized

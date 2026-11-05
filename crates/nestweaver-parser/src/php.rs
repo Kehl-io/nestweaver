@@ -145,11 +145,159 @@ pub(crate) fn collect_namespace_bindings(
     references.extend(regions);
 }
 
+/// Parser-owned facts for one named PHP class. Exact declaration/call byte
+/// regions keep repeated names on a line or in different namespaces distinct.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PhpClassFacts {
+    pub parent: Option<String>,
+    pub is_final: bool,
+    pub has_traits: bool,
+    pub methods: Vec<PhpMethodFacts>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PhpMethodFacts {
+    pub name: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub scope: LexicalScope,
+    pub is_static: bool,
+    pub is_final: bool,
+    pub is_abstract: bool,
+}
+
+pub(crate) fn collect_class_facts(
+    root: Node<'_>,
+    source: &[u8],
+    references: &mut Vec<RawReference>,
+) {
+    let regions = namespace_regions(root, source);
+    let mut nodes = vec![root];
+    while let Some(node) = nodes.pop() {
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+        if !matches!(
+            node.kind(),
+            "class_declaration" | "enum_declaration" | "anonymous_class"
+        ) {
+            continue;
+        }
+        // Empty identity marks an anonymous lexical class boundary. It must
+        // hide an outer named class for self/parent/static dispatch.
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .unwrap_or("");
+        let namespace = namespace_for_position(&regions, node.start_byte()).unwrap_or("");
+        let qualified = if name.is_empty() || namespace.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{namespace}\\{name}")
+        };
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        let parent = children
+            .iter()
+            .find(|n| n.kind() == "base_clause")
+            .and_then(|base| base.named_child(0))
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(str::to_owned);
+        let is_final = node.kind() == "enum_declaration"
+            || children.iter().any(|n| n.kind() == "final_modifier");
+        let body = node.child_by_field_name("body");
+        let mut members = Vec::new();
+        if let Some(body) = body {
+            let mut cursor = body.walk();
+            members.extend(body.named_children(&mut cursor));
+        }
+        let methods = members
+            .iter()
+            .filter(|n| n.kind() == "method_declaration")
+            .filter_map(|method| {
+                let name = method
+                    .child_by_field_name("name")?
+                    .utf8_text(source)
+                    .ok()?
+                    .to_owned();
+                let mut cursor = method.walk();
+                let modifiers: Vec<_> = method
+                    .named_children(&mut cursor)
+                    .map(|n| n.kind())
+                    .collect();
+                Some(PhpMethodFacts {
+                    name,
+                    start_line: method.start_position().row as u32 + 1,
+                    end_line: method.end_position().row as u32 + 1,
+                    scope: scope(method.start_byte(), method.end_byte(), method.start_byte()),
+                    is_static: modifiers.contains(&"static_modifier"),
+                    is_final: modifiers.contains(&"final_modifier"),
+                    is_abstract: modifiers.contains(&"abstract_modifier")
+                        || method.child_by_field_name("body").is_none(),
+                })
+            })
+            .collect();
+        let facts = PhpClassFacts {
+            parent,
+            is_final,
+            has_traits: members
+                .iter()
+                .any(|member| member.kind() == "use_declaration"),
+            methods,
+        };
+        references.push(RawReference {
+            name: qualified,
+            kind: ReferenceKind::PhpClassDefinition,
+            start_line: node.start_position().row as u32 + 1,
+            context: serde_json::to_string(&facts).unwrap_or_default(),
+            receiver: None,
+            scope: Some(scope(node.start_byte(), node.end_byte(), node.start_byte())),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parse_source;
     use std::path::Path;
+
+    #[test]
+    fn php_static_calls_keep_receivers_and_ast_owned_class_flags() {
+        let source = "<?php\nnamespace App;\nfinal class Child extends \\Lib\\Base {\n use SomeTrait;\n final public static function run() { self::m(); static::m(); parent::m(); \\Lib\\Base::m(); $class::m(); }\n public function instance() {}\n}\n";
+        let parsed = parse_source(Path::new("static.php"), source).unwrap();
+        assert!(!parsed.has_syntax_errors);
+        for receiver in ["self", "static", "parent", "\\Lib\\Base", "$class"] {
+            let position = source.find(&format!("{receiver}::m()")).unwrap();
+            for kind in [ReferenceKind::Call, ReferenceKind::PhpStaticCall] {
+                assert!(
+                    parsed.references.iter().any(|r| r.kind == kind
+                        && r.name == "m"
+                        && r.receiver.as_deref() == Some(receiver)
+                        && r.scope.is_some_and(|scope| scope.position == position)),
+                    "{receiver}: {:#?}",
+                    parsed.references
+                );
+            }
+        }
+        let class = parsed
+            .references
+            .iter()
+            .find(|r| r.kind == ReferenceKind::PhpClassDefinition && r.name == "App\\Child")
+            .unwrap();
+        let facts: PhpClassFacts = serde_json::from_str(&class.context).unwrap();
+        assert!(facts.is_final && facts.has_traits);
+        assert_eq!(facts.parent.as_deref(), Some("\\Lib\\Base"));
+        let run = facts.methods.iter().find(|m| m.name == "run").unwrap();
+        assert!(run.is_static && run.is_final && !run.is_abstract);
+        assert!(
+            !facts
+                .methods
+                .iter()
+                .find(|m| m.name == "instance")
+                .unwrap()
+                .is_static
+        );
+    }
 
     #[test]
     fn php_namespace_facts_record_regions_and_import_categories() {
@@ -276,11 +424,11 @@ mod tests {
     }
 
     #[test]
-    fn php_only_named_free_calls_receive_namespace_positions() {
+    fn php_free_and_static_calls_keep_positions_but_instance_calls_keep_type_lookup() {
         let source = "<?php\nclass Carrier { public function method() {} public static function staticMethod() {} }\nfunction named() {}\nfunction caller(Carrier $input) {\n $bound = new Carrier();\n $bound->method();\n Carrier::staticMethod();\n $input?->method();\n named();\n Vendor\\helper();\n namespace\\local();\n}\n";
         let parsed = parse_source(Path::new("receivers.php"), source).unwrap();
         assert!(!parsed.has_syntax_errors);
-        for name in ["Carrier", "method", "staticMethod"] {
+        for name in ["Carrier", "method"] {
             let captures: Vec<_> = parsed
                 .references
                 .iter()
@@ -324,13 +472,22 @@ mod tests {
                         && binding.scope.is_none())
             );
         }
-        // Nullsafe member calls are not currently captured by php.scm; any
-        // present receiver capture must nevertheless remain unscoped.
+        let static_call = parsed
+            .references
+            .iter()
+            .find(|r| r.kind == ReferenceKind::Call && r.name == "staticMethod")
+            .unwrap();
+        assert_eq!(static_call.receiver.as_deref(), Some("Carrier"));
+        assert!(static_call.scope.is_some());
+        // Nullsafe member calls are not currently captured by php.scm; ordinary
+        // member captures retain their existing unscoped type lookup.
         assert!(
             parsed
                 .references
                 .iter()
-                .filter(|r| r.kind == ReferenceKind::Call && r.receiver.is_some())
+                .filter(|r| r.kind == ReferenceKind::Call
+                    && r.receiver.is_some()
+                    && r.name != "staticMethod")
                 .all(|r| r.scope.is_none())
         );
     }

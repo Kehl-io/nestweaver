@@ -19,9 +19,21 @@ backup. A publication predecessor that the new engine has already opened
 writable is not a substitute for this backup. Keep the backup outside the
 publication directories.
 
-This update also moves the resolver generation to 20 and the parsed-cache
-version to 14 for the Dart and PowerShell grammar changes. Force re-index each
+The current resolver generation is 21 and parsed-cache version is 15, covering
+PHP static-method ownership and the preceding Dart/PowerShell grammar changes. Force re-index each
 repository once; cache invalidation alone does not replace existing graph facts.
+
+## Canonical ranking scope
+
+Indexing, code watching, publication rebuild and lazy ranking all use the
+unified code-and-notes scope for the canonical PageRank sidecar. The artifact's
+scope fingerprint is checked on warmup. A legacy code-only canonical artifact
+is disclosed and left for a lazy unified refill; it does not require another
+graph rebuild. Explicit scoped ranking computations and their explicitly
+declared artifacts continue to support code-only and notes-only scopes.
+
+This scope migration is separate from a resolver upgrade. A graph whose
+resolver generation is stale still needs the forced repository reindex above.
 
 ## Storage-engine upgrade (LadybugDB 0.21): rebuild required
 

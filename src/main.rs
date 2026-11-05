@@ -359,23 +359,11 @@ fn load_cli_local_embedder(
 /// Load an embedding model for the DIRECT (non-daemon) query route's own
 /// semantic ranking leg — currently wired for `project-context` only.
 ///
-/// nw-429: `daemon_may_serve` forces `--config` (and `--no-tests`/
-/// `--prefer-instance`) off the daemon and onto this direct route, and that
-/// reroute is deliberate — see its doc comment for why forwarding a config
-/// to a shared daemon is a security bypass, not a convenience. What that
-/// reroute did not account for is that the direct route never loaded a
-/// model at all: every call site threaded `embed_model: None`
-/// unconditionally, so a query that took this route always answered
-/// `semantic_applied: false` / `seed_tokens_charged: 0`, silently, on
-/// exactly the invocation `~/brain/CLAUDE.md` mandates
-/// (`project-context --config`).
-///
-/// The fix is not to forward the daemon's warm model — that IS the
-/// process-lifetime state nw-316's research says cannot cross a request
-/// boundary, since the loaded model must match the vectors already on disk
-/// and the daemon's is bound to ITS boot config, not the caller's named
-/// one — but to give the direct route the SAME capability the daemon has:
-/// load its own model, from the same primitive `embed --local` already uses
+/// nw-429 supplied semantic capability for direct reads. nw-850 now routes
+/// explicitly configured project-context reads through the checked connector,
+/// which verifies the live owner's configuration without reconfiguring it.
+/// A permitted direct read still needs its own model, matching the persisted
+/// embedding identity, from the same primitive `embed --local` already uses
 /// in-process (`EmbedModel::load_with_policy_and_artifact_mode`), using
 /// `embedding_load_config`/`embedding_cache_dir_for_load_with`/
 /// `daemon_embedding_device_policy` — made `pub` in `nestweaver-daemon` so
@@ -2024,6 +2012,14 @@ const ENV_REGISTRY: &[EnvVar] = &[
     },
     EnvVar {
         name: "NESTWEAVER_NAMESPACE_REPLACEMENT_PROBE",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_NATIVE_SOAK_SECONDS",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_NATIVE_SOAK_THREADS",
         role: EnvRole::Internal,
     },
     // REQUESTS the daemon bypass. `NESTWEAVER_ALLOW_NO_DAEMON` permits it.
@@ -9877,6 +9873,9 @@ enum BrainCommands {
     },
     /// List all indexed vaults with their note counts.
     List {
+        /// Include a separate authenticated inventory for every configured upstream.
+        #[arg(long)]
+        upstreams: bool,
         #[arg(long, help = "Output as JSON")]
         json: bool,
         #[arg(
@@ -23403,18 +23402,39 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // Name the one repository the changed paths belong to before
             // anything else: repo-relative paths sent without it matched a
             // same-path file in every other indexed repo.
-            require_existing_db(&db_path)?;
             let repos: Vec<nestweaver_schema::Repo> = if use_daemon {
-                let rt = tokio::runtime::Runtime::new()?;
-                let mut client =
-                    rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
-                let response = rt.block_on(client.inner_mut().list_repos_json(
-                    tonic::Request::new(nestweaver_proto::JsonRequest {
-                        args_json: "{}".to_string(),
-                    }),
-                ))?;
-                serde_json::from_str(&response.into_inner().result_json)?
+                if let Some(selected) = selected_existing_database(&db_path)? {
+                    // nw-904: affected-tests keeps its TwoTier local/org
+                    // semantics even in primary mode. Choose the changed
+                    // paths' owning local repo before the local analysis.
+                    require_openable_db(&selected)?;
+                    let rt = tokio::runtime::Runtime::new()?;
+                    let mut client =
+                        rt.block_on(nestweaver_client::DaemonClient::connect(&db_path, None))?;
+                    let response = rt.block_on(client.inner_mut().list_repos_json(
+                        tonic::Request::new(nestweaver_proto::JsonRequest {
+                            args_json: "{}".to_string(),
+                        }),
+                    ))?;
+                    serde_json::from_str(&response.into_inner().result_json)?
+                } else {
+                    // nw-779: without a selected local graph, use a verified
+                    // replica or authenticated upstream inventory. The checked
+                    // funnel never creates a local database or falls back to
+                    // native access after an upstream refusal.
+                    let inventory = try_hybrid_json_rpc_checked(
+                        true,
+                        &db_path,
+                        None,
+                        "list_repos",
+                        serde_json::json!({}),
+                    )?
+                    .context("repository inventory unavailable for affected-tests")?;
+                    serde_json::from_value(unwrap_hybrid_payload(inventory))
+                        .context("decode affected-tests repository inventory")?
+                }
             } else {
+                require_existing_db(&db_path)?;
                 open_store(Some(&db_path))?.list_repos(None)?
             };
             let working_root = detect_repo_root();
@@ -26192,9 +26212,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // `include_components` came to differ between them (nw-316 leg 2).
             let direct_args = project_args.clone();
             let daemon_result = try_hybrid_json_rpc_checked(
-                // nw-316: `--config` names an InstanceConfig the daemon cannot
-                // honour, so it reroutes rather than being forwarded.
-                daemon_may_serve(use_daemon, config.as_deref()),
+                // nw-850: the checked connector verifies the named config
+                // against the owning daemon. Never bypass that verification
+                // by treating an explicit config as a direct-read request.
+                use_daemon,
                 &db_path,
                 config.as_deref(),
                 "project_context",
@@ -29071,7 +29092,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             Ok(pid) => (pid, None),
                             Err(error) => (None, Some(error)),
                         };
-                    let backing_error = if reachable.is_some() {
+                    let observed_health = if reachable.is_some() {
                         tokio::runtime::Runtime::new()?.block_on(async {
                             let mut client =
                                 nestweaver_client::DaemonClient::connect_existing(&db_path).await?;
@@ -29080,14 +29101,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 client.health_check(),
                             )
                             .await??;
-                            Ok::<_, anyhow::Error>(
-                                (health.backing_file_valid == Some(false))
-                                    .then_some(health.backing_file_error),
-                            )
+                            Ok::<_, anyhow::Error>(Some(health))
                         })?
                     } else {
                         None
                     };
+                    let backing_error = observed_health.as_ref().and_then(|health| {
+                        (health.backing_file_valid == Some(false))
+                            .then_some(health.backing_file_error.as_str())
+                    });
                     if let Some(error) = &backing_error {
                         if json {
                             println!(
@@ -29142,6 +29164,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "state": state, "evidence": evidence, "pid": pid, "endpoint_error": endpoint_error,
                                 "db_path": db_path_abs, "instance_id": instance_id, "socket": socket,
+                                "daemon_version": observed_health.as_ref().map(|health| &health.version),
+                                "client_version": env!("CARGO_PKG_VERSION"),
+                                "daemon_resolver_generation": observed_health.as_ref().and_then(|health| health.resolver_generation),
+                                "client_resolver_generation": nestweaver_engine::resolver_generation::RESOLVER_GENERATION,
+                                "resolver_skew": observed_health.as_ref().and_then(nestweaver_client::daemon_resolver_skew),
                                 "supervision": pid.map(nestweaver_daemon::lifecycle::process_supervision).unwrap_or("unknown/unverifiable"),
                                 "next_action": if state == "running_but_unreachable" || state == "unknown" { "Inspect the verified holder. Do not start another writer or remove runtime files." } else { "Use daemon stop/restart for this selected database; a systemd-user owner may restart it until its unit is stopped." }
                             }))?
@@ -29204,6 +29231,21 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             && reachable == Some(pid)
                         {
                             println!("Daemon is running (PID {pid})");
+                            if let Some(health) = &observed_health {
+                                println!(
+                                    "  Version: {} (client {})",
+                                    health.version,
+                                    env!("CARGO_PKG_VERSION")
+                                );
+                                println!(
+                                    "  Resolver: {} (client {})",
+                                    health
+                                        .resolver_generation
+                                        .map(|generation| generation.to_string())
+                                        .unwrap_or_else(|| "unknown".into()),
+                                    nestweaver_engine::resolver_generation::RESOLVER_GENERATION
+                                );
+                            }
                             println!(
                                 "  Supervision: {}",
                                 nestweaver_daemon::lifecycle::process_supervision(pid)
@@ -44050,36 +44092,6 @@ mod nw401_cluster_disclosure_tests {
 }
 
 #[cfg(test)]
-mod nw316_route_tests {
-    use super::daemon_may_serve;
-    use std::path::Path;
-
-    /// nw-316. `--config` must force the direct route rather than be forwarded
-    /// into the RPC: `InstanceConfig` carries the authorization policy, so a
-    /// forwarded config is a permission bypass, and most of the struct is
-    /// process-lifetime rather than request-scoped.
-    #[test]
-    fn naming_a_config_forces_the_direct_route() {
-        assert!(
-            daemon_may_serve(true, None),
-            "an ordinary request still uses the daemon"
-        );
-        assert!(
-            !daemon_may_serve(true, Some(Path::new("/tmp/instance.toml"))),
-            "--config must reroute, never forward"
-        );
-        assert!(
-            !daemon_may_serve(false, None),
-            "an explicit no-daemon request is still direct"
-        );
-        assert!(
-            !daemon_may_serve(false, Some(Path::new("/tmp/instance.toml"))),
-            "both reasons together stay direct"
-        );
-    }
-}
-
-#[cfg(test)]
 mod resolver_generation_gate_tests {
     use super::*;
     use nestweaver_engine::blast_radius::{AnalysisStatus, BlastRadiusResult};
@@ -45722,5 +45734,56 @@ mod direct_store_compatibility_tests {
             json_payload_with_store_compatibility(&first, wire.clone()).unwrap(),
             wire
         );
+    }
+}
+
+#[cfg(test)]
+mod vault_discovery_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn brain_list_upstreams_accepts_config_and_json() {
+        std::thread::Builder::new()
+            .name("vault-discovery-cli-acceptance".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "nestweaver",
+                    "brain",
+                    "list",
+                    "--upstreams",
+                    "--json",
+                    "--config",
+                    "owner.toml",
+                ])
+                .unwrap();
+                let Commands::Brain { command } = cli.command else {
+                    panic!("expected brain command")
+                };
+                assert!(matches!(
+                    *command,
+                    BrainCommands::List {
+                        upstreams: true,
+                        json: true,
+                        config: Some(_),
+                        ..
+                    }
+                ));
+                let cli = Cli::try_parse_from(["nestweaver", "brain", "list"]).unwrap();
+                let Commands::Brain { command } = cli.command else {
+                    panic!("expected brain command")
+                };
+                assert!(matches!(
+                    *command,
+                    BrainCommands::List {
+                        upstreams: false,
+                        ..
+                    }
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

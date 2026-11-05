@@ -2596,24 +2596,26 @@ repos = [{repos}]
         );
     }
 
-    /// D1: every code-link group is its own publication, and each one wiped
-    /// the PageRank cache and deleted its sidecar without recomputing, so on
-    /// production every ranked read recomputed over ~300k symbols every ~25 s
-    /// for the whole relink. Note->code edges are not in code-only PageRank,
-    /// so a code-link publication must leave a warm code-only cache intact.
+    /// nw-742: code-link groups may retain a code-only explicit cache while
+    /// mutating, but the canonical artifact must cover the whole brain. Bridge
+    /// edits invalidate unified ranks; the final read may rebuild once after
+    /// the group publications. Explicit scoped artifacts remain supported.
     #[test]
-    fn code_link_publications_keep_a_warm_code_only_pagerank() {
+    fn code_link_publications_restore_unified_ranks_and_preserve_explicit_scope_apis() {
         let fx = two_widgets();
         full_vault_refresh(&fx);
+        let code_scope = nestweaver_store::GraphScope::code_only();
+        let unified_scope = nestweaver_store::GraphScope::unified();
+        let damping = nestweaver_store::ranking::PAGERANK_DAMPING;
+        let iterations = nestweaver_store::ranking::PAGERANK_ITERATIONS;
         fx.store
-            .compute_pagerank(
-                nestweaver_store::ranking::PAGERANK_DAMPING,
-                nestweaver_store::ranking::PAGERANK_ITERATIONS,
-                &nestweaver_store::GraphScope::code_only(),
-            )
+            .compute_pagerank(damping, iterations, &code_scope)
             .unwrap();
-        let before = fx.store.pagerank_scores().unwrap();
-        assert!(!before.is_empty(), "the fixture must have ranked symbols");
+        let code_before = fx.store.pagerank_scores().unwrap();
+        assert!(
+            !code_before.is_empty(),
+            "the fixture must have ranked symbols"
+        );
         let lazy_before = fx.store.lazy_pagerank_computations();
 
         MAX_EDGES_OVERRIDE.with(|max| max.set(Some(2)));
@@ -2626,21 +2628,64 @@ repos = [{repos}]
         let report = report.unwrap();
         assert!(report.rewritten.len() >= 2, "K >= 2 groups: {report:?}");
 
-        let after = fx.store.pagerank_scores().unwrap();
-        assert_eq!(
-            fx.store.lazy_pagerank_computations(),
-            lazy_before,
-            "a code-link publication forced a lazy PageRank recompute"
+        let canonical = fx.store.pagerank_scores().unwrap();
+        assert!(
+            fx.store.lazy_pagerank_computations() <= lazy_before + 1,
+            "link groups must need at most one final lazy rebuild"
         );
-        assert_eq!(after, before, "code-only ranks must be unchanged");
+        for note in fx.store.list_notes(None).unwrap() {
+            assert!(
+                canonical.contains_key(&note.uid),
+                "canonical ranks omitted {}",
+                note.uid
+            );
+        }
+        assert!(code_before.keys().all(|uid| canonical.contains_key(uid)));
+        fx.store
+            .compute_pagerank(damping, iterations, &unified_scope)
+            .unwrap();
+        assert_eq!(
+            fx.store.pagerank_scores().unwrap(),
+            canonical,
+            "published/lazy ranks must equal a fresh unified computation after bridge edits"
+        );
 
-        // D1 review: the warm cache is re-saved at the new generation, so the
-        // sidecar is not left missing after the relink, and it loads (it is
-        // bound to the current generation).
         let sidecar = crate::sidecar_path(&fx.db, ".pagerank.json");
-        assert!(sidecar.exists(), "the relink left no PageRank sidecar");
-        fx.store.load_pagerank_cache(&sidecar).unwrap();
-        assert_eq!(fx.store.pagerank_scores().unwrap(), before);
+        assert!(
+            sidecar.exists(),
+            "the final ranked read must persist canonical ranks"
+        );
+        let unified_fingerprint = nestweaver_store::ranking::pagerank_algorithm_fingerprint(
+            damping,
+            iterations,
+            &unified_scope,
+        );
+        fx.store
+            .load_pagerank_cache_expecting(&sidecar, Some(&unified_fingerprint))
+            .unwrap();
+        assert_eq!(fx.store.pagerank_scores().unwrap(), canonical);
+
+        // A deliberate scoped computation and custom artifact still rank only
+        // code, even after canonical publication has adopted unified scope.
+        fx.store
+            .compute_pagerank(damping, iterations, &code_scope)
+            .unwrap();
+        assert_eq!(fx.store.pagerank_scores().unwrap(), code_before);
+        let explicit = crate::sidecar_path(&fx.db, ".explicit-code-pagerank.json");
+        fx.store.save_pagerank_cache(&explicit).unwrap();
+        let code_fingerprint = nestweaver_store::ranking::pagerank_algorithm_fingerprint(
+            damping,
+            iterations,
+            &code_scope,
+        );
+        fx.store
+            .load_pagerank_cache_expecting(&explicit, Some(&code_fingerprint))
+            .unwrap();
+        assert_eq!(fx.store.pagerank_scores().unwrap(), code_before);
+        fx.store
+            .load_pagerank_cache_expecting(&sidecar, Some(&unified_fingerprint))
+            .unwrap();
+        assert_eq!(fx.store.pagerank_scores().unwrap(), canonical);
     }
 
     /// The daemon's boot contract: a pass with nothing to change publishes

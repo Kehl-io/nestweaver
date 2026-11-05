@@ -6,6 +6,7 @@ pub mod hybrid;
 pub mod progress;
 pub mod repo_identity;
 pub mod runtime_status;
+pub mod vault_inventory;
 
 // These modules moved to the `nestweaver-federation` crate (nw-017 Phase B,
 // 5a). Re-export them at their old paths so `nestweaver_client::discovery`,
@@ -35,6 +36,53 @@ use nestweaver_proto::nest_weaver_daemon_client::NestWeaverDaemonClient;
 /// caller who spawned the process can report its failure in milliseconds
 /// instead of at the boot ceiling (nw-309).
 pub type ReadinessAbort<'a> = &'a mut dyn FnMut() -> Option<String>;
+
+/// Compare declared resolver semantics, preserving unknown older peers.
+/// This is diagnostic evidence, never authority to restart or replace a writer.
+pub fn daemon_resolver_skew(health: &nestweaver_proto::HealthCheckResponse) -> Option<bool> {
+    health
+        .resolver_generation
+        .map(|generation| generation != nestweaver_engine::resolver_generation::RESOLVER_GENERATION)
+}
+
+fn disclose_same_version_resolver_skew(health: &nestweaver_proto::HealthCheckResponse) {
+    if health.version == env!("CARGO_PKG_VERSION") && daemon_resolver_skew(health) == Some(true) {
+        warn!(
+            daemon_resolver_generation = health.resolver_generation,
+            client_resolver_generation =
+                nestweaver_engine::resolver_generation::RESOLVER_GENERATION,
+            "same product version, different resolver builds; reads use the running daemon's semantics. Inspect daemon status and explicitly restart the selected owner when appropriate; no automatic replacement was requested"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolver_provenance_tests {
+    use super::daemon_resolver_skew;
+
+    #[test]
+    fn old_health_without_resolver_provenance_is_unknown() {
+        let old = nestweaver_proto::HealthCheckResponse {
+            version: env!("CARGO_PKG_VERSION").into(),
+            ..Default::default()
+        };
+        assert_eq!(daemon_resolver_skew(&old), None);
+    }
+
+    #[test]
+    fn equal_product_versions_can_disclose_distinct_resolver_semantics() {
+        let generation = nestweaver_engine::resolver_generation::RESOLVER_GENERATION;
+        let mut peer = nestweaver_proto::HealthCheckResponse {
+            version: env!("CARGO_PKG_VERSION").into(),
+            resolver_generation: Some(generation),
+            ..Default::default()
+        };
+        assert_eq!(daemon_resolver_skew(&peer), Some(false));
+        peer.resolver_generation = Some(generation - 1);
+        assert_eq!(daemon_resolver_skew(&peer), Some(true));
+        assert_eq!(peer.version, env!("CARGO_PKG_VERSION"));
+    }
+}
 
 /// Client for the NestWeaver daemon.
 ///
@@ -1279,6 +1327,7 @@ impl DaemonClient {
         // A responsive daemon with an orphaned backing file remains the
         // incumbent. Preserve access to diagnosis/shutdown; returning a
         // connection error here would invite autostart of another writer.
+        disclose_same_version_resolver_skew(&resp);
         Ok((client, resp))
     }
 
@@ -1544,7 +1593,9 @@ impl DaemonClient {
         .await
         .context("health check timed out — daemon connected but unresponsive")?
         .context("health check failed")?;
-        Ok(resp.into_inner())
+        let health = resp.into_inner();
+        disclose_same_version_resolver_skew(&health);
+        Ok(health)
     }
 
     /// Return graph and structured embedding readiness for the running daemon.

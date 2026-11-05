@@ -21,6 +21,139 @@ const HTTP_LOW_SPEED_ARGS: [&str; 4] = [
     "http.lowSpeedTime=60",
 ];
 
+/// Failure provenance captured at the Git network boundary. Only a Host
+/// failure is evidence against another repository on the same host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteFailureKind {
+    Host,
+    Repository,
+    Local,
+}
+
+#[derive(Debug)]
+pub(crate) struct RemoteGitFailure {
+    pub(crate) kind: RemoteFailureKind,
+    source: anyhow::Error,
+}
+
+impl RemoteGitFailure {
+    fn from_guard(error: crate::ssrf::SsrfError) -> Self {
+        let kind = if matches!(&error, crate::ssrf::SsrfError::ResolutionFailed(_)) {
+            RemoteFailureKind::Host
+        } else {
+            RemoteFailureKind::Repository
+        };
+        Self {
+            kind,
+            source: error.into(),
+        }
+    }
+
+    fn from_command(error: anyhow::Error) -> Self {
+        // Spawn/wait filesystem failures are local. The timeout wrapper's
+        // timeout error has no io::Error source and remains a host failure.
+        let kind = if error.chain().any(|cause| cause.is::<std::io::Error>())
+            || matches!(
+                error.to_string().as_str(),
+                "git command cancelled"
+                    | "git output exceeded its bounded capture limit"
+                    | "failed to read bounded git output"
+            ) {
+            RemoteFailureKind::Local
+        } else {
+            RemoteFailureKind::Host
+        };
+        Self {
+            kind,
+            source: error,
+        }
+    }
+
+    fn from_stderr(stderr: &str, message: String) -> Self {
+        Self {
+            kind: classify_remote_stderr(stderr),
+            source: anyhow::anyhow!(message),
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteGitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for RemoteGitFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
+fn classify_remote_stderr(stderr: &str) -> RemoteFailureKind {
+    let lower = stderr.to_ascii_lowercase();
+    // A URL/path or remote prose can contain repository-error words. An
+    // explicit transport failure remains a host signal in mixed diagnostics.
+    if [
+        "could not resolve host",
+        "could not resolve hostname",
+        "failed to connect",
+        "connection refused",
+        "connection reset",
+        "connection timed out",
+        "operation timed out",
+        "requested url returned error: 5",
+        "ssl certificate problem",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return RemoteFailureKind::Host;
+    }
+    let local_output = lower
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("remote:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if [
+        "no space left on device",
+        "disk quota exceeded",
+        "read-only file system",
+        "insufficient permission for adding an object",
+        "unable to create directory",
+        "not a directory",
+        "unable to write file",
+        "could not write",
+        "cannot create directory",
+    ]
+    .iter()
+    .any(|needle| local_output.contains(needle))
+    {
+        return RemoteFailureKind::Local;
+    }
+    if [
+        "repository not found",
+        "authentication failed",
+        "permission denied (publickey",
+        "could not read username",
+        "could not read password",
+        "terminal prompts disabled",
+        "invalid username or password",
+        "requested url returned error: 401",
+        "requested url returned error: 403",
+        "requested url returned error: 404",
+        "couldn't find remote ref",
+        "does not appear to be a git repository",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return RemoteFailureKind::Repository;
+    }
+    // Unknown network-operation failures remain conservative, rather than
+    // guessing that an unrecognized/translated transport failure is harmless.
+    RemoteFailureKind::Host
+}
+
 /// SSRF guard for a clone/fetch URL.
 ///
 /// Delegates to [`crate::ssrf::guard_git_url`], which rejects `file://` and
@@ -30,12 +163,12 @@ const HTTP_LOW_SPEED_ARGS: [&str; 4] = [
 /// `file://`, no network) keep working. Production builds never compile this
 /// branch: a `file://` clone source is rejected here exactly as it is at the
 /// add-repo / webhook / config entry points.
-fn guard_clone_url(url: &str) -> Result<crate::ssrf::GitNetGuard, crate::ssrf::SsrfError> {
+fn guard_clone_url(url: &str) -> Result<crate::ssrf::GitNetGuard, RemoteGitFailure> {
     #[cfg(test)]
     if url.starts_with("file://") {
         return Ok(crate::ssrf::GitNetGuard::default());
     }
-    crate::ssrf::guard_git_url(url)
+    crate::ssrf::guard_git_url(url).map_err(RemoteGitFailure::from_guard)
 }
 
 /// A `git` command for a network operation: the `[git] credential_method`
@@ -269,16 +402,19 @@ impl BareClone {
         // Hard timeout so a blackholed remote can't wedge the worker (and its
         // semaphore permit) forever — it kills+reaps the process group on timeout.
         let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
+            .map_err(RemoteGitFailure::from_command)
             .context("failed to run git fetch")?;
         if !output.status.success() {
-            anyhow::bail!(
-                "git fetch failed for {}: {}",
-                self.url,
-                with_credential_hint(
-                    String::from_utf8_lossy(&output.stderr).trim(),
-                    self.credential_method.as_deref()
-                )
-            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(RemoteGitFailure::from_stderr(
+                &stderr,
+                format!(
+                    "git fetch failed for {}: {}",
+                    self.url,
+                    with_credential_hint(stderr.trim(), self.credential_method.as_deref())
+                ),
+            )
+            .into());
         }
         Ok(())
     }
@@ -335,15 +471,18 @@ impl BareClone {
         let mut cmd = net_git_command(&guard, self.credential_method.as_deref());
         cmd.arg("-C").arg(&self.path).args(LS_REMOTE_HEAD_OPERANDS);
         let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_net_timeout())
+            .map_err(RemoteGitFailure::from_command)
             .context("failed to run git ls-remote")?;
         if !output.status.success() {
-            anyhow::bail!(
-                "git ls-remote failed: {}",
-                with_credential_hint(
-                    String::from_utf8_lossy(&output.stderr).trim(),
-                    self.credential_method.as_deref()
-                )
-            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(RemoteGitFailure::from_stderr(
+                &stderr,
+                format!(
+                    "git ls-remote failed: {}",
+                    with_credential_hint(stderr.trim(), self.credential_method.as_deref())
+                ),
+            )
+            .into());
         }
         let line = String::from_utf8_lossy(&output.stdout);
         let sha = line
@@ -444,19 +583,22 @@ impl BareCloneWorkspace {
         // git self-abort a truly stalled transfer well before the wall-clock cap;
         // on timeout the process group is killed so no hung clone leaks a permit.
         let output = crate::git_cmd::run_git_with_timeout(cmd, crate::git_cmd::git_clone_timeout())
+            .map_err(RemoteGitFailure::from_command)
             .with_context(|| {
                 format!("failed to run git clone --filter=blob:none --bare for {url}")
             })?;
 
         if !output.status.success() {
-            anyhow::bail!(
-                "git clone --bare failed for {}: {}",
-                url,
-                with_credential_hint(
-                    String::from_utf8_lossy(&output.stderr).trim(),
-                    self.credential_method.as_deref()
-                )
-            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(RemoteGitFailure::from_stderr(
+                &stderr,
+                format!(
+                    "git clone --bare failed for {}: {}",
+                    url,
+                    with_credential_hint(stderr.trim(), self.credential_method.as_deref())
+                ),
+            )
+            .into());
         }
 
         Ok(BareClone {
@@ -784,6 +926,69 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_failure_provenance_distinguishes_job_errors_and_host_outages() {
+        use super::{RemoteFailureKind, RemoteGitFailure, classify_remote_stderr};
+        for stderr in [
+            "fatal: repository not found",
+            "fatal: Authentication failed",
+            "Permission denied (publickey)",
+            "fatal: could not read Username",
+            "fatal: couldn't find remote ref deleted",
+            "The requested URL returned error: 404",
+        ] {
+            assert_eq!(
+                classify_remote_stderr(stderr),
+                RemoteFailureKind::Repository,
+                "{stderr}"
+            );
+        }
+        for stderr in [
+            "No space left on device",
+            "Disk quota exceeded",
+            "read-only file system",
+            "Could not write object",
+            "Not a directory",
+        ] {
+            assert_eq!(
+                classify_remote_stderr(stderr),
+                RemoteFailureKind::Local,
+                "{stderr}"
+            );
+        }
+        for stderr in [
+            "Connection refused",
+            "Could not resolve host",
+            "The requested URL returned error: 503",
+            "unrecognized failure",
+            "fatal: unable to access repository not found/: Could not resolve host",
+            "remote: No space left on device",
+        ] {
+            assert_eq!(
+                classify_remote_stderr(stderr),
+                RemoteFailureKind::Host,
+                "{stderr}"
+            );
+        }
+        let dns =
+            RemoteGitFailure::from_guard(crate::ssrf::SsrfError::ResolutionFailed("host".into()));
+        assert_eq!(dns.kind, RemoteFailureKind::Host);
+        let policy =
+            RemoteGitFailure::from_guard(crate::ssrf::SsrfError::ResolvesInternal("host".into()));
+        assert_eq!(policy.kind, RemoteFailureKind::Repository);
+        assert!(dns.to_string().contains("DNS resolution failed"));
+        assert!(!dns.to_string().contains("internal/private"));
+        assert!(policy.to_string().contains("internal/private"));
+        let spawn = RemoteGitFailure::from_command(
+            std::io::Error::from(std::io::ErrorKind::NotFound).into(),
+        );
+        assert_eq!(spawn.kind, RemoteFailureKind::Local);
+        let timeout = RemoteGitFailure::from_command(anyhow::anyhow!("git command timed out"));
+        assert_eq!(timeout.kind, RemoteFailureKind::Host);
+        let cancelled = RemoteGitFailure::from_command(anyhow::anyhow!("git command cancelled"));
+        assert_eq!(cancelled.kind, RemoteFailureKind::Local);
+    }
+
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;

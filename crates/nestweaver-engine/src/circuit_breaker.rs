@@ -28,6 +28,12 @@ pub enum CircuitState {
 }
 
 #[derive(Debug)]
+enum Admission {
+    Closed,
+    Probe(Instant),
+}
+
+#[derive(Debug)]
 struct HostState {
     /// Timestamps of recent failures (within the window).
     failures: Vec<Instant>,
@@ -150,24 +156,24 @@ impl RemoteCircuitBreakers {
     }
 
     /// Atomically decide whether to admit a request for the given host and, in
-    /// half-open, reserve the single probe permit. Returns `true` if the caller
-    /// may proceed:
+    /// half-open, reserve the single probe permit. Returns the admission provenance if the
+    /// caller may proceed:
     ///   * CLOSED — always admitted;
     ///   * OPEN — never admitted;
     ///   * HALF_OPEN — admitted only if no probe is already in flight (the first
     ///     caller wins; concurrent callers short-circuit until it resolves).
-    fn try_admit(&self, host: &str) -> bool {
+    fn try_admit(&self, host: &str) -> Option<Admission> {
         let mut map = self.hosts.lock().unwrap();
         let hs = map.entry(host.to_string()).or_insert_with(HostState::new);
         match hs.state(Instant::now()) {
-            CircuitState::Closed => true,
-            CircuitState::Open => false,
+            CircuitState::Closed => Some(Admission::Closed),
+            CircuitState::Open => None,
             CircuitState::HalfOpen => {
                 if hs.probe_in_flight {
-                    false
+                    None
                 } else {
                     hs.probe_in_flight = true;
-                    true
+                    hs.opened_at.map(Admission::Probe)
                 }
             }
         }
@@ -189,6 +195,18 @@ impl RemoteCircuitBreakers {
         }
     }
 
+    fn release_neutral_probe(&self, host: &str, admission: Admission) {
+        let Admission::Probe(opened_at) = admission else {
+            return;
+        };
+        let mut map = self.hosts.lock().unwrap();
+        if let Some(hs) = map.get_mut(host)
+            && hs.opened_at == Some(opened_at)
+        {
+            hs.probe_in_flight = false;
+        }
+    }
+
     /// Execute a fallible operation through the circuit breaker.
     /// Returns `Err` with the original error if the operation fails, or a
     /// circuit-open error if the host is currently blocked.
@@ -196,10 +214,26 @@ impl RemoteCircuitBreakers {
     where
         F: FnOnce() -> Result<T, E>,
     {
+        self.call_classified(host, f, |_| true)
+    }
+
+    /// Execute an operation whose errors distinguish host outages from
+    /// repository/local failures. A neutral error still reaches the caller,
+    /// but neither heals the host nor spends its failure budget. In half-open
+    /// it releases the one-probe reservation without changing the cooldown.
+    pub fn call_classified<F, T, E>(
+        &self,
+        host: &str,
+        f: F,
+        counts_as_host_failure: impl FnOnce(&E) -> bool,
+    ) -> Result<T, CircuitBreakerError<E>>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
         // Atomically admit (and, in half-open, reserve the single probe permit).
-        if !self.try_admit(host) {
+        let Some(admission) = self.try_admit(host) else {
             return Err(CircuitBreakerError::CircuitOpen(host.to_string()));
-        }
+        };
 
         // If `f()` unwinds (e.g. a panic inside the git fetch running under
         // `spawn_blocking`), neither arm below runs. The guard releases the
@@ -220,8 +254,13 @@ impl RemoteCircuitBreakers {
                 Ok(val)
             }
             Err(e) => {
+                let host_failure = counts_as_host_failure(&e);
                 guard.armed = false;
-                self.record_failure(host);
+                if host_failure {
+                    self.record_failure(host);
+                } else {
+                    self.release_neutral_probe(host, admission);
+                }
                 Err(CircuitBreakerError::Inner(e))
             }
         }
@@ -374,7 +413,9 @@ mod tests {
         // Simulate K callers racing to probe at once: exactly one is admitted,
         // the rest short-circuit.
         const K: usize = 8;
-        let admitted = (0..K).filter(|_| cb.try_admit("github.com")).count();
+        let admitted = (0..K)
+            .filter(|_| cb.try_admit("github.com").is_some())
+            .count();
         assert_eq!(
             admitted, 1,
             "half-open must admit exactly one probe; the rest short-circuit"
@@ -416,7 +457,7 @@ mod tests {
             hs.opened_at = Some(Instant::now() - COOLDOWN - Duration::from_secs(1));
         }
         assert!(
-            cb.try_admit("github.com"),
+            cb.try_admit("github.com").is_some(),
             "a fresh half-open probe must be admitted after a panicking probe"
         );
     }
@@ -445,6 +486,96 @@ mod tests {
             let _ = cb.call("gitlab.com", || Err::<i32, _>("timeout"));
         }
         assert_eq!(cb.state("gitlab.com"), CircuitState::Open);
+    }
+
+    #[test]
+    fn classified_job_errors_preserve_the_host_failure_budget() {
+        let cb = RemoteCircuitBreakers::new();
+        for _ in 0..FAILURE_THRESHOLD * 2 {
+            assert!(matches!(
+                cb.call_classified("host", || Err::<(), _>("auth"), |_| false),
+                Err(CircuitBreakerError::Inner("auth"))
+            ));
+        }
+        assert_eq!(cb.state("host"), CircuitState::Closed);
+        for _ in 0..FAILURE_THRESHOLD - 1 {
+            cb.record_failure("host");
+        }
+        let _ = cb.call_classified("host", || Err::<(), _>("404"), |_| false);
+        cb.record_failure("host");
+        assert_eq!(
+            cb.state("host"),
+            CircuitState::Open,
+            "neutral is not success"
+        );
+    }
+
+    #[test]
+    fn neutral_half_open_probe_releases_only_its_reservation_without_rearming() {
+        let cb = RemoteCircuitBreakers::new();
+        for _ in 0..FAILURE_THRESHOLD {
+            cb.record_failure("host");
+        }
+        let old = Instant::now() - COOLDOWN - Duration::from_secs(1);
+        cb.hosts.lock().unwrap().get_mut("host").unwrap().opened_at = Some(old);
+        let _ = cb.call_classified("host", || Err::<(), _>("repo missing"), |_| false);
+        let map = cb.hosts.lock().unwrap();
+        let hs = map.get("host").unwrap();
+        assert_eq!(hs.opened_at, Some(old));
+        assert!(!hs.probe_in_flight);
+        drop(map);
+        assert_eq!(cb.state("host"), CircuitState::HalfOpen);
+        assert_eq!(
+            cb.call_classified("host", || Ok::<_, &str>(7), |_| false)
+                .unwrap(),
+            7
+        );
+        assert_eq!(cb.state("host"), CircuitState::Closed);
+    }
+
+    #[test]
+    fn delayed_neutral_closed_request_cannot_release_another_probe() {
+        let cb = RemoteCircuitBreakers::new();
+        let _ = cb.call_classified(
+            "host",
+            || {
+                for _ in 0..FAILURE_THRESHOLD {
+                    cb.record_failure("host");
+                }
+                cb.hosts.lock().unwrap().get_mut("host").unwrap().opened_at =
+                    Some(Instant::now() - COOLDOWN - Duration::from_secs(1));
+                assert!(cb.try_admit("host").is_some());
+                Err::<(), _>("old job denied")
+            },
+            |_| false,
+        );
+        assert!(
+            cb.try_admit("host").is_none(),
+            "the real probe remains reserved"
+        );
+    }
+
+    #[test]
+    fn classifier_panic_still_releases_and_rearms_half_open_probe() {
+        let cb = RemoteCircuitBreakers::new();
+        for _ in 0..FAILURE_THRESHOLD {
+            cb.record_failure("host");
+        }
+        cb.hosts.lock().unwrap().get_mut("host").unwrap().opened_at =
+            Some(Instant::now() - COOLDOWN - Duration::from_secs(1));
+        let result = std::panic::catch_unwind(|| {
+            let _ = cb.call_classified("host", || Err::<(), _>("error"), |_| panic!("classifier"));
+        });
+        assert!(result.is_err());
+        assert_eq!(cb.state("host"), CircuitState::Open);
+        assert!(
+            !cb.hosts
+                .lock()
+                .unwrap()
+                .get("host")
+                .unwrap()
+                .probe_in_flight
+        );
     }
 
     #[test]

@@ -1705,7 +1705,7 @@ fn finalize_committed_index_with_io(
     io: &dyn IndexEpilogueIo,
     refresh_pagerank: bool,
 ) -> Result<(), DeletionReconciliationError> {
-    let scope = refresh_pagerank.then(nestweaver_store::GraphScope::code_only);
+    let scope = refresh_pagerank.then(nestweaver_store::GraphScope::unified);
     finalize_committed_index_for_scope_with_io(lease, db_path, operation, io, scope.as_ref(), true)
 }
 
@@ -1867,9 +1867,9 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
         // the next open reconciles — or a clean publication WITH a sidecar
         // matching the committed graph. The state that must never occur is
         // marker retired + generation advanced + no sidecar: it reports CLEAN
-        // while the note side of the graph has no ranks, and the lazy
-        // fallback (`ranking.rs` `ensure_pagerank_loaded`) recomputes only
-        // `code_only()` and only in memory, so nothing would ever say so.
+        // with no immediately loadable ranks. Canonical lazy fallback now
+        // recomputes/persists unified scope, but is recovery work rather than
+        // a substitute for publishing the fresh artifact atomically.
         //
         // Scope of that guarantee: a refresh-LESS clean publish
         // (`pagerank_scope: None`, `publish_clean: true`) still deletes the
@@ -1961,8 +1961,8 @@ pub(crate) fn finalize_committed_index_for_scope_with_io(
                 // dirty-window state survives publication — including the
                 // ranks this finalizer just computed and persisted. Reload
                 // them from the committed sidecar so in-process readers keep
-                // the scope the disk now holds; a lazy refill would be
-                // `code_only()`, narrower than a unified publication.
+                // the exact parameters the disk now holds. Canonical lazy
+                // refill also uses unified scope, but need not repeat work.
                 // nw-147: this caller KNOWS the parameters it just computed
                 // with (compute_pagerank above uses 0.85 / 20 over this exact
                 // scope), so it can verify the sidecar's algorithm fingerprint
@@ -2202,11 +2202,9 @@ impl IndexPublicationRecovery {
 /// anywhere inside such a finalize therefore leaves either the marker still
 /// set — dirty, which the next open reconciles — or a clean publication WITH a
 /// sidecar matching the committed graph. Never clean with an advanced
-/// generation and no sidecar: that state reports CLEAN while the note side of
-/// the graph has no ranks, and the lazy fallback (`ranking.rs`,
-/// `ensure_pagerank_loaded` → `compute_pagerank_warm_locked`) ranks
-/// `GraphScope::code_only()` and only in memory — it never re-persists, and on
-/// a brain database it never covers the note side at all.
+/// generation and no sidecar: that state reports CLEAN with no immediately
+/// loadable ranking. Lazy fallback now computes and persists unified scope,
+/// but atomic publication must not depend on a subsequent query to finish it.
 ///
 /// The guarantee does NOT extend to a refresh-less clean publish
 /// (`pagerank_scope: None`, `publish_clean: true`), which deletes the stale
@@ -2397,9 +2395,9 @@ fn recover_abandoned_index_publication_with_io_and_marker_hook(
     //
     // Which scope the canonical sidecar currently holds is NOT knowable from
     // here, and it is not always unified: whichever publisher ran last wins.
-    // `nestweaver index` and the code watcher publish `code_only()`; the vault
-    // watcher publishes `unified()`. A fresh `index --repo` followed by
-    // `brain add` leaves a sym-only sidecar on disk.
+    // Older builds published code-only artifacts from ordinary indexing and
+    // the code watcher. All canonical producers now use unified scope, but
+    // recovery may still encounter an incumbent artifact from an older build.
     //
     // `unified()` is right precisely because it is a strict SUPERSET: it can
     // only ever widen what was published, never narrow it. `code_only()` could
@@ -9126,6 +9124,9 @@ struct PreparedIncrementalFile {
     rel_str: String,
     source: String,
     parsed: nestweaver_parser::ParsedFile,
+    // Preserve PHP instance-call lookup when replacing a caller's symbols.
+    // Infer from this frozen parse before mutation/publication ownership.
+    php_type_env: Option<Box<nestweaver_resolver::types::TypeEnvironment>>,
 }
 
 enum PreparedIncrementalOutcome {
@@ -9200,11 +9201,20 @@ fn prepare_incremental_file(
     if let Some(skipped) = parsed.unparsable_skip(rel_str.clone()) {
         return Ok(PreparedIncrementalOutcome::PolicySkipped(skipped));
     }
+    let php_type_env = (detect_language(&abs_path) == Some(Language::Php)).then(|| {
+        Box::new(nestweaver_resolver::types::TypeEnvironment::build(
+            &source,
+            Language::Php,
+            &parsed.symbols,
+            &parsed.type_bindings,
+        ))
+    });
     Ok(PreparedIncrementalOutcome::Ready(PreparedIncrementalFile {
         abs_path,
         rel_str,
         source,
         parsed,
+        php_type_env,
     }))
 }
 
@@ -9599,8 +9609,18 @@ fn write_prepared_incremental_file_txn(
         parsed.symbols.clone(),
         parsed.references.clone(),
     )];
-    let resolved_edges =
-        resolve_references_with_context(&file_data, lang, r_uid, &workspace_ctx, None, None);
+    let php_type_envs = prepared
+        .php_type_env
+        .as_deref()
+        .map(|env| HashMap::from([(rel_str.clone(), env.clone())]));
+    let resolved_edges = resolve_references_with_context(
+        &file_data,
+        lang,
+        r_uid,
+        &workspace_ctx,
+        php_type_envs.as_ref(),
+        None,
+    );
     let insertable_edges: Vec<_> = resolved_edges
         .into_iter()
         .filter(|e| !e.target_uid.starts_with("unresolved:"))
@@ -10399,7 +10419,7 @@ fn reresolve_affected_dependents(
         None,
     )?;
 
-    // Rebuild just PHP function CALLS. A new/removed duplicate can invalidate
+    // Rebuild PHP function/static-method CALLS. A new/removed duplicate can invalidate
     // an untouched caller even when neither surviving endpoint changed.
     GraphStore::delete_function_calls_for_files_on(
         conn,
@@ -10811,8 +10831,8 @@ pub(crate) fn prepare_watcher_batch_resolution(
             source.clone(),
         ));
     }
-    // The watcher holds the write gate here, so the inert throttle: a
-    // throttle wait must never hold the gate (nw-812).
+    // Preparation runs before mutation ownership (nw-825). Keep the existing
+    // inert throttle policy; no throttle wait is introduced into publication.
     let type_envs = build_type_environments(
         reader,
         &env_files,
@@ -11233,9 +11253,12 @@ fn build_reresolve_edges_unlogged(
                 return false;
             };
             if php_peers.contains(sf)
-                && e.evidence
-                    .iter()
-                    .any(|e| e.kind == "php_namespace_function")
+                && e.evidence.iter().any(|e| {
+                    matches!(
+                        e.kind.as_str(),
+                        "php_namespace_function" | "php_static_method"
+                    )
+                })
             {
                 return true;
             }
@@ -23151,6 +23174,85 @@ module.exports = { check, plain };\n";
     }
 
     #[test]
+    fn ordinary_index_and_force_reindex_keep_the_publication_ranking_scope() {
+        use nestweaver_schema::{Note, NoteKind};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        fs::write(
+            repo.join("main.js"),
+            "function f() { return g(); }\nfunction g() { return 1; }\n",
+        )
+        .unwrap();
+        let store = GraphStore::create(&db).unwrap();
+        store.ensure_data_instance_id("test").unwrap();
+        store
+            .insert_note(&Note {
+                uid: "note:parity".into(),
+                vault_uid: "vlt:parity".into(),
+                file_path: "parity.md".into(),
+                title: "Parity".into(),
+                note_kind: NoteKind::General,
+                word_count: 1,
+                content_hash: "h".into(),
+                frontmatter: None,
+                frontmatter_raw: None,
+                created_at: None,
+                modified_at: None,
+                pagerank_score: None,
+                embedding: None,
+            })
+            .unwrap();
+        drop(store);
+        let mut expected = None;
+        for force in [false, true] {
+            index_directory_with_options(
+                &repo,
+                &db,
+                "test",
+                "https://example.com/parity",
+                "sha",
+                force,
+                None,
+            )
+            .unwrap();
+            let store = GraphStore::open(&db).unwrap();
+            let fingerprint = nestweaver_store::ranking::pagerank_algorithm_fingerprint(
+                0.85,
+                20,
+                &nestweaver_store::GraphScope::unified(),
+            );
+            store
+                .load_pagerank_cache_expecting(
+                    &crate::sidecar_path(&db, ".pagerank.json"),
+                    Some(&fingerprint),
+                )
+                .unwrap();
+            let published = store.pagerank_scores().unwrap();
+            assert!(
+                published.contains_key("note:parity"),
+                "ordinary indexing dropped note ranks"
+            );
+            store
+                .compute_pagerank(0.85, 20, &nestweaver_store::GraphScope::unified())
+                .unwrap();
+            let rebuilt = store.pagerank_scores().unwrap();
+            assert_eq!(published.len(), rebuilt.len());
+            for (uid, score) in &published {
+                assert!((rebuilt[uid] - score).abs() < 1e-9);
+            }
+            if let Some(previous) = expected {
+                assert_eq!(
+                    published, previous,
+                    "force reindex changed scope without graph edits"
+                );
+            }
+            expected = Some(published);
+        }
+    }
+
+    #[test]
     fn full_index_writes_pagerank_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("t.lbug");
@@ -24007,6 +24109,227 @@ module.exports = { check, plain };\n";
                 index_directory(&src, &db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
             assert_eq!(result.files_count, 0, "no-change run must remain a no-op");
             assert_eq!(targets(), before);
+        }
+    }
+
+    #[test]
+    fn php_static_method_lifecycle_matches_full_and_incremental_after_restart() {
+        for git_incremental in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let src = temp.path().join("repo");
+            let db = temp.path().join("php-static.lbug");
+            fs::create_dir_all(&src).unwrap();
+            let controls = "class Holder {\n public function instance() {}\n}\nfunction ordinary() { $x = new Holder(); $x->instance(); }\n";
+            fs::write(
+                src.join("main.php"),
+                format!("<?php\nuse Lib\\X;\nfunction m() {{ X::m(); }}\n{controls}"),
+            )
+            .unwrap();
+            let definition = "<?php\nnamespace Lib;\nclass X { public static function m() {} }\n";
+            fs::write(src.join("target.php"), definition).unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "commit.gpgSign=false",
+                    ])
+                    .args(args)
+                    .current_dir(&src)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.name", "PHP static fixture"]);
+            git(&["config", "user.email", "php@example.invalid"]);
+            let commit = || {
+                git(&["add", "-A"]);
+                git(&["commit", "-qm", "fixture"]);
+                git(&["rev-parse", "HEAD"])
+            };
+            let initial = commit();
+            let url = "https://example.invalid/php-static-lifecycle";
+            let repo = repo_uid("test", url);
+            index_directory(&src, &db, "test", url, &initial).unwrap();
+            let caller = symbol_uid(&repo, "main.php", "m", 3);
+            let target = symbol_uid(&repo, "target.php", "m", 3);
+            // Every read reopens the store, exercising persisted graph state.
+            let targets = || {
+                let store = GraphStore::open(&db).unwrap();
+                let mut targets: Vec<_> = store
+                    .load_typed_edges()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|edge| edge.0 == caller && edge.2 == "CALLS")
+                    .map(|edge| edge.1)
+                    .collect();
+                targets.sort();
+                targets
+            };
+            let ordinary_uid = symbol_uid(&repo, "main.php", "ordinary", 7);
+            let ordinary_targets = || {
+                let store = GraphStore::open(&db).unwrap();
+                let mut targets: Vec<_> = store
+                    .load_typed_edges()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|edge| edge.0 == ordinary_uid && edge.2 == "CALLS")
+                    .map(|edge| edge.1)
+                    .collect();
+                targets.sort();
+                targets
+            };
+            let original_ordinary = ordinary_targets();
+            assert!(
+                original_ordinary.contains(&symbol_uid(&repo, "main.php", "instance", 5)),
+                "initial full index, git_incremental={git_incremental}: instance control must resolve"
+            );
+            let update = |phase: &str| {
+                let head = commit();
+                if git_incremental {
+                    incremental_index(&src, &db, "test", url).unwrap();
+                } else {
+                    index_directory(&src, &db, "test", url, &head).unwrap();
+                }
+                assert_eq!(
+                    ordinary_targets(),
+                    original_ordinary,
+                    "{phase}, git_incremental={git_incremental}: ordinary method/constructor edges must survive without duplicates"
+                );
+            };
+            assert_eq!(
+                targets(),
+                vec![target.clone()],
+                "initial full index, git_incremental={git_incremental}"
+            );
+            fs::write(src.join("duplicate.php"), definition).unwrap();
+            // Restart with no parsed cache must reconstruct exact class facts.
+            for suffix in [".parsed_cache.bin", ".parsed_cache.log"] {
+                let path = crate::sidecar_path(&db, suffix);
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+            update("duplicate class added");
+            assert!(
+                targets().is_empty(),
+                "duplicate class added, git_incremental={git_incremental}: must invalidate an unchanged caller"
+            );
+            fs::remove_file(src.join("duplicate.php")).unwrap();
+            update("duplicate class removed");
+            assert_eq!(
+                targets(),
+                vec![target.clone()],
+                "duplicate class removed, git_incremental={git_incremental}"
+            );
+            // Changing only the caller still needs unchanged target class facts.
+            fs::write(
+                src.join("main.php"),
+                format!(
+                    "<?php\nuse Lib\\X as Selected;\nfunction m() {{ Selected::M(); }}\n{controls}"
+                ),
+            )
+            .unwrap();
+            update("caller alias edited");
+            assert_eq!(
+                targets(),
+                vec![target.clone()],
+                "caller alias edited, git_incremental={git_incremental}"
+            );
+            fs::write(
+                src.join("target.php"),
+                "<?php\nnamespace Lib;\nclass X { public static function other() {} }\n",
+            )
+            .unwrap();
+            update("method removed");
+            assert!(
+                targets().is_empty(),
+                "method removed, git_incremental={git_incremental}: must not bind caller homonym"
+            );
+            fs::write(src.join("target.php"), definition).unwrap();
+            update("method restored");
+            assert_eq!(
+                targets(),
+                vec![target.clone()],
+                "method restored, git_incremental={git_incremental}"
+            );
+            let before = targets();
+            // Check the no-op contract of the same indexing route. Git
+            // incremental publishes graph/SHA/parses, but does not populate
+            // the ordinary indexer's filemeta mtime cache.
+            if git_incremental {
+                let result = incremental_index(&src, &db, "test", url).unwrap();
+                assert!(
+                    !result.fell_back_to_full,
+                    "no-change git restart must remain incremental"
+                );
+                assert_eq!(
+                    (
+                        result.files_added,
+                        result.files_modified,
+                        result.files_deleted,
+                        result.files_renamed,
+                        result.files_skipped
+                    ),
+                    (0, 0, 0, 0, 0),
+                    "no-change git restart must not mutate source coverage"
+                );
+            } else {
+                let result =
+                    index_directory(&src, &db, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+                assert_eq!(
+                    result.files_count, 0,
+                    "no-change ordinary restart must not reindex sources"
+                );
+            }
+            assert_eq!(
+                targets(),
+                before,
+                "no-change restart, git_incremental={git_incremental}: no duplicate static edges"
+            );
+            assert_eq!(
+                ordinary_targets(),
+                original_ordinary,
+                "no-change restart, git_incremental={git_incremental}: no duplicate ordinary edges"
+            );
+            // A fresh full graph is the semantic oracle for the final state.
+            let oracle = temp.path().join("oracle.lbug");
+            index_directory(&src, &oracle, "test", url, &git(&["rev-parse", "HEAD"])).unwrap();
+            let store = GraphStore::open(&oracle).unwrap();
+            let oracle_targets: Vec<_> = store
+                .load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .filter(|edge| edge.0 == caller && edge.2 == "CALLS")
+                .map(|edge| edge.1)
+                .collect();
+            assert_eq!(
+                targets(),
+                oracle_targets,
+                "fresh full static oracle, git_incremental={git_incremental}"
+            );
+            let mut oracle_ordinary: Vec<_> = store
+                .load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .filter(|edge| edge.0 == ordinary_uid && edge.2 == "CALLS")
+                .map(|edge| edge.1)
+                .collect();
+            oracle_ordinary.sort();
+            assert_eq!(
+                ordinary_targets(),
+                oracle_ordinary,
+                "fresh full ordinary oracle, git_incremental={git_incremental}"
+            );
         }
     }
 

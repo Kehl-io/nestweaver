@@ -7765,6 +7765,7 @@ impl NestWeaverDaemon for DaemonService {
         let backing_file_error = self.state.store.verify_backing_file().err();
         Ok(Response::new(HealthCheckResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
+            resolver_generation: Some(nestweaver_engine::resolver_generation::RESOLVER_GENERATION),
             instance_id: self.state.instance_id.clone(),
             db_path: self.state.selected_db_path.display().to_string(),
             uptime_seconds: uptime,

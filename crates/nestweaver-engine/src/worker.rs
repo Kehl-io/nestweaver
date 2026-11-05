@@ -838,8 +838,17 @@ fn prepare_job_with_policy(
 
     let (bare_path, remote_sha) = if let Some(cb) = circuit_breakers {
         let host = RemoteCircuitBreakers::extract_host(&job.repo_url);
-        cb.call(&host, fetch)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        cb.call_classified(&host, fetch, |error| {
+            error
+                .downcast_ref::<crate::bare_clone::RemoteGitFailure>()
+                .is_some_and(|failure| failure.kind == crate::bare_clone::RemoteFailureKind::Host)
+        })
+        .map_err(|error| match error {
+            crate::circuit_breaker::CircuitBreakerError::Inner(error) => error,
+            crate::circuit_breaker::CircuitBreakerError::CircuitOpen(host) => {
+                anyhow::anyhow!("circuit breaker open for host: {host}")
+            }
+        })?
     } else {
         fetch()?
     };
@@ -3077,6 +3086,53 @@ unskip = ["vendor"]
         assert!(
             !store.list_files_by_repo(&r_uid).unwrap().is_empty(),
             "full re-index must write File nodes"
+        );
+    }
+
+    #[test]
+    fn missing_branch_errors_do_not_open_the_breaker_for_a_healthy_remote() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source");
+        create_source_repo(&src, &[("a.rs", "pub fn a() {}\n")]);
+        let url = format!("file://{}", src.display());
+        let workspace = BareCloneWorkspace::new(&tmp.path().join("workspace")).unwrap();
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let breakers = RemoteCircuitBreakers::new();
+        let mut bad = make_code_job(1, "bad", &url);
+        bad.branch = Some("missing-branch".into());
+        for _ in 0..6 {
+            let error = prepare_job(
+                &bad,
+                &workspace,
+                &store,
+                "test",
+                Some(&breakers),
+                RepoType::Code,
+            )
+            .unwrap_err();
+            assert!(
+                !error.to_string().contains("circuit breaker open"),
+                "{error:#}"
+            );
+            assert!(
+                error
+                    .downcast_ref::<crate::bare_clone::RemoteGitFailure>()
+                    .is_some(),
+                "remote error provenance survives the breaker: {error:#}"
+            );
+        }
+        let good = make_code_job(2, "healthy", &url);
+        assert!(
+            prepare_job(
+                &good,
+                &workspace,
+                &store,
+                "test",
+                Some(&breakers),
+                RepoType::Code
+            )
+            .unwrap()
+            .is_some()
         );
     }
 
