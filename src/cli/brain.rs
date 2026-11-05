@@ -4457,17 +4457,29 @@ fn collect_vault_sources(
     ))
 }
 
+fn vault_source_summary(source: &serde_json::Value) -> String {
+    let mode = source["mode"]
+        .as_str()
+        .map(|mode| format!(", {mode} mode"))
+        .unwrap_or_default();
+    let count = source["vault_count"]
+        .as_u64()
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unavailable".into());
+    format!(
+        "Vault source: {} ({}{mode})\n  Vaults: {count}",
+        source["source"].as_str().unwrap_or("unknown"),
+        source["status"].as_str().unwrap_or("unavailable"),
+    )
+}
+
 fn print_vault_sources(inventory: &serde_json::Value) {
     let peers = inventory["upstreams"]
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
     for source in std::iter::once(&inventory["local"]).chain(peers.iter()) {
-        println!(
-            "Vault source: {} ({})",
-            source["source"].as_str().unwrap_or("unknown"),
-            source["status"].as_str().unwrap_or("unavailable")
-        );
+        println!("{}", vault_source_summary(source));
         if let Some(rows) = source["vaults"].as_array() {
             for row in rows {
                 println!(
@@ -4516,6 +4528,21 @@ fn vault_sources_exit_code(inventory: &serde_json::Value) -> i32 {
 #[cfg(test)]
 mod vault_source_inventory_tests {
     use super::*;
+
+    #[test]
+    fn peer_summary_keeps_mode_and_distinguishes_empty_from_unavailable() {
+        let mut source = serde_json::json!({"source":"status-peer", "status":"available", "mode":"fallback", "vault_count":0, "url":"http://user:secret@host", "token":"private-token"});
+        assert_eq!(
+            vault_source_summary(&source),
+            "Vault source: status-peer (available, fallback mode)\n  Vaults: 0"
+        );
+        source["status"] = serde_json::json!("forbidden");
+        source["vault_count"] = serde_json::Value::Null;
+        assert_eq!(
+            vault_source_summary(&source),
+            "Vault source: status-peer (forbidden, fallback mode)\n  Vaults: unavailable"
+        );
+    }
 
     #[test]
     fn unavailable_or_forbidden_sources_make_listing_partial_and_nonzero() {

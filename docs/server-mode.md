@@ -1087,6 +1087,11 @@ retains its `upstreams` name/mode metadata; endpoint URLs are omitted there too.
 
 `brain status` includes the same per-source `vault_sources` inventory when
 upstreams are configured and names unmapped upstream vaults in text output.
+Text summaries include the configured peer name and mode, the vault-inventory
+status, and its vault count. An available empty inventory reports `Vaults: 0`;
+a forbidden or unavailable inventory reports `Vaults: unavailable`. Availability
+records the authenticated vault-listing response. Text status no longer issues
+separate version/health and repository-count probes for its peer summary.
 `mapping_status` distinguishes explicit accepted bindings, identical full UIDs,
 unmapped vaults, rejected mappings and an unavailable local inventory. Copy the
 upstream UID from the suggested `vault_mappings` example, then replace

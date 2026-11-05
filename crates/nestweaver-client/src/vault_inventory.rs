@@ -52,11 +52,9 @@ async fn inventory_peers(local: &Value, configs: Vec<UpstreamConfig>) -> Result<
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("upstream-{}", index + 1));
-            (
-                index,
-                config.vault_mappings.clone(),
-                query_peer(&name, &config).await,
-            )
+            let mut source = query_peer(&name, &config).await;
+            source["mode"] = json!(config.mode);
+            (index, config.vault_mappings.clone(), source)
         });
     }
     let mut peers = Vec::new();
@@ -436,6 +434,7 @@ mod tests {
         assert_eq!(inventory.len(), 3);
         for (index, result) in inventory.iter().enumerate() {
             assert_eq!(result["source"], format!("peer-{index}"));
+            assert_eq!(result["mode"], "fallback");
             assert!(!result.to_string().contains("secret-token"));
             assert!(!result.to_string().contains("SECRET"));
             if index == 2 {
