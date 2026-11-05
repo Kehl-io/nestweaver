@@ -318,7 +318,7 @@ pub trait ContentReader: Send + Sync {
 /// Order matters: binary sniff, lossy UTF-8, NUL strip, lone-CR rewrite.
 /// Callers apply their own size ceiling to the raw bytes BEFORE calling and
 /// to the decoded text after, as the two readers obtain bytes differently.
-fn decode_source_bytes(rel_path: &Path, raw: Vec<u8>) -> Result<String> {
+pub(crate) fn decode_source_bytes(rel_path: &Path, raw: Vec<u8>) -> Result<String> {
     // Genuinely binary content would decode into garbage symbols, so skip it
     // using the NUL-byte heuristic that ripgrep, git and grep all use: a file is
     // binary iff it contains a NUL, tested over the leading window.
@@ -834,7 +834,7 @@ impl FilesystemReader {
     /// `~/.ssh/id_ed25519`, or a `..` in a stored path, must not be read.
     /// Symlinks that stay inside the root still work. A path that does not
     /// exist is returned as joined, so callers keep reporting it as missing.
-    fn contained_path(&self, rel_path: &Path) -> Result<PathBuf> {
+    pub(crate) fn contained_path(&self, rel_path: &Path) -> Result<PathBuf> {
         let abs = self.repo_path.join(rel_path);
         let resolved = match std::fs::canonicalize(&abs) {
             Ok(resolved) => resolved,
@@ -1803,9 +1803,10 @@ impl GitBareReader {
     }
 
     /// Apply the server's guarded Git policy to prefetches and lazy reads.
-    /// Calling this, including with `None`, opts reads into origin validation
-    /// and the same IP pins and credential isolation as clone/fetch. Plain local
-    /// readers retain their cached/no-origin behavior.
+    /// Calling this, including with `None`, makes reads/probes strictly
+    /// offline. Missing blobs use explicit fetches with the same origin guard,
+    /// IP pins and credential isolation as clone/fetch. Plain local readers
+    /// retain their existing behavior.
     pub fn with_credential_method(mut self, method: Option<String>) -> Self {
         self.credential_method = method;
         self.guarded_remote_reads = true;
@@ -1813,21 +1814,17 @@ impl GitBareReader {
     }
 
     fn read_command(&self, operands: &[&str]) -> Result<Command> {
-        let mut cmd = if self.guarded_remote_reads && !self.local_objects_only {
-            let origin = crate::bare_clone::read_origin_url(&self.bare_path)?;
-            crate::bare_clone::guarded_git_command(&origin, self.credential_method.as_deref())?
-        } else {
-            let mut cmd = Command::new("git");
-            apply_git_isolation(&mut cmd);
-            if self.local_objects_only {
-                // Git versions predating --no-lazy-fetch ignore this env var.
-                // An empty transport allowlist also keeps repair offline on
-                // those versions, while cached object reads still work.
-                cmd.env("GIT_NO_LAZY_FETCH", "1")
-                    .env("GIT_ALLOW_PROTOCOL", "");
-            }
-            cmd
-        };
+        let mut cmd = Command::new("git");
+        apply_git_isolation(&mut cmd);
+        if self.guarded_remote_reads || self.local_objects_only {
+            // Server reads are strictly local too. Never ask DNS or attach
+            // credentials just to inspect a tree or an already-present blob.
+            // On old Git, the transport allowlist is the backstop when the
+            // no-lazy-fetch env variable is ignored. Missing blobs are fetched
+            // explicitly through BareClone below, with a freshly guarded origin.
+            cmd.env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_ALLOW_PROTOCOL", "");
+        }
         cmd.arg("-C").arg(&self.bare_path).args(operands);
         Ok(cmd)
     }
@@ -1909,7 +1906,8 @@ impl GitBareReader {
     ///
     /// The fetch is guarded exactly like `BareClone::fetch_branch`: the origin
     /// URL goes through the SSRF guard and the connect IP is pinned. Server
-    /// lazy reads use the same guard through their prepared command.
+    /// missing-blob reads use this same guarded explicit fetch, never an
+    /// implicitly network-capable pooled command.
     pub fn prefetch_blobs(&self, wanted: &[PathBuf]) -> Result<usize> {
         if self.local_objects_only || wanted.is_empty() {
             return Ok(0);
@@ -1988,6 +1986,9 @@ impl GitBareReader {
         for chunk in to_fetch.chunks(PREFETCH_CHUNK) {
             clone.fetch_objects(chunk)?;
         }
+        // Never reuse a child's negative object/pack view across a fetch,
+        // including prefetches made outside read_blob_decoded.
+        *self.batch.lock().unwrap_or_else(|error| error.into_inner()) = None;
         Ok(to_fetch.len())
     }
 
@@ -2067,12 +2068,23 @@ impl GitBareReader {
             // nw-386: normalise lone CR here, not at the caller — see
             // `decode_git_blob`.
             Ok(BatchObject::Found(content)) => decode(rel_path, content),
-            Ok(BatchObject::Missing) => anyhow::bail!(
-                "path {} not found at {} in {}",
-                rel_path.display(),
-                self.sha,
-                self.bare_path.display()
-            ),
+            Ok(BatchObject::Missing) => {
+                if self.guarded_remote_reads {
+                    // A pooled child can retain negative object/pack state.
+                    // Retire it before an explicit fetch and use the bounded
+                    // one-shot read; the next cached read starts a fresh pool.
+                    *guard = None;
+                    drop(guard);
+                    self.read_file_via_show(rel_path, decode)
+                } else {
+                    anyhow::bail!(
+                        "path {} not found at {} in {}",
+                        rel_path.display(),
+                        self.sha,
+                        self.bare_path.display()
+                    )
+                }
+            }
             Ok(BatchObject::TooLarge(observed_bytes)) => {
                 // Mirror the filesystem oversized-file skip: the blob was already
                 // read-and-discarded (never materialized) so the stream stays
@@ -2111,9 +2123,22 @@ impl GitBareReader {
         // emitting its bytes, so an oversized blob is never materialized here (the
         // batch reader's cap would otherwise be bypassed whenever this fallback
         // fires — spawn failure, mid-stream death, or timeout).
-        let size_cmd = self.read_command(&["cat-file", "-s", &spec])?;
-        let size_output = run_git_with_timeout(size_cmd, git_net_timeout())
-            .with_context(|| format!("failed to preflight object size for {spec}"))?;
+        let probe_size = || {
+            let size_cmd = self.read_command(&["cat-file", "-s", &spec])?;
+            run_git_with_timeout(size_cmd, git_net_timeout())
+                .with_context(|| format!("failed to preflight object size for {spec}"))
+        };
+        let mut size_output = probe_size()?;
+        if !size_output.status.success()
+            && self.guarded_remote_reads
+            && !self.local_objects_only
+            && self.prefetch_blobs(&[rel_path.to_path_buf()])? > 0
+        {
+            // The only network path is the explicit guarded fetch above.
+            // Verify presence/size again offline; a remote which did not send
+            // the object must fail, not enter a repeated lazy-fetch loop.
+            size_output = probe_size()?;
+        }
         if !size_output.status.success() {
             anyhow::bail!(
                 "git cat-file -s {} failed: {}",
@@ -3299,6 +3324,55 @@ mod tests {
         }
     }
 
+    /// nw-928: these objects are present, so even an unresolvable origin is
+    /// irrelevant to tree/size/body reads and the no-op prefetch. Previously
+    /// every command tried to resolve that origin before spawning Git.
+    #[test]
+    fn server_reader_cached_objects_do_not_require_resolvable_origin() {
+        let (_tmp, bare, sha) = setup_bare_repo(&[("present.rs", "pub fn present() {}\n")]);
+        super::test_util::git(
+            &bare,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let reader = GitBareReader::new(&bare, &sha).with_credential_method(None);
+        assert_eq!(
+            reader.list_files().unwrap(),
+            vec![PathBuf::from("present.rs")]
+        );
+        assert_eq!(
+            reader.read_file(Path::new("present.rs")).unwrap(),
+            "pub fn present() {}\n"
+        );
+        assert_eq!(
+            reader
+                .read_file_via_show(Path::new("present.rs"), decode_git_blob)
+                .unwrap(),
+            "pub fn present() {}\n"
+        );
+        assert_eq!(
+            reader
+                .prefetch_blobs(&[PathBuf::from("present.rs")])
+                .unwrap(),
+            0
+        );
+        assert!(reader.read_file(Path::new("absent.rs")).is_err());
+        let command = reader.read_command(&["cat-file", "--batch"]).unwrap();
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("GIT_NO_LAZY_FETCH")),
+            Some(&Some(std::ffi::OsStr::new("1")))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("GIT_ALLOW_PROTOCOL")),
+            Some(&Some(std::ffi::OsStr::new("")))
+        );
+    }
+
     /// nw-908: policy changes the eligibility fingerprint, but an unconfigured
     /// repo keeps its stored one (no forced re-index for everyone).
     #[test]
@@ -3389,9 +3463,10 @@ for arg in "$@"; do
         case "$arg" in --batch) mode=batch;; -s) mode=size;; esac
     fi
     test "$arg" != show || mode=show
+    test "$arg" != fetch || mode=fetch
     previous=$arg
 done
-if test "$mode" != other && test "${GIT_NO_LAZY_FETCH:-}" != 1; then
+if test "$mode" = fetch && test "${GIT_NO_LAZY_FETCH:-}" != 1; then
     answer=$(printf 'protocol=https\nhost=github.com\n\n' | "$NW_REAL_GIT" credential fill 2>/dev/null) || exit 93
     case "$answer" in *password=synthetic-reader-token*) ;; *) exit 94;; esac
     printf '%s\n' "$mode" >> "$NW_READ_GATE_LOG"
@@ -3508,9 +3583,15 @@ fi
             reader.read_file(Path::new("f0.rs")).unwrap(),
             "pub fn f0() {}\n"
         );
+        // The offline child may exit on a missing promisor object on old
+        // Git. A cached follow-up must restart/use the pool without fetching.
+        assert_eq!(
+            reader.read_file(Path::new("f0.rs")).unwrap(),
+            "pub fn f0() {}\n"
+        );
         assert!(
             reader.batch.lock().unwrap().is_some(),
-            "successful read must use the live pooled child"
+            "cached read uses a live pooled child"
         );
         assert_eq!(missing_blobs(&bare, &sha), 1);
         assert_eq!(
@@ -3520,10 +3601,16 @@ fi
             "pub fn f1() {}\n"
         );
         assert_eq!(missing_blobs(&bare, &sha), 0);
-        assert_eq!(
-            std::fs::read_to_string(gate_log).unwrap(),
-            "batch\nsize\nshow\n"
+        assert!(
+            reader.batch.lock().unwrap().is_none(),
+            "explicit fetch retires the pooled object's old pack view"
         );
+        assert_eq!(
+            reader.read_file(Path::new("f1.rs")).unwrap(),
+            "pub fn f1() {}\n"
+        );
+        assert!(reader.batch.lock().unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(gate_log).unwrap(), "fetch\nfetch\n");
     }
 
     /// nw-832: prefetching N blobs of a blobless clone is O(1) fetches (one

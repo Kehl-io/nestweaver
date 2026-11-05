@@ -26,6 +26,10 @@ message HealthCheckResponse {
   // responsive for diagnosis and shutdown; it must not trigger autostart.
   optional bool backing_file_valid = 11;
   string backing_file_error = 12;
+  // Resolver semantics may change between builds with the same product
+  // version. Absent on older daemons means unknown, never generation zero.
+  // Diagnostic provenance only: skew does not authorize replacing a daemon.
+  optional uint32 resolver_generation = 13;
 }
 
 message ShutdownRequest {}

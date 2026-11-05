@@ -174,6 +174,208 @@ impl CurrentPointer {
     }
 }
 
+/// Recognize a complete quiet regex layout for retaining an incumbent restore
+/// target. This is a PRESERVATION proof only: callers must never recursively
+/// delete a tree on the strength of these descriptors. No graph file is opened
+/// (closing one could release the restore caller's POSIX database locks).
+pub fn is_preservable_live_layout(
+    root: &Path,
+    identity: &crate::PublicationIdentity,
+    graph_generation: u64,
+) -> anyhow::Result<bool> {
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_DESCRIPTOR: u64 = 8 * 1024 * 1024;
+    fn inventory(path: &Path, depth: usize, total: &mut usize) -> anyhow::Result<bool> {
+        *total += 1;
+        if *total > MAX_ENTRIES || depth > 5 {
+            return Ok(false);
+        }
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                if !inventory(&entry?.path(), depth + 1, total)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        } else {
+            if !metadata.is_file() {
+                return Ok(false);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                Ok(metadata.nlink() == 1)
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(false)
+            }
+        }
+    }
+    fn entries(path: &Path) -> anyhow::Result<Vec<std::fs::DirEntry>> {
+        let values = std::fs::read_dir(path)?
+            .take(MAX_ENTRIES + 1)
+            .collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            values.len() <= MAX_ENTRIES,
+            "regex layout entry limit exceeded"
+        );
+        Ok(values)
+    }
+    fn read(path: &Path) -> anyhow::Result<Vec<u8>> {
+        use std::io::Read;
+        let metadata = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() <= MAX_DESCRIPTOR,
+            "unsupported regex descriptor"
+        );
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(MAX_DESCRIPTOR + 1)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_DESCRIPTOR,
+            "oversized regex descriptor"
+        );
+        Ok(bytes)
+    }
+    fn metadata_supported(
+        value: &RegexShardMetadata,
+        identity: &crate::PublicationIdentity,
+        generation: u64,
+    ) -> bool {
+        value.schema_version == REGEX_INDEX_SCHEMA_VERSION
+            && value.tokenizer_fingerprint == REGEX_TOKENIZER_FINGERPRINT
+            && value.brain_uuid == identity.brain_uuid
+            && value.publication_uuid == identity.publication_uuid
+            && value.source_graph_generation <= generation
+            && !value.scope_uid.is_empty()
+            && value.candidate_digest.len() == 64
+            && value
+                .candidate_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }
+    identity.validate()?;
+    let mut entries_seen = 0;
+    if !std::fs::symlink_metadata(root)?.is_dir() || !inventory(root, 0, &mut entries_seen)? {
+        return Ok(false);
+    }
+    let top = entries(root)?;
+    if top.len() != 1 || top[0].file_name() != "scopes" || !top[0].file_type()?.is_dir() {
+        return Ok(false);
+    }
+    for scope in entries(&root.join("scopes"))? {
+        if !scope.file_type()?.is_dir() {
+            return Ok(false);
+        }
+        let contents = entries(&scope.path())?;
+        if contents.len() != 2
+            || !contents.iter().all(|entry| {
+                let name = entry.file_name();
+                name == "CURRENT" || name == "generations"
+            })
+        {
+            return Ok(false);
+        }
+        if !std::fs::symlink_metadata(scope.path().join("generations"))?.is_dir() {
+            return Ok(false);
+        }
+        let raw: serde_json::Value = serde_json::from_slice(&read(&scope.path().join("CURRENT"))?)?;
+        if !raw.as_object().is_some_and(|object| {
+            object.len() == 4
+                && object.keys().all(|key| {
+                    ["version", "generation", "metadata", "checksum"].contains(&key.as_str())
+                })
+        }) {
+            return Ok(false);
+        }
+        if !raw
+            .get("metadata")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|object| {
+                object.len() == 9
+                    && object.keys().all(|key| {
+                        [
+                            "schema_version",
+                            "tokenizer_fingerprint",
+                            "brain_uuid",
+                            "publication_uuid",
+                            "source_graph_generation",
+                            "scope_uid",
+                            "scope_epoch",
+                            "candidate_count",
+                            "candidate_digest",
+                        ]
+                        .contains(&key.as_str())
+                    })
+            })
+        {
+            return Ok(false);
+        }
+        let pointer: CurrentPointer = serde_json::from_value(raw)?;
+        pointer.validate()?;
+        if !metadata_supported(&pointer.metadata, identity, graph_generation)
+            || scope.file_name() != scope_hash(&pointer.metadata.scope_uid).as_str()
+        {
+            return Ok(false);
+        }
+        let mut selected = false;
+        for generation in entries(&scope.path().join("generations"))? {
+            if !generation.file_type()?.is_dir() {
+                return Ok(false);
+            }
+            let Some(name) = generation.file_name().to_str().map(str::to_owned) else {
+                return Ok(false);
+            };
+            let mut parts = name.splitn(3, '-');
+            let Some(epoch) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+                return Ok(false);
+            };
+            let Some(digest_prefix) = parts.next() else {
+                return Ok(false);
+            };
+            if !parts
+                .next()
+                .is_some_and(|part| uuid::Uuid::parse_str(part).is_ok())
+            {
+                return Ok(false);
+            }
+            if !crate::tantivy_index::is_preservable_live_layout(&generation.path())? {
+                return Ok(false);
+            }
+            // Open the already-inventoried Tantivy index read-only to bind its
+            // metadata document to the selector. This never opens the graph.
+            let index = Index::open_in_dir(generation.path())?;
+            let fields = inspect_fields(&index.schema())?;
+            let (metadata, count) = read_metadata(&index, fields)?;
+            if !metadata_supported(&metadata, identity, graph_generation)
+                || metadata.scope_uid != pointer.metadata.scope_uid
+                || epoch != metadata.scope_epoch
+                || epoch > pointer.metadata.scope_epoch
+                || metadata
+                    .candidate_digest
+                    .get(..metadata.candidate_digest.len().min(16))
+                    != Some(digest_prefix)
+                || count != metadata.candidate_count
+            {
+                return Ok(false);
+            }
+            if name == pointer.generation {
+                if metadata != pointer.metadata {
+                    return Ok(false);
+                }
+                selected = true;
+            }
+        }
+        if !selected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Outcome of [`RegexIndex::recover_missing_current`].
 enum MissingCurrentRecovery {
     /// The sole leftover generation was validated and durably selected.
@@ -1678,6 +1880,124 @@ mod tests {
             candidate_count: count,
             candidate_digest: digest.to_string(),
         }
+    }
+
+    fn preservable_fixture(root: &Path) -> crate::PublicationIdentity {
+        let identity = crate::PublicationIdentity::new_brain();
+        let index = RegexIndex::new(root);
+        for epoch in [1_u64, 2] {
+            let digest = blake3::hash(&epoch.to_le_bytes()).to_hex().to_string();
+            let mut metadata = metadata(epoch, 1, &digest);
+            metadata.brain_uuid = identity.brain_uuid.clone();
+            metadata.publication_uuid = identity.publication_uuid.clone();
+            let trigrams = HashSet::from(["abc".into()]);
+            index
+                .replace_scope(
+                    metadata,
+                    &[RegexShardDocument {
+                        uid: "sym:fixture",
+                        kind: "Symbol",
+                        path: "fixture.rs".into(),
+                        text_hash: "hash",
+                        trigrams: &trigrams,
+                    }],
+                )
+                .unwrap();
+        }
+        identity
+    }
+
+    fn layout_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(
+            root: &Path,
+            dir: &Path,
+            values: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    visit(root, &entry.path(), values);
+                } else if entry.file_type().unwrap().is_file() {
+                    values.insert(
+                        entry.path().strip_prefix(root).unwrap().into(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut values = std::collections::BTreeMap::new();
+        visit(root, root, &mut values);
+        values
+    }
+
+    #[test]
+    fn live_regex_recognizer_checks_every_generation_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = preservable_fixture(dir.path());
+        let before = layout_bytes(dir.path());
+        assert!(is_preservable_live_layout(dir.path(), &identity, 2).unwrap());
+        assert_eq!(
+            layout_bytes(dir.path()),
+            before,
+            "recognition must not create locks or repair descriptors"
+        );
+        let index = RegexIndex::new(dir.path());
+        let pointer = index.current_pointer("repo:test").unwrap().unwrap();
+        let generations = index.scope_root("repo:test").join("generations");
+        let old = std::fs::read_dir(&generations)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.file_name() != pointer.generation.as_str())
+            .unwrap()
+            .path();
+        std::fs::write(old.join("personal.txt"), b"irreplaceable").unwrap();
+        let with_personal = layout_bytes(dir.path());
+        assert!(!is_preservable_live_layout(dir.path(), &identity, 2).unwrap());
+        assert_eq!(
+            layout_bytes(dir.path()),
+            with_personal,
+            "unknown files must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn live_regex_recognizer_refuses_foreign_stale_and_forged_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = preservable_fixture(dir.path());
+        assert!(
+            !is_preservable_live_layout(dir.path(), &crate::PublicationIdentity::new_brain(), 2)
+                .unwrap()
+        );
+        assert!(!is_preservable_live_layout(dir.path(), &identity, 1).unwrap());
+        let index = RegexIndex::new(dir.path());
+        let path = index.scope_root("repo:test").join("CURRENT");
+        let mut pointer: CurrentPointer =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        pointer.metadata.candidate_count += 1;
+        pointer.checksum = pointer.expected_checksum().unwrap();
+        std::fs::write(&path, serde_json::to_vec(&pointer).unwrap()).unwrap();
+        let before = layout_bytes(dir.path());
+        assert!(!is_preservable_live_layout(dir.path(), &identity, 2).unwrap());
+        assert_eq!(layout_bytes(dir.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_regex_recognizer_refuses_symlinks_and_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = preservable_fixture(dir.path());
+        let outside = tempfile::tempdir().unwrap();
+        let personal = outside.path().join("personal");
+        std::fs::write(&personal, b"mine").unwrap();
+        std::os::unix::fs::symlink(&personal, dir.path().join("linked")).unwrap();
+        assert!(!is_preservable_live_layout(dir.path(), &identity, 2).unwrap());
+        std::fs::remove_file(dir.path().join("linked")).unwrap();
+        let current = RegexIndex::new(dir.path())
+            .scope_root("repo:test")
+            .join("CURRENT");
+        std::fs::hard_link(&current, outside.path().join("hardlink")).unwrap();
+        assert!(!is_preservable_live_layout(dir.path(), &identity, 2).unwrap());
+        assert_eq!(std::fs::read(personal).unwrap(), b"mine");
     }
 
     /// nw-744: the post-commit read of staged `meta.json` can be `NotFound`.

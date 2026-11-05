@@ -5,6 +5,12 @@ on:
   schedule:
     - cron: '17 4 * * 0'
   workflow_dispatch:
+    inputs:
+      cache_mode:
+        description: 'Capacity validation: cold skips restores; warm requires the exact native cache'
+        type: choice
+        options: [normal, cold, warm]
+        default: normal
 
 permissions:
   contents: read
@@ -19,6 +25,7 @@ env:
   RUST_BACKTRACE: 1
   LBUG_BUILD_FROM_SOURCE: "1"
   CFLAGS: "-DZSTD_DISABLE_ASM"
+  COVERAGE_CACHE_MODE: ${{ inputs.cache_mode || 'normal' }}
   # mold, purely for link speed. Set as an env override rather than appended to
   # .cargo/config.toml: a second [target.x86_64-unknown-linux-gnu] table is a
   # TOML duplicate key and fails the build outright. No duplicate-symbol
@@ -54,6 +61,7 @@ jobs:
         # in scripts/fetch-lbug-source.sh only.
         run: scripts/fetch-lbug-source.sh
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: inputs.cache_mode != 'cold'
         with:
           # Only main saves; PR caches would evict main's under the repo cap.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -65,7 +73,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libssl-dev libzstd-dev pkg-config protobuf-compiler mold lcov
       - name: Compute native dependency cache key
         id: nativekey
         run: |
@@ -74,6 +82,8 @@ jobs:
           RUSTC_VER=$(rustc --version | awk '{print $2}')
           echo "key=${LBUG_VER}-${OSSL_VER}-rustc${RUSTC_VER}" >> "$GITHUB_OUTPUT"
       - name: Cache native build outputs (lbug C++, OpenSSL)
+        id: nativecache
+        if: inputs.cache_mode != 'cold'
         # lbug (C++ graph DB, built from source) and vendored OpenSSL dominate
         # cold-build time. Keyed on their package versions (not Cargo.lock as a
         # whole) so they survive release-please lockfile churn.
@@ -84,9 +94,13 @@ jobs:
             target/**/build/lbug-*/out
             target/**/build/openssl-sys-*/out
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
-          restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
+          # A capacity witness must not restore unrelated older build shapes.
+          # The warm validation explicitly refuses a miss instead of silently
+          # becoming a second cold run. Main CI owns saving this native key.
+          fail-on-cache-miss: ${{ inputs.cache_mode == 'warm' }}
       - name: Record coverage runner disk before instrumentation
         run: |
+          echo "Coverage cache mode: $COVERAGE_CACHE_MODE" | tee -a "$GITHUB_STEP_SUMMARY"
           df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | tee -a "$GITHUB_STEP_SUMMARY"
           du -sh target 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY" || true
       - name: Generate coverage
@@ -100,6 +114,35 @@ jobs:
           # the escape hatch now says so.
           NESTWEAVER_ALLOW_NO_DAEMON: "1"
           NESTWEAVER_NO_DAEMON: "1"
+      - name: Validate coverage artifact and bind capacity receipt
+        env:
+          NATIVE_KEY: native-${{ runner.os }}-${{ runner.arch }}-${{ steps.nativekey.outputs.key }}
+          NATIVE_CACHE_HIT: ${{ steps.nativecache.outputs.cache-hit }}
+          NATIVE_CACHE_MATCHED: ${{ steps.nativecache.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          test -s lcov.info
+          lcov --summary lcov.info | tee coverage-summary.txt
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          coverage = pathlib.Path('lcov.info')
+          digest = hashlib.sha256()
+          with coverage.open('rb') as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                  digest.update(chunk)
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert head == os.environ['GITHUB_SHA'], 'coverage must bind the exact workflow SHA'
+          mode = os.environ['COVERAGE_CACHE_MODE']
+          hit = os.environ.get('NATIVE_CACHE_HIT') == 'true'
+          if mode == 'warm':
+              assert hit, 'warm capacity acceptance requires an exact restored native cache'
+          if mode == 'cold':
+              assert not hit, 'cold capacity acceptance must skip native restore'
+          receipt = dict(sha=head, cache_mode=mode, native_cache_key=os.environ['NATIVE_KEY'],
+                         native_cache_hit=hit, native_cache_matched=os.environ.get('NATIVE_CACHE_MATCHED'),
+                         lcov_bytes=coverage.stat().st_size, lcov_sha256=digest.hexdigest())
+          pathlib.Path('coverage-capacity.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PY
       - name: Report coverage runner disk usage
         if: always()
         run: |
@@ -109,6 +152,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-report
-          path: lcov.info
+          path: |
+            lcov.info
+            coverage-summary.txt
+            coverage-capacity.json
           retention-days: 3
 

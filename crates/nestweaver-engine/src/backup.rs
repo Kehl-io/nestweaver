@@ -3997,6 +3997,27 @@ enum ReplacementDisposition {
 }
 
 fn replacement_disposition(data_dir: &Path) -> anyhow::Result<ReplacementDisposition> {
+    // A live regex layout is admitted only for retention, even if an earlier
+    // restored manifest happens to inventory its filenames. Invalid regex
+    // descriptors must not fall back to the archive-deletion recognizer.
+    let has_regex_directory =
+        std::fs::read_dir(data_dir)?
+            .take(100_001)
+            .try_fold(false, |found, entry| {
+                let entry = entry?;
+                Ok::<_, std::io::Error>(
+                    found
+                        || (entry.file_name().to_string_lossy().ends_with(".regex-v3")
+                            && entry.file_type()?.is_dir()),
+                )
+            })?;
+    if has_regex_directory {
+        require_backup!(
+            recognisable_data_dir(data_dir, true)?,
+            "live regex directory is unknown or unverified; all files preserved"
+        );
+        return Ok(ReplacementDisposition::PreserveLive);
+    }
     if is_recognisable_data_dir(data_dir)? {
         return Ok(ReplacementDisposition::DeleteProvenArchive);
     }
@@ -4025,6 +4046,47 @@ fn recognised_live_sidecar(data_dir: &Path, graph: &str, name: &str) -> anyhow::
     }
     if name == format!("{graph}.tantivy") {
         return nestweaver_store::tantivy_index::is_preservable_live_layout(&path);
+    }
+    if name == format!("{graph}.regex-v3") {
+        // All native graph handles remain untouched while restore owns POSIX
+        // writer locks. Cross-check the regex identity against the bound,
+        // checksummed ranking descriptor and durable generation instead.
+        // Descriptor syntax only admits PreserveLive, never deletion.
+        let ranking_path = data_dir.join(format!("{graph}.pagerank.json"));
+        let generation_path = data_dir.join(format!("{graph}.generation"));
+        if !ranking_path.exists() || !generation_path.exists() {
+            return Ok(false);
+        }
+        let envelope: nestweaver_store::artifact_envelope::ArtifactEnvelope =
+            serde_json::from_slice(&bounded_live_read(&ranking_path)?)?;
+        let generation: u64 = std::str::from_utf8(&bounded_live_read(&generation_path)?)?
+            .trim()
+            .parse()?;
+        let identity = nestweaver_store::PublicationIdentity {
+            brain_uuid: envelope.brain_uuid.clone(),
+            publication_uuid: envelope.publication_uuid.clone(),
+        };
+        identity.validate()?;
+        let fingerprint = nestweaver_store::ranking::pagerank_fingerprint_from_declared(
+            &envelope.algorithm_parameters,
+        )
+        .ok_or_else(|| {
+            BackupRefusal("unsupported live ranking descriptor; all files preserved".into())
+        })?;
+        let _: HashMap<String, f64> = envelope.validate_and_decode(
+            nestweaver_store::artifact_envelope::ArtifactExpectation {
+                artifact_kind: nestweaver_store::ranking::PAGERANK_ARTIFACT_KIND,
+                artifact_schema_version:
+                    nestweaver_store::ranking::PAGERANK_ARTIFACT_SCHEMA_VERSION,
+                identity: &identity,
+                producer_version: env!("CARGO_PKG_VERSION"),
+                source_graph_generation: generation,
+                algorithm_fingerprint: &fingerprint,
+            },
+        )?;
+        return nestweaver_store::regex_index::is_preservable_live_layout(
+            &path, &identity, generation,
+        );
     }
     if name == format!("{graph}.markdown-derivation.json") {
         let bundle: crate::publication::PublicationBundleV3 = serde_json::from_slice(
@@ -4184,6 +4246,7 @@ fn recognisable_data_dir(data_dir: &Path, live: bool) -> anyhow::Result<bool> {
             if [
                 ".publications",
                 ".tantivy",
+                ".regex-v3",
                 ".markdown-derivation.json",
                 ".skipped_notes.json",
             ]
@@ -10570,6 +10633,114 @@ mod destination_guard_tests {
             workspace_path: None,
             overwrite: true,
         }
+    }
+
+    fn natural_regex_dataset(root: &Path) -> (PathBuf, PathBuf) {
+        let repo = root.join("repo");
+        let data = root.join("data");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(
+            repo.join("main.js"),
+            "function target() { return 1; }\nfunction caller() { return target(); }\n",
+        )
+        .unwrap();
+        let db = data.join("brain.lbug");
+        crate::index::index_directory(&repo, &db, "test", "file:///fixture", "sha").unwrap();
+        let store = nestweaver_store::GraphStore::open(&db).unwrap();
+        store.build_trigram_index().unwrap();
+        drop(store);
+        assert_eq!(
+            replacement_disposition(&data).unwrap(),
+            ReplacementDisposition::PreserveLive
+        );
+        (data, db)
+    }
+
+    fn exact_tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                (
+                    entry.path().strip_prefix(root).unwrap().into(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stopped_natural_regex_restore_preserves_incumbent_and_supports_repeat_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, db) = natural_regex_dataset(dir.path());
+        let snapshot = dir.path().join("snapshot.nwsnap.zst");
+        backup_save(&save_config(&db, snapshot.clone())).unwrap();
+        let before = exact_tree_bytes(&data);
+        let result = backup_restore(&RestoreConfig {
+            snapshot_path: snapshot.clone(),
+            data_dir: data.clone(),
+            replace: true,
+        })
+        .unwrap();
+        assert_eq!(result.preserved_copies.len(), 1);
+        assert_eq!(
+            exact_tree_bytes(&result.preserved_copies[0]),
+            before,
+            "entire incumbent must remain byte-for-byte available"
+        );
+        assert_eq!(
+            replacement_disposition(&data).unwrap(),
+            ReplacementDisposition::PreserveLive,
+            "a restored manifest cannot turn regex recognition into deletion authority"
+        );
+        let graph = nestweaver_store::GraphStore::open(&db).unwrap();
+        assert_eq!(graph.lookup_symbols_by_name("target").unwrap().len(), 1);
+        assert_eq!(graph.lookup_symbols_by_name("caller").unwrap().len(), 1);
+        assert_eq!(
+            graph
+                .load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .filter(|edge| edge.2 == "CALLS")
+                .count(),
+            1
+        );
+        drop(graph);
+        let repeated = backup_restore(&RestoreConfig {
+            snapshot_path: snapshot,
+            data_dir: data,
+            replace: true,
+        })
+        .unwrap();
+        assert!(!repeated.preserved_copies.is_empty());
+    }
+
+    #[test]
+    fn natural_regex_restore_refuses_unknown_and_foreign_descriptors_without_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, db) = natural_regex_dataset(dir.path());
+        let regex = crate::sidecar_path(&db, ".regex-v3");
+        let personal = regex.join("personal.txt");
+        std::fs::write(&personal, b"irreplaceable").unwrap();
+        let before = exact_tree_bytes(&data);
+        assert!(replacement_disposition(&data).is_err());
+        assert_eq!(exact_tree_bytes(&data), before);
+        std::fs::remove_file(personal).unwrap();
+        let selector = walkdir::WalkDir::new(&regex)
+            .into_iter()
+            .map(Result::unwrap)
+            .find(|entry| entry.file_name() == "CURRENT")
+            .unwrap()
+            .into_path();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&selector).unwrap()).unwrap();
+        raw["metadata"]["brain_uuid"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+        std::fs::write(&selector, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let before = exact_tree_bytes(&data);
+        assert!(replacement_disposition(&data).is_err());
+        assert_eq!(exact_tree_bytes(&data), before);
     }
 
     fn make_db(dir: &Path) -> PathBuf {

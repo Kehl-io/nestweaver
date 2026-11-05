@@ -69,7 +69,9 @@ use serde::{Deserialize, Serialize};
 ///      preserve repo-wide function lookup across unchanged source.
 /// 14 — Dart 0.3 renames declaration nodes and PowerShell 0.26.6 repairs
 ///      native-command argument parsing; discard facts from the older grammars.
-const CACHE_VERSION: u32 = 14;
+/// 15 — PHP static-call and class-owner facts; older records cannot safely
+///      participate in the dedicated static-method resolver.
+const CACHE_VERSION: u32 = 15;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -1293,6 +1295,8 @@ mod tests {
                             | nestweaver_parser::ReferenceKind::PhpFunctionImport
                             | nestweaver_parser::ReferenceKind::PhpNamespaceAlias
                             | nestweaver_parser::ReferenceKind::PhpFunctionCall
+                            | nestweaver_parser::ReferenceKind::PhpStaticCall
+                            | nestweaver_parser::ReferenceKind::PhpClassDefinition
                     )
                 })
                 .map(|mut reference| {

@@ -131,7 +131,14 @@ pub fn warm_pagerank_from_sidecar(store: &GraphStore, db_path: &Path) -> Option<
     // so a front end that reinvents this path warm-loads nothing at all.
     nestweaver_engine::migrate_sidecar(db_path, "pagerank.json", ".pagerank.json");
     let pr_path = nestweaver_engine::sidecar_path(db_path, ".pagerank.json");
-    match store.load_pagerank_cache(&pr_path) {
+    // Canonical ranking is whole-brain on every producer and lazy refill.
+    // A valid old code-only artifact is still the wrong canonical scope.
+    let expected = nestweaver_store::ranking::pagerank_algorithm_fingerprint(
+        nestweaver_store::ranking::PAGERANK_DAMPING,
+        nestweaver_store::ranking::PAGERANK_ITERATIONS,
+        &nestweaver_store::GraphScope::unified(),
+    );
+    match store.load_pagerank_cache_expecting(&pr_path, Some(&expected)) {
         Ok(()) => None,
         // The loader's own sentence is carried rather than paraphrased. It
         // already names the field that did not match and ends in a runnable
@@ -1883,6 +1890,36 @@ mod pagerank_sidecar_disclosure_tests {
         max - min
     }
 
+    #[test]
+    fn canonical_warmup_refuses_a_valid_code_only_artifact_and_refills_unified() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let sidecar = dir.path().join("graph.lbug.pagerank.json");
+        let store = seeded_store(&db);
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        store.save_pagerank_cache(&sidecar).unwrap();
+        drop(store);
+        let store = GraphStore::open(&db).unwrap();
+        let warning = warm_pagerank_from_sidecar(&store, &db)
+            .expect("a legacy canonical scope needs disclosure");
+        assert!(warning.contains("fingerprint"), "{warning}");
+        let scores = store.pagerank_scores().unwrap();
+        assert_eq!(scores.len(), 3);
+        assert_eq!(store.lazy_pagerank_computations(), 1);
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(
+            envelope["algorithm_fingerprint"],
+            serde_json::json!(nestweaver_store::ranking::pagerank_algorithm_fingerprint(
+                0.85,
+                20,
+                &GraphScope::unified()
+            ))
+        );
+    }
+
     /// nw-391. The whole item in one test: a sidecar the loader REFUSES must
     /// not pass unremarked, and the ranks that come out must not be the flat
     /// 1/N the refusal used to leave behind.
@@ -1899,7 +1936,7 @@ mod pagerank_sidecar_disclosure_tests {
 
         let store = seeded_store(&db);
         store
-            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .compute_pagerank(0.85, 20, &GraphScope::unified())
             .unwrap();
         store.save_pagerank_cache(&sidecar).unwrap();
         drop(store);
@@ -1967,7 +2004,7 @@ mod pagerank_sidecar_disclosure_tests {
 
         let store = seeded_store(&db);
         store
-            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .compute_pagerank(0.85, 20, &GraphScope::unified())
             .unwrap();
         store.save_pagerank_cache(&sidecar).unwrap();
         let valid = std::fs::read(&sidecar).unwrap();

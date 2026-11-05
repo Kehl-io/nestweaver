@@ -79,16 +79,18 @@ def main():
         registry.write_text(f'[[upstream]]\nname = "status-peer"\nurl = "grpc://127.0.0.1:{grpc_port}"\ntoken = "{TOKEN}"\nmode = "fallback"\ntimeout = "2s"\n')
         registry.chmod(0o600)
         registry_before = registry.read_bytes()
-        # Deliberately text, with normal user-registry discovery. JSON returns
-        # before the human-readable upstream summary and misses this regression.
+        # Deliberately text, with normal user-registry discovery. nw-930's
+        # authenticated per-source vault inventory exercises reactor ownership
+        # without claiming separate HealthCheck/RepoStates observations.
         status = client.run("brain", "status", "--db", client.db, timeout=30)
-        assert "Server: status-peer (v" in status.stdout, "configured upstream summary missing"
-        assert "fallback mode, healthy, 0 repos)" in status.stdout, status.stdout
+        assert "Vault source: status-peer (available, fallback mode)\n  Vaults: 0" in status.stdout, status.stdout
+        assert TOKEN not in status.stdout + status.stderr
+        assert f"grpc://127.0.0.1:{grpc_port}" not in status.stdout
         assert "there is no reactor running" not in status.stderr
         assert registry.read_bytes() == registry_before
         assert int(client.pidfile.read_text()) == client.child.pid
         assert int(peer.pidfile.read_text()) == peer.child.pid
-        report.update(outcome="PASS", text_upstream_summary=True, authenticated_health_and_inventory=True, registry_unchanged=True)
+        report.update(outcome="PASS", text_upstream_summary=True, authenticated_vault_inventory=True, registry_unchanged=True)
     except BaseException as error:
         report.update(error_type=type(error).__name__, error=str(error), no_reactor_failure="there is no reactor running" in str(error))
     finally:

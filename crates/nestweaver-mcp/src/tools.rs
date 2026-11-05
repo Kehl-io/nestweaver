@@ -6034,9 +6034,14 @@ fn bare_reader_for_repo(
     workspace_root: &std::path::Path,
     repo_uid: &str,
 ) -> Option<nestweaver_engine::content_reader::GitBareReader> {
-    let limits = current_instance_config()
+    let config = current_instance_config();
+    let limits = config
+        .as_ref()
         .map(|config| config.indexing.limits())
         .unwrap_or_default();
+    let credential_method = config
+        .as_ref()
+        .map(|config| config.git.credential_method.clone());
     let repo = store.lookup_repo(repo_uid).ok().flatten()?;
     // The bare clone is named solely from the URL by `ensure_clone` (it never
     // sees the explicit repo name), so resolve the on-disk dir the same way —
@@ -6050,18 +6055,20 @@ fn bare_reader_for_repo(
     // graph indexed at that commit, and the bare clone's HEAD may have been
     // fetched past it. Fall back to HEAD only when no server sha is recorded
     // (local repos store "local" or an empty sha).
-    if repo.indexed_sha.is_empty() || repo.indexed_sha == "local" {
+    let reader = if repo.indexed_sha.is_empty() || repo.indexed_sha == "local" {
         nestweaver_engine::content_reader::GitBareReader::from_head_with_limits(&bare_path, limits)
-            .ok()
+            .ok()?
     } else {
-        Some(
-            nestweaver_engine::content_reader::GitBareReader::with_limits(
-                &bare_path,
-                &repo.indexed_sha,
-                limits,
-            ),
+        nestweaver_engine::content_reader::GitBareReader::with_limits(
+            &bare_path,
+            &repo.indexed_sha,
+            limits,
         )
-    }
+    };
+    // Source-body reads use the same explicit server policy as indexing.
+    // Even without instance configuration, cached reads stay offline and a
+    // missing promisor blob must use the guarded fetch path.
+    Some(reader.with_credential_method(credential_method))
 }
 
 /// Build an inline-body reader resolver for the current mode.
@@ -24414,6 +24421,149 @@ fn current_db_path(_store: &GraphStore) -> Result<std::path::PathBuf, anyhow::Er
 #[cfg(test)]
 mod server_mode_tests {
     use super::*;
+
+    #[test]
+    fn server_bare_reader_keeps_cached_blobs_but_guards_missing_blob_fetches() {
+        use nestweaver_engine::content_reader::{ContentReader, GitBareReader};
+        use std::path::Path;
+        use std::process::Command;
+
+        // No service, DNS, credentials or global Git config: the only origin is
+        // a temporary file:// repository, which server fetch policy rejects.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("origin");
+        std::fs::create_dir(&src).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor="])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&src, &["init", "-q"]);
+        git(&src, &["config", "user.email", "fixture@example.invalid"]);
+        git(&src, &["config", "user.name", "fixture"]);
+        git(&src, &["config", "uploadpack.allowFilter", "true"]);
+        git(&src, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+        std::fs::write(src.join("cached.rs"), "pub fn cached() {}\n").unwrap();
+        std::fs::write(src.join("missing.rs"), "pub fn missing() {}\n").unwrap();
+        git(&src, &["add", "."]);
+        git(&src, &["commit", "-q", "-m", "fixture"]);
+        let sha = git(&src, &["rev-parse", "HEAD"]);
+        let missing_oid = git(&src, &["rev-parse", "HEAD:missing.rs"]);
+        let url = format!("file://{}", src.display());
+        let clone_name = nestweaver_engine::pull::clone_dir_name_from_url(&url);
+        let clone_into = |workspace: &Path| {
+            std::fs::create_dir_all(workspace).unwrap();
+            let bare = workspace.join(format!("{clone_name}.git"));
+            git(
+                tmp.path(),
+                &[
+                    "clone",
+                    "-q",
+                    "--bare",
+                    "--filter=blob:none",
+                    &url,
+                    bare.to_str().unwrap(),
+                ],
+            );
+            // Fetch exactly one blob through a plain reader to seed the cache.
+            assert_eq!(
+                GitBareReader::new(&bare, &sha)
+                    .read_file(Path::new("cached.rs"))
+                    .unwrap(),
+                "pub fn cached() {}\n"
+            );
+            let missing = git(
+                &bare,
+                &[
+                    "-c",
+                    "protocol.allow=never",
+                    "rev-list",
+                    "--objects",
+                    "--no-walk",
+                    "--missing=print",
+                    &sha,
+                ],
+            );
+            assert!(
+                missing
+                    .lines()
+                    .any(|line| line == format!("?{missing_oid}")),
+                "fixture must still lack the requested blob: {missing}"
+            );
+            bare
+        };
+
+        // Positive control: this local origin really can satisfy an implicit
+        // lazy read. Keep it separate so it cannot populate the tested cache.
+        let control = clone_into(&tmp.path().join("control"));
+        assert_eq!(
+            GitBareReader::new(&control, &sha)
+                .read_file(Path::new("missing.rs"))
+                .unwrap(),
+            "pub fn missing() {}\n"
+        );
+
+        assert!(
+            current_instance_config().is_none(),
+            "test requires configless policy"
+        );
+        // Cover both helper constructors, including both local HEAD sentinels.
+        for (index, indexed_sha) in [sha.as_str(), "local", ""].into_iter().enumerate() {
+            let workspace = tmp.path().join(format!("workspace-{index}"));
+            let bare = clone_into(&workspace);
+            let store = GraphStore::in_memory().unwrap();
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: "repo-guard".into(),
+                    url: url.clone(),
+                    indexed_sha: indexed_sha.into(),
+                    staleness_commits_behind: 0,
+                    instance_id: "fixture".into(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+            let reader = bare_reader_for_repo(&store, &workspace, "repo-guard").unwrap();
+            assert_eq!(
+                reader.read_file(Path::new("cached.rs")).unwrap(),
+                "pub fn cached() {}\n"
+            );
+            assert!(
+                reader.read_file(Path::new("missing.rs")).is_err(),
+                "server reader must enforce fetch policy even without instance config ({indexed_sha:?})"
+            );
+            let missing = git(
+                &bare,
+                &[
+                    "-c",
+                    "protocol.allow=never",
+                    "rev-list",
+                    "--objects",
+                    "--no-walk",
+                    "--missing=print",
+                    &sha,
+                ],
+            );
+            assert!(
+                missing
+                    .lines()
+                    .any(|line| line == format!("?{missing_oid}")),
+                "rejected server read must not fetch the missing blob"
+            );
+            assert_eq!(
+                reader.read_file(Path::new("cached.rs")).unwrap(),
+                "pub fn cached() {}\n"
+            );
+        }
+    }
 
     // read_symbols in server mode must read source at the repo's recorded
     // indexed_sha, NOT the bare clone's HEAD — the daemon may have fetched past

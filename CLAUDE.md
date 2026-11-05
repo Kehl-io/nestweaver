@@ -570,7 +570,8 @@ federation          (leaf: schema + proto only)
 
 ### Current resolver upgrade
 
-Resolver generation 20 and parsed-cache version 14 cover Dart 0.3 and
+Resolver generation 21 and parsed-cache version 15 add PHP static-call owner,
+inheritance and dispatch facts. Generation 20 and cache 14 cover Dart 0.3 and
 PowerShell 0.26.6 grammar changes. Generation 19 and cache 13 add repo-wide PHP function
 namespace identities, `use function` aliases and duplicate refusal. Generation 18
 and cache 12's Scala grammar 0.26.3 repairs remain included. Existing graphs may

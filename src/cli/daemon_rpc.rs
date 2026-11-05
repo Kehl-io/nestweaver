@@ -127,33 +127,6 @@ pub(crate) fn daemon_rpc_timeout(args: &serde_json::Value) -> Option<std::time::
     Some(budget.unwrap_or(RPC_TIMEOUT_DEFAULT))
 }
 
-/// Whether the daemon may serve a request that named `--config`.
-///
-/// It may not, and this is a SECURITY boundary, not a convenience. nw-316's
-/// research settled it: `InstanceConfig` carries `authz`, and
-/// `build_daemon_permission_source` derives the daemon's ENTIRE permission
-/// source from it, with `None` meaning every caller is `VisibleRepos::All`. A
-/// client that could forward its own config into request handling could supply
-/// its own authorization policy, or omit it and be promoted to see everything --
-/// a total bypass of nw-403 and nw-415. Most of the struct is also
-/// process-lifetime rather than request-scoped (`embedding` names a model the
-/// daemon loaded at BOOT, against vectors already on disk), so "forward the
-/// config" silently splits into keys that can be honoured and keys that cannot,
-/// with nothing telling the caller which half it got.
-///
-/// So `--config` joins `--no-tests` and `--prefer-instance` in forcing the
-/// direct route: the caller gets exactly the config they named, and a shared
-/// multi-client daemon can never be reconfigured by one client. A caller who
-/// genuinely needs a different config served remotely wants a second daemon
-/// INSTANCE, which the instance model already supports.
-///
-/// `tool_brain_guide` already refuses a caller-supplied `config` for the same
-/// reason and says so in its schema; this is that precedent applied to the
-/// route that has an alternative.
-pub(crate) fn daemon_may_serve(use_daemon: bool, config: Option<&std::path::Path>) -> bool {
-    use_daemon && config.is_none()
-}
-
 /// Matches MCP `MAX_IDENTIFIER_LEN`. A 10k-character `--repo` used to leave
 /// the CLI as gRPC PROTOCOL_ERROR rather than an honest client rejection.
 pub(crate) const MAX_REPO_SELECTOR_LEN: usize = 512;
@@ -1487,6 +1460,31 @@ mod replica_existing_read_tests {
                             .unary(Status(endpoint, operation), request)
                             .await)
                     }
+                    "/nestweaver.daemon.v1.NestWeaverDaemon/GetProjectContext" => {
+                        struct Project(ReadEndpoint);
+                        impl tonic::server::UnaryService<nestweaver_proto::ProjectContextRequest> for Project {
+                            type Response = nestweaver_proto::ProjectContextResponse;
+                            type Future = std::future::Ready<
+                                Result<tonic::Response<Self::Response>, tonic::Status>,
+                            >;
+                            fn call(
+                                &mut self,
+                                request: tonic::Request<nestweaver_proto::ProjectContextRequest>,
+                            ) -> Self::Future {
+                                let request = request.into_inner();
+                                self.0.requests.lock().unwrap().push(("GetProjectContext".into(), serde_json::json!({
+                                    "project": request.project, "token_budget": request.token_budget,
+                                    "include_components": request.include_components,
+                                })));
+                                std::future::ready(Ok(tonic::Response::new(nestweaver_proto::ProjectContextResponse {
+                                    result_json: serde_json::json!({"project": request.project, "connected": [], "replica_read": true}).to_string(),
+                                })))
+                            }
+                        }
+                        Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                            .unary(Project(endpoint), request)
+                            .await)
+                    }
                     "/nestweaver.daemon.v1.NestWeaverDaemon/Search" => {
                         struct Search(ReadEndpoint);
                         impl tonic::server::UnaryService<nestweaver_proto::BrainSearchRequest> for Search {
@@ -1686,6 +1684,232 @@ mod replica_existing_read_tests {
                 let _ = std::fs::remove_dir_all(self.socket.parent().unwrap());
             }
         }
+    }
+
+    #[test]
+    fn real_health_resolver_skew_is_disclosed_without_replacing_the_verified_owner() {
+        use std::os::unix::fs::MetadataExt;
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let generation = nestweaver_engine::resolver_generation::RESOLVER_GENERATION;
+        for advertised in [Some(generation - 1), None] {
+            let replica = Replica::new();
+            replica.health.lock().unwrap().resolver_generation = advertised;
+            let instance = nestweaver_daemon::lifecycle::instance_id_from_db_path(&replica.anchor);
+            let pidfile = nestweaver_daemon::lifecycle::pidfile_path(&instance);
+            let binding = nestweaver_daemon::lifecycle::effective_config_binding_path(&instance);
+            let original_binding = std::fs::read(&binding).unwrap();
+            let original_pidfile = std::fs::read(&pidfile).unwrap();
+            let original_socket_inode = std::fs::metadata(&replica.socket).unwrap().ino();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let captured = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || CapturedLog(captured.clone()))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    // Exercise ordinary version-checking admission as well as
+                    // existing-read admission against an actual UDS/HTTP2 peer.
+                    let mut ordinary = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        nestweaver_client::DaemonClient::connect(&replica.anchor, None),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    let first = ordinary.health_check().await.unwrap();
+                    assert_eq!(first.version, env!("CARGO_PKG_VERSION"));
+                    assert_eq!(first.resolver_generation, advertised);
+                    assert_eq!(
+                        nestweaver_client::daemon_resolver_skew(&first),
+                        advertised.map(|_| true)
+                    );
+                    let mut read = nestweaver_client::DaemonClient::connect_existing_verified_read(
+                        &replica.anchor,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    let second = read.health_check().await.unwrap();
+                    assert_eq!(second.pid, std::process::id());
+                    assert_eq!(second.resolver_generation, advertised);
+                    assert_eq!(second.version, first.version);
+                });
+                let answer = try_hybrid_json_rpc_checked(
+                    true,
+                    &replica.anchor,
+                    None,
+                    "brain_status",
+                    serde_json::json!({}),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(answer["replica_read"], true);
+            });
+            let log = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+            if advertised.is_some() {
+                assert!(
+                    log.contains("same product version, different resolver builds"),
+                    "{log}"
+                );
+                assert!(
+                    log.contains(&format!("daemon_resolver_generation={}", generation - 1)),
+                    "{log}"
+                );
+                assert!(
+                    log.contains(&format!("client_resolver_generation={generation}")),
+                    "{log}"
+                );
+            } else {
+                assert!(
+                    !log.contains("different resolver builds"),
+                    "older peers must remain unknown: {log}"
+                );
+            }
+            assert!(
+                !log.contains("requesting graceful daemon restart"),
+                "resolver evidence must not request replacement: {log}"
+            );
+            assert_eq!(
+                std::fs::metadata(&replica.socket).unwrap().ino(),
+                original_socket_inode
+            );
+            assert_eq!(std::fs::read(&binding).unwrap(), original_binding);
+            assert_eq!(std::fs::read(&pidfile).unwrap(), original_pidfile);
+            let contender = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pidfile)
+                .unwrap();
+            assert_ne!(
+                unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0,
+                "incumbent owner lock must remain held"
+            );
+            let requests = replica.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].0,
+                "/nestweaver.daemon.v1.NestWeaverDaemon/BrainStatusJson"
+            );
+            assert!(
+                !replica.anchor.exists(),
+                "read must not materialize a direct graph"
+            );
+        }
+    }
+
+    #[test]
+    fn project_context_named_config_reaches_its_verified_owner_without_a_direct_open() {
+        std::thread::Builder::new()
+            .name("project-context-cli-acceptance".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let replica = Replica::new();
+                let config = replica.dir.path().join("owner.toml");
+                std::fs::write(
+                    &config,
+                    format!(
+                        r#"instance_id = "replica-test"
+    [snapshot_storage]
+    backend = "local"
+    path = "{}"
+    [workspace]
+    backend = "local"
+    path = "{}"
+    [inference]
+    endpoint = "http://127.0.0.1:9"
+    embedding_model = "offline"
+    summary_model = "offline"
+    [git]
+    credential_method = "ssh"
+    "#,
+                        replica.dir.path().join("snapshots").display(),
+                        replica.dir.path().join("workspace").display()
+                    ),
+                )
+                .unwrap();
+                let canonical = std::fs::canonicalize(&config).unwrap();
+                let instance =
+                    nestweaver_daemon::lifecycle::instance_id_from_db_path(&replica.anchor);
+                nestweaver_daemon::lifecycle::write_effective_config_binding(
+                    &instance,
+                    &nestweaver_daemon::lifecycle::EffectiveConfigBinding::new(
+                        std::process::id(),
+                        nestweaver_daemon::lifecycle::EffectiveConfigBindingSource::Configured {
+                            path: canonical.display().to_string(),
+                        },
+                    ),
+                )
+                .unwrap();
+                let invoke = |config: &std::path::Path| {
+                    let cli = crate::Cli::try_parse_from([
+                        "nestweaver",
+                        "project-context",
+                        "fixture-project",
+                        "--db",
+                        replica.anchor.to_str().unwrap(),
+                        "--config",
+                        config.to_str().unwrap(),
+                        "--token-budget",
+                        "321",
+                        "--json",
+                    ])
+                    .unwrap();
+                    crate::run(
+                        cli,
+                        &crate::OutputConfig {
+                            quiet: true,
+                            verbose: false,
+                            color: false,
+                        },
+                    )
+                };
+                assert_eq!(invoke(&config).unwrap().0, crate::EXIT_SUCCESS);
+                let calls = replica.requests.lock().unwrap().clone();
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "the command must issue exactly one owning-daemon query"
+                );
+                assert_eq!(calls[0].0, "GetProjectContext");
+                assert_eq!(calls[0].1["project"], "fixture-project");
+                assert_eq!(calls[0].1["token_budget"], 321);
+                assert!(!replica.anchor.exists(), "no direct graph may be created");
+
+                let other = replica.dir.path().join("other.toml");
+                std::fs::copy(&config, &other).unwrap();
+                assert!(
+                    invoke(&other).is_err(),
+                    "a different config path must be refused"
+                );
+                assert_eq!(
+                    replica.requests.lock().unwrap().len(),
+                    1,
+                    "mismatched intent must never reach dispatch"
+                );
+                assert!(!replica.anchor.exists());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     fn actual_search(anchor: &std::path::Path) -> anyhow::Result<(i32, Option<String>)> {
@@ -1943,5 +2167,286 @@ credential_method = "ssh"
                 .iter()
                 .all(|p| !p.exists())
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_only_affected_tests_regressions {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    };
+    use tonic::codegen::{Service, http};
+
+    #[derive(Clone)]
+    struct Peer {
+        mode: Arc<AtomicU8>,
+        calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+    impl tonic::server::NamedService for Peer {
+        const NAME: &'static str = "nestweaver.daemon.v1.NestWeaverDaemon";
+    }
+    impl Service<http::Request<tonic::body::Body>> for Peer {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+        >;
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+            let peer = self.clone();
+            Box::pin(async move {
+                assert_eq!(
+                    request.headers().get("authorization").unwrap(),
+                    "Bearer nw779-private-authenticated-fixture-token"
+                );
+                let method = request.uri().path().rsplit('/').next().unwrap().to_owned();
+                if method == "HealthCheck" {
+                    struct Health;
+                    impl tonic::server::UnaryService<nestweaver_proto::HealthCheckRequest> for Health {
+                        type Response = nestweaver_proto::HealthCheckResponse;
+                        type Future = std::future::Ready<
+                            Result<tonic::Response<Self::Response>, tonic::Status>,
+                        >;
+                        fn call(
+                            &mut self,
+                            _: tonic::Request<nestweaver_proto::HealthCheckRequest>,
+                        ) -> Self::Future {
+                            std::future::ready(Ok(tonic::Response::new(
+                                nestweaver_proto::HealthCheckResponse::default(),
+                            )))
+                        }
+                    }
+                    return Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                        .unary(Health, request)
+                        .await);
+                }
+                struct Json(Peer, String);
+                impl tonic::server::UnaryService<nestweaver_proto::JsonRequest> for Json {
+                    type Response = nestweaver_proto::JsonResponse;
+                    type Future =
+                        std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
+                    fn call(
+                        &mut self,
+                        request: tonic::Request<nestweaver_proto::JsonRequest>,
+                    ) -> Self::Future {
+                        let args: serde_json::Value =
+                            serde_json::from_str(&request.into_inner().args_json).unwrap();
+                        self.0.calls.lock().unwrap().push((self.1.clone(), args));
+                        let mode = self.0.mode.load(Ordering::SeqCst);
+                        if self.1 == "ListReposJson" && mode == 1 {
+                            return std::future::ready(Err(tonic::Status::permission_denied(
+                                "inventory forbidden",
+                            )));
+                        }
+                        let repo = |uid: &str| serde_json::json!({"uid":uid,"url":format!("https://example.invalid/{uid}.git"),"indexed_sha":"fixture","staleness_commits_behind":0,"instance_id":"fixture","name":uid,"root_path":null});
+                        let value = match self.1.as_str() {
+                            "ListReposJson" if mode == 2 => {
+                                serde_json::json!([repo("first"), repo("second")])
+                            }
+                            "ListReposJson" => serde_json::json!([repo("first")]),
+                            "AffectedTests" => serde_json::to_value(
+                                nestweaver_engine::affected_tests::empty_derived_selection(),
+                            )
+                            .unwrap(),
+                            "Investigate" => {
+                                serde_json::json!({"status":"ok","upstream_fixture":true})
+                            }
+                            method => panic!("unexpected upstream RPC: {method}"),
+                        };
+                        std::future::ready(Ok(tonic::Response::new(
+                            nestweaver_proto::JsonResponse {
+                                result_json: value.to_string(),
+                            },
+                        )))
+                    }
+                }
+                Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                    .unary(Json(peer, method), request)
+                    .await)
+            })
+        }
+    }
+
+    /// Invoke actual CLI dispatch in a private process so environment/config
+    /// discovery cannot race unrelated unit tests.
+    #[test]
+    fn invoke_cli_fixture() {
+        if std::env::var_os("NW779_CHILD_CASE").is_none() {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("nw779-cli-fixture".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(invoke_cli_fixture_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn invoke_cli_fixture_body() {
+        use clap::Parser;
+        let Ok(case) = std::env::var("NW779_CHILD_CASE") else {
+            return;
+        };
+        let db = PathBuf::from(std::env::var_os("NW779_CHILD_DB").unwrap());
+        let args = if case == "investigate" {
+            vec![
+                "nestweaver",
+                "investigate",
+                "fixture",
+                "--no-embed",
+                "--json",
+                "--db",
+                db.to_str().unwrap(),
+            ]
+        } else {
+            vec![
+                "nestweaver",
+                "affected-tests",
+                "--files",
+                "src/a.py",
+                "--json",
+                "--db",
+                db.to_str().unwrap(),
+            ]
+        };
+        let result = crate::run(
+            Cli::try_parse_from(args).unwrap(),
+            &OutputConfig {
+                quiet: true,
+                verbose: false,
+                color: false,
+            },
+        );
+        match case.as_str() {
+            "forbidden" => {
+                assert!(format!("{:#}", result.unwrap_err()).contains("inventory forbidden"))
+            }
+            "invalid" => assert!(result.is_err()),
+            "ambiguous" => assert_eq!(result.unwrap().0, EXIT_USAGE),
+            _ => assert_eq!(result.unwrap().0, EXIT_SUCCESS),
+        }
+        if case == "invalid" {
+            assert_eq!(std::fs::read(&db).unwrap(), b"not a database");
+        } else {
+            assert!(!db.exists());
+            assert!(!nestweaver_engine::publication::default_publication_root(&db).exists());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_local_routes_authenticated_inventory_and_keeps_refusals_fail_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mode = Arc::new(AtomicU8::new(0));
+        let peer = Peer {
+            mode: mode.clone(),
+            calls: calls.clone(),
+        };
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(peer)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        for (case, peer_mode, expected_methods) in [
+            ("success", 0, vec!["ListReposJson", "AffectedTests"]),
+            ("investigate", 0, vec!["Investigate"]),
+            ("forbidden", 1, vec!["ListReposJson"]),
+            ("ambiguous", 2, vec!["ListReposJson"]),
+            ("invalid", 0, vec![]),
+        ] {
+            mode.store(peer_mode, Ordering::SeqCst);
+            calls.lock().unwrap().clear();
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("absent.lbug");
+            if case == "invalid" {
+                std::fs::write(&db, b"not a database").unwrap();
+            }
+            let config = dir.path().join("config/nestweaver");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(config.join("upstreams.toml"),format!("[[upstream]]\nurl = \"http://{addr}\"\ntoken = \"nw779-private-authenticated-fixture-token\"\nmode = \"primary\"\ntimeout = \"5s\"\n")).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "cli::daemon_rpc::upstream_only_affected_tests_regressions::invoke_cli_fixture",
+                    "--nocapture",
+                ])
+                .current_dir(dir.path())
+                .env("NW779_CHILD_CASE", case)
+                .env("NW779_CHILD_DB", &db)
+                .env("HOME", dir.path().join("home"))
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .env("XDG_DATA_HOME", dir.path().join("data"))
+                .env("XDG_STATE_HOME", dir.path().join("state"))
+                .env("XDG_RUNTIME_DIR", dir.path().join("runtime"));
+            for key in [
+                "NESTWEAVER_DB",
+                "NESTWEAVER_UPSTREAM",
+                "NESTWEAVER_TOKEN",
+                "NESTWEAVER_NO_DAEMON",
+                "NESTWEAVER_ALLOW_NO_DAEMON",
+            ] {
+                child.env_remove(key);
+            }
+            let output = tokio::task::spawn_blocking(move || {
+                child
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let mut process = child.spawn().unwrap();
+                let started = std::time::Instant::now();
+                while process.try_wait().unwrap().is_none() {
+                    if started.elapsed() > std::time::Duration::from_secs(30) {
+                        process.kill().unwrap();
+                        let output = process.wait_with_output().unwrap();
+                        panic!(
+                            "private CLI fixture timed out: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                process.wait_with_output().unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child test filter must execute the fixture"
+            );
+            let observed = calls.lock().unwrap().clone();
+            assert_eq!(
+                observed
+                    .iter()
+                    .map(|(method, _)| method.as_str())
+                    .collect::<Vec<_>>(),
+                expected_methods,
+                "{case}"
+            );
+            if case == "success" {
+                assert_eq!(observed[1].1["repo"], "first");
+                assert_eq!(
+                    observed[1].1["changed_files"],
+                    serde_json::json!(["src/a.py"])
+                );
+            }
+        }
+        server.abort();
     }
 }

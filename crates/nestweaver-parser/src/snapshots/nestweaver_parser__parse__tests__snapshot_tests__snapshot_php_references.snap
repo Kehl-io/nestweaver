@@ -1,6 +1,6 @@
 ---
 source: crates/nestweaver-parser/src/parse.rs
-assertion_line: 11769
+assertion_line: 12325
 expression: "parsed_references(\"simple.php\", &source)"
 ---
 - scope:
@@ -46,6 +46,17 @@ expression: "parsed_references(\"simple.php\", &source)"
   start_line: 6
   context: "App\\Services\\Logger"
   receiver: ~
+- scope:
+    start: 266
+    end: 564
+    position: 266
+    initialized_at: 266
+    hoisted_var: false
+  name: "App\\Models\\SimpleGreeter"
+  kind: PhpClassDefinition
+  start_line: 21
+  context: "{\"parent\":null,\"is_final\":false,\"has_traits\":true,\"methods\":[{\"name\":\"greet\",\"start_line\":25,\"end_line\":29,\"scope\":{\"start\":339,\"end\":464,\"position\":339,\"initialized_at\":339,\"hoisted_var\":false},\"is_static\":false,\"is_final\":false,\"is_abstract\":false},{\"name\":\"formatName\",\"start_line\":31,\"end_line\":34,\"scope\":{\"start\":470,\"end\":562,\"position\":470,\"initialized_at\":470,\"hoisted_var\":false},\"is_static\":false,\"is_final\":false,\"is_abstract\":false}]}"
+  receiver: ~
 - name: GreeterInterface
   kind: Implements
   start_line: 21
@@ -77,6 +88,17 @@ expression: "parsed_references(\"simple.php\", &source)"
   kind: PhpFunctionCall
   start_line: 33
   context: return ucfirst($name);
+  receiver: ~
+- scope:
+    start: 566
+    end: 629
+    position: 566
+    initialized_at: 566
+    hoisted_var: false
+  name: "App\\Models\\Priority"
+  kind: PhpClassDefinition
+  start_line: 37
+  context: "{\"parent\":null,\"is_final\":true,\"has_traits\":false,\"methods\":[]}"
   receiver: ~
 - name: SimpleGreeter
   kind: Call

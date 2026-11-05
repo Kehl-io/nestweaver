@@ -59,7 +59,7 @@
 
 ; Scoped call expressions (static methods)
 (scoped_call_expression
-  name: (name) @name) @reference.call
+  name: (name) @name) @reference.call @reference.php_static
 
 ; Namespace use declarations (top-level use statements)
 (namespace_use_declaration

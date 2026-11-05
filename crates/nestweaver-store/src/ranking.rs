@@ -1614,6 +1614,48 @@ impl GraphStore {
         self.save_pagerank_cache_inner(path, self.graph_generation())
     }
 
+    /// Persist the canonical whole-brain ranking after a non-code publication.
+    /// Explicit scoped compute/save APIs remain available, but a caller writing
+    /// the ordinary brain sidecar must not accidentally re-save a code-only
+    /// cache retained by the non-code invalidation optimization.
+    pub fn save_canonical_pagerank_cache(&self, path: &std::path::Path) -> Result<(), StoreError> {
+        let _flight = self
+            .pagerank_compute_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_index_publication_dirty() {
+            self.invalidate_unowned_ranking_caches_locked();
+            return Ok(());
+        }
+        if self
+            .pagerank_cache
+            .lock()
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let expected = pagerank_algorithm_fingerprint(
+            PAGERANK_DAMPING,
+            PAGERANK_ITERATIONS,
+            &GraphScope::unified(),
+        );
+        let observed = self
+            .pagerank_artifact_fingerprint
+            .lock()
+            .map_err(|e| StoreError::Query(format!("lock: {e}")))?
+            .clone();
+        if observed.as_deref() != Some(expected.as_str()) {
+            self.compute_pagerank_warm_locked(
+                PAGERANK_DAMPING,
+                PAGERANK_ITERATIONS,
+                &GraphScope::unified(),
+                None,
+            )?;
+        }
+        self.save_pagerank_cache_inner(path, self.graph_generation())
+    }
+
     /// Persist the PageRank sidecar while the caller's OWN index publication
     /// is still dirty. [`IndexPublicationLease::save_pagerank`] is the only
     /// caller and token-validates ownership first. The guarded public variant
@@ -1891,7 +1933,7 @@ impl GraphStore {
         self.compute_pagerank_warm_locked(
             PAGERANK_DAMPING,
             PAGERANK_ITERATIONS,
-            &GraphScope::code_only(),
+            &GraphScope::unified(),
             None,
         )
         .inspect_err(|error| tracing::warn!("lazy PageRank computation failed: {error}"))?;
@@ -1975,6 +2017,99 @@ mod tests {
             framework_hint: None,
             canonical_id: None,
         }
+    }
+
+    #[test]
+    fn canonical_lazy_and_saved_ranks_match_unified_bridged_graph_after_restart() {
+        use nestweaver_schema::{Note, NoteKind};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.lbug");
+        let canonical = dir.path().join("graph.lbug.pagerank.json");
+        let explicit = dir.path().join("explicit-code-scope.json");
+        let store = GraphStore::create(&db).unwrap();
+        for name in ["A", "B", "C"] {
+            store.insert_symbol(&make_symbol(name, name)).unwrap();
+        }
+        for (from, to) in [("A", "B"), ("B", "C")] {
+            store.insert_edge(&make_calls_edge(from, to)).unwrap();
+        }
+        for uid in ["note:1", "note:2", "note:disconnected"] {
+            store
+                .insert_note(&Note {
+                    uid: uid.into(),
+                    vault_uid: "vlt:test".into(),
+                    file_path: format!("{uid}.md"),
+                    title: uid.into(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: "hash".into(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: None,
+                    embedding: None,
+                })
+                .unwrap();
+        }
+        {
+            let conn = store.conn().unwrap();
+            for note in ["note:1", "note:2"] {
+                let mut query = conn.prepare("MATCH (n:Note {uid: $note}), (s:Symbol {uid: $symbol}) CREATE (n)-[:REFERENCES_CODE_NOTE_TO_SYMBOL {confidence: 1.0}]->(s)").unwrap();
+                conn.execute(
+                    &mut query,
+                    vec![
+                        ("note", lbug::Value::String(note.into())),
+                        ("symbol", lbug::Value::String("A".into())),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::unified())
+            .unwrap();
+        let expected = store.pagerank_scores().unwrap();
+        assert_eq!(expected.len(), 6);
+        store
+            .compute_pagerank(0.85, 20, &GraphScope::code_only())
+            .unwrap();
+        let code = store.pagerank_scores().unwrap();
+        assert_eq!(code.len(), 3, "explicit scope remains supported");
+        assert!(
+            ((expected["A"] / expected["B"]) - (code["A"] / code["B"])).abs() > 1e-6,
+            "bridges must exercise more than uniform rescaling"
+        );
+        store.save_pagerank_cache(&explicit).unwrap();
+        store.save_canonical_pagerank_cache(&canonical).unwrap();
+        let fingerprint = super::pagerank_algorithm_fingerprint(0.85, 20, &GraphScope::unified());
+        drop(store);
+        let store = GraphStore::open(&db).unwrap();
+        store
+            .load_pagerank_cache_expecting(&canonical, Some(&fingerprint))
+            .unwrap();
+        let assert_scores = |actual: std::collections::HashMap<String, f64>| {
+            assert_eq!(actual.len(), expected.len());
+            for (uid, score) in &expected {
+                assert!(
+                    (actual[uid] - score).abs() < 1e-9,
+                    "{uid}: {actual:?} vs {expected:?}"
+                );
+            }
+        };
+        assert_scores(store.pagerank_scores().unwrap());
+        store.invalidate_pagerank();
+        assert_scores(store.pagerank_scores().unwrap());
+        let code_fingerprint =
+            super::pagerank_algorithm_fingerprint(0.85, 20, &GraphScope::code_only());
+        store
+            .load_pagerank_cache_expecting(&explicit, Some(&code_fingerprint))
+            .unwrap();
+        assert_eq!(
+            store.pagerank_scores().unwrap(),
+            code,
+            "arbitrary explicit artifacts retain their declared scope"
+        );
     }
 
     #[test]

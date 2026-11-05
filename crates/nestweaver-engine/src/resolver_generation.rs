@@ -380,7 +380,10 @@ use std::path::Path;
 /// 20 — Dart 0.3 and PowerShell 0.26.6 change grammar-derived declarations
 ///      and references. Parsed cache 14 discards old facts; existing graphs
 ///      need a force reindex to publish the updated symbols and edges.
-pub const RESOLVER_GENERATION: u32 = 20;
+/// 21 — PHP static calls carry namespace-qualified class ownership, inheritance
+///      and dispatch facts. Cache 15 reparses these facts; force reindex once
+///      so stored calls no longer retain generic same-name false edges.
+pub const RESOLVER_GENERATION: u32 = 21;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

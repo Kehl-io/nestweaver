@@ -192,10 +192,21 @@ backup with the previous binary before upgrading. To downgrade, reinstall that
 binary and restore the pre-upgrade backup; do not point it at the upgraded file.
 See the [storage upgrade guidance](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
-Resolver generation **20** and parsed cache **14** accompany the Dart 0.3 and
-PowerShell 0.26.6 grammar updates. Force re-index each repository once after
+Resolver generation **21** and parsed cache **15** include PHP static-method
+ownership and inheritance facts alongside the Dart 0.3 and PowerShell 0.26.6
+grammar updates. Force re-index each repository once after
 upgrading to publish the new parser facts; invalidating the parse cache alone
 does not replace symbols and edges already stored in the graph.
+
+Canonical publication PageRank now consistently covers the unified code and
+notes graph after indexing, watching and rebuilding. Older canonical sidecars
+with a code-only scope are disclosed and recomputed lazily on the first ranked
+query; no graph rebuild is required for this ranking migration alone. Explicit
+scoped ranking APIs retain their requested scope.
+
+`daemon status --json` reports both client and daemon resolver generations.
+An older daemon without this provenance reports `null`; differing builds with
+the same product version disclose skew without automatically replacing a writer.
 
 - A database from before LadybugDB 0.21 needs a **publication rebuild**, not
   just a forced index. Back it up and follow the error's recovery command and
