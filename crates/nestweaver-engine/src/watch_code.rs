@@ -160,6 +160,95 @@ fn preparation_relative_path(path: &Path) -> Option<PathBuf> {
     Some(relative)
 }
 
+/// Resolve event identity, including a missing symlink target, without reading
+/// content. Callers must first retain FilesystemReader's containment verdict.
+/// The result never grants read permission or replaces the logical signature.
+fn resolver_config_event_path(
+    root: &Path,
+    logical: &Path,
+) -> anyhow::Result<(PathBuf, HashSet<PathBuf>)> {
+    use std::path::Component;
+    let canonical_root = std::fs::canonicalize(root)?;
+    let normalize = |path: &Path| -> anyhow::Result<PathBuf> {
+        let mut normalized = PathBuf::new();
+        for part in path.components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    anyhow::ensure!(
+                        normalized.pop(),
+                        "config event path escapes filesystem root"
+                    );
+                }
+                _ => normalized.push(part.as_os_str()),
+            }
+        }
+        Ok(normalized)
+    };
+    let mut pending = logical.to_path_buf();
+    let mut event_dependencies = HashSet::new();
+    let mut hops = 0;
+    'resolve: loop {
+        let mut prefix = PathBuf::new();
+        let mut parts = pending.components();
+        while let Some(part) = parts.next() {
+            match part {
+                Component::CurDir => continue,
+                Component::ParentDir => {
+                    // Even when the final file canonicalizes elsewhere, the
+                    // kernel requires this directory to exist before '..'.
+                    if prefix.starts_with(&canonical_root) && prefix != canonical_root {
+                        event_dependencies.insert(prefix.clone());
+                    }
+                    anyhow::ensure!(prefix.pop(), "config event path escapes filesystem root");
+                    continue;
+                }
+                _ => prefix.push(part.as_os_str()),
+            }
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    // Intermediate aliases can retarget without touching the
+                    // final logical name or either physical target.
+                    if prefix.starts_with(&canonical_root) {
+                        event_dependencies.insert(prefix.clone());
+                    }
+                    hops += 1;
+                    anyhow::ensure!(hops <= 40, "config event symlink hop limit exceeded");
+                    let target = std::fs::read_link(&prefix)?;
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        prefix.parent().unwrap_or(Path::new("/")).join(target)
+                    };
+                    pending = target.join(parts.as_path());
+                    continue 'resolve;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // All existing ancestors have been resolved, so the suffix
+                    // is an absent dependency rather than a symlink inode.
+                    let missing = prefix.join(parts.as_path());
+                    let normalized = normalize(&missing)?;
+                    anyhow::ensure!(
+                        normalized.starts_with(&canonical_root),
+                        "config event target escapes watcher root"
+                    );
+                    // Keep the first missing ancestor in the identity. The
+                    // kernel rejects missing/../existing before traversing
+                    // '..'; collapsing it would invent a readable input.
+                    return Ok((missing, event_dependencies));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::ensure!(
+            prefix.starts_with(&canonical_root),
+            "config event target escapes watcher root"
+        );
+        return Ok((prefix, event_dependencies));
+    }
+}
+
 fn readable_signature(signature: &str) -> Option<(&str, &str, u64)> {
     let mut fields = signature.strip_prefix("readable:")?.split(':');
     Some((fields.next()?, fields.next()?, fields.next()?.parse().ok()?))
@@ -2258,11 +2347,12 @@ impl CodeWatcher {
         &self,
         reader: &crate::content_reader::FilesystemReader,
         files: &[PathBuf],
-    ) -> anyhow::Result<HashSet<PathBuf>> {
+    ) -> anyhow::Result<(HashSet<PathBuf>, HashSet<PathBuf>)> {
         #[cfg(test)]
         RESOLVER_PROBE_PASSES.with(|passes| passes.set(passes.get() + 1));
         self.ensure_not_stopping()?;
         let probed = std::cell::RefCell::new(HashSet::new());
+        let event_only = std::cell::RefCell::new(HashSet::new());
         let _ = nestweaver_resolver::discover_workspace_context_with_files(files, |relative| {
             let normalized = preparation_relative_path(relative).ok_or_else(|| {
                 std::io::Error::new(
@@ -2271,11 +2361,22 @@ impl CodeWatcher {
                 )
             })?;
             self.ensure_not_stopping().map_err(std::io::Error::other)?;
-            probed.borrow_mut().insert(self.repo_root.join(normalized));
+            let logical = self.repo_root.join(normalized);
+            probed.borrow_mut().insert(logical.clone());
+            // Preserve the reader's authority, then trace the original path:
+            // canonicalization alone loses symlink and traversal-directory
+            // dependencies. Directory events never become file signatures.
+            reader
+                .contained_path(relative)
+                .map_err(std::io::Error::other)?;
+            let (physical, directories) = resolver_config_event_path(&self.repo_root, &logical)
+                .map_err(std::io::Error::other)?;
+            probed.borrow_mut().insert(physical);
+            event_only.borrow_mut().extend(directories);
             reader.read_file(relative).map_err(std::io::Error::other)
         });
         self.ensure_not_stopping()?;
-        Ok(probed.into_inner())
+        Ok((probed.into_inner(), event_only.into_inner()))
     }
 
     fn event_snapshot_paths(
@@ -2335,7 +2436,7 @@ impl CodeWatcher {
         // including nested Go modules and custom tsconfig extends filenames.
         // This context is discarded: only later hash-bound reads may supply
         // preparation facts. Absent probes are recorded as inputs too.
-        let probed = self.resolver_probe_paths(reader, &listed)?;
+        let (probed, event_only) = self.resolver_probe_paths(reader, &listed)?;
         paths.extend(probed.iter().cloned());
         self.ensure_not_stopping()?;
         paths.sort();
@@ -2365,7 +2466,8 @@ impl CodeWatcher {
                         // contained paths even when the source walk excludes
                         // them (for example node_modules/shared/tsconfig).
                         let observed_path = if probed.contains(path) {
-                            reader.contained_path(relative)?
+                            reader.contained_path(relative)?;
+                            resolver_config_event_path(&self.repo_root, path)?.0
                         } else {
                             path.clone()
                         };
@@ -2447,7 +2549,7 @@ impl CodeWatcher {
                 signatures: inputs,
                 files: listed,
             },
-            probed,
+            probed.union(&event_only).cloned().collect(),
         ))
     }
 
@@ -5801,6 +5903,385 @@ mod tests {
                 "one initial discovery plus final validation; expansion must reuse supplied probes"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_config_symlink_targets_and_retargets_match_full_graph() {
+        use std::os::unix::fs::symlink;
+        for directory_link in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            for name in ["src", "a", "b", "first", "second"] {
+                std::fs::create_dir_all(root.join(name)).unwrap();
+            }
+            let root = std::fs::canonicalize(root).unwrap();
+            std::fs::write(root.join("src/main.ts"), "import { selected } from '@choice/target';\nexport function caller() { return selected(); }\n").unwrap();
+            for name in ["a", "b"] {
+                std::fs::write(
+                    root.join(format!("{name}/target.ts")),
+                    "export function selected() {}\n",
+                )
+                .unwrap();
+            }
+            let config = |name: &str| {
+                format!(r#"{{"compilerOptions":{{"paths":{{"@choice/*":["{name}/*"]}}}}}}"#)
+            };
+            let first = root.join("first/custom.settings");
+            let second = root.join("second/custom.settings");
+            std::fs::write(&first, config("a")).unwrap();
+            std::fs::write(&second, config("a")).unwrap();
+            let link = root.join("logical");
+            let intermediate = root.join("intermediate.settings");
+            let logical_config = if directory_link {
+                symlink(root.join("first"), &intermediate).unwrap();
+                symlink("intermediate.settings", &link).unwrap();
+                link.join("custom.settings")
+            } else {
+                // Resolve the symlink before its following parent component:
+                // bridge/../custom.settings means first/custom.settings.
+                std::fs::create_dir_all(root.join("first/nested")).unwrap();
+                symlink(root.join("first/nested"), root.join("bridge")).unwrap();
+                symlink("bridge/../custom.settings", &intermediate).unwrap();
+                symlink("intermediate.settings", &link).unwrap();
+                link.clone()
+            };
+            let relative_config = logical_config
+                .strip_prefix(&root)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            std::fs::write(
+                root.join("tsconfig.json"),
+                format!(r#"{{"extends":"./{relative_config}"}}"#),
+            )
+            .unwrap();
+            let url = format!("file://{}", root.display());
+            let uid = nestweaver_schema::repo_uid("test", &url);
+            // Start with a dangling file or directory-prefix alias.
+            std::fs::remove_file(&first).unwrap();
+            if directory_link {
+                std::fs::remove_dir(root.join("first")).unwrap();
+            }
+            let (_, store) =
+                crate::index::index_directory_in_memory(&root, "test", &url, "sha").unwrap();
+            let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), &root, "test");
+            let caller = nestweaver_schema::symbol_uid(&uid, "src/main.ts", "caller", 2);
+            let assert_oracle = |phase: &str, selected: Option<&str>| {
+                let actual: Vec<_> = store
+                    .callees_of(&caller)
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.file_path)
+                    .collect();
+                assert_eq!(
+                    actual,
+                    selected
+                        .into_iter()
+                        .map(|name| format!("{name}/target.ts"))
+                        .collect::<Vec<_>>(),
+                    "{phase}, directory_link={directory_link}"
+                );
+                let (_, full) =
+                    crate::index::index_directory_in_memory(&root, "test", &url, "sha").unwrap();
+                let edges = |graph: &GraphStore| {
+                    let mut rows: Vec<_> = graph
+                        .load_typed_edges()
+                        .unwrap()
+                        .into_iter()
+                        .map(|row| format!("{row:?}"))
+                        .collect();
+                    rows.sort();
+                    rows
+                };
+                assert_eq!(
+                    edges(&store),
+                    edges(&full),
+                    "{phase}: exact typed property/multiplicity parity, directory_link={directory_link}"
+                );
+            };
+            let apply = |phase: &str, event: &Path, selected: Option<&str>| {
+                assert!(
+                    matches!(
+                        process_fixture_batch(
+                            &watcher,
+                            &store,
+                            &uid,
+                            &root,
+                            &[event.to_path_buf()]
+                        ),
+                        WatchBatchOutcome::Published { .. }
+                    ),
+                    "{phase}: physical or logical config event must publish"
+                );
+                assert_oracle(phase, selected);
+            };
+            let reader = crate::content_reader::FilesystemReader::new(&root);
+            let probes = watcher
+                .resolver_probe_paths(&reader, &reader.list_files().unwrap())
+                .unwrap()
+                .0;
+            assert!(probes.contains(&logical_config));
+            assert!(probes.contains(&first));
+            assert_eq!(
+                resolver_config_event_path(&root, &logical_config)
+                    .unwrap()
+                    .0,
+                first
+            );
+            assert_oracle("initial dangling alias", None);
+            std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+            std::fs::write(&first, config("a")).unwrap();
+            apply("absent physical target created", &first, Some("a"));
+            // This write follows the logical symlink, but notify names its
+            // physical target (including a symlinked parent directory).
+            std::fs::write(&logical_config, config("b")).unwrap();
+            apply("physical target edited", &first, Some("b"));
+            std::fs::remove_file(&first).unwrap();
+            apply("physical target deleted", &first, None);
+            std::fs::write(&first, config("b")).unwrap();
+            apply("physical target recreated", &first, Some("b"));
+            if directory_link {
+                std::fs::remove_dir_all(root.join("first")).unwrap();
+                apply("physical ancestor deleted", &root.join("first"), None);
+                std::fs::create_dir_all(root.join("first")).unwrap();
+                std::fs::write(&first, config("b")).unwrap();
+                apply(
+                    "physical ancestor recreated",
+                    &root.join("first"),
+                    Some("b"),
+                );
+            }
+            std::fs::remove_file(&intermediate).unwrap();
+            symlink(
+                if directory_link {
+                    root.join("second")
+                } else {
+                    second.clone()
+                },
+                &intermediate,
+            )
+            .unwrap();
+            apply("intermediate symlink retargeted", &intermediate, Some("a"));
+            let probes = watcher
+                .resolver_probe_paths(&reader, &reader.list_files().unwrap())
+                .unwrap()
+                .0;
+            assert!(probes.contains(&logical_config));
+            assert!(probes.contains(&second));
+            assert!(
+                !probes.contains(&first),
+                "old physical config is no longer consumed"
+            );
+            std::fs::write(&first, config("a")).unwrap();
+            let generation = store.graph_generation();
+            assert!(matches!(
+                process_fixture_batch(&watcher, &store, &uid, &root, &[first]),
+                WatchBatchOutcome::Unchanged
+            ));
+            assert_eq!(
+                store.graph_generation(),
+                generation,
+                "unused old target must not publish"
+            );
+            assert_oracle("unused old target ignored", Some("a"));
+            std::fs::write(&logical_config, config("b")).unwrap();
+            apply("new physical target edited", &second, Some("b"));
+            std::fs::remove_file(&link).unwrap();
+            symlink(
+                if directory_link {
+                    root.join("first")
+                } else {
+                    root.join("first/custom.settings")
+                },
+                &link,
+            )
+            .unwrap();
+            apply("logical symlink retargeted", &link, Some("a"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_config_missing_ancestor_parent_component_stays_absent() {
+        use std::os::unix::fs::symlink;
+        for gate in ["missing", "missing.ts"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            std::fs::create_dir_all(root.join("a")).unwrap();
+            std::fs::write(root.join("a/target.ts"), "export function selected() {}\n").unwrap();
+            std::fs::write(root.join("main.ts"), "import { selected } from '@choice/target';\nexport function caller() { selected(); }\n").unwrap();
+            std::fs::write(
+                root.join("actual.settings"),
+                r#"{"compilerOptions":{"paths":{"@choice/*":["a/*"]}}}"#,
+            )
+            .unwrap();
+            let logical = root.join("custom.settings");
+            symlink(format!("{gate}/../actual.settings"), &logical).unwrap();
+            std::fs::write(
+                root.join("tsconfig.json"),
+                r#"{"extends":"./custom.settings"}"#,
+            )
+            .unwrap();
+            let watcher = CodeWatcher::new(root.join("watch.lbug"), &root, "test");
+            let reader = crate::content_reader::FilesystemReader::new(&root);
+            let physical = resolver_config_event_path(&root, &logical).unwrap().0;
+            assert_eq!(physical, root.join(format!("{gate}/../actual.settings")));
+            assert!(
+                physical.starts_with(root.join(gate)),
+                "creation of first missing ancestor must deliver a config event"
+            );
+            let snapshot = watcher.batch_input_snapshot(&reader, &[]).unwrap();
+            assert_eq!(snapshot.signatures[&logical], "absent");
+            assert_eq!(snapshot.signatures[&physical], "absent");
+            let prepared = PreparationReader {
+                inner: &reader,
+                signatures: &snapshot,
+                invalidated: AtomicBool::new(false),
+            };
+            assert!(
+                prepared
+                    .read_optional_file(Path::new("custom.settings"))
+                    .unwrap()
+                    .is_none()
+            );
+            prepared.ensure_valid().unwrap();
+            let url = format!("file://{}", root.display());
+            let uid = nestweaver_schema::repo_uid("test", &url);
+            let (_, store) =
+                crate::index::index_directory_in_memory(&root, "test", &url, "sha").unwrap();
+            let caller = nestweaver_schema::symbol_uid(&uid, "main.ts", "caller", 2);
+            let assert_oracle = |phase: &str, selected: bool| {
+                let actual: Vec<_> = store
+                    .callees_of(&caller)
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.file_path)
+                    .collect();
+                assert_eq!(
+                    actual,
+                    if selected {
+                        vec!["a/target.ts".to_owned()]
+                    } else {
+                        vec![]
+                    },
+                    "{phase}: kernel path traversal controls optional config availability"
+                );
+                let (_, full) =
+                    crate::index::index_directory_in_memory(&root, "test", &url, "sha").unwrap();
+                let edges = |graph: &GraphStore| {
+                    let mut rows: Vec<_> = graph
+                        .load_typed_edges()
+                        .unwrap()
+                        .into_iter()
+                        .map(|row| format!("{row:?}"))
+                        .collect();
+                    rows.sort();
+                    rows
+                };
+                assert_eq!(
+                    edges(&store),
+                    edges(&full),
+                    "{phase}: exact typed graph/property/multiplicity parity"
+                );
+            };
+            assert_oracle("missing traversal directory", false);
+            let missing = root.join(gate);
+            std::fs::create_dir(&missing).unwrap();
+            let (snapshot, events) = watcher
+                .batch_input_snapshot_with_probes(&reader, &[])
+                .unwrap();
+            assert!(
+                events.contains(&missing),
+                "retain existing traversal directory for future removal events"
+            );
+            assert!(
+                !snapshot.signatures.contains_key(&missing),
+                "event-only directories, including .ts names, are never file signatures/parser inputs"
+            );
+            assert!(matches!(
+                process_fixture_batch(
+                    &watcher,
+                    &store,
+                    &uid,
+                    &root,
+                    std::slice::from_ref(&missing)
+                ),
+                WatchBatchOutcome::Published { .. }
+            ));
+            assert_oracle("traversal directory created", true);
+            std::fs::remove_dir(&missing).unwrap();
+            assert!(matches!(
+                process_fixture_batch(&watcher, &store, &uid, &root, &[missing]),
+                WatchBatchOutcome::Published { .. }
+            ));
+            assert_oracle("traversal directory removed", false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_config_symlink_outside_root_never_admits_external_probe() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let external = dir.path().join("external.settings");
+        std::fs::write(
+            &external,
+            r#"{"compilerOptions":{"paths":{"@choice/*":["secret/*"]}}}"#,
+        )
+        .unwrap();
+        let logical = root.join("custom.settings");
+        symlink(&external, &logical).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"extends":"./custom.settings"}"#,
+        )
+        .unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), &root, "test");
+        let reader = crate::content_reader::FilesystemReader::new(&root);
+        let probes = watcher
+            .resolver_probe_paths(&reader, &reader.list_files().unwrap())
+            .unwrap()
+            .0;
+        assert!(
+            probes.contains(&logical),
+            "retain logical input so the containment failure poisons preparation"
+        );
+        assert!(!probes.contains(&external));
+        assert!(probes.iter().all(|path| path.starts_with(&root)));
+        assert!(reader.contained_path(Path::new("custom.settings")).is_err());
+        assert!(
+            watcher.batch_input_snapshot(&reader, &[]).is_err(),
+            "external config must not become authoritative or a deletion"
+        );
+        // The original reader permits missing paths; event identity must still
+        // refuse a dangling target outside the root, never subscribe to it.
+        std::fs::remove_file(&external).unwrap();
+        let probes = watcher
+            .resolver_probe_paths(&reader, &reader.list_files().unwrap())
+            .unwrap()
+            .0;
+        assert!(!probes.contains(&external));
+        assert!(probes.iter().all(|path| path.starts_with(&root)));
+        assert!(watcher.batch_input_snapshot(&reader, &[]).is_err());
+        std::fs::remove_file(&logical).unwrap();
+        symlink("custom.settings", &logical).unwrap();
+        assert!(
+            reader.contained_path(Path::new("custom.settings")).is_err(),
+            "preserve original cycle refusal"
+        );
+        assert!(
+            resolver_config_event_path(&root, &logical).is_err(),
+            "event-only helper is independently hop-bounded"
+        );
+        let snapshot = watcher.batch_input_snapshot(&reader, &[]).unwrap();
+        assert!(
+            snapshot.signatures[&logical].starts_with("inaccessible:"),
+            "preserve the existing reader error observation, never absent or readable"
+        );
     }
 
     #[cfg(unix)]
