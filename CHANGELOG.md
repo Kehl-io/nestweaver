@@ -1,5 +1,46 @@
 # Changelog
 
+## [12.2.5](https://github.com/Kehl-io/nestweaver/compare/v12.2.4...v12.2.5) (2026-11-06)
+
+
+### Bug Fixes
+
+* **auth:** accept the Bearer scheme case-insensitively ([8658553](https://github.com/Kehl-io/nestweaver/commit/8658553a16dbe8010f14eb887e2db1722dd6c6dc))
+* **build:** align LadybugDB source pin with 0.22.1 ([e33884b](https://github.com/Kehl-io/nestweaver/commit/e33884b9998105273545c9128c1f3769c9c5eb83))
+* **ci:** select OpenSSL 3 for native macOS builds ([3fad8aa](https://github.com/Kehl-io/nestweaver/commit/3fad8aa21bc0c7d728a373a05f241c881d44d500))
+* **cli:** enter runtime before upstream status probes ([92630b9](https://github.com/Kehl-io/nestweaver/commit/92630b964cb720ef693d6ae2d8f7d7d2a38f7649))
+* **client:** preserve live diagnostics during indexing ([2dd2eaa](https://github.com/Kehl-io/nestweaver/commit/2dd2eaa2d76cb10c4d3f687f5cb5e462f04cff57))
+* close indexing and discovery regression gaps ([f7abf1a](https://github.com/Kehl-io/nestweaver/commit/f7abf1ac8b9291ba76f716f7ca27c195eabb1da2))
+* **daemon:** find system-unit sockets across runtime candidates ([644e35d](https://github.com/Kehl-io/nestweaver/commit/644e35d8a1879f03aa90536ea2f2ced9bb43a90b))
+* **daemon:** harden network binding, MCP limits, device flow, restore and socket paths ([86984bf](https://github.com/Kehl-io/nestweaver/commit/86984bfcf9b9dbc78d8f84d1a12d258e92efc8ad))
+* **daemon:** make admin repo removal, config persistence, reload and webhooks correct ([07babc3](https://github.com/Kehl-io/nestweaver/commit/07babc384ac30d0dc0343a14b671295a24c01955))
+* **daemon:** make indexing worker, scheduler and shutdown drain robust ([5b8d071](https://github.com/Kehl-io/nestweaver/commit/5b8d0712286d56a70bb9153669ff30c3066a6cd5))
+* **daemon:** probe exact branch refs and recover a poisoned reaper queue ([ad2d0d1](https://github.com/Kehl-io/nestweaver/commit/ad2d0d13edb9990cb4354c427d080d1d9fb433a8))
+* **deps:** adapt grammar queries and engine compatibility coverage ([87614ad](https://github.com/Kehl-io/nestweaver/commit/87614adbd4283bf599ca26b8056f66c5143986bb))
+* **deps:** patch cmark and zip security advisories ([4f8ec4c](https://github.com/Kehl-io/nestweaver/commit/4f8ec4cadba270e47a3defda7e30ddd270708d9f))
+* **deps:** preserve checkpoint diagnostics and align the lbug ABI guard ([6497770](https://github.com/Kehl-io/nestweaver/commit/6497770dccd69ec04d3f6e2fcb6cc51007742e9d))
+* **engine:** bound full-refresh rescans and validate credential method ([178f5c4](https://github.com/Kehl-io/nestweaver/commit/178f5c402b53a468413837667aeea46f1663a37c))
+* **engine:** close SSRF gaps, honor git credentials and clone root, poll concurrently ([1e0c100](https://github.com/Kehl-io/nestweaver/commit/1e0c10039a9b3ded8f907e83116308d6738b938c))
+* **engine:** give the guide render skeleton a loadable credential method ([8723d7a](https://github.com/Kehl-io/nestweaver/commit/8723d7a862fc72cacc17c7ec8d9abe9c0f9f0529))
+* **engine:** key schedule dedupe on repo id and canonical url and keep overrides ([bcd457d](https://github.com/Kehl-io/nestweaver/commit/bcd457d749519ed40b4ac5455ca7b24922bb4c17))
+* **engine:** make server-mode bare-clone indexing match a local index ([2d56853](https://github.com/Kehl-io/nestweaver/commit/2d56853721ca70ba31b0b95868f58f6dd64d1509))
+* **engine:** reconcile resolver inputs on watcher restart ([5af1b9e](https://github.com/Kehl-io/nestweaver/commit/5af1b9e7d2ba7e216034c1985c8bb9a165f53940))
+* **engine:** track contained resolver config alias events ([8a14740](https://github.com/Kehl-io/nestweaver/commit/8a147408c4995a5437d1e44ab5548b029ee5dcc9))
+* **engine:** update an existing poll schedule row instead of stacking duplicates ([1b91cd3](https://github.com/Kehl-io/nestweaver/commit/1b91cd3154854f8b051e5877108a1344f8316859))
+* **federation:** harden upstream routing, health, TLS trust and discovery ([a50fe46](https://github.com/Kehl-io/nestweaver/commit/a50fe464aa79855ef62e3d6a4537ca65b2158f4d))
+* **federation:** merge federated results by canonical identity, never by title ([83bf670](https://github.com/Kehl-io/nestweaver/commit/83bf670f2c47b5879ceacb7658278b2681c70370))
+* **git:** preserve guarded credentials for lazy blob reads ([e77e493](https://github.com/Kehl-io/nestweaver/commit/e77e493b0085e5951282cf7abc461e2c01dc9bd8))
+* harden indexing, routed reads and session ownership ([754b436](https://github.com/Kehl-io/nestweaver/commit/754b436eb31a42e89f2b2c09823a019c37c95f13))
+* **index:** distinguish frontmatter document identities ([ff4429f](https://github.com/Kehl-io/nestweaver/commit/ff4429f391a923cb06588b758977660eccfa83e4))
+* preserve peer mode and validate vault status summaries ([da697e9](https://github.com/Kehl-io/nestweaver/commit/da697e9b80f73d440f88c4713fe7a84ba781d831))
+* protect web note reads and normalize search and MCP results ([96c357d](https://github.com/Kehl-io/nestweaver/commit/96c357de6e495cfeebd345c186c796c509025154))
+* **server:** complete server-mode hardening and replica reads ([73acbbb](https://github.com/Kehl-io/nestweaver/commit/73acbbb517d6f8810094862a3677c9958fd5c7d2))
+* **server:** harden indexing, federation, and replica reads ([62973bf](https://github.com/Kehl-io/nestweaver/commit/62973bf49ad285bd36001588d2573f6e50f00a89))
+* tighten search limits and clarify CLI and web results ([0560315](https://github.com/Kehl-io/nestweaver/commit/0560315b8070fb090bec1e82d91a08181d3c63d9))
+* **web:** preserve indexed notes, search truncation and keyboard actions ([806c13c](https://github.com/Kehl-io/nestweaver/commit/806c13c4c357519af89cba510d97f885579e4747))
+* **web:** recover a poisoned job queue and harden admin auth parsing ([c874a06](https://github.com/Kehl-io/nestweaver/commit/c874a063f9145018d20971789f353edf96d065d6))
+* **web:** recover a poisoned job queue and report unqueued repos on reload ([2f9ad95](https://github.com/Kehl-io/nestweaver/commit/2f9ad9551661bd0bfae70a6ecc3a302a37d482c8))
+
 ## [12.2.4](https://github.com/Kehl-io/nestweaver/compare/v12.2.3...v12.2.4) (2026-10-28)
 
 
