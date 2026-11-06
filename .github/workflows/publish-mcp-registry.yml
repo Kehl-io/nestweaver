@@ -1,0 +1,119 @@
+name: Publish MCP Registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact published stable version (X.Y.Z)
+        required: true
+        type: string
+      release_sha:
+        description: Full 40-character commit SHA of the published release tag
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: mcp-registry-publish
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate immutable registry release
+    if: github.repository == 'Kehl-io/nestweaver' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.workflow_ref == 'Kehl-io/nestweaver/.github/workflows/publish-mcp-registry.yml@refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      manifest_sha256: ${{ steps.release.outputs.manifest_sha256 }}
+      should_publish: ${{ steps.release.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate public release and immutable npm ownership
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          python3 scripts/prepare-mcp-registry-release.py \
+            --version "$RELEASE_VERSION" --expected-sha "$RELEASE_SHA" \
+            --output "$RUNNER_TEMP/mcp-release" --github-output "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish approved registry release with OIDC
+    needs: prepare
+    if: needs.prepare.outputs.should_publish == 'true' && github.repository == 'Kehl-io/nestweaver' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.workflow_ref == 'Kehl-io/nestweaver/.github/workflows/publish-mcp-registry.yml@refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # Only this job may request the short-lived registry identity.
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+    steps:
+      # Execute only reviewed main-branch preparation code, never release code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set private publisher paths
+        run: |
+          printf 'MCP_SESSION_HOME=%s/mcp-registry-home\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MCP_PUBLISHER=%s/mcp-publisher/mcp-publisher\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Revalidate exact release before requesting identity
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST_SHA256: ${{ needs.prepare.outputs.manifest_sha256 }}
+        run: |
+          python3 scripts/prepare-mcp-registry-release.py \
+            --version "$RELEASE_VERSION" --expected-sha "$RELEASE_SHA" \
+            --output "$RUNNER_TEMP/mcp-release" --github-output "$GITHUB_OUTPUT" \
+            --expected-manifest-sha256 "$MANIFEST_SHA256"
+      - name: Install checksum-pinned official publisher
+        if: steps.release.outputs.should_publish == 'true'
+        run: |
+          set -euo pipefail
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          mkdir -p "$(dirname "$MCP_PUBLISHER")"
+          archive="$RUNNER_TEMP/mcp-publisher.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 3 --output "$archive" \
+            https://github.com/modelcontextprotocol/registry/releases/download/v1.8.6/mcp-publisher_linux_amd64.tar.gz
+          printf '%s  %s\n' 1fbe93fc0783c2394d8012c8d6e50a59e98cb2cc2d216264cc69f405d0e21340 "$archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$(dirname "$MCP_PUBLISHER")" mcp-publisher
+      - name: Validate manifest with official registry
+        if: steps.release.outputs.should_publish == 'true'
+        run: '"$MCP_PUBLISHER" validate "$RUNNER_TEMP/mcp-release/server.json"'
+      - name: Authenticate with approved repository OIDC identity
+        if: steps.release.outputs.should_publish == 'true'
+        run: |
+          mkdir -p "$MCP_SESSION_HOME"
+          chmod 700 "$MCP_SESSION_HOME"
+          HOME="$MCP_SESSION_HOME" "$MCP_PUBLISHER" login github-oidc --registry https://registry.modelcontextprotocol.io
+      - name: Publish exact validated release manifest
+        if: steps.release.outputs.should_publish == 'true'
+        run: 'HOME="$MCP_SESSION_HOME" "$MCP_PUBLISHER" publish "$RUNNER_TEMP/mcp-release/server.json"'
+      - name: Verify exact public version and latest entry
+        run: |
+          python3 scripts/prepare-mcp-registry-release.py \
+            --version "$RELEASE_VERSION" --expected-sha "$RELEASE_SHA" \
+            --output "$RUNNER_TEMP/mcp-release" --verify-published
+      - name: Remove temporary registry session
+        if: always()
+        run: |
+          if [ -x "$MCP_PUBLISHER" ]; then
+            HOME="$MCP_SESSION_HOME" "$MCP_PUBLISHER" logout || true
+          fi
+          case "$MCP_SESSION_HOME" in
+            "$RUNNER_TEMP/mcp-registry-home") rm -rf -- "$MCP_SESSION_HOME" ;;
+            *) exit 1 ;;
+          esac
