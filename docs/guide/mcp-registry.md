@@ -66,8 +66,8 @@ replace schema validation or the registry's online ownership check.
 
 This preparation does not create a listing or publish an npm release.
 `12.2.3` was already published without `mcpName`; its immutable npm artifact
-cannot satisfy ownership verification. Release 12.2.4 includes `mcpName` and a matching manifest; verify the immutable
-public package before submitting it. Publishing the CLI/npm release does not
+cannot satisfy ownership verification. Releases 12.2.4 and 12.2.5 include `mcpName` and matching manifests; verify the
+exact immutable public package before submitting it. Publishing the CLI/npm release does not
 register an MCP listing. Do not overwrite or attempt to republish `12.2.3`.
 
 1. Review and merge this preparation through normal repository controls. Obtain
