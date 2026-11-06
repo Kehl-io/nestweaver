@@ -72,8 +72,10 @@ test.describe("Search Flow", () => {
       const row = dropdown.getByRole("option").filter({ hasText: file });
       await expect(row.getByRole("img", { name: "Note", exact: true })).toBeVisible();
       await expect(row).toContainText(rows[0].score.toFixed(2));
-      await row.getByRole("button", { name: "Detail", exact: true }).click();
+      await row.getByRole("button", { name: "Detail", exact: true }).press("Space");
       await expect(page.getByRole("complementary", { name: "Source and note evidence" })).toContainText(body);
+      await expect(input).toHaveValue("title:*");
+      await expect(dropdown).toBeHidden();
       await input.fill("greet");
       await expect(dropdown.getByRole("option").filter({ hasText: "greet" }).first()).toBeVisible();
       expect(errors).toEqual([]);
@@ -473,6 +475,44 @@ test("Detail preserves scene identities, lens and representation while Explore a
   await expect(results).toBeVisible();
   await expect.poll(async () => (await read()).active_lens.lens).toBe("search");
   await expect.poll(async () => (await read()).graph.nodes.some((n: { label: string }) => n.label === "releaseA")).toBe(true);
+});
+
+test("focused search buttons own keyboard activation and a focused row still explores", async ({ page }) => {
+  await page.goto("/?representation=json");
+  const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+  const read = async () => JSON.parse((await json.textContent()) ?? "{}");
+  await expect.poll(async () => (await read()).graph.nodes.length).toBeGreaterThan(0);
+  const before = await read();
+  const input = page.getByTestId("search-input");
+  const results = page.getByRole("listbox", { name: "Search results" });
+  const option = results.getByRole("option").filter({ hasText: "releaseA" }).first();
+  const seeds = () => new URL(page.url()).searchParams.get("seeds")?.split(",") ?? [];
+  await input.fill("releaseA");
+
+  await option.getByRole("button", { name: "Detail", exact: true }).press("Enter");
+  await expect(results).toBeHidden();
+  await expect(input).toHaveValue("releaseA");
+  await expect(page.getByRole("complementary", { name: "Source and note evidence" })).toContainText("releaseA");
+  expect((await read()).active_lens).toEqual(before.active_lens);
+
+  await input.focus();
+  const addedUid = (await option.getAttribute("id"))!.replace(/^search-option-/, "");
+  expect(seeds()).not.toContain(addedUid);
+  await option.getByRole("button", { name: "Add", exact: true }).press("Space");
+  await expect(results).toBeVisible();
+  await expect(input).toHaveValue("releaseA");
+  await expect.poll(seeds).toContain(addedUid);
+
+  await input.fill("releaseB");
+  const nextOption = results.getByRole("option").filter({ hasText: "releaseB" }).first();
+  const exploredUid = (await nextOption.getAttribute("id"))!.replace(/^search-option-/, "");
+  await nextOption.press("Shift+Enter");
+  await expect(results).toBeVisible();
+  await expect(input).toHaveValue("releaseB");
+  await nextOption.press("Enter");
+  await expect(results).toBeHidden();
+  await expect(input).toHaveValue("");
+  await expect.poll(seeds).toEqual([exploredUid]);
 });
 
 test("committed refresh updates held evidence and search without reopening a dismissed dropdown", async ({ page }) => {

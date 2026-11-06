@@ -30,6 +30,31 @@ fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
     idx
 }
 
+fn mention_snippet<'a>(content: &'a str, title_lower: &str) -> Option<&'a str> {
+    // Match with str's contextual lowercasing (e.g. Greek final sigma).
+    // Its only context-sensitive mapping changes the sigma, not its width,
+    // so each source char's lowercase byte width still maps the match back.
+    let lower_start = content.to_lowercase().find(title_lower)?;
+    let lower_end = lower_start + title_lower.len();
+    let mut lower_offset = 0;
+    let mut original_start = None;
+    for (offset, ch) in content.char_indices() {
+        lower_offset += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+        if lower_offset > lower_start {
+            let start = *original_start.get_or_insert(offset);
+            if lower_offset >= lower_end {
+                // A match can cover part of an expanded lowercase char.
+                // Include the whole original char, then add context.
+                let end = offset + ch.len_utf8();
+                let start = floor_char_boundary(content, start.saturating_sub(50));
+                let end = ceil_char_boundary(content, end.saturating_add(50));
+                return Some(&content[start..end]);
+            }
+        }
+    }
+    None
+}
+
 pub async fn brain_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let vault_count = state.store.list_vaults(None)?.len();
     let note_count = state.store.count_notes()?;
@@ -419,19 +444,12 @@ pub async fn unlinked_mentions(
             continue;
         };
 
-        let content_lower = content.to_lowercase();
-        if let Some(pos) = content_lower.find(&title_lower) {
-            let start = pos.saturating_sub(50);
-            let end = (pos + title.len() + 50).min(content.len());
-            let start = floor_char_boundary(&content, start);
-            let end = ceil_char_boundary(&content, end);
-            let snippet = content[start..end].to_string();
-
+        if let Some(snippet) = mention_snippet(&content, &title_lower) {
             mentions.push(UnlinkedMention {
                 note_uid: candidate.uid.clone(),
                 title: candidate.title.clone(),
                 path: candidate.file_path.clone(),
-                snippet,
+                snippet: snippet.to_string(),
             });
         }
     }
@@ -454,7 +472,7 @@ pub async fn brain_search(
 ) -> Result<Response, ApiError> {
     let state2 = state.clone();
     let query = params.clone();
-    let response =
+    let (response, local_truncated) =
         crate::rank_events::with_rank_event(&state, move || brain_search_response(&state2, params))
             .await?;
     let Some(fed) = state.federation.get().filter(|f| f.is_configured()) else {
@@ -472,11 +490,12 @@ pub async fn brain_search(
     let local: serde_json::Value = serde_json::from_slice(&bytes)?;
     let limit = query.limit.unwrap_or(20).clamp(1, 500);
     let result = fed
-        .search(
+        .search_with_local_truncation(
             "brain_search",
             &json!({"query":query.q.unwrap_or_default(),"limit":limit}),
             local,
             limit,
+            local_truncated,
         )
         .await;
     Ok(Json(result).into_response())
@@ -485,7 +504,7 @@ pub async fn brain_search(
 fn brain_search_response(
     state: &Arc<AppState>,
     params: BrainSearchParams,
-) -> Result<Response, ApiError> {
+) -> Result<(Response, bool), ApiError> {
     let q = params.q.unwrap_or_default();
     if q.is_empty() {
         return Err(ApiError::bad_request("query parameter 'q' is required"));
@@ -505,11 +524,11 @@ fn brain_search_response(
             search.results.len(),
             search.total_count,
         );
-        return Ok(Json(json!({
-            "results": search.results,
-            "_meta": meta,
-        }))
-        .into_response());
+        let local_truncated = search.total_count.is_some_and(|n| n > search.results.len());
+        return Ok((
+            Json(json!({"results": search.results, "_meta": meta})).into_response(),
+            local_truncated,
+        ));
     }
 
     // Use tantivy if available, otherwise fall back to lookup_notes_by_title
@@ -518,7 +537,7 @@ fn brain_search_response(
             Ok(hits) => {
                 let hits = retain_graph_backed_search_hits(&state.store, hits);
                 let json = serde_json::to_value(&hits)?;
-                return Ok(Json(json).into_response());
+                return Ok((Json(json).into_response(), false));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "tantivy search failed, falling back to title lookup");
@@ -526,14 +545,16 @@ fn brain_search_response(
         }
     }
 
-    let hits: Vec<_> = state
-        .store
-        .lookup_notes_by_title(&q)?
+    let notes = state.store.lookup_notes_by_title(&q)?;
+    let local_truncated = notes.len() > limit;
+    let hits: Vec<_> = notes
         .into_iter()
         .take(limit)
         .map(workspaces::note_search_hit)
         .collect();
-    Ok(Json(hits).into_response())
+    // Standalone search keeps its bare array. Federation needs the clipping
+    // bit separately, since its final cap cannot see the rows omitted here.
+    Ok((Json(hits).into_response(), local_truncated))
 }
 
 struct ScopedBrainSearch {
@@ -947,7 +968,7 @@ mod tests {
             }
             let state = AppState::new(store, index, temp.path().join("graph.lbug"));
             let search = |q: &str, limit, workspace: Option<&str>| {
-                let response = brain_search_response(
+                let (response, _) = brain_search_response(
                     &state,
                     BrainSearchParams {
                         q: Some(q.into()),

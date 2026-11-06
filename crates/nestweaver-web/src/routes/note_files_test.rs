@@ -63,6 +63,16 @@ async fn note_detail_and_mentions_use_the_same_indexed_vault_boundary() {
     fs::create_dir(&other).unwrap();
     fs::write(vault.join("target.md"), "Résumé\n").unwrap();
     fs::write(vault.join("dupe..name.md"), "A mention of Résumé.\n").unwrap();
+    fs::write(
+        vault.join(Path::new("\\literal.md")),
+        "Another mention of Résumé.\n",
+    )
+    .unwrap();
+    fs::write(
+        vault.join("unicode.md"),
+        format!("{} Résumé.\n", "Ⱥ".repeat(120)),
+    )
+    .unwrap();
     fs::write(vault.join("empty.md"), "").unwrap();
     fs::write(vault.join("binary.md"), [0xff]).unwrap();
     fs::write(vault.join("leaf.md"), "Indexed leaf.\n").unwrap();
@@ -77,6 +87,8 @@ async fn note_detail_and_mentions_use_the_same_indexed_vault_boundary() {
     for (id, path, title) in [
         ("target", "target.md", "Résumé"),
         ("dots", "dupe..name.md", "Dotted"),
+        ("backslash", "\\literal.md", "Literal backslash"),
+        ("unicode", "unicode.md", "Unicode prefix"),
         ("empty", "empty.md", "Empty"),
         ("invalid-utf8", "binary.md", "Binary"),
         ("missing", "missing.md", "Missing"),
@@ -105,6 +117,7 @@ async fn note_detail_and_mentions_use_the_same_indexed_vault_boundary() {
     for (id, expected_body) in [
         ("target", "Résumé\n"),
         ("dots", "A mention of Résumé.\n"),
+        ("backslash", "Another mention of Résumé.\n"),
         ("empty", ""),
         ("invalid-utf8", ""),
         ("missing", ""),
@@ -126,10 +139,36 @@ async fn note_detail_and_mentions_use_the_same_indexed_vault_boundary() {
     let (status, alias) = get(&app, "/api/v1/symbol/note:leaf").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(alias["body"], "");
+    let (status, alias) = get(&app, "/api/v1/symbol/note:backslash").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(alias["body"], "Another mention of Résumé.\n");
+    let (status, source) = get(&app, "/api/v1/source?file=%5Cliteral.md").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(source["error"], "invalid_file_path");
     let (status, mentions) = get(&app, "/api/v1/brain/unlinked-mentions/note:target").await;
     assert_eq!(status, StatusCode::OK);
     let mentions = mentions.as_array().unwrap();
-    assert_eq!(mentions.len(), 1, "{mentions:?}");
-    assert_eq!(mentions[0]["note_uid"], "note:dots");
-    assert_eq!(mentions[0]["snippet"], "A mention of Résumé.\n");
+    assert_eq!(mentions.len(), 3, "{mentions:?}");
+    for (id, expected) in [
+        ("note:dots", "A mention of Résumé.\n".to_owned()),
+        ("note:backslash", "Another mention of Résumé.\n".to_owned()),
+        ("note:unicode", format!("{} Résumé.\n", "Ⱥ".repeat(25))),
+    ] {
+        let mention = mentions.iter().find(|m| m["note_uid"] == id).unwrap();
+        assert_eq!(mention["snippet"], expected, "{id}");
+    }
+}
+
+#[test]
+fn mention_mapping_preserves_contextual_lowercasing_and_whole_original_chars() {
+    assert_eq!(
+        super::mention_snippet("prefix ΟΣ. suffix", "ος"),
+        Some("prefix ΟΣ. suffix")
+    );
+    assert_eq!(super::mention_snippet("prefix ΟΣ. suffix", "οσ"), None);
+
+    // The match covers only the first scalar of İ's lowercase expansion.
+    let content = format!("{}İ{}", ".".repeat(60), ".".repeat(60));
+    let snippet = super::mention_snippet(&content, "i").unwrap();
+    assert_eq!(snippet, &content[10..112]);
 }

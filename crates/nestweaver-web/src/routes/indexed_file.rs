@@ -9,7 +9,6 @@ impl<'a> IndexedFilePath<'a> {
     pub(super) fn new(path: &'a str) -> Option<Self> {
         let relative = Path::new(path);
         if path.is_empty()
-            || path.starts_with('\\')
             || path.contains('\0')
             || !relative
                 .components()
@@ -96,12 +95,18 @@ mod tests {
             "../note.md",
             "sub/../note.md",
             "/note.md",
-            "\\note.md",
             "a\0.md",
         ] {
             assert!(IndexedFilePath::new(path).is_none(), "{path:?}");
         }
-        for path in ["dupe..name.md", "sub/.hidden.md", "Étage/note.md"] {
+        // Backslash is a literal filename character on Unix. The public
+        // source route still applies its separate request grammar.
+        for path in [
+            "dupe..name.md",
+            "sub/.hidden.md",
+            "Étage/note.md",
+            "\\note.md",
+        ] {
             assert!(IndexedFilePath::new(path).is_some(), "{path:?}");
         }
     }

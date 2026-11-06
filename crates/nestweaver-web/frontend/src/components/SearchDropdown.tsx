@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, type KeyboardEvent } from "react";
 import { useStore } from "../stores";
 import { loadGapItems } from "../api/client";
 import {
@@ -144,6 +144,16 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
     });
   }
 
+  function activateFocusedOption(event: KeyboardEvent<HTMLDivElement>, uid: string, kind: string) {
+    // Nested buttons own their keyboard activation, just like pointer clicks.
+    if (event.target !== event.currentTarget || event.defaultPrevented || event.nativeEvent.isComposing
+      || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onSelect(uid, kind);
+    }
+  }
+
   function askFromSearch() {
     if (!askText) return;
     setLlmQuery(askText);
@@ -271,7 +281,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               tabIndex={0}
               aria-selected={activeDescendant === `search-option-${s.uid}`}
               onClick={() => onSelect(s.uid, s.kind)}
-              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(s.uid, s.kind); } }}
+              onKeyDown={(event) => activateFocusedOption(event, s.uid, s.kind)}
               className="flex min-w-0 w-full flex-col items-stretch gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
             >
               <button
@@ -343,7 +353,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
               tabIndex={0}
               aria-selected={activeDescendant === `search-option-${n.uid}`}
               onClick={() => onSelect(n.uid, n.kind)}
-              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(n.uid, n.kind); } }}
+              onKeyDown={(event) => activateFocusedOption(event, n.uid, n.kind)}
               className="flex min-w-0 w-full flex-col items-stretch gap-2 px-3 py-1.5 text-sm hover:bg-[var(--color-surface-alt)]"
             >
               <button
