@@ -4131,15 +4131,10 @@ fn cli_limit_help_states_the_default_the_code_actually_applies() {
     );
 }
 
-/// nw-431 / nw-217b: `search --limit` carried no `value_parser`, so it
-/// enforced NEITHER of `brain_search`'s declared bounds (schema:
-/// `minimum: 1, maximum: 1000`) -- `--limit 0` returned an empty result set
-/// at exit 0, indistinguishable from "no matches", and `--limit 1001`
-/// silently returned extra rows. Both ends are now a clap usage error at
-/// exit 64, matching `blast-radius --depth`'s shape, and the help states the
-/// bound and names the schema it matches.
+/// nw-431 / nw-217b: out-of-range symbol search limits are usage errors.
+/// nw-526: plain search help describes its own limit contract.
 #[test]
-fn search_limit_enforces_the_brain_search_schema_bound() {
+fn search_limit_enforces_and_documents_symbol_search_bounds() {
     nestweaver_cmd()
         .args(["search", "anything", "--limit", "0"])
         .assert()
@@ -4156,8 +4151,9 @@ fn search_limit_enforces_the_brain_search_schema_bound() {
         .args(["search", "--help"])
         .assert()
         .success()
+        .stdout(contains("Maximum symbol-name substring matches"))
         .stdout(contains("1-1000"))
-        .stdout(contains("brain_search"));
+        .stdout(contains("brain_search").not());
 }
 
 /// nw-430 FIX 3 (review follow-up). `--no-embed` used to be a `global = true`
