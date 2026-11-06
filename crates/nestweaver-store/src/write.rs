@@ -226,6 +226,7 @@ pub const CONTRACT_DERIVATION_DEBT_PREFIX: &str = "contract_derivation_debt:";
 /// partial". It is read by [`GraphStore::repo_index_incomplete`] (stale-check
 /// `incomplete`, `needs_reindex`) and makes the next index a full replacement.
 pub const REPO_PUBLICATION_INCOMPLETE_PREFIX: &str = "repo_publication_incomplete:";
+pub(crate) const REPO_RESOLVER_INPUTS_PREFIX: &str = "repo-resolver-inputs:";
 
 /// What a classified destructive store mutation can prove about durable state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5795,13 +5796,14 @@ impl GraphStore {
 
     /// Delete a Repo node (and its REPO_HAS_FILE edges) by UID.
     pub fn delete_repo_node(&self, repo_uid: &str) -> Result<(), StoreError> {
-        let conn = self.conn()?;
+        let conn = self.begin_transaction()?;
+        Self::clear_repo_resolver_inputs_on(&conn, repo_uid)?;
         exec_params(
             &conn,
             "MATCH (r:Repo {uid: $uid}) DETACH DELETE r",
             vec![("uid", lbug::Value::String(repo_uid.to_string()))],
         )?;
-        Ok(())
+        self.commit_transaction(&conn)
     }
 
     /// Delete all repo-scoped graph nodes that are NOT keyed off a stable,
@@ -9489,6 +9491,41 @@ impl GraphStore {
         )
     }
 
+    /// Publish the resolver input proof with the edges it describes.
+    pub fn set_repo_resolver_inputs_on(
+        conn: &crate::db::StoreConnection<'_>,
+        repo_uid: &str,
+        proof: &str,
+    ) -> Result<(), StoreError> {
+        Self::clear_repo_resolver_inputs_on(conn, repo_uid)?;
+        exec_params(
+            conn,
+            "CREATE (:Meta {key: $k, value: $v})",
+            vec![
+                (
+                    "k",
+                    lbug::Value::String(format!("{REPO_RESOLVER_INPUTS_PREFIX}{repo_uid}")),
+                ),
+                ("v", lbug::Value::String(proof.to_owned())),
+            ],
+        )
+    }
+
+    /// Invalidate a proof before committing edges that it cannot attest.
+    pub fn clear_repo_resolver_inputs_on(
+        conn: &crate::db::StoreConnection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
+        exec_params(
+            conn,
+            "MATCH (m:Meta {key: $k}) DETACH DELETE m",
+            vec![(
+                "k",
+                lbug::Value::String(format!("{REPO_RESOLVER_INPUTS_PREFIX}{repo_uid}")),
+            )],
+        )
+    }
+
     /// Record, in its own committed transaction, that a publication of
     /// `repo_uid` has started and may be left partial. See
     /// [`REPO_PUBLICATION_INCOMPLETE_PREFIX`].
@@ -9514,6 +9551,7 @@ impl GraphStore {
                 ],
             )
         })
+        .and_then(|()| Self::clear_repo_resolver_inputs_on(&conn, repo_uid))
         .and_then(|()| self.commit_transaction(&conn));
         if result.is_err() {
             let _ = conn.query("ROLLBACK");
@@ -9525,8 +9563,27 @@ impl GraphStore {
     /// publication that rewrote the whole repo graph has fully landed.
     pub fn clear_repo_publication_incomplete(&self, repo_uid: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
+        Self::clear_repo_publication_incomplete_on(&conn, repo_uid)
+    }
+
+    /// Complete a multi-transaction source publication with its resolver proof.
+    pub fn finish_repo_source_publication(
+        &self,
+        repo_uid: &str,
+        proof: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.begin_transaction()?;
+        Self::set_repo_resolver_inputs_on(&conn, repo_uid, proof)?;
+        Self::clear_repo_publication_incomplete_on(&conn, repo_uid)?;
+        self.commit_transaction(&conn)
+    }
+
+    fn clear_repo_publication_incomplete_on(
+        conn: &crate::db::StoreConnection<'_>,
+        repo_uid: &str,
+    ) -> Result<(), StoreError> {
         exec_params(
-            &conn,
+            conn,
             "MATCH (m:Meta {key: $k}) DETACH DELETE m",
             vec![(
                 "k",

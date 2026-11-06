@@ -2,10 +2,9 @@
 //!
 //! Watches supported source files and the exact config/extends paths probed by
 //! resolver workspace discovery. Config-only live edits revisit eligible callers;
-//! unrelated JSON is not a source input. Config-only drift while stopped remains
-//! outside source-hash startup reconciliation; after such a change run
-//! `index --repo <repo> --db <db> --force`. Manifest events retain their separate
-//! derivation/debt policy rather than this source-config replay policy.
+//! unrelated JSON is not a source input. Startup compares the resolver inputs
+//! used by the graph with the current inputs and replays config-only drift.
+//! Manifest events retain their separate derivation/debt policy.
 //! Uses a 2-second debounce window to batch rapid saves into a single
 //! re-index pass. On each trigger the changed files are re-parsed: new
 //! or modified files get their symbols replaced via delete + re-insert;
@@ -292,7 +291,10 @@ impl PreparationReader<'_> {
             signature
                 == Some(format!("inaccessible:{:?}:{:?}", io.kind(), io.raw_os_error()).as_str())
                 || (matches!(signature, None | Some("absent"))
-                    && io.kind() == std::io::ErrorKind::NotFound)
+                    && matches!(
+                        io.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ))
         } else {
             (signature.is_some_and(|value| value.starts_with("oversized"))
                 && error.is::<crate::content_reader::SourceTooLarge>())
@@ -1204,7 +1206,7 @@ impl CodeWatcher {
         let paths = self.event_snapshot_paths(store, r_uid, events)?;
         let (initial, probes) = self.batch_input_snapshot_with_probes(reader, &paths)?;
         self.expand_event_paths_with_snapshot(
-            store, r_uid, reader, repo_url, events, &initial, &probes,
+            store, r_uid, reader, repo_url, events, &initial, &probes, false,
         )
     }
 
@@ -1218,6 +1220,7 @@ impl CodeWatcher {
         events: &[PathBuf],
         initial: &BatchInputSnapshot,
         probes: &HashSet<PathBuf>,
+        reconcile_resolver_config: bool,
     ) -> anyhow::Result<Vec<PathBuf>> {
         let mut paths = HashSet::new();
         let mut incumbent_paths = HashSet::new();
@@ -1229,12 +1232,14 @@ impl CodeWatcher {
         // A consumed config is authoritative regardless of its filename suffix.
         // Reuse the initial snapshot's discovery and signatures: no extra walk,
         // cached facts or context pass is introduced for source-only batches.
-        if events.iter().any(|event| {
-            event.strip_prefix(&self.repo_root).is_ok_and(|relative| {
-                preparation_relative_path(relative).is_some()
-                    && probes.iter().any(|probe| probe.starts_with(event))
+        if reconcile_resolver_config
+            || events.iter().any(|event| {
+                event.strip_prefix(&self.repo_root).is_ok_and(|relative| {
+                    preparation_relative_path(relative).is_some()
+                        && probes.iter().any(|probe| probe.starts_with(event))
+                })
             })
-        }) {
+        {
             for path in initial
                 .signatures
                 .keys()
@@ -1611,6 +1616,7 @@ impl CodeWatcher {
             prepared_contracts,
             publish_contracts,
             validate_known_specs,
+            false,
             after_plan,
             || {
                 mutation_lease = self.acquire_mutation_lease("watch_code_batch")?;
@@ -1632,6 +1638,7 @@ impl CodeWatcher {
         prepared_contracts: Option<&crate::index::ContractDerivationPlan>,
         publish_contracts: bool,
         validate_known_specs: bool,
+        reconcile_resolver_config: bool,
         after_plan: F,
         admit: G,
     ) -> Result<WatchBatchOutcome, anyhow::Error>
@@ -1691,6 +1698,7 @@ impl CodeWatcher {
             &code_events,
             &source_snapshot,
             &resolver_probes,
+            reconcile_resolver_config,
         ) {
             Ok(paths) => paths,
             Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
@@ -2014,6 +2022,42 @@ impl CodeWatcher {
             Ok(resolution) => resolution,
             Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
         };
+        let resolver_inputs = batch_resolution
+            .as_ref()
+            .and_then(crate::index::WatcherBatchResolution::resolver_inputs);
+        if reconcile_resolver_config
+            && resolver_inputs.is_none()
+            && batch_resolution
+                .as_ref()
+                .is_none_or(crate::index::WatcherBatchResolution::has_workspace_sources)
+        {
+            return Ok(WatchBatchOutcome::Skipped {
+                reason: anyhow::anyhow!(
+                    "could not prove complete resolver configuration replay; retrying"
+                ),
+            });
+        }
+        let previous_resolver_inputs = if batch_resolution.is_some() {
+            match store.get_repo_resolver_inputs(r_uid) {
+                Ok(proof) => proof,
+                Err(reason) => {
+                    return Ok(WatchBatchOutcome::Skipped {
+                        reason: reason.into(),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let resolver_inputs_invalidated = previous_resolver_inputs.is_some()
+            && resolver_inputs.is_none()
+            && batch_resolution.as_ref().is_some_and(|resolution| {
+                resolution.observed_resolver_inputs() != previous_resolver_inputs.as_deref()
+            });
+        let resolver_repair_pending = resolver_inputs_invalidated
+            && batch_resolution
+                .as_ref()
+                .is_some_and(crate::index::WatcherBatchResolution::has_workspace_sources);
 
         for path in &prepared_paths {
             let valid = match path {
@@ -2170,6 +2214,18 @@ impl CodeWatcher {
                 rdeps = rdeps.len(),
                 "published watcher batch resolution"
             );
+            let previous = previous_resolver_inputs.as_deref();
+            if let Some(proof) = resolver_inputs {
+                if Some(proof) != previous {
+                    GraphStore::set_repo_resolver_inputs_on(&txn, r_uid, proof)
+                        .context("publish watcher resolver input proof")?;
+                }
+            } else if resolver_inputs_invalidated {
+                // A partial batch under different inputs invalidates the old
+                // proof. A -> B -> A must not certify mixed-context edges.
+                GraphStore::clear_repo_resolver_inputs_on(&txn, r_uid)
+                    .context("invalidate watcher resolver input proof")?;
+            }
         }
 
         if publish_contracts
@@ -2306,6 +2362,14 @@ impl CodeWatcher {
             return Ok(WatchBatchOutcome::PublishedPending {
                 files_processed,
                 reason,
+            });
+        }
+        if resolver_repair_pending {
+            return Ok(WatchBatchOutcome::PublishedPending {
+                files_processed,
+                reason: anyhow::anyhow!(
+                    "resolver configuration changed during partial source replay; whole-repository repair remains pending"
+                ),
             });
         }
         Ok(WatchBatchOutcome::Published { files_processed })
@@ -2592,6 +2656,7 @@ impl CodeWatcher {
             None,
             true,
             true,
+            false,
             || {},
             || {
                 mutation_lease = self.acquire_mutation_lease("watch_code_batch")?;
@@ -2696,6 +2761,28 @@ impl CodeWatcher {
         };
         let mut seen = HashSet::new();
         let mut drift = CodeStartupDrift::default();
+        let languages: HashSet<_> = indexed
+            .keys()
+            .filter_map(|path| detect_language(Path::new(path)))
+            .collect();
+        if languages
+            .iter()
+            .copied()
+            .any(crate::index::language_uses_workspace_context)
+        {
+            let current = crate::index::resolver_inputs_for_inventory(&reader, languages, &listed)?
+                .context(
+                    "resolver configuration inputs are unavailable for startup reconciliation",
+                )?;
+            drift.resolver_config_changed =
+                store.get_repo_resolver_inputs(r_uid)?.as_deref() != Some(current.as_str());
+            // The source scan deliberately does not infer mass deletion from
+            // an empty inventory. A config replay must preserve that guard.
+            anyhow::ensure!(
+                !drift.resolver_config_changed || !listed.is_empty(),
+                "cannot reconcile resolver configuration with an empty repository inventory"
+            );
+        }
         for rel_path in listed {
             if self.stop_flag.load(Ordering::Relaxed) {
                 return Err(WatchMutationRefused.into());
@@ -3036,8 +3123,8 @@ impl CodeWatcher {
             failures,
             retry_in_ms = delay.as_millis() as u64,
             "CodeWatcher startup reconciliation failed; sources changed while no watcher \
-             ran are missing or stale until it succeeds (retrying; `nestweaver index` \
-             also heals it)"
+             ran are missing or stale until it succeeds (retrying; forced indexing with the \
+             same repository, database and configuration can also repair it)"
         );
         // An uncomputable drift is disclosed against the repo root itself.
         self.record_debt(
@@ -3099,6 +3186,7 @@ impl CodeWatcher {
         // must consume that scoped debt even when disk has no new drift.
         let source_publication = !drift.replay.is_empty()
             || drift.spec_changed
+            || drift.resolver_config_changed
             || !store.contract_derivation_failures(Some(r_uid))?.is_empty();
         let manifest_capture = if (manifest_changed || source_publication) && predecessor.is_some()
         {
@@ -3143,7 +3231,14 @@ impl CodeWatcher {
             crate::manifest::mark_manifest_reconciliation_pending(&self.db_path, &reason)?;
         }
         let manifest_revision = crate::manifest::manifest_debt_revision(&self.db_path)?;
-        let chunks = drift.replay.len().div_ceil(128).max(1);
+        // A config repair changes all eligible callers. Publish its graph and
+        // evidence together, without stamping a mixture of chunk contexts.
+        let chunk_size = if drift.resolver_config_changed {
+            drift.replay.len().max(1)
+        } else {
+            128
+        };
+        let chunks = drift.replay.len().div_ceil(chunk_size).max(1);
         // Once all targets exist, repeat bounded source replacement/resolution
         // so imports from an earlier chunk can reach new later-chunk symbols.
         // Persist the whole replay set before its first commit: content hashes
@@ -3157,8 +3252,8 @@ impl CodeWatcher {
             let mut mutation_lease = None;
             let last = index + 1 == total_chunks;
             if let Some(plan) = &contract_plan {
-                let start = ((index % chunks) * 128).min(drift.replay.len());
-                let end = (start + 128).min(drift.replay.len());
+                let start = ((index % chunks) * chunk_size).min(drift.replay.len());
+                let end = (start + chunk_size).min(drift.replay.len());
                 match self.process_batch_with_plan_and_admission(
                     store,
                     r_uid,
@@ -3168,6 +3263,7 @@ impl CodeWatcher {
                     Some(plan),
                     last,
                     index == 0,
+                    drift.resolver_config_changed,
                     || {},
                     || {
                         mutation_lease = self.acquire_mutation_lease("watch_code_batch")?;
@@ -3478,6 +3574,8 @@ struct CodeStartupDrift {
     /// Absolute paths to replay through the batch seam, sorted.
     replay: Vec<PathBuf>,
     spec_changed: bool,
+    /// The current resolver inputs differ from the graph's proven inputs.
+    resolver_config_changed: bool,
     /// Sources the walk could not read, with the error: disclosed, not
     /// replayed, and never treated as deleted.
     unreadable: Vec<(PathBuf, String)>,
@@ -3895,7 +3993,7 @@ impl CodeWatcher {
 
     /// `Ok(true)` when the graph already holds the worktree the watcher would
     /// apply: startup drift has nothing to replay, no source it could not
-    /// read, and no spec change. A committed source missing from the graph
+    /// read, and no spec or resolver configuration change. A source missing from the graph
     /// is replay, so HEAD stays behind until that file is present.
     fn graph_matches_worktree(
         &self,
@@ -3904,7 +4002,10 @@ impl CodeWatcher {
         repo_url: &str,
     ) -> anyhow::Result<bool> {
         let drift = self.startup_drift(store, r_uid, repo_url)?;
-        Ok(drift.replay.is_empty() && drift.unreadable.is_empty() && !drift.spec_changed)
+        Ok(drift.replay.is_empty()
+            && drift.unreadable.is_empty()
+            && !drift.spec_changed
+            && !drift.resolver_config_changed)
     }
 
     /// `Ok(true)` when git status reports a modified or untracked source the
@@ -4318,6 +4419,10 @@ mod known_spec_guard_witness {
 
 #[cfg(test)]
 mod tests {
+    mod startup_config_tests {
+        include!("watch_code_startup_config_tests.rs");
+    }
+
     struct EditSpecAfterCommitIo {
         spec: PathBuf,
     }
@@ -4732,31 +4837,14 @@ mod tests {
         let store = GraphStore::open_or_create(&db).unwrap();
         let url = format!("file://{}", root.display());
         let uid = nestweaver_schema::repo_uid("test", &url);
-        store
-            .insert_repo(&nestweaver_schema::Repo {
-                uid: uid.clone(),
-                url: url.clone(),
-                indexed_sha: base.clone(),
-                staleness_commits_behind: 0,
-                instance_id: "test".to_string(),
-                name: None,
-                root_path: Some(root.display().to_string()),
-            })
-            .unwrap();
+        crate::index::index_directory_with_store(
+            &store, &root, &db, "test", &url, &base, true, None,
+        )
+        .unwrap();
         let watcher = CodeWatcher::new(&db, &root, "test");
         let filemeta = crate::sidecar_path(&db, ".filemeta.json");
         let filemeta_bytes = br#"{"sentinel":"nw-808-filemeta"}"#;
         std::fs::write(&filemeta, filemeta_bytes).unwrap();
-        store
-            .insert_file(&nestweaver_schema::File {
-                uid: nestweaver_schema::file_uid(&uid, "src/a.js"),
-                path: "src/a.js".to_string(),
-                repo_uid: uid.clone(),
-                content_hash: crate::hash::blake3_hex(
-                    &std::fs::read_to_string(root.join("src/a.js")).unwrap(),
-                ),
-            })
-            .unwrap();
         let indexed = || store.lookup_repo(&uid).unwrap().unwrap().indexed_sha;
 
         git(&["commit", "--allow-empty", "-m", "no source change"]);
@@ -4858,27 +4946,17 @@ mod tests {
         let store = GraphStore::open_or_create(&db).unwrap();
         let url = format!("file://{}", root.display());
         let uid = nestweaver_schema::repo_uid("test", &url);
-        store
-            .insert_repo(&nestweaver_schema::Repo {
-                uid: uid.clone(),
-                url: url.clone(),
-                indexed_sha: base.clone(),
-                staleness_commits_behind: 0,
-                instance_id: "test".to_string(),
-                name: None,
-                root_path: Some(root.display().to_string()),
-            })
+        crate::index::index_directory_with_store(
+            &store, &root, &db, "test", &url, &base, true, None,
+        )
+        .unwrap();
+        assert!(store.get_repo_resolver_inputs(&uid).unwrap().is_some());
+        let txn = store.begin_transaction().unwrap();
+        GraphStore::delete_symbols_in_file_on(&txn, &uid, "src/missed.js").unwrap();
+        GraphStore::delete_file_node_on(&txn, &nestweaver_schema::file_uid(&uid, "src/missed.js"))
             .unwrap();
-        store
-            .insert_file(&nestweaver_schema::File {
-                uid: nestweaver_schema::file_uid(&uid, "src/kept.js"),
-                path: "src/kept.js".to_string(),
-                repo_uid: uid.clone(),
-                content_hash: crate::hash::blake3_hex(
-                    &std::fs::read_to_string(root.join("src/kept.js")).unwrap(),
-                ),
-            })
-            .unwrap();
+        store.commit_transaction(&txn).unwrap();
+        drop(txn);
         let watcher = CodeWatcher::new(&db, &root, "test");
         let indexed = || store.lookup_repo(&uid).unwrap().unwrap().indexed_sha;
         let graph_paths = || -> Vec<String> {
@@ -4934,14 +5012,32 @@ mod tests {
             "clearing the dirty file leaves the missing graph source behind {clean}"
         );
 
-        store
-            .insert_file(&nestweaver_schema::File {
+        let txn = store.begin_transaction().unwrap();
+        GraphStore::clear_repo_resolver_inputs_on(&txn, &uid).unwrap();
+        GraphStore::insert_file_on(
+            &txn,
+            &nestweaver_schema::File {
                 uid: nestweaver_schema::file_uid(&uid, "src/missed.js"),
                 path: "src/missed.js".to_string(),
                 repo_uid: uid.clone(),
                 content_hash: crate::hash::blake3_hex(missed_body),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
+        store.commit_transaction(&txn).unwrap();
+        drop(txn);
+        watcher.record_applied_head(&store, &uid, false).unwrap();
+        assert_eq!(
+            indexed(),
+            base,
+            "matching source hashes without a resolver proof must not advance HEAD"
+        );
+        // Establish the proof through a real publication while deliberately
+        // recording the older SHA. HEAD tracking must now advance it.
+        crate::index::index_directory_with_store(
+            &store, &root, &db, "test", &url, &base, true, None,
+        )
+        .unwrap();
         watcher.record_applied_head(&store, &uid, false).unwrap();
         assert_eq!(
             indexed(),

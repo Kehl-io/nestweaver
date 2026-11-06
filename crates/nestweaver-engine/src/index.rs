@@ -4526,6 +4526,7 @@ pub(crate) fn file_member_of_edges(
 }
 
 struct IndexResolution {
+    resolver_inputs: Option<String>,
     skip_resolution: bool,
     resolve_filter: Option<std::collections::HashSet<String>>,
     insertable_edges: Vec<nestweaver_schema::ResolvedEdge>,
@@ -4784,7 +4785,8 @@ fn prepare_index_resolution(
     resolve_pb.set_message("Resolving cross-file references...");
     resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let workspace_ctx = workspace_context_for_languages(reader, file_languages.values().copied())?;
+    let (workspace_ctx, resolver_inputs) =
+        workspace_context_and_resolver_inputs(reader, file_languages.values().copied())?;
 
     // A deletion changes its dependents' export view just as an edit does, so
     // it seeds the dependency expansion too (it is then dropped from the
@@ -4995,6 +4997,7 @@ fn prepare_index_resolution(
         import_survey_for_resolved_files(&resolver_view, file_languages, &workspace_ctx, &only)
     };
     let resolution = IndexResolution {
+        resolver_inputs,
         skip_resolution,
         resolve_filter,
         insertable_edges,
@@ -5921,6 +5924,11 @@ where
         // may be partial; the run's last write retires it. An error between
         // the two also leaves it, deliberately: proving that every earlier
         // transaction rolled back is harder than one spare full rebuild.
+        let prior_resolver_inputs = if root_path.is_some() {
+            store.get_repo_resolver_inputs(&r_uid)?
+        } else {
+            None
+        };
         graph_mutation_attempted.set(true);
         store
             .set_repo_publication_incomplete(&r_uid, "index graph write")
@@ -6298,9 +6306,42 @@ where
         store
             .set_repo_index_policy(&r_uid, &reader.eligibility_fingerprint())
             .context("persist indexed reader eligibility")?;
-        store
-            .clear_repo_publication_incomplete(&r_uid)
-            .context("retire publication-incomplete debt")?;
+        let mut resolver_inputs = None;
+        if root_path.is_some()
+            && let Some(proof) = resolution.resolver_inputs.as_deref()
+        {
+            if prior_resolver_inputs.as_deref() == Some(proof) {
+                resolver_inputs = Some(proof);
+            } else if !resolution.skip_resolution && unreadable_dirs.is_empty() {
+                let resolved: HashSet<&str> = parsed_files_for_resolver
+                    .iter()
+                    .map(|(path, ..)| path.as_str())
+                    .collect();
+                let covers_workspace = store
+                    .list_files_by_repo(&r_uid)?
+                    .iter()
+                    .filter(|(_, path)| uses_workspace_context(path))
+                    .all(|(_, path)| {
+                        resolved.contains(path.as_str())
+                            && resolution
+                                .resolve_filter
+                                .as_ref()
+                                .is_none_or(|filter| filter.contains(path))
+                    });
+                if covers_workspace {
+                    resolver_inputs = Some(proof);
+                }
+            }
+        }
+        if let Some(proof) = resolver_inputs {
+            store
+                .finish_repo_source_publication(&r_uid, proof)
+                .context("complete source publication with resolver inputs")?;
+        } else {
+            store
+                .clear_repo_publication_incomplete(&r_uid)
+                .context("retire publication-incomplete debt")?;
+        }
 
         // ── Summary ───────────────────────────────────────────────────────────
         let elapsed = started.elapsed();
@@ -8501,6 +8542,11 @@ fn incremental_index_with_name_and_io_and_authority(
     // If we crash before commit, the next run replays from the old SHA.
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, &new_sha)
         .with_context(|| "update_repo_sha")?;
+    // This incremental pass may leave unchanged workspace callers outside
+    // its resolver scope. Reconcile them before trusting a repo-wide proof.
+    if !changed_files.is_empty() || !removed_files.is_empty() {
+        GraphStore::clear_repo_resolver_inputs_on(&txn, &r_uid)?;
+    }
     nestweaver_store::GraphStore::set_repo_index_policy_on(
         &txn,
         &r_uid,
@@ -9043,6 +9089,7 @@ where
 
     nestweaver_store::GraphStore::update_repo_sha_on(&txn, &r_uid, new_sha)
         .with_context(|| "update_repo_sha")?;
+    GraphStore::clear_repo_resolver_inputs_on(&txn, &r_uid)?;
     nestweaver_store::GraphStore::set_repo_index_policy_on(
         &txn,
         &r_uid,
@@ -9850,6 +9897,10 @@ pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
     )
 }
 
+fn uses_workspace_context(path: &str) -> bool {
+    detect_language(Path::new(path)).is_some_and(language_uses_workspace_context)
+}
+
 /// Shared source scope for both type-environment preparation and edge
 /// replacement. In particular, resolved file edges do not record PHP negative
 /// function-name dependencies, so unrelated PHP declarations can change a
@@ -9897,29 +9948,127 @@ fn workspace_context_for_languages(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
 ) -> anyhow::Result<nestweaver_resolver::WorkspaceContext> {
+    discover_resolver_inputs(reader, languages, false).map(|(context, _)| context)
+}
+
+fn workspace_context_and_resolver_inputs(
+    reader: &dyn crate::content_reader::ContentReader,
+    languages: impl IntoIterator<Item = Language>,
+) -> anyhow::Result<(nestweaver_resolver::WorkspaceContext, Option<String>)> {
+    discover_resolver_inputs(reader, languages, true)
+}
+
+fn discover_resolver_inputs(
+    reader: &dyn crate::content_reader::ContentReader,
+    languages: impl IntoIterator<Item = Language>,
+    capture: bool,
+) -> anyhow::Result<(nestweaver_resolver::WorkspaceContext, Option<String>)> {
     let languages: Vec<_> = languages.into_iter().collect();
-    if languages
+    // Only Go module discovery uses the repository inventory.
+    let files = if languages.contains(&Language::Go) {
+        reader
+            .list_files()
+            .context("enumerate required Go workspace manifests")?
+    } else {
+        Vec::new()
+    };
+    resolver_context_for_inventory(reader, &languages, &files, capture)
+}
+
+/// Compare the same resolver observations using the startup walk's inventory.
+pub(crate) fn resolver_inputs_for_inventory(
+    reader: &dyn crate::content_reader::ContentReader,
+    languages: impl IntoIterator<Item = Language>,
+    files: &[PathBuf],
+) -> anyhow::Result<Option<String>> {
+    let languages: Vec<_> = languages.into_iter().collect();
+    resolver_context_for_inventory(reader, &languages, files, true).map(|(_, proof)| proof)
+}
+
+fn resolver_context_for_inventory(
+    reader: &dyn crate::content_reader::ContentReader,
+    languages: &[Language],
+    files: &[PathBuf],
+    capture: bool,
+) -> anyhow::Result<(nestweaver_resolver::WorkspaceContext, Option<String>)> {
+    use std::io::ErrorKind;
+    if !languages
         .iter()
         .copied()
         .any(language_uses_workspace_context)
     {
-        // Only Go module discovery needs repository inventory. Other workspace
-        // languages keep their read-only manifest callback and hot-path cost.
-        let files = if languages.contains(&Language::Go) {
-            reader
-                .list_files()
-                .context("enumerate required Go workspace manifests")?
-        } else {
-            Vec::new()
-        };
-        Ok(discover_workspace_context_with_files(&files, |path| {
-            reader
-                .read_file(path)
-                .map_err(|error| std::io::Error::other(error.to_string()))
-        }))
-    } else {
-        Ok(nestweaver_resolver::WorkspaceContext::default())
+        return Ok((nestweaver_resolver::WorkspaceContext::default(), None));
     }
+    let capture = capture && reader.version_id() == "local";
+    let probes = std::cell::RefCell::new(std::collections::BTreeMap::new());
+    let unproven = std::cell::Cell::new(false);
+    let files = if languages.contains(&Language::Go) {
+        files
+    } else {
+        &[]
+    };
+    let context = discover_workspace_context_with_files(files, |path| {
+        let result = reader.read_file(path);
+        if !capture {
+            return result.map_err(std::io::Error::other);
+        }
+        // Hash the decoded bytes the resolver actually received. The
+        // watcher's admission guard separately checks raw bytes and ABA.
+        let state = match &result {
+            Ok(source) => Some(crate::hash::blake3_hex(source)),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                        matches!(io.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+                    })
+                }) =>
+            {
+                Some("absent".to_owned())
+            }
+            Err(_) => None,
+        };
+        if let Some(state) = state {
+            if probes
+                .borrow_mut()
+                .insert(path.to_path_buf(), state.clone())
+                .is_some_and(|prior| prior != state)
+            {
+                unproven.set(true);
+            }
+        } else {
+            unproven.set(true);
+        }
+        result.map_err(|error| std::io::Error::other(error.to_string()))
+    });
+    if unproven.get() || !capture {
+        return Ok((context, None));
+    }
+    // The proof binds membership and state to the local root, reader policy
+    // and resolver generation. Persist only the digest, never config content.
+    let probes: Vec<_> = probes
+        .into_inner()
+        .into_iter()
+        .map(|(path, state)| {
+            (
+                crate::hash::blake3_hex_bytes(path.as_os_str().as_encoded_bytes()),
+                state,
+            )
+        })
+        .collect();
+    let root = std::fs::canonicalize(reader.root()).unwrap_or_else(|_| reader.root().to_path_buf());
+    let serialized = serde_json::to_vec(&(
+        crate::resolver_generation::RESOLVER_GENERATION,
+        crate::hash::blake3_hex_bytes(root.as_os_str().as_encoded_bytes()),
+        reader.eligibility_fingerprint(),
+        probes,
+    ))?;
+    Ok((
+        context,
+        Some(format!(
+            "resolver-inputs-v1:{}",
+            crate::hash::blake3_hex_bytes(&serialized)
+        )),
+    ))
 }
 
 /// Shared added-file seeds for resolution and watcher type environments.
@@ -10469,6 +10618,7 @@ pub(crate) struct WatcherBatchResolutionInputs<'a> {
 /// same resolve filter, so a batch publishes the edges a full index would.
 pub(crate) struct WatcherBatchResolution {
     resolution: IndexResolution,
+    has_workspace_sources: bool,
     /// The resolver view, kept for the dependency rows.
     resolver_files: Vec<ParsedFileEntry>,
     /// Files this resolution cannot re-resolve from content the graph holds:
@@ -10490,6 +10640,37 @@ pub(crate) struct WatcherBatchResolution {
 }
 
 impl WatcherBatchResolution {
+    pub(crate) fn has_workspace_sources(&self) -> bool {
+        self.has_workspace_sources
+    }
+
+    /// Proof from the exact configuration reads used to build this batch.
+    pub(crate) fn observed_resolver_inputs(&self) -> Option<&str> {
+        self.resolution.resolver_inputs.as_deref()
+    }
+
+    /// Only a batch that resolved every workspace caller may advance the proof.
+    pub(crate) fn resolver_inputs(&self) -> Option<&str> {
+        if self.resolution.skip_resolution
+            || !self.view_covers_repo
+            || self
+                .protected_files
+                .iter()
+                .any(|path| uses_workspace_context(path))
+            || self.resolver_files.iter().any(|(path, ..)| {
+                uses_workspace_context(path)
+                    && self
+                        .resolution
+                        .resolve_filter
+                        .as_ref()
+                        .is_some_and(|filter| !filter.contains(path))
+            })
+        {
+            return None;
+        }
+        self.observed_resolver_inputs()
+    }
+
     /// Inside the batch transaction, after the per-file replacement: clear
     /// the outgoing resolved edges of every re-resolved file the replacement
     /// did not already remove, then insert the resolution. Returns the
@@ -10645,6 +10826,10 @@ pub(crate) fn prepare_watcher_batch_resolution(
     if changed.is_empty() && removed_files.is_empty() {
         return Ok(None);
     }
+    let has_workspace_sources = existing
+        .difference(&removed_files)
+        .chain(changed)
+        .any(|path| uses_workspace_context(path));
     let added_files: HashSet<String> = changed
         .iter()
         .filter(|path| !existing.contains(*path))
@@ -10877,6 +11062,7 @@ pub(crate) fn prepare_watcher_batch_resolution(
     protected_uids.extend(unverified_uids.iter().cloned());
     Ok(Some(WatcherBatchResolution {
         resolution,
+        has_workspace_sources,
         resolver_files,
         protected_files,
         protected_uids,

@@ -5440,6 +5440,19 @@ impl GraphStore {
 
     // ── DB-level metadata ───────────────────────────────────────────────────
 
+    /// The resolver input proof recorded by the last complete source publication.
+    pub fn get_repo_resolver_inputs(&self, repo_uid: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare("MATCH (m:Meta {key: $k}) RETURN m.value")
+            .map_err(|error| StoreError::Query(format!("prepare resolver input proof: {error}")))?;
+        let key = format!("{}{repo_uid}", crate::write::REPO_RESOLVER_INPUTS_PREFIX);
+        let mut rows = conn
+            .execute(&mut statement, vec![("k", Value::String(key))])
+            .map_err(|error| StoreError::Query(format!("read resolver input proof: {error}")))?;
+        rows.next().map(|row| extract_string(&row, 0)).transpose()
+    }
+
     /// Eligibility policy used by the last successfully published repository
     /// index. Missing metadata means an older index needs a full rebuild;
     /// query failures must never be interpreted as an unchanged policy.
