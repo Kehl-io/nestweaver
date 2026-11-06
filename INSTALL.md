@@ -4,6 +4,9 @@ Install the CLI from npm or a verified pre-built archive from
 [GitHub Releases](https://github.com/Kehl-io/nestweaver/releases/latest), or
 build from source. There is currently no published crates.io package.
 
+For an existing database, [stop the old daemon and back up with the previous
+binary before upgrading](#upgrading-an-existing-database).
+
 ## npm
 
 Requires Node.js 18+ and one of the supported macOS/Linux platforms below.
@@ -188,27 +191,30 @@ open target/release/NestWeaver.app
 is refused with `nestweaver::db_rebuild_required`. Back it up and follow the
 [publication rebuild guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required)
 and the error's recovery command. A forced re-index alone is not the remedy
-for an incompatible storage format.
+for an incompatible storage format. A compatible format 47 database can still
+migrate to format 49 on a writable open or checkpoint in 12.2.5. Stop the old
+daemon and back up with the previous binary before upgrading. Downgrading after
+migration requires restoring that backup with the previous binary. See the
+[LadybugDB 0.22 storage and rollback guide](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
-For a compatible database, the current **`RESOLVER_GENERATION` is 19**.
+For a compatible database, the current **`RESOLVER_GENERATION` is 21**.
 Compatibility requires an exact match: a graph written by an older or newer
 resolver must be fully re-indexed before you trust its edges and rankings.
 
 ```sh
 nestweaver stale-check --db /path/to/nestweaver.lbug
 nestweaver index --repo /path/to/repo --db /path/to/nestweaver.lbug --force
-nestweaver brain refresh /path/to/vault --db /path/to/nestweaver.lbug
 ```
 
 `stale-check` reports `outdated_resolver` and exits 2 for a resolver mismatch.
-Upgrading to 12.2.4 moves the generation from 17 (in 12.2.3) to 19 and
-parsed cache from 11 to 13. Scala cached declarations and PHP namespace/function
-alias resolution changed, so every repository
-needs this forced re-index once. **`--force` is required**: incremental indexing
+12.2.5 uses generation 21 and parsed cache 15, covering PHP static-method
+ownership and the Dart and PowerShell grammar changes. Every repository needs
+this forced re-index once. **`--force` is required**: incremental indexing
 at git HEAD can report no changes and retain the old generation.
 
-Refresh each registered vault once against the rebuilt code graph. Markdown
-derivation version 3 also repairs encoded URL paths and absolute note paths
+If also crossing the earlier Markdown derivation upgrade, run
+`nestweaver brain refresh /path/to/vault` for each registered vault. Markdown
+derivation version 3 repairs encoded URL paths and absolute note paths
 contained within the registered vault. Vaults carry
 no code resolver generation and are not refreshed by a repository index. Users
 upgrading from before 12.2.2 also need this step for frontmatter wikilinks and
