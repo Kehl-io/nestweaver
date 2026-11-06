@@ -169,6 +169,18 @@ impl WebFederation {
         }
     }
     pub async fn search(&self, tool: &str, params: &Value, local: Value, limit: usize) -> Value {
+        self.search_with_local_truncation(tool, params, local, limit, false)
+            .await
+    }
+
+    pub(crate) async fn search_with_local_truncation(
+        &self,
+        tool: &str,
+        params: &Value,
+        local: Value,
+        limit: usize,
+        mut local_truncated: bool,
+    ) -> Value {
         let original_meta = local.get("_meta").cloned();
         let mut answer = local;
         annotate_rows(&mut answer, "local");
@@ -192,6 +204,8 @@ impl WebFederation {
                     if upstream.mode == RoutingMode::Primary {
                         answer = server;
                         sources = vec![upstream.name.clone()];
+                        // The primary replaced the locally clipped result.
+                        local_truncated = false;
                     } else {
                         answer = merge_json_results_with_vault_mappings(
                             &answer,
@@ -226,7 +240,8 @@ impl WebFederation {
                 answer["truncated"] = json!(true);
             }
         }
-        let truncated = peer_truncated || answer["truncated"].as_bool().unwrap_or(false);
+        let truncated =
+            local_truncated || peer_truncated || answer["truncated"].as_bool().unwrap_or(false);
         answer["truncated"] = json!(truncated);
         let partial = states
             .iter()
@@ -650,6 +665,81 @@ mod tests {
             let result = fed.analysis(tool, &json!({}), Some(&owner)).await;
             assert_eq!(result["org_wide_impact"]["source_server"], "B");
             assert_eq!(result["org_wide_impact"]["status"], "unavailable");
+        }
+    }
+    #[tokio::test]
+    async fn brain_search_preserves_local_clipping_only_when_local_rows_contribute() {
+        use nestweaver_schema::{Note, NoteKind, Vault};
+
+        for mode in [RoutingMode::Fallback, RoutingMode::Primary] {
+            let (dir, state) = state();
+            state
+                .store
+                .insert_vault(&Vault {
+                    uid: "vlt:local".into(),
+                    name: "Local".into(),
+                    root_path: dir.path().display().to_string(),
+                    instance_id: "test".into(),
+                })
+                .unwrap();
+            for name in ["first", "second"] {
+                state
+                    .store
+                    .insert_note(&Note {
+                        uid: format!("note:{name}"),
+                        vault_uid: "vlt:local".into(),
+                        file_path: format!("{name}.md"),
+                        title: "title:*".into(),
+                        note_kind: NoteKind::General,
+                        word_count: 1,
+                        content_hash: "fixture".into(),
+                        frontmatter: None,
+                        frontmatter_raw: None,
+                        created_at: None,
+                        modified_at: None,
+                        pagerank_score: None,
+                        embedding: None,
+                    })
+                    .unwrap();
+            }
+            let mut cfg = config();
+            cfg.mode = mode;
+            let mut fed = WebFederation::new(&[cfg], local(), false).unwrap();
+            fed.remote_override = Some(Arc::new(|_, _| {
+                Box::pin(async {
+                    Ok(json!({"results":[{"uid":"note:remote","kind":"note","title":"title:*"}]}))
+                })
+            }));
+            assert!(state.federation.set(Arc::new(fed)).is_ok());
+
+            for suffix in ["", "&workspace=all"] {
+                for limit in [1, 2] {
+                    let result = response(
+                        state.clone(),
+                        &format!("/api/v1/brain/search?q=title%3A%2A&limit={limit}{suffix}"),
+                    )
+                    .await;
+                    let local_wins = mode == RoutingMode::Fallback;
+                    let clipped = local_wins && limit == 1;
+                    assert_eq!(result["truncated"], clipped, "{result}");
+                    assert_eq!(result["_federation"]["truncated"], clipped, "{result}");
+                    assert_eq!(
+                        result["results"].as_array().unwrap().len(),
+                        if local_wins { limit } else { 1 }
+                    );
+                    assert_eq!(
+                        result["_federation"]["upstreams"][0]["status"],
+                        if local_wins {
+                            "not-needed"
+                        } else {
+                            "available"
+                        }
+                    );
+                    if !local_wins {
+                        assert_eq!(result["results"][0]["uid"], "note:remote");
+                    }
+                }
+            }
         }
     }
     #[tokio::test]

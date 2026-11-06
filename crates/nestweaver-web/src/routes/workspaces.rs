@@ -678,7 +678,7 @@ pub fn note_search_hit(note: Note) -> serde_json::Value {
         "title": note.title,
         "file_path": note.file_path,
         "vault_uid": note.vault_uid,
-        "score": note.pagerank_score.unwrap_or(0.0),
+        "score": note.pagerank_score.filter(|score| score.is_finite()).unwrap_or(0.0),
     })
 }
 

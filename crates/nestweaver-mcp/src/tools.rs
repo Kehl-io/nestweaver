@@ -1148,8 +1148,8 @@ fn affected_tests_has_files_and_base_ref(args: &Value) -> bool {
         && (args.get("changed_files").is_some() || args.get("files").is_some())
 }
 
-/// Fold alias spellings onto the canonical key (nw-558). Call before
-/// validation and dispatch; a conflict is left in place for
+/// Fold aliases and equivalent argument values onto their canonical
+/// representation before validation and dispatch. A conflict is left in place for
 /// [`validate_tool_arguments`] to refuse with a named error.
 pub fn canonicalize_tool_arguments(name: &str, mut args: Value) -> Value {
     if conflicting_alias_error(name, &args).is_some() {
@@ -1165,6 +1165,14 @@ pub fn canonicalize_tool_arguments(name: &str, mut args: Value) -> Value {
                 object.entry(canonical.to_string()).or_insert(value);
             }
         }
+    }
+    if name == "read_symbols"
+        && let Some(value) = object.get_mut("token_budget")
+        && let Some(budget) = read_symbols_token_budget(value)
+    {
+        // JSON Schema accepts integral decimal/exponent forms. Send the
+        // integer representation on every hop, including to older peers.
+        *value = Value::from(budget);
     }
     args
 }
@@ -5873,16 +5881,31 @@ fn bound_identifiers(v: Vec<String>, field: &str) -> Result<Vec<String>, anyhow:
     Ok(v)
 }
 
+fn read_symbols_token_budget(value: &Value) -> Option<u64> {
+    use nestweaver_engine::read_symbols::MAX_READ_SYMBOLS_TOKEN_BUDGET;
+    if let Some(budget) = value.as_u64() {
+        return (budget <= MAX_READ_SYMBOLS_TOKEN_BUDGET).then_some(budget);
+    }
+    let budget = value.as_f64()?;
+    if !budget.is_finite()
+        || budget.fract() != 0.0
+        || !(0.0..=MAX_READ_SYMBOLS_TOKEN_BUDGET as f64).contains(&budget)
+    {
+        return None;
+    }
+    Some(budget as u64)
+}
+
 fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
-    let max_budget = nestweaver_engine::read_symbols::MAX_READ_SYMBOLS_TOKEN_BUDGET;
+    use nestweaver_engine::read_symbols::MAX_READ_SYMBOLS_TOKEN_BUDGET;
     let token_budget = args
         .get("token_budget")
         .map(|value| {
-            value
-                .as_u64()
-                .filter(|&budget| budget <= max_budget)
+            read_symbols_token_budget(value)
                 .map(|budget| budget as usize)
-                .ok_or_else(|| anyhow!("'token_budget' must be an integer from 0 to {max_budget}"))
+                .ok_or_else(|| {
+                    anyhow!("'token_budget' must be an integer from 0 to {MAX_READ_SYMBOLS_TOKEN_BUDGET}")
+                })
         })
         .transpose()?;
     let targets: Vec<String> = bound_identifiers(
@@ -39176,22 +39199,37 @@ mod lookup_not_found_contract_tests {
     #[test]
     fn read_symbols_token_budget_schema_and_handler_reject_invalid_values() {
         let store = GraphStore::in_memory().unwrap();
-        validate_tool_arguments("read_symbols", &json!({"targets": ["sym:x"]})).unwrap();
-        for budget in [0, 1, 16_000] {
+        let omitted = json!({"targets": ["sym:x"]});
+        validate_tool_arguments("read_symbols", &omitted).unwrap();
+        assert_eq!(
+            canonicalize_tool_arguments("read_symbols", omitted.clone()),
+            omitted
+        );
+        for (raw, expected) in [
+            ("0", 0),
+            ("0.0", 0),
+            ("-0.0", 0),
+            ("1", 1),
+            ("1.0", 1),
+            ("1e3", 1_000),
+            ("16000", 16_000),
+            ("16000.0", 16_000),
+        ] {
+            let budget = serde_json::from_str::<Value>(raw).unwrap();
             let args = json!({"targets": ["sym:x"], "token_budget": budget});
             validate_tool_arguments("read_symbols", &args).unwrap();
+            let canonical = canonicalize_tool_arguments("read_symbols", args.clone());
+            assert_eq!(canonical["token_budget"].as_u64(), Some(expected), "{raw}");
             tool_read_symbols(&store, args).unwrap();
         }
-        for budget in [
-            json!(-1),
-            json!(16_001),
-            json!(1_000_000_000),
-            json!(1.5),
-            json!("0"),
-            Value::Null,
+        for raw in [
+            "-1", "-1.0", "16001", "16001.0", "1e9", "1.5", "1e-1", r#""0""#, "null",
         ] {
+            let budget = serde_json::from_str::<Value>(raw).unwrap();
             let args = json!({"targets": ["sym:x"], "token_budget": budget});
-            let validation = validate_tool_arguments("read_symbols", &args).unwrap_err();
+            let canonical = canonicalize_tool_arguments("read_symbols", args.clone());
+            assert_eq!(canonical, args, "{raw}");
+            let validation = validate_tool_arguments("read_symbols", &canonical).unwrap_err();
             assert!(
                 validation.to_string().contains("token_budget"),
                 "{validation}"
@@ -39218,10 +39256,10 @@ mod lookup_not_found_contract_tests {
             "fixture",
         )
         .unwrap();
-        let call = |budget: Option<u64>| {
+        let call = |budget: Option<&str>| {
             let mut args = json!({"targets": ["greet", "hello"]});
             if let Some(budget) = budget {
-                args["token_budget"] = json!(budget);
+                args["token_budget"] = serde_json::from_str(budget).unwrap();
             }
             let response = mcp_result(&store, "read_symbols", args);
             assert_eq!(response["isError"], false, "{response}");
@@ -39241,7 +39279,7 @@ mod lookup_not_found_contract_tests {
         assert_eq!(uncapped["dropped"], json!([]));
         assert!(uncapped.get("budget_exceeded_by_first_symbol").is_none());
 
-        let zero = call(Some(0));
+        let zero = call(Some("0"));
         assert_eq!(zero["symbols"].as_array().unwrap().len(), 1);
         assert_eq!(zero["symbols"][0]["uid"], symbols[0]["uid"]);
         assert_eq!(zero["symbols"][0]["body"], first);
@@ -39253,12 +39291,18 @@ mod lookup_not_found_contract_tests {
         assert_eq!(overrun["requested_tokens"], 0);
         assert!(overrun["returned_tokens"].as_u64().unwrap() > 0);
         assert!(overrun["note"].as_str().unwrap().contains("EXCEEDS"));
+        assert_eq!(call(Some("0.0")), zero);
+        assert_eq!(call(Some("-0.0")), zero);
 
-        let positive = call(Some(1));
+        let positive = call(Some("1"));
         assert_eq!(positive["symbols"].as_array().unwrap().len(), 1);
         assert_ne!(positive["symbols"][0]["body"], first);
         assert_eq!(positive["symbols"][0]["body_truncated"], true);
         assert_eq!(positive["truncated"], true);
+        assert_eq!(call(Some("1.0")), positive);
+        assert_eq!(call(Some("1e0")), positive);
+        assert_eq!(call(Some("1e3")), uncapped);
+        assert_eq!(call(Some("16000.0")), uncapped);
     }
 
     /// nw-557. ONE not-found contract for every lookup-by-identifier tool:

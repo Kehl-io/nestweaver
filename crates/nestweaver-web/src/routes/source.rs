@@ -1,11 +1,6 @@
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-#[cfg(unix)]
-use std::{
-    ffi::CString,
-    os::fd::{AsRawFd, FromRawFd},
-};
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -14,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
 
+use super::indexed_file::IndexedFilePath;
 use crate::state::AppState;
 
 /// Largest file `/source` will read. The UI shows a window of lines, so a
@@ -84,6 +80,9 @@ fn read_indexed_file(repo_root: &Path, file: &str) -> Read {
 // The hook makes the gap between validation and opening deterministic in the
 // race test. Production always passes a no-op.
 fn read_indexed_file_with_hook(repo_root: &Path, file: &str, before_open: impl FnOnce()) -> Read {
+    let Some(indexed_file) = IndexedFilePath::new(file) else {
+        return Read::NotAvailable;
+    };
     let (Ok(canon_root), Ok(canon_path)) = (
         std::fs::canonicalize(repo_root),
         std::fs::canonicalize(repo_root.join(file)),
@@ -109,16 +108,9 @@ fn read_indexed_file_with_hook(repo_root: &Path, file: &str, before_open: impl F
     before_open();
     // Open each component relative to a pinned directory descriptor. A path
     // swapped for a symlink after canonicalization must never be followed.
-    #[cfg(unix)]
-    let opened = open_without_symlinks(&canon_root, Path::new(file));
-    #[cfg(not(unix))]
-    let opened: std::io::Result<std::fs::File> = Err(std::io::ErrorKind::Unsupported.into());
-    let Ok(f) = opened else {
+    let Ok(f) = indexed_file.open_regular(&canon_root) else {
         return Read::NotAvailable;
     };
-    if !f.metadata().is_ok_and(|m| m.is_file()) {
-        return Read::NotAvailable;
-    }
     // Read raw bytes and check the size BEFORE decoding: the cap can cut a
     // multi-byte character, and an oversized file must report TooLarge, not
     // the UTF-8 error that cut produces.
@@ -131,57 +123,6 @@ fn read_indexed_file_with_hook(repo_root: &Path, file: &str, before_open: impl F
         },
         Err(_) => Read::NotAvailable,
     }
-}
-
-#[cfg(unix)]
-fn open_without_symlinks(root: &Path, relative: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::ffi::OsStrExt;
-    // Start at the (already canonical) repository root rather than at `/`:
-    // only the components below the root are untrusted, and some sandboxes
-    // and containers refuse to open `/` or an ancestor directory for reading.
-    let root = CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    // SAFETY: the C string is NUL terminated; a successful fd is owned by File.
-    let fd = unsafe {
-        libc::open(
-            root.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: open returned a new owned fd.
-    let mut dir = unsafe { std::fs::File::from_raw_fd(fd) };
-    let components: Vec<_> = relative
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s),
-            _ => None,
-        })
-        .collect();
-    for (i, part) in components.iter().enumerate() {
-        let name = CString::new(part.as_bytes())
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | if i + 1 < components.len() {
-                libc::O_DIRECTORY
-            } else {
-                0
-            };
-        // SAFETY: dir is open, name is NUL terminated, and the returned fd is
-        // transferred into File before dir is dropped.
-        let next = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
-        if next < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: openat returned a new owned fd.
-        dir = unsafe { std::fs::File::from_raw_fd(next) };
-    }
-    Ok(dir)
 }
 
 #[cfg(all(test, unix))]

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Read as _;
 use std::sync::Arc;
 
 use axum::Json;
@@ -8,6 +9,7 @@ use nestweaver_store::{SearchHit, TantivyIndex};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::indexed_file::IndexedFilePath;
 use crate::error::ApiError;
 use crate::routes::workspaces::{self, P1Provenance, WorkspaceKind};
 use crate::state::AppState;
@@ -26,6 +28,31 @@ fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
         idx += 1;
     }
     idx
+}
+
+fn mention_snippet<'a>(content: &'a str, title_lower: &str) -> Option<&'a str> {
+    // Match with str's contextual lowercasing (e.g. Greek final sigma).
+    // Its only context-sensitive mapping changes the sigma, not its width,
+    // so each source char's lowercase byte width still maps the match back.
+    let lower_start = content.to_lowercase().find(title_lower)?;
+    let lower_end = lower_start + title_lower.len();
+    let mut lower_offset = 0;
+    let mut original_start = None;
+    for (offset, ch) in content.char_indices() {
+        lower_offset += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+        if lower_offset > lower_start {
+            let start = *original_start.get_or_insert(offset);
+            if lower_offset >= lower_end {
+                // A match can cover part of an expanded lowercase char.
+                // Include the whole original char, then add context.
+                let end = offset + ch.len_utf8();
+                let start = floor_char_boundary(content, start.saturating_sub(50));
+                let end = ceil_char_boundary(content, end.saturating_add(50));
+                return Some(&content[start..end]);
+            }
+        }
+    }
+    None
 }
 
 pub async fn brain_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
@@ -281,6 +308,26 @@ pub async fn resolve_wikilink(
     Ok(Json(destination).into_response())
 }
 
+#[cfg(all(test, unix))]
+#[path = "note_files_test.rs"]
+mod note_files_test;
+
+fn read_local_note_body(
+    store: &nestweaver_store::GraphStore,
+    note: &nestweaver_schema::Note,
+) -> Result<Option<String>, ApiError> {
+    let relative = IndexedFilePath::new(&note.file_path)
+        .ok_or_else(|| ApiError::bad_request("invalid note file path"))?;
+    let Ok(vault) = store.lookup_vault(&note.vault_uid) else {
+        return Ok(None);
+    };
+    let Ok(mut file) = relative.open_regular(std::path::Path::new(&vault.root_path)) else {
+        return Ok(None);
+    };
+    let mut body = String::new();
+    Ok(file.read_to_string(&mut body).ok().map(|_| body))
+}
+
 pub async fn note_by_uid(
     State(state): State<Arc<AppState>>,
     Path(uid): Path<String>,
@@ -310,18 +357,7 @@ pub async fn note_by_uid(
     let headings = state.store.headings_in_note(&uid)?;
     let sections = state.store.sections_in_note(&uid)?;
 
-    if note.file_path.contains("..") {
-        return Err(ApiError::bad_request("invalid note file path"));
-    }
-
-    // Read file body from vault root + note file_path
-    let body = match state.store.lookup_vault(&note.vault_uid) {
-        Ok(vault) => {
-            let full_path = std::path::Path::new(&vault.root_path).join(&note.file_path);
-            std::fs::read_to_string(&full_path).unwrap_or_default()
-        }
-        Err(_) => String::new(),
-    };
+    let body = read_local_note_body(&state.store, &note)?.unwrap_or_default();
 
     Ok(Json(json!({
         "note": note,
@@ -403,33 +439,17 @@ pub async fn unlinked_mentions(
             continue;
         }
 
-        // Validate candidate file path before reading
-        if candidate.file_path.contains("..") {
+        // An unavailable candidate cannot contribute a snippet.
+        let Ok(Some(content)) = read_local_note_body(&state.store, candidate) else {
             continue;
-        }
-
-        // Read the note's file content to check for title mentions
-        let content = match state.store.lookup_vault(&candidate.vault_uid) {
-            Ok(vault) => {
-                let full_path = std::path::Path::new(&vault.root_path).join(&candidate.file_path);
-                std::fs::read_to_string(&full_path).unwrap_or_default()
-            }
-            Err(_) => continue,
         };
 
-        let content_lower = content.to_lowercase();
-        if let Some(pos) = content_lower.find(&title_lower) {
-            let start = pos.saturating_sub(50);
-            let end = (pos + title.len() + 50).min(content.len());
-            let start = floor_char_boundary(&content, start);
-            let end = ceil_char_boundary(&content, end);
-            let snippet = content[start..end].to_string();
-
+        if let Some(snippet) = mention_snippet(&content, &title_lower) {
             mentions.push(UnlinkedMention {
                 note_uid: candidate.uid.clone(),
                 title: candidate.title.clone(),
                 path: candidate.file_path.clone(),
-                snippet,
+                snippet: snippet.to_string(),
             });
         }
     }
@@ -452,7 +472,7 @@ pub async fn brain_search(
 ) -> Result<Response, ApiError> {
     let state2 = state.clone();
     let query = params.clone();
-    let response =
+    let (response, local_truncated) =
         crate::rank_events::with_rank_event(&state, move || brain_search_response(&state2, params))
             .await?;
     let Some(fed) = state.federation.get().filter(|f| f.is_configured()) else {
@@ -470,11 +490,12 @@ pub async fn brain_search(
     let local: serde_json::Value = serde_json::from_slice(&bytes)?;
     let limit = query.limit.unwrap_or(20).clamp(1, 500);
     let result = fed
-        .search(
+        .search_with_local_truncation(
             "brain_search",
             &json!({"query":query.q.unwrap_or_default(),"limit":limit}),
             local,
             limit,
+            local_truncated,
         )
         .await;
     Ok(Json(result).into_response())
@@ -483,7 +504,7 @@ pub async fn brain_search(
 fn brain_search_response(
     state: &Arc<AppState>,
     params: BrainSearchParams,
-) -> Result<Response, ApiError> {
+) -> Result<(Response, bool), ApiError> {
     let q = params.q.unwrap_or_default();
     if q.is_empty() {
         return Err(ApiError::bad_request("query parameter 'q' is required"));
@@ -503,11 +524,11 @@ fn brain_search_response(
             search.results.len(),
             search.total_count,
         );
-        return Ok(Json(json!({
-            "results": search.results,
-            "_meta": meta,
-        }))
-        .into_response());
+        let local_truncated = search.total_count.is_some_and(|n| n > search.results.len());
+        return Ok((
+            Json(json!({"results": search.results, "_meta": meta})).into_response(),
+            local_truncated,
+        ));
     }
 
     // Use tantivy if available, otherwise fall back to lookup_notes_by_title
@@ -516,7 +537,7 @@ fn brain_search_response(
             Ok(hits) => {
                 let hits = retain_graph_backed_search_hits(&state.store, hits);
                 let json = serde_json::to_value(&hits)?;
-                return Ok(Json(json).into_response());
+                return Ok((Json(json).into_response(), false));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "tantivy search failed, falling back to title lookup");
@@ -525,8 +546,15 @@ fn brain_search_response(
     }
 
     let notes = state.store.lookup_notes_by_title(&q)?;
-    let json = serde_json::to_value(&notes)?;
-    Ok(Json(json).into_response())
+    let local_truncated = notes.len() > limit;
+    let hits: Vec<_> = notes
+        .into_iter()
+        .take(limit)
+        .map(workspaces::note_search_hit)
+        .collect();
+    // Standalone search keeps its bare array. Federation needs the clipping
+    // bit separately, since its final cap cannot see the rows omitted here.
+    Ok((Json(hits).into_response(), local_truncated))
 }
 
 struct ScopedBrainSearch {
@@ -855,6 +883,145 @@ mod tests {
     use super::*;
     use nestweaver_schema::{Note, NoteKind, Vault};
     use nestweaver_store::GraphStore;
+
+    #[tokio::test]
+    async fn title_fallback_returns_bounded_search_rows_with_or_without_tantivy() {
+        use nestweaver_schema::{Project, Repo};
+
+        for with_index in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = GraphStore::in_memory().unwrap();
+            let index = with_index
+                .then(|| TantivyIndex::open_or_create(&temp.path().join("search")).unwrap());
+            for (name, title, score) in [
+                ("selected", "title:*", Some(1.25)),
+                ("other", "TITLE:*", None),
+                ("partial", "title:* is not an exact title", None),
+                ("recovery", "Recovery", None),
+            ] {
+                let vault_uid = format!("vlt:{name}");
+                store
+                    .insert_vault(&Vault {
+                        uid: vault_uid.clone(),
+                        name: name.into(),
+                        root_path: temp.path().join(name).display().to_string(),
+                        instance_id: "review".into(),
+                    })
+                    .unwrap();
+                let note = Note {
+                    uid: format!("note:{name}"),
+                    vault_uid,
+                    file_path: format!("{name}.md"),
+                    title: title.into(),
+                    note_kind: NoteKind::General,
+                    word_count: 1,
+                    content_hash: "fixture".into(),
+                    frontmatter: None,
+                    frontmatter_raw: None,
+                    created_at: None,
+                    modified_at: None,
+                    pagerank_score: score,
+                    embedding: None,
+                };
+                store.insert_note(&note).unwrap();
+                if let Some(index) = &index {
+                    index
+                        .update_note(
+                            &note.uid,
+                            &note.title,
+                            &note.vault_uid,
+                            &["recoverywitness".into()],
+                            &[],
+                            &[],
+                            &[],
+                        )
+                        .unwrap();
+                }
+            }
+            store
+                .insert_project(&Project {
+                    uid: "project:selected".into(),
+                    name: "Selected".into(),
+                    summary: None,
+                    instance_id: "review".into(),
+                })
+                .unwrap();
+            store
+                .batch_insert_project_note_edges(&[("project:selected", "note:selected")])
+                .unwrap();
+            store
+                .insert_repo(&Repo {
+                    uid: "repo:selected".into(),
+                    url: "https://example.invalid/selected.git".into(),
+                    indexed_sha: "fixture".into(),
+                    staleness_commits_behind: 0,
+                    instance_id: "review".into(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+            if let Some(index) = &index {
+                assert!(
+                    index.search("title:*", 20).is_err(),
+                    "fixture must force fallback"
+                );
+            }
+            let state = AppState::new(store, index, temp.path().join("graph.lbug"));
+            let search = |q: &str, limit, workspace: Option<&str>| {
+                let (response, _) = brain_search_response(
+                    &state,
+                    BrainSearchParams {
+                        q: Some(q.into()),
+                        limit: Some(limit),
+                        workspace: workspace.map(str::to_owned),
+                        scope: None,
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{}", error.message));
+                async move {
+                    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                        .await
+                        .unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                }
+            };
+
+            let expected = json!({
+                "uid": "note:selected", "kind": "Note", "title": "title:*",
+                "file_path": "selected.md", "vault_uid": "vlt:selected", "score": 1.25,
+            });
+            let rows = search("title:*", 20, None).await;
+            let rows = rows
+                .as_array()
+                .expect("unscoped search remains a JSON array");
+            assert_eq!(rows.len(), 2, "case-insensitive exact matches only");
+            assert!(rows.contains(&expected), "{rows:?}");
+            let other = rows.iter().find(|row| row["uid"] == "note:other").unwrap();
+            assert_eq!(other["score"], 0.0);
+            let bounded = search("title:*", 1, None).await;
+            assert_eq!(bounded, json!([rows[0]]), "keep the existing prefix order");
+            assert_eq!(search("noexactwitness", 20, None).await, json!([]));
+
+            for workspace in ["vlt:selected", "project:selected"] {
+                let scoped = search("title:*", 20, Some(workspace)).await;
+                assert_eq!(scoped["results"], json!([expected]), "{scoped}");
+                assert!(
+                    scoped["_meta"]["trust"]["unsupported"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("note-body-search"))
+                );
+            }
+            let repo = search("title:*", 20, Some("repo:selected")).await;
+            assert_eq!(repo["results"], json!([]));
+            if with_index {
+                let full_text = search("recoverywitness", 20, None).await;
+                assert!(full_text.as_array().unwrap().iter().any(|hit| {
+                    hit["uid"] == "note:recovery" && hit["score"].as_f64().unwrap_or(0.0) > 0.0
+                }));
+            }
+        }
+    }
 
     #[test]
     fn review_vault_search_filters_before_global_top_hits() {
