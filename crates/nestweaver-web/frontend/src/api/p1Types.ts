@@ -158,6 +158,7 @@ export interface ScopedNoteSearchHit {
   uid: string;
   kind: ScopedNoteSearchKind;
   title: string;
+  file_path?: string;
   vault_uid: string;
   score: number;
 }

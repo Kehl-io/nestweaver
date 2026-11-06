@@ -130,6 +130,27 @@ test.describe("Deep links (batch 11)", () => {
     await expect(page.getByRole("status", { name: "Overview filter" })).toHaveCount(0);
   });
 
+  test("repository overview omits unmeasured row state (nw-534)", async ({ page }) => {
+    await page.route((url) => url.pathname === "/api/v1/repos", (route) => route.fulfill({
+      json: [
+        { uid: "repo:test:fresh", url: "https://example.test/fresh", indexed_sha: "sha", staleness_commits_behind: 0 },
+        { uid: "repo:test:stale", url: "https://example.test/stale", indexed_sha: "older", staleness_commits_behind: 5 },
+        { uid: "repo:test:missing", url: "https://example.test/missing", indexed_sha: null },
+        { uid: "repo:test:unknown", url: "https://example.test/unknown", indexed_sha: "sha", staleness_commits_behind: null },
+      ],
+    }));
+    await page.goto("/?mode=repos&representation=table");
+    const table = page.getByRole("table", { name: "Repos result rows" });
+    for (const name of ["fresh", "stale", "missing", "unknown"]) {
+      await expect(table.getByRole("button", { name: new RegExp(`^${name}, Repo`) })).toBeVisible();
+    }
+    await expect(table.getByRole("columnheader", { name: "State" })).toHaveCount(0);
+    await expect(table).toHaveAccessibleDescription("Repository freshness is unavailable in this overview.");
+
+    await page.goto("/?mode=overview&representation=table");
+    await expect(page.getByRole("table").getByRole("columnheader", { name: "State" })).toBeVisible();
+  });
+
   test("an invalid ?node= deep link fetches once, shows one not-found state, and disables actions (nw-567)", async ({
     page,
   }) => {

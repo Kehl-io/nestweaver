@@ -39,6 +39,7 @@ function splitScopedSearchResults(results: ScopedSearchHit[]): {
           uid: hit.uid,
           kind: hit.kind,
           title: hit.title,
+          file_path: hit.file_path,
           vault_uid: hit.vault_uid,
           score: hit.score,
         });

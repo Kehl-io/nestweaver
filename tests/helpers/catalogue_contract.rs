@@ -107,7 +107,14 @@ fn assert_wire_tool_contract(wire: &Value, full: &Value) {
     for (key, value) in full.as_object().unwrap() {
         match key.as_str() {
             "inputSchema" => schema(&wire[key], value),
-            "description" => assert!(wire[key].as_str().unwrap().len() <= 200),
+            "description" => {
+                let summary = wire[key]
+                    .as_str()
+                    .unwrap()
+                    .strip_suffix(" _meta.stale_repos=federation lag. See stale_check.")
+                    .expect("wire description must disclose federation staleness");
+                assert!(summary.len() <= 200, "compact summary exceeds its budget");
+            }
             _ => assert_eq!(&wire[key], value),
         }
     }

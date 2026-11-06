@@ -7960,6 +7960,52 @@ fn brain_watch_refuses_a_vault_it_cannot_enumerate() {
     );
 }
 
+#[test]
+fn detect_implicit_projects_preview_explains_missing_entry_notes() {
+    let fixture = ExistingDbCliFixture::new();
+    let vault = fixture.db.parent().unwrap().join("vault");
+    nestweaver_store::GraphStore::open_or_create(&fixture.db).unwrap();
+    for (folder, note) in [
+        ("Projects/Alpha", "Intro.md"),
+        ("Workspaces/Beta", "Intro.md"),
+        ("Projects/Gamma", "Gamma.md"),
+        ("Workspaces/Delta", "_Overview.md"),
+    ] {
+        let path = vault.join(folder);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join(note), "# Project\n").unwrap();
+    }
+    std::fs::write(vault.join("Projects/README.md"), "# Projects\n").unwrap();
+    fixture
+        .command()
+        .args(["daemon", "--db"])
+        .arg(&fixture.db)
+        .arg("start")
+        .assert()
+        .success();
+    let generation = sidecar_path(&fixture.db, ".generation");
+    let generation_before = std::fs::read(&generation).ok();
+    fixture
+        .command()
+        .args(["detect-implicit-projects", "--dry-run", "--vault"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&fixture.db)
+        .assert()
+        .success()
+        .stdout(contains("2 implicit project(s)"))
+        .stdout(contains("  Gamma\n"))
+        .stdout(contains("  Delta\n"))
+        .stdout(contains(
+            r#"Skipped "Projects/Alpha": expected "Alpha.md" or "_Overview.md""#,
+        ))
+        .stdout(contains(
+            r#"Skipped "Workspaces/Beta": expected "Beta.md" or "_Overview.md""#,
+        ))
+        .stdout(contains("Projects/README.md").not());
+    assert_eq!(std::fs::read(&generation).ok(), generation_before);
+}
+
 /// The same `!exists() || !is_dir()` shape guards `detect-implicit-projects`,
 /// which enumerates the vault too. Not named in the nw-287 report — found by
 /// asking where else the property has to hold.

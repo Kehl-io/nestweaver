@@ -26,6 +26,7 @@ use nestweaver_engine::{
     truncate_to_budget_keeping_first,
 };
 use nestweaver_schema::SymbolKind;
+use nestweaver_schema::limits::{BRAIN_SEARCH_MAX_QUERY_CHARS, validate_brain_search_query_length};
 use nestweaver_store::tantivy_index::{SearchTotal, SearchTotalRelation};
 use nestweaver_store::{GraphStore, SearchLogicalIdentity, TantivyIndex};
 use serde_json::{Value, json};
@@ -822,6 +823,15 @@ fn all_tool_schemas() -> Vec<Value> {
         let Some(object) = tool.as_object_mut() else {
             continue;
         };
+        // Every successful dispatch crosses provenance_seam::stamp.
+        if let Some(description) = object.get_mut("description")
+            && let Some(text) = description.as_str()
+        {
+            *description = json!(format!(
+                "{text}\n\n{}",
+                nestweaver_schema::provenance::STALE_REPOS_DESCRIPTION
+            ));
+        }
         object.insert(
             "annotations".to_string(),
             serde_json::json!({
@@ -1393,7 +1403,23 @@ pub fn unknown_tool_message(name: &str) -> String {
     truncate_utf8_bytes(&format!("Unknown tool: {name}"), MAX_VALIDATION_ERROR_BYTES)
 }
 
+/// Validate the raw search argument without copying it or echoing its value.
+pub(crate) fn validate_brain_search_query_argument(
+    name: &str,
+    args: &Value,
+) -> Result<(), ToolArgumentsInvalid> {
+    if name == "brain_search"
+        && let Some(query) = args.get("query").and_then(Value::as_str)
+    {
+        validate_brain_search_query_length(query).map_err(|reason| ToolArgumentsInvalid {
+            message: format!("invalid arguments for tool 'brain_search': /query: {reason}"),
+        })?;
+    }
+    Ok(())
+}
+
 pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), anyhow::Error> {
+    validate_brain_search_query_argument(name, args)?;
     let Some(validator) = tool_validators().get(name) else {
         let name = truncate_utf8_bytes(name, MAX_TOOL_NAME_IN_ERROR_BYTES);
         let message =
@@ -1610,7 +1636,14 @@ pub(crate) fn assert_wire_tool_contract(wire: &Value, full: &Value) {
     for (key, value) in full.as_object().unwrap() {
         match key.as_str() {
             "inputSchema" => schema(&wire[key], value),
-            "description" => assert!(wire[key].as_str().unwrap().len() <= 200),
+            "description" => {
+                let summary = wire[key]
+                    .as_str()
+                    .unwrap()
+                    .strip_suffix(COMPACT_PROVENANCE_DESCRIPTION)
+                    .expect("wire description must disclose federation staleness");
+                assert!(summary.len() <= 200, "compact summary exceeds its budget");
+            }
             _ => assert_eq!(&wire[key], value),
         }
     }
@@ -1634,13 +1667,13 @@ fn compact_tool_description(name: &str) -> &'static str {
             "BM25 keyword search over notes, headings, sections, tags and symbols; returns UIDs for follow-up. limit is per kind; total_matches counts every match."
         }
         "note_get" => {
-            "Read a note's body, sections and frontmatter by uid, path or title. Use sections to fetch parts; continue a cut body with next_body_offset as body_offset."
+            "Read note by uid, path or title. Resume via next_body_offset as body_offset. word_count counts whitespace-delimited words in the full body after YAML frontmatter."
         }
         "backlinks" => {
             "List notes that wikilink to a target note (uid, path or unique title), with section, confidence and text. Duplicate titles refuse with candidate UIDs."
         }
         "brain_status" => {
-            "Indexed vaults and repos with counts, staleness and search/embedding health. null counts are unreadable, not zero; see unavailable and manifest_recovery."
+            "Indexed vaults and repos with counts and search/embedding health. Null counts are unreadable. See unavailable and manifest_recovery."
         }
         "brain_add_source" => {
             "Index a local vault, code repo or markdown folder (absolute or ~/ path); type is auto-detected. name sets a vault display name. Re-adding re-indexes."
@@ -1757,12 +1790,18 @@ fn compact_tool_description(name: &str) -> &'static str {
     }
 }
 
+// Keep the common provenance disclosure short enough for one complete page.
+const COMPACT_PROVENANCE_DESCRIPTION: &str = " _meta.stale_repos=federation lag. See stale_check.";
+
 fn compact_wire_tool(mut tool: Value) -> Value {
     if let Some(schema) = tool.get_mut("inputSchema") {
         compact_schema_documentation(schema);
     }
     let name = tool["name"].as_str().expect("registered tool name");
-    tool["description"] = json!(compact_tool_description(name));
+    tool["description"] = json!(format!(
+        "{}{COMPACT_PROVENANCE_DESCRIPTION}",
+        compact_tool_description(name)
+    ));
     tool
 }
 
@@ -1797,7 +1836,7 @@ pub fn tool_list_page(lite: bool, cursor: Option<&str>) -> Result<Value, String>
                         ("unset_extension", "uid") => "Node UID",
                         ("query_extensions", "uid") => "Node UID; ignores key",
                         ("brain_memory_related", "uid") => "Seed note UID",
-                        ("brain_search", "query") => "Free-text query",
+                        ("brain_search", "query") => "Max 16384 UTF-8 bytes",
                         ("regex_search", "query") => "pattern alias",
                         ("investigate", "query") => "Topic/feature query",
                         ("get_summary", "target") => "Summary name/path filter",
@@ -2053,6 +2092,43 @@ mod tool_schema_validation_tests {
     }
 
     #[test]
+    fn brain_search_query_schema_and_validation_bound_raw_unicode_input() {
+        let catalogue = tool_list_page(false, None).unwrap();
+        let search = catalogue["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "brain_search")
+            .unwrap();
+        assert_eq!(
+            search["inputSchema"]["properties"]["query"]["maxLength"],
+            4096
+        );
+        assert_eq!(search["inputSchema"]["properties"]["query"]["minLength"], 1);
+        for character in ['a', '界', '🧠'] {
+            for count in [4095, 4096, 4097] {
+                let query: String = std::iter::repeat_n(character, count).collect();
+                let result = validate_tool_arguments("brain_search", &json!({"query": query}));
+                if count <= 4096 {
+                    assert!(result.is_ok(), "{character:?} at {count} scalars");
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(error.is::<ToolArgumentsInvalid>());
+                    let message = error.to_string();
+                    assert!(message.contains("4096 Unicode scalar values"));
+                    assert!(message.contains("16384 UTF-8 bytes"));
+                    assert!(message.len() <= MAX_VALIDATION_ERROR_BYTES);
+                }
+            }
+        }
+        assert!(validate_tool_arguments("brain_search", &json!({})).is_err());
+        assert!(validate_tool_arguments("brain_search", &json!({"query": ""})).is_err());
+        assert!(
+            validate_tool_arguments("investigate", &json!({"query": "x".repeat(4097)})).is_ok()
+        );
+    }
+
+    #[test]
     fn review_not_found_wrapper_bounds_both_representations() {
         let result = wrap_tool_not_found(
             json!({"status":"not_found", "target":"missing-symbol", "message":"retry ".repeat(12_000)}),
@@ -2113,7 +2189,7 @@ mod tool_schema_validation_tests {
             ),
             (
                 "note_get",
-                "Read a note's body, sections and frontmatter by uid, path or title. Use sections to fetch parts; continue a cut body with next_body_offset as body_offset.",
+                "Read note by uid, path or title. Resume via next_body_offset as body_offset. word_count counts whitespace-delimited words in the full body after YAML frontmatter.",
             ),
             (
                 "backlinks",
@@ -2121,7 +2197,7 @@ mod tool_schema_validation_tests {
             ),
             (
                 "brain_status",
-                "Indexed vaults and repos with counts, staleness and search/embedding health. null counts are unreadable, not zero; see unavailable and manifest_recovery.",
+                "Indexed vaults and repos with counts and search/embedding health. Null counts are unreadable. See unavailable and manifest_recovery.",
             ),
             (
                 "brain_add_source",
@@ -2290,7 +2366,10 @@ mod tool_schema_validation_tests {
         let mut documented_arguments = 0;
         for tool in tools {
             let name = tool["name"].as_str().unwrap();
-            let summary = tool["description"].as_str().unwrap();
+            let description = tool["description"].as_str().unwrap();
+            let summary = description
+                .strip_suffix(COMPACT_PROVENANCE_DESCRIPTION)
+                .unwrap_or_else(|| panic!("missing provenance disclosure for {name}"));
             assert_eq!(summary, expected[name], "authored summary for {name}");
             // 12.1.1: real descriptions, about 150 bytes each (catalogue
             // budget 40,000; see `output_budget::CATALOGUE_BYTES`).
@@ -2313,6 +2392,13 @@ mod tool_schema_validation_tests {
                 .find(|original| original["name"] == name)
                 .unwrap();
             assert_wire_tool_contract(tool, original);
+            assert!(
+                original["description"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(nestweaver_schema::provenance::STALE_REPOS_DESCRIPTION),
+                "missing detailed provenance disclosure for {name}"
+            );
             for (argument, schema) in original["inputSchema"]["properties"].as_object().unwrap() {
                 if schema["description"].as_str().is_some() {
                     documented_arguments += 1;
@@ -5788,6 +5874,17 @@ fn bound_identifiers(v: Vec<String>, field: &str) -> Result<Vec<String>, anyhow:
 }
 
 fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::Error> {
+    let max_budget = nestweaver_engine::read_symbols::MAX_READ_SYMBOLS_TOKEN_BUDGET;
+    let token_budget = args
+        .get("token_budget")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|&budget| budget <= max_budget)
+                .map(|budget| budget as usize)
+                .ok_or_else(|| anyhow!("'token_budget' must be an integer from 0 to {max_budget}"))
+        })
+        .transpose()?;
     let targets: Vec<String> = bound_identifiers(
         args.get("targets")
             .or_else(|| args.get("uids_or_fqns"))
@@ -5814,10 +5911,6 @@ fn tool_read_symbols(store: &GraphStore, args: Value) -> Result<Value, anyhow::E
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
         .min(u8::MAX as u64) as u8;
-    let token_budget = args
-        .get("token_budget")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize);
     let explicit_root = arg_root_opt(store, &args)?;
     let fallback_root = explicit_root.clone().unwrap_or_default();
 
@@ -6193,6 +6286,8 @@ fn tool_schema_read_symbols() -> Value {
                 },
                 "token_budget": {
                     "type": "integer",
+                    "minimum": 0,
+                    "maximum": nestweaver_engine::read_symbols::MAX_READ_SYMBOLS_TOKEN_BUDGET,
                     "description": "Approximate requested token cap for combined source. Native CLI cuts a first symbol larger than this budget to fit (`body_truncated: true`, with a closing marker line) and drops later symbols after this budget. Omission removes that token cap; 0 requests only the first symbol, in full. MCP independently applies its 20KB logical / 40KB escaped wire bound, which may truncate even the first symbol; inspect output_budget and retry narrowly."
                 },
                 "root": {
@@ -8878,7 +8973,8 @@ fn tool_schema_brain_search() -> Value {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Free-text query — natural language works. Example: \"database migration\" or \"AuthService\"."
+                    "maxLength": BRAIN_SEARCH_MAX_QUERY_CHARS,
+                    "description": "Free-text query up to 4,096 Unicode scalar values and 16,384 UTF-8 bytes."
                 },
                 "limit": {
                     "type": "integer",
@@ -8944,19 +9040,19 @@ fn tool_brain_search(
     args: Value,
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
+    validate_brain_search_query_argument("brain_search", &args)?;
     require_verified_embedding_identity_for_rerank(store, &args)?;
     let raw_query = args
         .get("query")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("'query' must be a string"))?
-        .to_string();
+        .ok_or_else(|| anyhow!("'query' must be a string"))?;
     // nw-379: above `expand_query_with_aliases` on purpose. An empty query
     // means "match everything" here (and in `investigate`), the same
     // amplification `regex_search`/`count_patterns` already refuse -- and
     // alias expansion runs on the raw string, so checking after it would let
     // an alias table turn `""` into a non-empty expansion and slip past a
     // check placed below it.
-    if is_blank_query(&raw_query) {
+    if is_blank_query(raw_query) {
         return Err(anyhow!("empty query strings are not allowed"));
     }
     let limit = args
@@ -8977,7 +9073,7 @@ fn tool_brain_search(
     // Expand the query with taxonomy aliases for better recall.
     let db_path = current_db_path(store).unwrap_or_default();
     let aliases = load_alias_sidecar(&db_path);
-    let query = expand_query_with_aliases(&raw_query, &aliases);
+    let query = expand_query_with_aliases(raw_query, &aliases);
 
     // Feature F7 (PRF half): opt in to pseudo-relevance-feedback query
     // expansion via `prf: true`. Off by default.
@@ -10512,7 +10608,7 @@ mod brain_search_total_contract_tests {
 fn tool_schema_note_get() -> Value {
     json!({
         "name": "note_get",
-        "description": "Fetch note body/sections and metadata. MCP applies 20KB logical / 40KB escaped output bounds; continue with next_body_offset as body_offset (Unicode characters); keep UID/sections unchanged. Native CLI retains the full requested body.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid or a vault-relative path for unambiguous lookup; duplicate titles refuse with candidate UIDs\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
+        "description": "Fetch note body/sections and metadata. word_count counts whitespace-delimited words in the full body after YAML frontmatter. MCP applies 20KB logical / 40KB escaped output bounds; continue with next_body_offset as body_offset (Unicode characters); keep UID/sections unchanged. Native CLI retains the full requested body.\n\nRequires either 'uid' or 'title' (at least one must be provided).\n\nGuidelines:\n- Use after brain_search or brain_context identifies a relevant note\n- Pass uid or a vault-relative path for unambiguous lookup; duplicate titles refuse with candidate UIDs\n- Use sections parameter to retrieve only specific heading sections — much more token-efficient for large notes\n\nLimitations:\n- Markdown notes only — for code symbols use read_symbols\n- Not a discovery tool — use brain_search or brain_context to find notes first",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -39075,6 +39171,94 @@ mod lookup_not_found_contract_tests {
             Ok(value) => wrap_tool_result(value),
             Err(error) => wrap_tool_failure(tool, &error),
         }
+    }
+
+    #[test]
+    fn read_symbols_token_budget_schema_and_handler_reject_invalid_values() {
+        let store = GraphStore::in_memory().unwrap();
+        validate_tool_arguments("read_symbols", &json!({"targets": ["sym:x"]})).unwrap();
+        for budget in [0, 1, 16_000] {
+            let args = json!({"targets": ["sym:x"], "token_budget": budget});
+            validate_tool_arguments("read_symbols", &args).unwrap();
+            tool_read_symbols(&store, args).unwrap();
+        }
+        for budget in [
+            json!(-1),
+            json!(16_001),
+            json!(1_000_000_000),
+            json!(1.5),
+            json!("0"),
+            Value::Null,
+        ] {
+            let args = json!({"targets": ["sym:x"], "token_budget": budget});
+            let validation = validate_tool_arguments("read_symbols", &args).unwrap_err();
+            assert!(
+                validation.to_string().contains("token_budget"),
+                "{validation}"
+            );
+            let handler = tool_read_symbols(&store, args).unwrap_err();
+            assert!(
+                handler.to_string().contains("integer from 0 to 16000"),
+                "{handler}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_symbols_zero_budget_preserves_first_complete_body_through_mcp_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = "function greet(name) {\n  return hello(name);\n}";
+        let second = "function hello(n) {\n  return n;\n}";
+        std::fs::write(dir.path().join("main.js"), format!("{first}\n{second}\n")).unwrap();
+        let url = format!("file://{}", dir.path().display());
+        let (_, store) = nestweaver_engine::index::index_directory_in_memory(
+            dir.path(),
+            "default",
+            &url,
+            "fixture",
+        )
+        .unwrap();
+        let call = |budget: Option<u64>| {
+            let mut args = json!({"targets": ["greet", "hello"]});
+            if let Some(budget) = budget {
+                args["token_budget"] = json!(budget);
+            }
+            let response = mcp_result(&store, "read_symbols", args);
+            assert_eq!(response["isError"], false, "{response}");
+            let structured = response["structuredContent"].clone();
+            let text: Value =
+                serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(structured, text);
+            assert!(structured.get("output_budget").is_none(), "{structured}");
+            structured
+        };
+        let uncapped = call(None);
+        let symbols = uncapped["symbols"].as_array().unwrap();
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0]["body"], first);
+        assert_eq!(symbols[1]["body"], second);
+        assert_eq!(uncapped["truncated"], false);
+        assert_eq!(uncapped["dropped"], json!([]));
+        assert!(uncapped.get("budget_exceeded_by_first_symbol").is_none());
+
+        let zero = call(Some(0));
+        assert_eq!(zero["symbols"].as_array().unwrap().len(), 1);
+        assert_eq!(zero["symbols"][0]["uid"], symbols[0]["uid"]);
+        assert_eq!(zero["symbols"][0]["body"], first);
+        assert_eq!(zero["symbols"][0]["body_available"], true);
+        assert!(zero["symbols"][0].get("body_truncated").is_none());
+        assert_eq!(zero["dropped"], json!([symbols[1]["uid"]]));
+        assert_eq!(zero["truncated"], true);
+        let overrun = &zero["budget_exceeded_by_first_symbol"];
+        assert_eq!(overrun["requested_tokens"], 0);
+        assert!(overrun["returned_tokens"].as_u64().unwrap() > 0);
+        assert!(overrun["note"].as_str().unwrap().contains("EXCEEDS"));
+
+        let positive = call(Some(1));
+        assert_eq!(positive["symbols"].as_array().unwrap().len(), 1);
+        assert_ne!(positive["symbols"][0]["body"], first);
+        assert_eq!(positive["symbols"][0]["body_truncated"], true);
+        assert_eq!(positive["truncated"], true);
     }
 
     /// nw-557. ONE not-found contract for every lookup-by-identifier tool:
