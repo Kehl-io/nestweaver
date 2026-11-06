@@ -2686,6 +2686,32 @@ fn parse_non_blank_query(value: &str) -> Result<String, String> {
     }
 }
 
+#[derive(Clone)]
+struct BrainSearchQueryParser;
+
+impl clap::builder::TypedValueParser for BrainSearchQueryParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        _command: &clap::Command,
+        _argument: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        use clap::error::ErrorKind;
+
+        let query = value.to_str().ok_or_else(|| {
+            clap::Error::raw(ErrorKind::InvalidUtf8, "search query must be valid UTF-8")
+        })?;
+        // A function value parser adds the rejected value to the error.
+        // Build the bounded diagnostic directly before making an owned copy.
+        nestweaver_schema::limits::validate_brain_search_query_length(query)
+            .map_err(|reason| clap::Error::raw(ErrorKind::ValueValidation, reason))?;
+        parse_non_blank_query(query)
+            .map_err(|reason| clap::Error::raw(ErrorKind::ValueValidation, reason))
+    }
+}
+
 /// [`parse_non_blank_query`] with `regex_search`/`count_patterns`'s existing
 /// wording, so `--help` and the parse-time rejection state the same noun the
 /// MCP tools already use for these two.
@@ -7205,12 +7231,11 @@ enum Commands {
         // result set at exit 0, indistinguishable from "no matches", and
         // `--limit 1001` silently returned 442 rows. The range is COPIED
         // from the schema, matching the `hubs --top` / `bridges --top`
-        // idiom (nw-251) and this binary's own `brain search --limit`,
-        // which already carries this exact range and wording.
+        // idiom (nw-251). Brain Search applies the same range per result kind.
         #[arg(
             long,
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1000),
-            help = "Maximum number of results (1-1000; default: 10, or [limits].default_result_limit from config; matches the MCP brain_search schema)"
+            help = "Maximum symbol-name substring matches (1-1000; default: 10, or [limits].default_result_limit from config)"
         )]
         limit: Option<usize>,
         #[arg(long, help = "Output as JSON")]
@@ -7267,7 +7292,8 @@ enum Commands {
         neighbors: u8,
         #[arg(
             long = "token-budget",
-            help = "Approximate token budget for the combined output. A first symbol larger than the budget is cut to fit and marked body_truncated; 0 returns the first symbol whole"
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=nestweaver_engine::read_symbols::MAX_READ_SYMBOLS_TOKEN_BUDGET),
+            help = "Approximate token budget for combined source (0-16000). Omit for no token cap. A first symbol larger than a positive budget is cut to fit and marked body_truncated. 0 returns only the first symbol whole"
         )]
         token_budget: Option<usize>,
         #[arg(
@@ -8390,7 +8416,7 @@ enum Commands {
         vault: PathBuf,
         #[arg(
             long,
-            help = "Report what would be created without writing to the graph"
+            help = "Preview projects and folders missing <folder>.md or _Overview.md without writing to the graph"
         )]
         dry_run: bool,
         #[arg(long, help = "Path to the database file")]
@@ -10063,8 +10089,8 @@ enum BrainCommands {
         after_help = "Examples:\n  nestweaver brain search stripe\n  nestweaver brain search \"payment flow\" --limit 5 --json"
     )]
     Search {
-        /// Search query string.
-        #[arg(value_parser = parse_non_blank_query)]
+        /// Search query, up to 4,096 Unicode scalar values and 16,384 UTF-8 bytes.
+        #[arg(value_parser = BrainSearchQueryParser)]
         query: String,
         #[arg(
             long,
@@ -26638,6 +26664,16 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         }
 
         Commands::DetectImplicitProjects { vault, dry_run, db } => {
+            let print_skipped =
+                |skipped: &[nestweaver_engine::project::ImplicitProjectMissingEntry]| {
+                    for candidate in skipped {
+                        let [named, overview] = &candidate.entry_notes;
+                        println!(
+                            "Skipped {:?}: expected {:?} or {:?}",
+                            candidate.folder, named, overview
+                        );
+                    }
+                };
             let db_path = selected_db_path(&db.unwrap_or_else(default_db_path))?;
             require_existing_db(&db_path)?;
 
@@ -26693,6 +26729,11 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         for slug in &detected {
                             println!("  {slug}");
                         }
+                    }
+                    if dry_run && let Some(skipped) = payload.get("skipped_missing_entry") {
+                        let skipped = serde_json::from_value::<Vec<_>>(skipped.clone())
+                            .context("decode skipped implicit project folders")?;
+                        print_skipped(&skipped);
                     }
                     let degraded = publication.and_then(|value| value["disposition"].as_str())
                         == Some("committed_degraded");
@@ -26769,6 +26810,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 for slug in &detected.projects {
                     println!("  {slug}");
                 }
+            }
+            if dry_run {
+                print_skipped(&detected.skipped_missing_entry);
             }
             for warning in &detected.publication.warnings {
                 eprintln!(
@@ -41634,6 +41678,87 @@ mod daemon_cli_tests {
 #[cfg(test)]
 mod cli_bounds_tests {
     use super::*;
+
+    #[test]
+    fn search_help_distinguishes_symbol_substring_and_brain_search() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let root = Cli::command();
+                let help = |subcommand: &clap::Command| {
+                    subcommand
+                        .clone()
+                        .render_long_help()
+                        .to_string()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let search = help(root.find_subcommand("search").unwrap());
+                assert!(
+                    search.contains("Maximum symbol-name substring matches"),
+                    "{search}"
+                );
+                assert!(search.contains("default: 10"), "{search}");
+                assert!(!search.contains("brain_search"), "{search}");
+                let brain = root.find_subcommand("brain").unwrap();
+                let brain_search = help(brain.find_subcommand("search").unwrap());
+                assert!(
+                    brain_search.contains("matches the MCP brain_search schema"),
+                    "{brain_search}"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn read_symbols_token_budget_preserves_zero_and_omission_and_enforces_range() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                for (flag, expected) in [
+                    (None, None),
+                    (Some("--token-budget=0"), Some(0)),
+                    (Some("--token-budget=1"), Some(1)),
+                    (Some("--token-budget=16000"), Some(16_000)),
+                ] {
+                    let cli = Cli::try_parse_from(
+                        ["nestweaver", "read-symbols", "greet"]
+                            .into_iter()
+                            .chain(flag),
+                    )
+                    .unwrap();
+                    let Commands::ReadSymbols {
+                        targets,
+                        token_budget,
+                        ..
+                    } = cli.command
+                    else {
+                        panic!("expected read-symbols command");
+                    };
+                    assert_eq!(token_budget, expected);
+                    let args = read_symbols_rpc_args(&targets, 0, token_budget, None);
+                    assert_eq!(
+                        args.get("token_budget"),
+                        expected.map(|n| serde_json::json!(n)).as_ref()
+                    );
+                }
+                for flag in [
+                    "--token-budget=-1",
+                    "--token-budget=16001",
+                    "--token-budget=1000000000",
+                    "--token-budget=1.5",
+                ] {
+                    let parsed = Cli::try_parse_from(["nestweaver", "read-symbols", "greet", flag]);
+                    assert!(parsed.is_err(), "{flag} must be refused");
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     /// CLI numeric bounds must match the MCP tool schemas (MCP parity):
     /// impact/blast-radius --depth 1..=15, regex-search --limit 1..=10000,

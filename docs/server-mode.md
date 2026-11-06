@@ -721,6 +721,14 @@ Once indexed, vault notes are queryable from any connected client just like loca
 
 In server mode these tools route to the server (merge or fallback), so a developer with no local copy of the vault still gets its notes in results, tagged `"server"` in `_meta.sources`.
 
+For `note_get`, `word_count` counts whitespace-delimited words in the full note
+body after YAML frontmatter. Section selection and pagination change how much
+body text the call returns. The count continues to describe the full body.
+
+`brain_search` and `nestweaver brain search` accept queries up to 4,096 Unicode
+scalar values and 16,384 UTF-8 bytes. The limits apply to the raw query before
+alias expansion.
+
 `note_get` now has a CLI twin — `nestweaver note get <title|uid>` — so a note can be read from a shell without going through an MCP client. (`brain_diff` likewise has `nestweaver brain diff <repo>`.)
 
 ### Git credentials
@@ -1268,6 +1276,10 @@ contributed. The example above is the **CLI/hybrid** route's vocabulary; on the
 daemon's own `/mcp` path `add_provenance_metadata` stamps `scope: "federated"`
 with `sources: ["daemon", "<upstream>"]` when an upstream is healthy, and
 `scope: "single-node"` with `sources: ["daemon"]` when not.
+
+`_meta.stale_repos` reports federation staleness for contributed upstream data.
+For local Git freshness, use `stale_check`, which compares the indexed commit
+with the repository's current HEAD.
 
 `_meta` also carries a `limits` leg when a safeguard clamped the request
 (`add_limit_metadata` in `crates/nestweaver-mcp/src/http.rs`).

@@ -585,6 +585,7 @@ function impactRows(
 
 export function NodeListView() {
   const graphInstance = useStore((s) => s.graphInstance);
+  const graphMode = useStore((s) => s.graphMode);
   const selectedNodeId = useStore((s) => s.selectedNodeId);
   const selectNode = useStore((s) => s.selectNode);
   const exploreNode = useStore((s) => s.exploreNode);
@@ -602,6 +603,9 @@ export function NodeListView() {
   const [filter, setFilter] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("order");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
+  const showState = !(graphMode === "repos" && activeLens.lens === "overview" && activeLens.label === "Repos");
+  const visibleSortKey = !showState && sortKey === "status" ? "order" : sortKey;
+  const visibleSortDirection = visibleSortKey === sortKey ? sortDirection : "asc";
 
   const rows = useMemo<ResultRow[]>(() => {
     const trustResult = trustSummary?.result ?? sceneMetadata?.trust.result ?? "unknown";
@@ -660,17 +664,17 @@ export function NodeListView() {
             row.primary,
             row.kind,
             row.relationship,
-            row.status,
+            showState ? row.status : "",
             row.location,
             row.metadata,
           ].some((value) => value.toLowerCase().includes(lower)),
         )
       : rows;
     return [...next].sort((a, b) => {
-      const base = compareValues(a[sortKey], b[sortKey]);
-      return sortDirection === "asc" ? base : -base;
+      const base = compareValues(a[visibleSortKey], b[visibleSortKey]);
+      return visibleSortDirection === "asc" ? base : -base;
     });
-  }, [rows, filter, sortKey, sortDirection]);
+  }, [rows, filter, showState, visibleSortKey, visibleSortDirection]);
 
   const setSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -710,8 +714,8 @@ export function NodeListView() {
   };
 
   const ariaSort = (key: SortKey) =>
-    sortKey === key
-      ? sortDirection === "asc"
+    visibleSortKey === key
+      ? visibleSortDirection === "asc"
         ? "ascending"
         : "descending"
       : "none";
@@ -744,7 +748,9 @@ export function NodeListView() {
         </div>
         <input
           type="search"
-          placeholder="Filter rows by result, relationship, state, or metadata..."
+          placeholder={showState
+            ? "Filter rows by result, relationship, state, or metadata..."
+            : "Filter rows by result, relationship, or metadata..."}
           value={filter}
           onChange={(event) => setFilter(event.target.value)}
           className="h-8 min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-muted)]"
@@ -755,10 +761,16 @@ export function NodeListView() {
         </span>
       </div>
 
+      {!showState && (
+        <p id="repo-result-state-description" className="border-b border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-text-muted)]">
+          Repository freshness is unavailable in this overview.
+        </p>
+      )}
       <div className="min-h-0 flex-1 overflow-auto">
         <table
           className="w-full min-w-[1060px] border-collapse text-left text-xs"
           aria-label={`${activeLens.label} result rows`}
+          aria-describedby={!showState ? "repo-result-state-description" : undefined}
         >
           <thead className="sticky top-0 z-10 bg-[var(--color-surface)] shadow-sm">
             <tr className="border-b border-[var(--color-border)]">
@@ -766,7 +778,7 @@ export function NodeListView() {
               <th scope="col" aria-sort={ariaSort("primary")} className="px-3 py-2">{header("primary", "Result")}</th>
               <th scope="col" aria-sort={ariaSort("kind")} className="px-3 py-2">{header("kind", "Kind")}</th>
               <th scope="col" aria-sort={ariaSort("relationship")} className="px-3 py-2">{header("relationship", "Semantics")}</th>
-              <th scope="col" aria-sort={ariaSort("status")} className="px-3 py-2">{header("status", "State")}</th>
+              {showState && <th scope="col" aria-sort={ariaSort("status")} className="px-3 py-2">{header("status", "State")}</th>}
               <th scope="col" aria-sort={ariaSort("location")} className="px-3 py-2">{header("location", "Evidence")}</th>
               <th scope="col" className="whitespace-nowrap px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
                 Metadata
@@ -820,9 +832,11 @@ export function NodeListView() {
                 <td className="max-w-[260px] px-3 py-2 text-[var(--color-text-muted)]">
                   {row.relationship}
                 </td>
-                <td className="px-3 py-2 text-[var(--color-text-muted)]">
-                  {row.status || "-"}
-                </td>
+                {showState && (
+                  <td className="px-3 py-2 text-[var(--color-text-muted)]">
+                    {row.status || "-"}
+                  </td>
+                )}
                 <td className="max-w-[240px] truncate px-3 py-2 text-[var(--color-text-muted)]">
                   {row.location || "-"}
                 </td>

@@ -24,6 +24,23 @@ pub fn drain_ceiling_from_env() -> u64 {
         .unwrap_or(DEFAULT_DRAIN_CEILING_SECS)
 }
 
+/// Raw brain search input bound shared by MCP and `nestweaver brain search`.
+pub const BRAIN_SEARCH_MAX_QUERY_CHARS: usize = 4_096;
+pub const BRAIN_SEARCH_MAX_QUERY_BYTES: usize = 16_384;
+
+/// Check the borrowed input before copying or expanding search aliases.
+pub fn validate_brain_search_query_length(query: &str) -> Result<(), String> {
+    if query.len() > BRAIN_SEARCH_MAX_QUERY_BYTES
+        || query.chars().take(BRAIN_SEARCH_MAX_QUERY_CHARS + 1).count()
+            > BRAIN_SEARCH_MAX_QUERY_CHARS
+    {
+        return Err(format!(
+            "query must be at most {BRAIN_SEARCH_MAX_QUERY_CHARS} Unicode scalar values and {BRAIN_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes"
+        ));
+    }
+    Ok(())
+}
+
 /// Longest source (vault or repo) display name an interface accepts, in chars.
 pub const MAX_SOURCE_NAME_CHARS: usize = 255;
 

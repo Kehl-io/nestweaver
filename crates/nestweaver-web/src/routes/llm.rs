@@ -252,19 +252,15 @@ fn semantic_failure_is_real(result: &BrainContextResult) -> bool {
 /// with `concise = false`: this route serializes uid, kind, title, location,
 /// and relevance. Seeds are charged first because the response always includes
 /// them. The engine then pins those same nodes at the front of `connected`.
-/// A pinned copy that was already charged, and that does not fit in what
-/// remains, is skipped so a later neighbor can still fill the budget.
+/// Skip over-budget pinned copies so later neighbors can fill the budget.
+/// Only an omitted original seed or neighbor counts as truncation.
 fn apply_token_budget(context: &mut BrainContextResult, budget: usize) -> (usize, bool) {
     let mut used = 0usize;
-    let seeds_truncated = take_within_budget(&mut context.seeds, budget, &mut used);
-    let charged_seed_uids: std::collections::HashSet<String> =
+    let pinned_seed_uids: std::collections::HashSet<String> =
         context.seeds.iter().map(|node| node.uid.clone()).collect();
-    let connected_truncated = take_connected_within_budget(
-        &mut context.connected,
-        budget,
-        &mut used,
-        &charged_seed_uids,
-    );
+    let seeds_truncated = take_within_budget(&mut context.seeds, budget, &mut used);
+    let connected_truncated =
+        take_connected_within_budget(&mut context.connected, budget, &mut used, &pinned_seed_uids);
     (used, seeds_truncated || connected_truncated)
 }
 
@@ -292,14 +288,14 @@ fn take_connected_within_budget(
     nodes: &mut Vec<BrainNode>,
     budget: usize,
     used: &mut usize,
-    charged_seed_uids: &std::collections::HashSet<String>,
+    pinned_seed_uids: &std::collections::HashSet<String>,
 ) -> bool {
     let mut kept = Vec::with_capacity(nodes.len());
     let mut truncated = false;
     for node in std::mem::take(nodes) {
         let cost = node_token_cost(&node);
         if used.saturating_add(cost) > budget {
-            if charged_seed_uids.contains(&node.uid) {
+            if pinned_seed_uids.contains(&node.uid) {
                 continue;
             }
             truncated = true;
@@ -634,5 +630,40 @@ mod tests {
             inline_body: None,
             body_complete: true,
         }
+    }
+
+    #[test]
+    fn oversized_seed_leaves_room_for_ranked_neighbors() {
+        let oversized = budget_node("sym:oversized", &"S".repeat(400));
+        let neighbor = budget_node("sym:neighbor", "n");
+        let cost = node_token_cost(&neighbor);
+        for budget in [cost - 1, cost] {
+            let mut context = BrainContextResult {
+                seeds: vec![oversized.clone()],
+                connected: vec![oversized.clone(), neighbor.clone()],
+                ..Default::default()
+            };
+            let (used, truncated) = apply_token_budget(&mut context, budget);
+            assert!(truncated);
+            assert!(context.seeds.is_empty());
+            if budget == cost {
+                assert_eq!(used, cost);
+                assert_eq!(context.connected.len(), 1);
+                assert_eq!(context.connected[0].uid, neighbor.uid);
+            } else {
+                assert_eq!(used, 0);
+                assert!(context.connected.is_empty());
+            }
+        }
+
+        let mut context = BrainContextResult {
+            connected: vec![oversized, neighbor],
+            ..Default::default()
+        };
+        assert_eq!(apply_token_budget(&mut context, cost), (0, true));
+        assert!(
+            context.connected.is_empty(),
+            "ordinary ranking keeps its prefix"
+        );
     }
 }

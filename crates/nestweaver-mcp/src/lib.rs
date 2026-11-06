@@ -434,23 +434,26 @@ fn dispatch_method_daemon_cancellable(
         }
 
         "tools/call" => {
-            let params = req.params.clone().unwrap_or(Value::Null);
-            let name = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(Value::Object(serde_json::Map::new()));
-
-            let Some(name) = name else {
+            let params = req.params.as_ref().unwrap_or(&Value::Null);
+            let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Frame::Error(error(
                     id,
                     error_code::INVALID_PARAMS,
                     "tools/call: 'name' is required",
                 ));
             };
+            let arguments = params.get("arguments");
+            if let Some(arguments) = arguments
+                && let Err(error) = tools::validate_brain_search_query_argument(name, arguments)
+            {
+                let error = tools::enforce_tool_allowed(name)
+                    .err()
+                    .unwrap_or_else(|| error.into());
+                return Frame::Success(success(id, tools::wrap_tool_failure(name, &error)));
+            }
+            let arguments = arguments
+                .cloned()
+                .unwrap_or(Value::Object(serde_json::Map::new()));
 
             // Isolate a panicking tool so one bad call can't unwind the stdio
             // read loop and kill the session (mirrors the HTTP path).
@@ -459,16 +462,16 @@ fn dispatch_method_daemon_cancellable(
             let _delivery =
                 tools::scoped_tool_delivery(nestweaver_schema::ToolDeliveryProfile::BoundedMcp);
             let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tools::dispatch_via_daemon_cancellable(client, rt, &name, arguments.clone(), cancel)
+                tools::dispatch_via_daemon_cancellable(client, rt, name, arguments.clone(), cancel)
             }));
             match dispatched {
                 Ok(Ok(result)) => {
                     if let Some(tracker) = tracker {
-                        record_interaction(tracker, &name, &arguments, &result);
+                        record_interaction(tracker, name, &arguments, &result);
                     }
                     Frame::Success(success(id, tools::wrap_tool_result(result)))
                 }
-                Ok(Err(e)) => Frame::Success(success(id, tools::wrap_tool_failure(&name, &e))),
+                Ok(Err(e)) => Frame::Success(success(id, tools::wrap_tool_failure(name, &e))),
                 Err(_) => Frame::Success(success(
                     id,
                     tools::wrap_tool_error(&format!("tool '{name}' panicked")),
@@ -713,23 +716,26 @@ fn dispatch_method_cancellable(
         }
 
         "tools/call" => {
-            let params = req.params.clone().unwrap_or(Value::Null);
-            let name = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(Value::Object(serde_json::Map::new()));
-
-            let Some(name) = name else {
+            let params = req.params.as_ref().unwrap_or(&Value::Null);
+            let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Frame::Error(error(
                     id,
                     error_code::INVALID_PARAMS,
                     "tools/call: 'name' is required",
                 ));
             };
+            let arguments = params.get("arguments");
+            if let Some(arguments) = arguments
+                && let Err(error) = tools::validate_brain_search_query_argument(name, arguments)
+            {
+                let error = tools::enforce_tool_allowed(name)
+                    .err()
+                    .unwrap_or_else(|| error.into());
+                return Frame::Success(success(id, tools::wrap_tool_failure(name, &error)));
+            }
+            let arguments = arguments
+                .cloned()
+                .unwrap_or(Value::Object(serde_json::Map::new()));
 
             // The stdio MCP server runs outside daemon context and has no
             // access to the lazily-loaded embedding model. Semantic search
@@ -745,7 +751,7 @@ fn dispatch_method_cancellable(
                 tools::dispatch_cancellable(
                     store,
                     tantivy,
-                    &name,
+                    name,
                     arguments.clone(),
                     None,
                     cancel,
@@ -755,7 +761,7 @@ fn dispatch_method_cancellable(
             match dispatched {
                 Ok(Ok(result)) => {
                     if let Some(tracker) = tracker {
-                        record_interaction(tracker, &name, &arguments, &result);
+                        record_interaction(tracker, name, &arguments, &result);
                     }
                     Frame::Success(success(id, tools::wrap_tool_result(result)))
                 }
@@ -764,7 +770,7 @@ fn dispatch_method_cancellable(
                     // isError=true — not as JSON-RPC errors — so the client
                     // can surface them to Claude rather than aborting the
                     // call sequence.
-                    Frame::Success(success(id, tools::wrap_tool_failure(&name, &e)))
+                    Frame::Success(success(id, tools::wrap_tool_failure(name, &e)))
                 }
                 Err(_) => Frame::Success(success(
                     id,
@@ -1276,6 +1282,30 @@ mod tests {
             }
             Frame::Error(e) => panic!("brain_search should succeed: {}", e.error.message),
         }
+    }
+
+    #[test]
+    fn brain_search_oversized_query_refuses_without_echoing_input() {
+        let store = GraphStore::in_memory().unwrap();
+        let query = format!("reject-this-input-{}", "x".repeat(200_000));
+        let req = make_request(
+            "tools/call",
+            6,
+            json!({"name": "brain_search", "arguments": {"query": query}}),
+        );
+        let Frame::Success(response) = dispatch_method(&store, None, &req, None) else {
+            panic!("a tool argument refusal should use the in-band result");
+        };
+        assert_eq!(response.result["isError"], true);
+        let wire = response.result.to_string();
+        assert!(wire.contains("4096 Unicode scalar values"));
+        assert!(wire.contains("16384 UTF-8 bytes"));
+        assert!(!wire.contains("reject-this-input"));
+        assert!(
+            wire.len() < 1024,
+            "bounded result, got {} bytes",
+            wire.len()
+        );
     }
 
     // ── interaction telemetry helper tests ────────────────────────────────

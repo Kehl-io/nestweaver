@@ -352,7 +352,7 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                   event.stopPropagation();
                   onSelect(n.uid, n.kind);
                 }}
-                className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start gap-2 text-left"
+                className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 text-left"
               >
                 <KindBadge kind={n.kind} />
                 <span className="min-w-0 break-all font-medium" title={n.title}>
@@ -361,6 +361,14 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                 <span className="ml-auto shrink-0 text-xs text-[var(--color-text-muted)]">
                   {n.score.toFixed(2)}
                 </span>
+                {n.file_path && (
+                  <span
+                    className="col-span-3 min-w-0 break-all text-xs text-[var(--color-text-muted)]"
+                    title={n.file_path}
+                  >
+                    {n.file_path}
+                  </span>
+                )}
               </button>
               <span className="flex flex-wrap gap-1">
                 <button

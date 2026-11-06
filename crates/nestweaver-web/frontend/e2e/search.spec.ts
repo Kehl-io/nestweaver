@@ -25,6 +25,36 @@ function symbolPayload(hit: {
 }
 
 test.describe("Search Flow", () => {
+  test("search exposes readable kind names and duplicate note paths (nw-536)", async ({ page }) => {
+    const kinds = ["Constant", "struct", "type_alias", "FutureKind", null];
+    await page.route("**/api/v1/search?**", (route) => route.fulfill({
+      json: kinds.map((kind, index) => ({
+        uid: `sym:test:kind-${index}`, name: `kindHit${index}`, kind,
+        file_path: `src/file-${index}.ts`, start_line: 1,
+      })),
+    }));
+    await page.route("**/api/v1/brain/search?**", (route) => route.fulfill({
+      json: ["north", "south"].map((folder) => ({
+        uid: `note:test:${folder}`, kind: "note", title: "Shared decision",
+        vault_uid: "vlt:test", file_path: `${folder}/decision.md`, score: 1.25,
+      })),
+    }));
+    await page.goto("/?workspace=all&representation=table");
+    await expect(page.getByRole("table").getByRole("row").nth(1)).toBeVisible({ timeout: 15_000 });
+    await page.getByTestId("search-input").fill("kindHit");
+    const dropdown = page.getByRole("listbox");
+    await expect(dropdown.getByRole("option").filter({ hasText: "kindHit0" })).toBeVisible({ timeout: 15_000 });
+    for (const [index, label] of ["Constant", "Struct", "Type alias", "Future Kind", "Unknown kind"].entries()) {
+      const row = dropdown.getByRole("option").filter({ hasText: `kindHit${index}` });
+      await expect(row.getByRole("img", { name: label, exact: true })).toBeVisible();
+    }
+    for (const folder of ["north", "south"]) {
+      const row = dropdown.getByRole("option").filter({ hasText: `${folder}/decision.md` });
+      await expect(row.getByRole("img", { name: "Note", exact: true })).toBeVisible();
+      await expect(row).toMatchAriaSnapshot(`- button /Shared decision.*1[.]25.*${folder}[/]decision[.]md/`);
+    }
+  });
+
   test("search via API returns results for known symbol", async ({ request }) => {
     const response = await request.get("/api/v1/search?q=greet");
     expect(response.ok()).toBeTruthy();

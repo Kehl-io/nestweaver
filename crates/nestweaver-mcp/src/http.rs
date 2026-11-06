@@ -1278,14 +1278,14 @@ async fn handle_mcp(
         }
 
         "tools/call" => {
-            let params = req.params.clone().unwrap_or(Value::Null);
+            let mut params = req.params.unwrap_or(Value::Null);
             let name = params
                 .get("name")
                 .and_then(|v| v.as_str())
                 .map(String::from);
             let arguments = params
-                .get("arguments")
-                .cloned()
+                .get_mut("arguments")
+                .map(Value::take)
                 .unwrap_or(Value::Object(serde_json::Map::new()));
 
             let Some(name) = name else {

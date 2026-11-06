@@ -5,7 +5,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use nestweaver_store::{SearchHit, TantivyIndex};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::ApiError;
@@ -592,7 +592,7 @@ fn tantivy_scoped_note_search(
     let hits = retain_graph_backed_search_hits(&state.store, hits);
     let results: Vec<_> = hits
         .into_iter()
-        .filter(|hit| hit_in_workspace(state, workspace, project_note_uids.as_ref(), hit))
+        .filter(|hit| hit_in_workspace(state, workspace, project_note_uids.as_ref(), &hit.hit))
         .map(|hit| serde_json::to_value(hit).unwrap_or(serde_json::Value::Null))
         .collect();
     // A stale search document is not a graph-backed result. Do not present its
@@ -816,27 +816,38 @@ fn scoped_brain_search(
 
 /// Drop Tantivy hits whose note identity is absent from the graph so search
 /// cannot present a ghost UID as a real note (404 on `/brain/note/{uid}`).
+#[derive(Serialize)]
+struct GraphBackedSearchHit {
+    #[serde(flatten)]
+    hit: SearchHit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_path: Option<String>,
+}
+
 fn retain_graph_backed_search_hits(
     store: &nestweaver_store::GraphStore,
     hits: Vec<SearchHit>,
-) -> Vec<SearchHit> {
+) -> Vec<GraphBackedSearchHit> {
     hits.into_iter()
-        .filter(|hit| search_hit_exists_in_graph(store, hit))
+        .filter_map(|hit| {
+            let note_uid = if hit.kind.eq_ignore_ascii_case("note") || hit.uid.starts_with("note:")
+            {
+                Some(hit.uid.as_str())
+            } else if !hit.note_uid.is_empty() {
+                Some(hit.note_uid.as_str())
+            } else {
+                None
+            };
+            let file_path = match note_uid {
+                Some(uid) => {
+                    let note = store.lookup_note(uid).ok()?;
+                    (note.vault_uid == hit.vault_uid).then_some(note.file_path)
+                }
+                None => None,
+            };
+            Some(GraphBackedSearchHit { hit, file_path })
+        })
         .collect()
-}
-
-fn search_hit_exists_in_graph(store: &nestweaver_store::GraphStore, hit: &SearchHit) -> bool {
-    let note_uid = if hit.kind.eq_ignore_ascii_case("note") || hit.uid.starts_with("note:") {
-        Some(hit.uid.as_str())
-    } else if !hit.note_uid.is_empty() {
-        Some(hit.note_uid.as_str())
-    } else {
-        None
-    };
-    match note_uid {
-        Some(uid) => store.lookup_note(uid).is_ok(),
-        None => true,
-    }
 }
 
 #[cfg(test)]
@@ -970,8 +981,11 @@ mod tests {
                 hit("sym:test:greet", "symbol"),
             ],
         );
-        let uids: Vec<&str> = kept.iter().map(|h| h.uid.as_str()).collect();
+        let uids: Vec<&str> = kept.iter().map(|h| h.hit.uid.as_str()).collect();
         assert_eq!(uids, vec!["note:notes:real", "sym:test:greet"]);
+        let response = serde_json::to_value(&kept).unwrap();
+        assert_eq!(response[0]["file_path"], "real.md");
+        assert!(response[1].get("file_path").is_none());
         assert!(
             !uids.contains(&"note:notes:ghost"),
             "a UID that 404s on brain/note must not appear as a search hit"

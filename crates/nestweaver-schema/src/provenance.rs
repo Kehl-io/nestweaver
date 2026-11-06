@@ -31,6 +31,10 @@ use serde_json::Value;
 /// invent a fifth spelling without deleting this line.
 pub const META_KEY: &str = "_meta";
 
+/// Shared wording for tool descriptions that expose the provenance stamp.
+pub const STALE_REPOS_DESCRIPTION: &str =
+    "_meta.stale_repos reports federation staleness. For local Git freshness, use stale_check.";
+
 /// The scope label for a result computed against the local graph with no
 /// upstreams involved.
 pub const SCOPE_LOCAL: &str = "local";
@@ -61,7 +65,7 @@ pub fn derived_scope<'a>(sources: &[&'a str]) -> &'a str {
 /// generation-mismatch repo UIDs, `stale_check`'s behind-HEAD git URLs, and
 /// `resolver_stale_repos`, a differently-named repo-UID population added
 /// later specifically to avoid deepening this collision). Nothing here
-/// decodes one as another; keep it that way.
+/// decodes one as another. For local Git freshness, use `stale_check`.
 pub fn provenance(scope: &str, sources: &[&str], stale_repos: &[String]) -> Value {
     serde_json::json!({
         "scope": scope,

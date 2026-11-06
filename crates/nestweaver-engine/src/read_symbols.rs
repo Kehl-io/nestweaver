@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::content_reader::ContentReader;
 
+/// Largest explicit source token budget on the CLI and MCP read-symbols routes.
+pub const MAX_READ_SYMBOLS_TOKEN_BUDGET: u64 = 16_000;
+
 /// One returned symbol window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolWindow {
@@ -1076,6 +1079,42 @@ mod tests {
         let (_r, store) =
             index_directory_in_memory(&src, "test", "https://example.com/repo", "abc123").unwrap();
         (dir, src, store)
+    }
+
+    #[test]
+    fn zero_budget_keeps_the_first_complete_symbol_and_reports_the_second_dropped() {
+        let (_dir, src, store) = test_repo();
+        let reader = FilesystemReader::new(&src);
+        let targets = ["greet".to_string(), "hello".to_string()];
+        let uncapped = read_symbols(&store, &targets, &reader, 0, None);
+        assert_eq!(uncapped.symbols.len(), 2);
+        let first = "function greet(name) {\n  return hello(name);\n}";
+        let second = "function hello(n) {\n  return n;\n}";
+        assert_eq!(uncapped.symbols[0].body, first);
+        assert_eq!(uncapped.symbols[1].body, second);
+        assert!(!uncapped.truncated);
+        assert!(uncapped.dropped.is_empty());
+        assert!(uncapped.budget_exceeded_by_first_symbol.is_none());
+
+        let zero = read_symbols(&store, &targets, &reader, 0, Some(0));
+        assert_eq!(zero.symbols.len(), 1);
+        assert_eq!(zero.symbols[0].uid, uncapped.symbols[0].uid);
+        assert_eq!(zero.symbols[0].body, first);
+        assert!(zero.symbols[0].body_available);
+        assert!(!zero.symbols[0].body_truncated);
+        assert_eq!(zero.dropped, vec![uncapped.symbols[1].uid.clone()]);
+        assert!(zero.truncated);
+        let overrun = zero.budget_exceeded_by_first_symbol.unwrap();
+        assert_eq!(overrun.requested_tokens, 0);
+        assert!(overrun.returned_tokens > 0);
+        assert!(overrun.note.contains("EXCEEDS"), "{overrun:?}");
+
+        let positive = read_symbols(&store, &targets, &reader, 0, Some(1));
+        assert_eq!(positive.symbols.len(), 1);
+        assert_ne!(positive.symbols[0].body, first);
+        assert!(positive.symbols[0].body_truncated);
+        assert!(positive.symbols[0].body.contains("truncated"));
+        assert!(positive.truncated);
     }
 
     /// nw-111 (3): a budget too small for even one symbol must be DISCLOSED.

@@ -12055,7 +12055,7 @@ impl NestWeaverDaemon for DaemonService {
                     "committed_degraded"
                 }
             };
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "projects": detected.projects,
                 "publication": {
                     "disposition": disposition,
@@ -12069,6 +12069,12 @@ impl NestWeaverDaemon for DaemonService {
                     }).collect::<Vec<_>>(),
                 },
             });
+            if dry_run {
+                payload["skipped_missing_entry"] =
+                    serde_json::to_value(detected.skipped_missing_entry).map_err(|error| {
+                        Status::internal(format!("serialization failed: {error:#}"))
+                    })?;
+            }
             serde_json::to_string(&payload)
                 .map_err(|error| Status::internal(format!("serialization failed: {error:#}")))
         };
@@ -26410,6 +26416,9 @@ repos = ["alpha"]
         let preview_dir = vault.path().join("Workspaces").join("preview-project");
         std::fs::create_dir_all(&preview_dir).unwrap();
         std::fs::write(preview_dir.join("_Overview.md"), "# Preview\n").unwrap();
+        let missing_entry = vault.path().join("Projects").join("missing-entry");
+        std::fs::create_dir_all(&missing_entry).unwrap();
+        std::fs::write(missing_entry.join("Intro.md"), "# Intro\n").unwrap();
         let held_gate = state.write_gate.mutex().lock_owned().await;
         let preview = DaemonService::new(state.clone())
             .detect_implicit_projects_json(Request::new(JsonRequest {
@@ -26424,6 +26433,13 @@ repos = ["alpha"]
         drop(held_gate);
         let preview: serde_json::Value = serde_json::from_str(&preview.into_inner().result_json)
             .expect("dry-run publication-aware JSON");
+        assert_eq!(
+            preview["skipped_missing_entry"],
+            serde_json::json!([{
+                "folder": "Projects/missing-entry",
+                "entry_notes": ["missing-entry.md", "_Overview.md"],
+            }])
+        );
         assert!(preview["projects"].as_array().is_some_and(|projects| {
             projects
                 .iter()

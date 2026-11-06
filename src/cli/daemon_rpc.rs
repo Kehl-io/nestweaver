@@ -1005,18 +1005,20 @@ pub(crate) fn dispatch_hybrid_mcp_request(
         }),
         "tools/list" => hybrid_catalogue_reply(request, lite),
         "tools/call" => {
-            let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+            let params = request.params.as_ref().unwrap_or(&serde_json::Value::Null);
             let name = params
                 .get("name")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            let arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-            // nw-558: fold alias spellings before the federation legs read
-            // the canonical keys.
-            let arguments = nestweaver_mcp::tools::canonicalize_tool_arguments(name, arguments);
+            let empty = serde_json::Value::Object(serde_json::Map::new());
+            let raw_arguments = params.get("arguments").unwrap_or(&empty);
+            // brain_search has no argument aliases. Borrow its input through
+            // validation so an oversized query is refused before any copy.
+            // Other tools still fold alias spellings before federation.
+            let canonical_arguments = (name != "brain_search").then(|| {
+                nestweaver_mcp::tools::canonicalize_tool_arguments(name, raw_arguments.clone())
+            });
+            let arguments = canonical_arguments.as_ref().unwrap_or(raw_arguments);
             if name.is_empty() {
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": id,
@@ -1028,7 +1030,7 @@ pub(crate) fn dispatch_hybrid_mcp_request(
                     "result": nestweaver_mcp::tools::wrap_tool_error(&error.to_string()),
                 })
             } else if let Err(error) =
-                nestweaver_mcp::tools::validate_tool_arguments(name, &arguments)
+                nestweaver_mcp::tools::validate_tool_arguments(name, arguments)
             {
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": id,
@@ -1048,7 +1050,7 @@ pub(crate) fn dispatch_hybrid_mcp_request(
                     } else {
                         rt.block_on(nestweaver_mcp::session::await_cancellable(
                             Some(cancel),
-                            hybrid.query(name, &arguments),
+                            hybrid.query(name, arguments),
                         ))
                     }
                 }));
@@ -1296,7 +1298,14 @@ mod hybrid_catalogue_tests {
         for (key, value) in full.as_object().unwrap() {
             match key.as_str() {
                 "inputSchema" => schema(&wire[key], value),
-                "description" => assert!(wire[key].as_str().unwrap().len() <= 200),
+                "description" => {
+                    let summary = wire[key]
+                        .as_str()
+                        .unwrap()
+                        .strip_suffix(" _meta.stale_repos=federation lag. See stale_check.")
+                        .expect("wire description must disclose federation staleness");
+                    assert!(summary.len() <= 200, "compact summary exceeds its budget");
+                }
                 _ => assert_eq!(&wire[key], value),
             }
         }

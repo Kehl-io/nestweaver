@@ -4131,15 +4131,10 @@ fn cli_limit_help_states_the_default_the_code_actually_applies() {
     );
 }
 
-/// nw-431 / nw-217b: `search --limit` carried no `value_parser`, so it
-/// enforced NEITHER of `brain_search`'s declared bounds (schema:
-/// `minimum: 1, maximum: 1000`) -- `--limit 0` returned an empty result set
-/// at exit 0, indistinguishable from "no matches", and `--limit 1001`
-/// silently returned extra rows. Both ends are now a clap usage error at
-/// exit 64, matching `blast-radius --depth`'s shape, and the help states the
-/// bound and names the schema it matches.
+/// nw-431 / nw-217b: out-of-range symbol search limits are usage errors.
+/// nw-526: plain search help describes its own limit contract.
 #[test]
-fn search_limit_enforces_the_brain_search_schema_bound() {
+fn search_limit_enforces_and_documents_symbol_search_bounds() {
     nestweaver_cmd()
         .args(["search", "anything", "--limit", "0"])
         .assert()
@@ -4156,8 +4151,9 @@ fn search_limit_enforces_the_brain_search_schema_bound() {
         .args(["search", "--help"])
         .assert()
         .success()
+        .stdout(contains("Maximum symbol-name substring matches"))
         .stdout(contains("1-1000"))
-        .stdout(contains("brain_search"));
+        .stdout(contains("brain_search").not());
 }
 
 /// nw-430 FIX 3 (review follow-up). `--no-embed` used to be a `global = true`
@@ -7958,6 +7954,52 @@ fn brain_watch_refuses_a_vault_it_cannot_enumerate() {
         stderr.contains("cannot be read"),
         "the error must name the readability failure: {stderr}"
     );
+}
+
+#[test]
+fn detect_implicit_projects_preview_explains_missing_entry_notes() {
+    let fixture = ExistingDbCliFixture::new();
+    let vault = fixture.db.parent().unwrap().join("vault");
+    nestweaver_store::GraphStore::open_or_create(&fixture.db).unwrap();
+    for (folder, note) in [
+        ("Projects/Alpha", "Intro.md"),
+        ("Workspaces/Beta", "Intro.md"),
+        ("Projects/Gamma", "Gamma.md"),
+        ("Workspaces/Delta", "_Overview.md"),
+    ] {
+        let path = vault.join(folder);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join(note), "# Project\n").unwrap();
+    }
+    std::fs::write(vault.join("Projects/README.md"), "# Projects\n").unwrap();
+    fixture
+        .command()
+        .args(["daemon", "--db"])
+        .arg(&fixture.db)
+        .arg("start")
+        .assert()
+        .success();
+    let generation = sidecar_path(&fixture.db, ".generation");
+    let generation_before = std::fs::read(&generation).ok();
+    fixture
+        .command()
+        .args(["detect-implicit-projects", "--dry-run", "--vault"])
+        .arg(&vault)
+        .arg("--db")
+        .arg(&fixture.db)
+        .assert()
+        .success()
+        .stdout(contains("2 implicit project(s)"))
+        .stdout(contains("  Gamma\n"))
+        .stdout(contains("  Delta\n"))
+        .stdout(contains(
+            r#"Skipped "Projects/Alpha": expected "Alpha.md" or "_Overview.md""#,
+        ))
+        .stdout(contains(
+            r#"Skipped "Workspaces/Beta": expected "Beta.md" or "_Overview.md""#,
+        ))
+        .stdout(contains("Projects/README.md").not());
+    assert_eq!(std::fs::read(&generation).ok(), generation_before);
 }
 
 /// The same `!exists() || !is_dir()` shape guards `detect-implicit-projects`,

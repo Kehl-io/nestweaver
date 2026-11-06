@@ -383,7 +383,14 @@ pub fn resolve_declared_repo<'a>(
 
 pub struct ImplicitProjectDetectionResult {
     pub projects: Vec<String>,
+    pub skipped_missing_entry: Vec<ImplicitProjectMissingEntry>,
     pub publication: GraphMutationPublicationOutcome,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ImplicitProjectMissingEntry {
+    pub folder: String,
+    pub entry_notes: [String; 2],
 }
 
 fn resolve_project_replacement<'a>(
@@ -1201,8 +1208,8 @@ pub const PROJECT_CONTAINER_DIRS: &[&str] = &["Projects", "Workspaces"];
 ///
 /// nw-161: only `<slug>/<slug>.md` was accepted. `_Overview.md` is the
 /// convention actually used under `Workspaces/`.
-fn is_entry_note(dir: &Path, slug: &str) -> bool {
-    dir.join(format!("{slug}.md")).is_file() || dir.join("_Overview.md").is_file()
+fn entry_note_names(slug: &str) -> [String; 2] {
+    [format!("{slug}.md"), "_Overview.md".to_owned()]
 }
 
 pub fn detect_implicit_projects(
@@ -1273,13 +1280,20 @@ pub fn detect_implicit_projects_with_publication_and_lease(
     mutation_lease_factory: Option<crate::watcher::WatchMutationLeaseFactory>,
 ) -> Result<ImplicitProjectDetectionResult, anyhow::Error> {
     let mut detected: Vec<(String, String)> = Vec::new();
+    let mut skipped_missing_entry = Vec::new();
     for container in PROJECT_CONTAINER_DIRS {
         let projects_dir = vault_root.join(container);
         if !projects_dir.is_dir() {
             continue;
         }
-        detect_in_container(&projects_dir, container, &mut detected)?;
+        detect_in_container(
+            &projects_dir,
+            container,
+            &mut detected,
+            dry_run.then_some(&mut skipped_missing_entry),
+        )?;
     }
+    skipped_missing_entry.sort_by(|left, right| left.folder.cmp(&right.folder));
 
     let mut project_names = Vec::new();
     let mut unique_names = std::collections::HashSet::new();
@@ -1292,6 +1306,7 @@ pub fn detect_implicit_projects_with_publication_and_lease(
     if dry_run || detected.is_empty() {
         return Ok(ImplicitProjectDetectionResult {
             projects: project_names,
+            skipped_missing_entry,
             publication: finalize_committed_graph_mutation(store, false),
         });
     }
@@ -1363,6 +1378,7 @@ pub fn detect_implicit_projects_with_publication_and_lease(
     }
     Ok(ImplicitProjectDetectionResult {
         projects: project_names,
+        skipped_missing_entry,
         publication,
     })
 }
@@ -1371,6 +1387,7 @@ fn detect_in_container(
     projects_dir: &Path,
     container: &str,
     detected: &mut Vec<(String, String)>,
+    mut skipped_missing_entry: Option<&mut Vec<ImplicitProjectMissingEntry>>,
 ) -> Result<(), anyhow::Error> {
     let read_dir = std::fs::read_dir(projects_dir)?;
     for entry in read_dir {
@@ -1385,7 +1402,14 @@ fn detect_in_container(
             None => continue,
         };
 
-        if !is_entry_note(&path, &slug) {
+        let entry_notes = entry_note_names(&slug);
+        if !entry_notes.iter().any(|name| path.join(name).is_file()) {
+            if let Some(skipped) = skipped_missing_entry.as_deref_mut() {
+                skipped.push(ImplicitProjectMissingEntry {
+                    folder: format!("{container}/{slug}"),
+                    entry_notes,
+                });
+            }
             continue;
         }
         detected.push((slug, container.to_string()));
