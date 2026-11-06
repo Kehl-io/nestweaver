@@ -1,4 +1,8 @@
 import { test, expect } from "@playwright/test";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 
 function symbolPayload(hit: {
   uid: string;
@@ -25,6 +29,94 @@ function symbolPayload(hit: {
 }
 
 test.describe("Search Flow", () => {
+  test("real title fallback opens the note and search recovers (nw-935)", async ({ page, request }) => {
+    test.setTimeout(90_000);
+    const fixture = JSON.parse(process.env.NESTWEAVER_UI_SOURCE_FIXTURE ?? "null") as {
+      binary: string; db: string; pidfile: string; pid: number;
+    } | null;
+    if (!fixture) throw new Error("missing owned release_ui.py fixture");
+    const run = promisify(execFile);
+    const assertOwner = async () => {
+      expect(Number(await readFile(fixture.pidfile, "utf8"))).toBe(fixture.pid);
+    };
+    await assertOwner();
+    const vault = await mkdtemp(join(dirname(fixture.db), "nw935-vault-"));
+    const file = "fallback-query-witness.md";
+    const body = "Indexed search fallback witness.";
+    let added = false;
+    try {
+      await writeFile(join(vault, file), `---\ntitle: "title:*"\n---\n\n${body}\n`);
+      await run(fixture.binary, ["brain", "add", vault, "--db", fixture.db], { timeout: 30_000 });
+      added = true;
+      await assertOwner();
+
+      const query = new URLSearchParams({ q: "title:*", limit: "1" });
+      const reply = await request.get(`/api/v1/brain/search?${query}`);
+      expect(reply.ok(), await reply.text()).toBe(true);
+      const rows = await reply.json();
+      expect(rows).toEqual([{
+        uid: expect.stringMatching(/^note:/),
+        kind: "Note",
+        title: "title:*",
+        vault_uid: expect.stringMatching(/^vlt:/),
+        file_path: file,
+        score: expect.any(Number),
+      }]);
+      const errors: string[] = [];
+      page.on("pageerror", (error) => errors.push(error.message));
+      await page.goto("/?workspace=all&representation=table");
+      await expect(page.getByRole("table").getByRole("row").nth(1)).toBeVisible({ timeout: 15_000 });
+      const input = page.getByTestId("search-input");
+      const dropdown = page.getByRole("listbox", { name: "Search results" });
+      await input.fill("title:*");
+      const row = dropdown.getByRole("option").filter({ hasText: file });
+      await expect(row.getByRole("img", { name: "Note", exact: true })).toBeVisible();
+      await expect(row).toContainText(rows[0].score.toFixed(2));
+      await row.getByRole("button", { name: "Detail", exact: true }).click();
+      await expect(page.getByRole("complementary", { name: "Source and note evidence" })).toContainText(body);
+      await input.fill("greet");
+      await expect(dropdown.getByRole("option").filter({ hasText: "greet" }).first()).toBeVisible();
+      expect(errors).toEqual([]);
+    } finally {
+      if (added) {
+        await assertOwner();
+        await run(fixture.binary, ["brain", "remove", vault, "--db", fixture.db], { timeout: 30_000 });
+        await assertOwner();
+      }
+      await rm(vault, { recursive: true, force: true });
+    }
+  });
+
+  test("note search omits malformed peer scores without losing the result (nw-935)", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.route("**/api/v1/search?**", (route) => route.fulfill({ json: [] }));
+    await page.route("**/api/v1/brain/search?**", (route) => route.fulfill({
+      json: ["missing", "string", "numeric"].map((key) => ({
+        uid: `note:test:${key}`,
+        kind: "Note",
+        title: `Peer note ${key}`,
+        file_path: `${key}.md`,
+        vault_uid: "vlt:test",
+        ...(key === "string" ? { score: "badscore" } : key === "numeric" ? { score: 1.25 } : {}),
+      })),
+    }));
+    await page.goto("/?workspace=all&representation=table");
+    await expect(page.getByRole("table").getByRole("row").nth(1)).toBeVisible({ timeout: 15_000 });
+    await page.getByTestId("search-input").fill("peer note");
+    const dropdown = page.getByRole("listbox", { name: "Search results" });
+    for (const key of ["missing", "string", "numeric"]) {
+      const row = dropdown.getByRole("option").filter({ hasText: `${key}.md` });
+      await expect(row).toContainText(`Peer note ${key}`);
+      if (key === "numeric") {
+        await expect(row).toContainText("1.25");
+      } else {
+        await expect(row).not.toContainText(/0\.00|NaN|badscore/);
+      }
+    }
+    expect(errors).toEqual([]);
+  });
+
   test("search exposes readable kind names and duplicate note paths (nw-536)", async ({ page }) => {
     const kinds = ["Constant", "struct", "type_alias", "FutureKind", null];
     await page.route("**/api/v1/search?**", (route) => route.fulfill({

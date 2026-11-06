@@ -8,6 +8,7 @@ pub mod flow;
 pub mod gaps;
 pub mod health;
 pub mod impact;
+mod indexed_file;
 pub mod llm;
 pub mod metrics;
 pub mod overview;

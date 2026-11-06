@@ -358,9 +358,11 @@ export function SearchDropdown({ onSelect, activeDescendant }: SearchDropdownPro
                 <span className="min-w-0 break-all font-medium" title={n.title}>
                   {n.title}{n.federation_source && <span className="ml-2 text-xs">Source: {n.federation_source}</span>}
                 </span>
-                <span className="ml-auto shrink-0 text-xs text-[var(--color-text-muted)]">
-                  {n.score.toFixed(2)}
-                </span>
+                {Number.isFinite(n.score) && (
+                  <span className="ml-auto shrink-0 text-xs text-[var(--color-text-muted)]">
+                    {n.score.toFixed(2)}
+                  </span>
+                )}
                 {n.file_path && (
                   <span
                     className="col-span-3 min-w-0 break-all text-xs text-[var(--color-text-muted)]"
