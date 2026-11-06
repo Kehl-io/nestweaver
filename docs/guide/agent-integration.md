@@ -1,11 +1,12 @@
 # Connect and verify an AI agent
 
-Install `nestweaver@12.2.4`, index the repositories you need, then configure the
+Install `nestweaver@12.2.5`, index the repositories you need, then configure the
 client with the same absolute database path. No model or API key is required for
-structural queries; embeddings are optional.
+structural queries; embeddings are optional. If you already have a database,
+[back it up with the old binary before installing 12.2.5](publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
 ```sh
-npm install --global nestweaver@12.2.4
+npm install --global nestweaver@12.2.5
 nestweaver index --repo /path/to/repo --db /absolute/path/to/nestweaver.lbug
 nestweaver setup --db /absolute/path/to/nestweaver.lbug
 nestweaver brain status --db /absolute/path/to/nestweaver.lbug --json
@@ -51,8 +52,9 @@ six for `--lite`, unless you selected an allowlist. Ask the agent to call
 caller with `brain_impact`. Confirm its repository and path match the CLI graph.
 A CLI command succeeding alone does not establish client MCP activation.
 
-After upgrading a compatible graph, force-index each repo for generation 19 and
-refresh each vault for Markdown derivation 3. Check `stale-check` and coverage
+After upgrading a compatible graph, force-index each repo for generation 21.
+If also crossing the earlier Markdown derivation upgrade, refresh each vault.
+Check `stale-check` and coverage
 warnings before trusting results. Configured projects require
 `nestweaver materialize-projects --config <config> --db <db>` after topology
 changes; verify the expected membership with `project-context <id>` using the

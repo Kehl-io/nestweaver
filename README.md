@@ -106,6 +106,9 @@ Opt-in usage tracking that learns from what agents actually use. It re-ranks onl
 
 ### 1. Install the CLI
 
+Upgrading an existing database? [Stop the old daemon and back up with the
+previous binary first](#upgrading--re-index-before-you-trust-a-ranking).
+
 With **Node.js 18+** on macOS 13.3+ or Linux with glibc 2.35+ (x86_64 or
 arm64):
 
@@ -187,8 +190,8 @@ notes below before using an older database with a new binary.
 **Upgrading an existing database?** Check compatibility before querying it:
 
 Builds with LadybugDB **0.22.1** read the 0.21.2 database format, but a
-writable open/checkpoint can upgrade its storage format from 47 to 49. Take a
-backup with the previous binary before upgrading. To downgrade, reinstall that
+writable open/checkpoint can upgrade its storage format from 47 to 49. Stop the
+old daemon and back up with the previous binary before upgrading. To downgrade, reinstall that
 binary and restore the pre-upgrade backup; do not point it at the upgraded file.
 See the [storage upgrade guidance](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
@@ -211,8 +214,8 @@ the same product version disclose skew without automatically replacing a writer.
 - A database from before LadybugDB 0.21 needs a **publication rebuild**, not
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
-- For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.4
-  uses resolver generation **19** (12.2.3 used **17**). If your
+- For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.5
+  uses resolver generation **21** (12.2.4 used **19**). If your
   binary reports a generation-stale graph, run
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
@@ -248,14 +251,11 @@ the same product version disclose skew without automatically replacing a writer.
   generation15 additionally handles inferred `var` slices, parenthesized range
   sources and single named factory results. Parsed cache10 reparses unchanged
   declarations for normalized return types and complete var/const/parameter shadow guards.
-- **Upgrading to 12.2.4 needs a forced re-index of every repository.**
-  Resolver generation 19 and parsed cache 13 include Scala cache invalidation
-  and PHP namespace/function-alias resolution since 12.2.3 (generation 17 /
-  cache 11). Run
+- **Upgrading to 12.2.5 needs a forced re-index of every repository.** Run
   `nestweaver index --repo <path> --force` once per repository, using your usual
   `--db` and `--config` bindings. Plain incremental indexing can leave an
   unchanged graph on its old generation. `stale-check` exits 2 until repaired.
-- **Refresh each registered vault once after upgrading.** Run
+- **Refresh registered vaults if crossing the earlier Markdown derivation upgrade.** Run
   `nestweaver brain refresh <vault>` with the same bindings to re-derive
   note-to-code relationships against the rebuilt graph. If upgrading from before
   12.2.2, this also repairs frontmatter wikilinks and block references.
@@ -265,7 +265,7 @@ the same product version disclose skew without automatically replacing a writer.
 <details>
 <summary>Detailed migration notes and changes for scripts and server clients</summary>
 
-**12.2.4 uses `RESOLVER_GENERATION` 19; 12.2.3 used 17. Every
+**12.2.5 uses `RESOLVER_GENERATION` 21; 12.2.4 used 19. Every
 graph indexed by a generation different from the running binary must be re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 
@@ -349,7 +349,7 @@ and leaves the repo on the old generation. Only a full re-index rewrites the
 edges.
 
 Vaults are not `Repo` nodes and carry no resolver generation, so the forced
-re-index does not touch them. After upgrading to 12.2.4, run one
+re-index does not touch them. When crossing the 12.2.4 Markdown derivation change, run one
 `brain refresh <vault>` per vault to re-derive links against the rebuilt code graph.
 
 **`stale-check` detects this as of 9.0.0.** A repo whose edges predate the

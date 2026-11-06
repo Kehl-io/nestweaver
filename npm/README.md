@@ -20,6 +20,12 @@ NestWeaver indexes a repository into a structural graph: symbols, calls, imports
 
 ## Install and query
 
+Upgrading an existing database? Stop the old daemon and save a backup with the
+previous binary before upgrading. The LadybugDB 0.22 engine can migrate storage
+format 47 to 49; downgrading after migration requires that backup. Check the
+[release notes](https://github.com/Kehl-io/nestweaver/releases/latest) for the
+version you are installing.
+
 ```sh
 npm install --global nestweaver
 
@@ -70,22 +76,20 @@ If optional dependencies were skipped, `nestweaver` exits 1 and names the platfo
 
 ## After you upgrade
 
-The current resolver generation is **19**. A graph recorded at any other generation has stale edges. Check, then re-index with `--force`. A plain `index` does nothing when the repo is already at HEAD.
+When the resolver generation changes, check the graph and re-index each
+repository with `--force`. A plain `index` can skip a repository already at Git
+HEAD and leave its old edges in place.
 
 ```sh
 nestweaver stale-check
 nestweaver index --repo . --force
-nestweaver brain refresh /path/to/vault   # once per registered vault
 ```
 
 `stale-check` exits 2 and reports `outdated_resolver` when a re-index is required.
-After upgrading to **12.2.4**, run `index --repo <path> --force` once for each
-repository (resolver generation 19, parsed cache 13) and `brain refresh <vault>`
-once for each registered vault. Keep your usual `--db` and `--config` bindings.
-Markdown derivation version 3 repairs encoded and absolute in-vault note links.
-The release also repairs Scala cache invalidation, PHP namespace/alias resolution,
-selected-file metadata refresh and interrupted backup recovery, and updates
-frontend dependencies. See the [changelog](https://github.com/Kehl-io/nestweaver/releases/tag/v12.2.4).
+Keep your usual `--db` and `--config` bindings. The release notes cover when a
+vault refresh is also needed. See the
+[storage and rollback guide](https://github.com/Kehl-io/nestweaver/blob/main/docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback)
+before opening a database with the new binary.
 
 ## License
 
