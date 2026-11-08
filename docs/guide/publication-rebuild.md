@@ -19,12 +19,14 @@ backup. A publication predecessor that the new engine has already opened
 writable is not a substitute for this backup. Keep the backup outside the
 publication directories.
 
-The current source uses resolver generation 22 and parsed-cache version 16.
+NestWeaver 12.2.6 uses resolver generation 22 and parsed-cache version 16.
 Anonymous JavaScript/TypeScript default callables own their body calls, and
 Svelte/Vue/Astro function spans skip destructured/default parameters. The PHP
 static-method ownership and preceding Dart/PowerShell grammar changes remain
 included. Force re-index each repository once; cache invalidation alone does
-not replace existing graph facts. Published 12.2.5 uses generation 21/cache 15.
+not replace existing graph facts. Previous release 12.2.5 uses generation 21/cache 15
+and the same LadybugDB 0.22.1 engine. Markdown derivation remains version 3;
+refresh each registered vault if also crossing the earlier Markdown link upgrade.
 
 ## Canonical ranking scope
 

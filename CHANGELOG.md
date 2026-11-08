@@ -10,6 +10,33 @@
 * preserve ambiguity, bridge repair and folder scrolling ([adb724c](https://github.com/Kehl-io/nestweaver/commit/adb724c237ae81f1b9d7a2da63bcab29be4abf82))
 * retain query database identity and historical Compare evidence ([15b27f0](https://github.com/Kehl-io/nestweaver/commit/15b27f01e1829a9da7b2d48277f89159029e90d0))
 
+### Upgrade notes
+
+12.2.6 uses resolver generation 22 and parsed-cache version 16; 12.2.5 used
+21/15. Force re-index each repository once with `index --repo <path> --force`,
+keeping the installation's normal `--db` and `--config` bindings. Plain
+incremental indexing can skip unchanged graphs and does not replace this step.
+Markdown derivation remains version 3: vaults already current on 12.2.5 do not
+need a blanket vault refresh. When crossing an older Markdown derivation
+upgrade, or when diagnostics request it, refresh each affected registered vault
+with `brain refresh <vault>` using the same bindings.
+
+LadybugDB remains 0.22.1, as in 12.2.5. Before upgrading, stop the old daemon and
+save a backup with the previous binary. Earlier 0.21.2 storage format 47 can
+migrate to 49 on a writable open; downgrading across that boundary requires the
+old binary and pre-upgrade backup. See the [storage and rollback guide](https://github.com/Kehl-io/nestweaver/blob/v12.2.6/docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
+Installing the package does not upgrade or re-index a live vault.
+
+### Release details
+
+* Keep useful ranked context when another input is ambiguous, with bounded per-input diagnostics preserved across MCP, CLI and two-tier composition; explicit tags retain tag resolution.
+* Reconcile valid vault ignore-policy changes automatically and schedule repair of retained notes' code references after full replacement.
+* Name the selected database in daemon-query storage diagnostics, preserve historical Compare export evidence and keep final file-tree rows reachable beneath selected-folder headers.
+* Resolve anonymous JavaScript/TypeScript default callables to their own body-call owners and correct destructured-parameter component spans; this is not object-literal callable support.
+* Verify all four exact native npm packages before publishing the launcher. Registry publication and clean-install verification still follow the protected release workflow.
+
+Validation covers the scoped changes in the [original batch ledger](https://github.com/Kehl-io/nestweaver/blob/v12.2.6/docs/validation/retrieval-small-backlog.md), [database/Compare ledger](https://github.com/Kehl-io/nestweaver/blob/v12.2.6/docs/validation/diagnostic-and-compare-export.md) and [corrective review ledger](https://github.com/Kehl-io/nestweaver/blob/v12.2.6/docs/validation/pr543-review-corrections.md). Explicit affected-host, historical-measurement and future-publication qualifications remain; passing CI is not a universal regression guarantee.
+
 ## [12.2.5](https://github.com/Kehl-io/nestweaver/compare/v12.2.4...v12.2.5) (2026-11-06)
 
 

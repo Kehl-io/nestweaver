@@ -195,7 +195,8 @@ old daemon and back up with the previous binary before upgrading. To downgrade, 
 binary and restore the pre-upgrade backup; do not point it at the upgraded file.
 See the [storage upgrade guidance](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
-The current source uses resolver generation **22** and parsed cache **16**.
+12.2.6 uses resolver generation **22** and parsed cache **16**.
+LadybugDB 0.22.1 is unchanged from 12.2.5.
 Anonymous JavaScript/TypeScript default functions now own calls in their bodies;
 Svelte, Vue and Astro function spans skip destructured/default parameters.
 Generation 21/cache 15's PHP static-method ownership and inheritance facts and
@@ -216,9 +217,8 @@ the same product version disclose skew without automatically replacing a writer.
 - A database from before LadybugDB 0.21 needs a **publication rebuild**, not
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
-- For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.5
-  uses resolver generation **21** (12.2.4 used **19**); the current source
-  requires generation **22**. If your binary reports a generation-stale graph, run
+- For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.6
+  requires resolver generation **22** (12.2.5 used **21**). If your binary reports a generation-stale graph, run
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - Generation 16 preserves declaring-package origin through Go factory-call
@@ -253,7 +253,7 @@ the same product version disclose skew without automatically replacing a writer.
   generation15 additionally handles inferred `var` slices, parenthesized range
   sources and single named factory results. Parsed cache10 reparses unchanged
   declarations for normalized return types and complete var/const/parameter shadow guards.
-- **Upgrading to 12.2.5 needs a forced re-index of every repository.** Run
+- **Upgrading to 12.2.6 needs a forced re-index of every repository.** Run
   `nestweaver index --repo <path> --force` once per repository, using your usual
   `--db` and `--config` bindings. Plain incremental indexing can leave an
   unchanged graph on its old generation. `stale-check` exits 2 until repaired.
@@ -267,7 +267,7 @@ the same product version disclose skew without automatically replacing a writer.
 <details>
 <summary>Detailed migration notes and changes for scripts and server clients</summary>
 
-**12.2.5 uses `RESOLVER_GENERATION` 21; 12.2.4 used 19. Every
+**12.2.6 uses `RESOLVER_GENERATION` 22; 12.2.5 used 21. Every
 graph indexed by a generation different from the running binary must be re-indexed.** Compatibility is an EXACT MATCH, not a floor, so a graph written
 by any other generation — older or newer — is treated as untrustworthy.
 

@@ -1313,8 +1313,8 @@ immediately in normal operation.
 
 > **This section is about *latency*, not *correctness*.** Everything below
 > describes how fast ranks are served, and assumes the underlying edges are the
-> ones the current resolver would write. **12.2.5 `RESOLVER_GENERATION` is 21**
-> (12.2.4 used 19)
+> ones the current resolver would write. **12.2.6 `RESOLVER_GENERATION` is 22**
+> (12.2.5 used 21)
 > (`crates/nestweaver-engine/src/resolver_generation.rs`), and compatibility is
 > an exact match rather than a floor, so a graph indexed by any other release
 > serves ranks *quickly* and *wrongly*. Through generation 4 that meant edges
@@ -1349,7 +1349,7 @@ immediately in normal operation.
 > 12.2.5 generation 21 and parsed cache 15 cover PHP static-method ownership
 > and Dart and PowerShell grammar changes. [Back up with the old binary first](guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback)
 > because the new engine can migrate storage format 47 to 49.
-> The current source requires generation 22/cache 16 for anonymous JS/TS default
+> 12.2.6 requires generation 22/cache 16 for anonymous JS/TS default
 > callable ownership and Svelte/Vue/Astro destructured-parameter function spans.
 > Force-reindex repositories once to replace existing ownership edges.
 > Markdown derivation version 3 separately refreshes eligible vault links for

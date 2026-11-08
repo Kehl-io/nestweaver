@@ -25,18 +25,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0            # full history needed for diff
-      - uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.5
+      - uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.6
         with:
           server: ${{ secrets.NESTWEAVER_URL }}
           token: ${{ secrets.NESTWEAVER_TOKEN }}
-          version: "12.2.5"
+          version: "12.2.6"
 ```
 
 That's it. The action diffs the PR against the base branch, sends the changed
 symbols to your NestWeaver server, and posts a comment with the results.
 
 **Pin the action to a release tag.** There is no moving major tag (`@v1`,
-`@v12`); reference an exact release such as `@v12.2.5` (or a commit SHA) and
+`@v12`); reference an exact release such as `@v12.2.6` (or a commit SHA) and
 bump it when you upgrade. The `version` input (default `latest`) separately
 selects which CLI release the action installs; set it to the same release to
 keep the action and the CLI in step.
@@ -97,11 +97,11 @@ pipeline availability to the NestWeaver server.
 
 GitHub Actions:
 ```yaml
-- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.5
+- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.6
   with:
     server: ${{ secrets.NESTWEAVER_URL }}
     token: ${{ secrets.NESTWEAVER_TOKEN }}
-    version: "12.2.5"
+    version: "12.2.6"
     fail-on-breaking: true
 ```
 
@@ -121,11 +121,11 @@ treat a missing report as a pipeline failure.
 
 GitHub Actions:
 ```yaml
-- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.5
+- uses: Kehl-io/nestweaver/.github/actions/nestweaver-impact@v12.2.6
   with:
     server: ${{ secrets.NESTWEAVER_URL }}
     token: ${{ secrets.NESTWEAVER_TOKEN }}
-    version: "12.2.5"
+    version: "12.2.6"
     fail-on-error: true
 ```
 
