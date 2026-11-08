@@ -314,3 +314,19 @@ or disconnect terminates the displaced controller; Ctrl-C stops only its own
 session, so an old controller cannot stop its replacement. A daemon restart
 creates a new session sequence. Existing explicit `watch-stop` remains the
 administrator operation that stops the current watcher.
+
+### Vault watcher configuration refusals
+
+`brain watch` exits 78 (`EX_CONFIG`) when its requested vault name belongs to a
+different vault. Correct the name or use `--name` to select a unique one; the
+refused watcher does not register or change the existing vault. Other runtime
+failures retain exit 1. Older daemons cannot provide the typed refusal field,
+so their clients retain the generic failure instead of guessing from prose.
+
+An unconditional launchd `KeepAlive=true` restarts even a permanent exit 78.
+For an operator-managed watcher that should start at login and restart only
+when it crashes, use `RunAtLoad=true` and `KeepAlive={Crashed=true}`. This also
+leaves ordinary nonzero configuration exits stopped. `SuccessfulExit=false`
+restarts *every* nonzero exit, including 78, so it does not solve this loop.
+After fixing configuration, start the job explicitly. A launchd job policy is
+separate from the CLI exit code; this release does not rewrite existing jobs.

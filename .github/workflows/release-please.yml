@@ -2139,9 +2139,26 @@ jobs:
           # have caught a REAL publish failure. Any package that never
           # matches its intended content after retrying stays a hard failure;
           # this does not swallow that case to make the run look green.
+          # Validate the complete publication plan before any registry mutation.
+          # nw-941: native packages must be exact in the registry before the
+          # launcher can become latest, including on resume/recover-npm.
+          ordered_packages="$(jq -ce '
+            if (length == 5
+                and ([.[].name] | sort) == ["nestweaver", "nestweaver-darwin-arm64", "nestweaver-darwin-x64", "nestweaver-linux-arm64", "nestweaver-linux-x64"]
+                and ([.[].version] | unique | length) == 1)
+            then sort_by(.name == "nestweaver", .name)
+            else error("expected launcher and four exact-version native packages") end
+          ' <<< "$PACKAGES_JSON")"
           overall_status=0
+          native_verified=0
           while IFS= read -r pkg; do
             PACKAGE_NAME="$(jq -er '.name' <<< "$pkg")"
+            if [ "$PACKAGE_NAME" = nestweaver ] && { [ "$native_verified" -ne 4 ] || [ "$overall_status" -ne 0 ]; }; then
+              echo "::error::launcher publication refused: all four native packages must verify first" >&2
+              echo "Launcher withheld: native package verification failed." >> "$GITHUB_STEP_SUMMARY"
+              overall_status=1
+              break
+            fi
             PACKAGE_VERSION="$(jq -er '.version' <<< "$pkg")"
             PACKAGE_INTEGRITY="$(jq -er '.integrity' <<< "$pkg")"
             PACKAGE_FILENAME="$(jq -er '.filename' <<< "$pkg")"
@@ -2178,6 +2195,9 @@ jobs:
             }
             publish_status=not-attempted
             if registry precheck > "$registry_result"; then
+              if [ "$PACKAGE_NAME" != nestweaver ]; then
+                native_verified=$((native_verified + 1))
+              fi
               report_registry
               echo "::endgroup::"
               continue
@@ -2250,12 +2270,15 @@ jobs:
             }
 
             if registry wait > "$registry_result"; then
+              if [ "$PACKAGE_NAME" != nestweaver ]; then
+                native_verified=$((native_verified + 1))
+              fi
               report_provenance
             else
               overall_status=1
             fi
             report_registry
             echo "::endgroup::"
-          done < <(jq -c '.[]' <<< "$PACKAGES_JSON")
+          done < <(jq -c '.[]' <<< "$ordered_packages")
 
           exit "$overall_status"

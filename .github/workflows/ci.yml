@@ -121,6 +121,8 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Keep merge titles out of conventional changelog entries
+        run: python3 scripts/check-pr-title.py
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
@@ -1287,6 +1289,11 @@ jobs:
             --binary ../../../target/debug/nestweaver \
             --node "$(command -v node)" \
             --browser "$browser_executable"
+          python3 ../../../tests/support/release_ui.py \
+            --binary ../../../target/debug/nestweaver \
+            --node "$(command -v node)" \
+            --browser "$browser_executable" \
+            --files-overflow-fixture e2e/files-overflow.spec.ts
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

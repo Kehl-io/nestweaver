@@ -7,6 +7,9 @@ import { brainSearchInWorkspace } from "../api/workspaces";
 import { useSymbolQuery } from "../hooks/useSymbolQuery";
 
 // A graph uid carries a type prefix; anything else is a name to resolve.
+// Bound user-entered names/UIDs without truncating an oversized identity into
+// a different query. Existing canonical UIDs fit well within this limit.
+const MAX_TARGET_LENGTH = 4096;
 const UID_PREFIX = /^(sym|note|repo|svc|tag|vlt|hdg|sec|file):/;
 
 function uidTail(uid: string): string {
@@ -49,6 +52,10 @@ export function PathTargetSelector() {
   const findPath = async (targetUid: string) => {
     if (!pathfindingFrom) return;
     const request = setPathfindingTarget(targetUid);
+    if (targetUid === pathfindingFrom) {
+      setPathResults([{ nodes: [targetUid], edges: [], length: 0 }], request);
+      return;
+    }
     try {
       const results = await api.paths(pathfindingFrom, targetUid, 5, 10);
       setPathResults(results, request);
@@ -72,7 +79,15 @@ export function PathTargetSelector() {
   // choice; none is reported instead of querying a literal path segment.
   const handleSubmit = async () => {
     const trimmedTarget = target.trim();
-    if (!trimmedTarget || !pathfindingFrom || pending) return;
+    if (!pathfindingFrom || pending) return;
+    if (!trimmedTarget) {
+      setResolution({ state: "error", message: "Enter a target name or UID." });
+      return;
+    }
+    if (trimmedTarget.length > MAX_TARGET_LENGTH) {
+      setResolution({ state: "error", message: `Target must be at most ${MAX_TARGET_LENGTH} characters.` });
+      return;
+    }
     if (UID_PREFIX.test(trimmedTarget)) {
       await findPath(trimmedTarget);
       return;
@@ -102,7 +117,7 @@ export function PathTargetSelector() {
       });
       return;
     }
-    const others = hits.filter((hit) => hit.uid !== pathfindingFrom);
+    const others = hits;
     const caseSensitive = others.filter((hit) => hit.name === trimmedTarget);
     const exact = caseSensitive.length > 0
       ? caseSensitive
@@ -143,6 +158,8 @@ export function PathTargetSelector() {
         <input
           type="text"
           value={target}
+          maxLength={MAX_TARGET_LENGTH}
+          aria-invalid={resolution.state === "error" || undefined}
           onChange={(e) => {
             setTarget(e.target.value);
             if (resolution.state !== "idle") setResolution({ state: "idle" });
@@ -157,7 +174,7 @@ export function PathTargetSelector() {
         />
         <button
           onClick={handleSubmit}
-          disabled={pending}
+          disabled={pending || !target.trim()}
           className="h-8 px-3 text-xs bg-[var(--color-graph-selection)] text-white rounded opacity-90 hover:opacity-100"
         >
           {pending ? "Finding" : "Find"}

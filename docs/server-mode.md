@@ -1349,6 +1349,9 @@ immediately in normal operation.
 > 12.2.5 generation 21 and parsed cache 15 cover PHP static-method ownership
 > and Dart and PowerShell grammar changes. [Back up with the old binary first](guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback)
 > because the new engine can migrate storage format 47 to 49.
+> The current source requires generation 22/cache 16 for anonymous JS/TS default
+> callable ownership and Svelte/Vue/Astro destructured-parameter function spans.
+> Force-reindex repositories once to replace existing ownership edges.
 > Markdown derivation version 3 separately refreshes eligible vault links for
 > encoded URL paths and absolute paths contained within the registered root.
 > Run `nestweaver brain refresh <vault>` for each vault after upgrading; a

@@ -1888,7 +1888,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
 
             if let Some(kind_str) = capture_name.strip_prefix("definition.") {
                 let mut kind = match kind_str {
-                    "function" => SymbolKind::Function,
+                    "function" | "default_function" => SymbolKind::Function,
                     "class" => SymbolKind::Class,
                     "method" => SymbolKind::Method,
                     "interface" => SymbolKind::Interface,
@@ -2045,6 +2045,7 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
                 // allocation until we know this symbol passes the dedup check.
                 let name_arena: &str = match &name_text {
                     Some(n) => arena.alloc_str(n),
+                    None if kind_str == "default_function" => "default",
                     None => node_text,
                 };
                 let name = name_arena.to_string();
@@ -6005,7 +6006,15 @@ fn collect_js_import_bindings(
                     name: exported,
                     kind: ReferenceKind::ExportAlias,
                     start_line: local.start_position().row as u32 + 1,
-                    context: text(local),
+                    context: if matches!(
+                        local.kind(),
+                        "function_expression" | "generator_function" | "arrow_function"
+                    ) && local.child_by_field_name("name").is_none()
+                    {
+                        "default".into()
+                    } else {
+                        text(local)
+                    },
                     receiver: statement
                         .child_by_field_name("source")
                         .map(|source| strip_quotes(&text(source))),
@@ -6026,6 +6035,14 @@ fn collect_js_import_bindings(
                     });
                 if let Some(local) = local {
                     push_export("default".into(), local);
+                } else if let Some(value) = statement.child_by_field_name("value")
+                    && matches!(
+                        value.kind(),
+                        "function_expression" | "generator_function" | "arrow_function"
+                    )
+                    && value.child_by_field_name("name").is_none()
+                {
+                    push_export("default".into(), value);
                 }
             }
             if !is_default && let Some(declaration) = statement.child_by_field_name("declaration") {
@@ -16365,5 +16382,86 @@ export function G(a) {\n\
         assert_eq!(call("parse"), Some(Some("x".to_string())));
         assert_eq!(call("generic"), Some(None));
         assert_eq!(call("make"), Some(Some("T".to_string())));
+    }
+    #[test]
+    fn anonymous_default_exports_have_one_callable_owner() {
+        for extension in ["js", "ts", "tsx"] {
+            for declaration in [
+                "export default function () {\n  helper();\n}",
+                "export default async () => {\n  helper();\n}",
+                "export default function* () {\n  helper();\n}",
+            ] {
+                let source = format!("function helper() {{}}\n{declaration}\n");
+                let parsed =
+                    parse_source(Path::new(&format!("src/default.{extension}")), &source).unwrap();
+                let owners: Vec<_> = parsed
+                    .symbols
+                    .iter()
+                    .filter(|s| s.name == "default")
+                    .collect();
+                assert_eq!(
+                    owners.len(),
+                    1,
+                    "{extension}: {declaration}: {:?}",
+                    parsed.symbols
+                );
+                assert_eq!(owners[0].kind, SymbolKind::Function);
+                assert_eq!(owners[0].visibility, Visibility::Public);
+                assert_eq!(owners[0].start_line, 2);
+                assert_eq!(owners[0].end_line, 4);
+                assert!(
+                    !parsed.symbols.iter().any(|s| s.name == MODULE_OWNER_NAME),
+                    "a deferred call is not module initialization"
+                );
+                assert!(
+                    parsed
+                        .references
+                        .iter()
+                        .any(|r| r.kind == ReferenceKind::ExportAlias
+                            && r.name == "default"
+                            && r.context == "default")
+                );
+            }
+            let named = parse_source(
+                Path::new(&format!("src/named.{extension}")),
+                "export default function named() {}\n",
+            )
+            .unwrap();
+            assert_eq!(
+                named
+                    .symbols
+                    .iter()
+                    .filter(|s| s.kind == SymbolKind::Function)
+                    .count(),
+                1
+            );
+            assert!(named.symbols.iter().all(|s| s.name != "default"));
+        }
+    }
+
+    #[test]
+    fn component_destructured_parameter_spans_reach_the_real_body_end() {
+        for (path, source) in [
+            (
+                "src/load.svelte",
+                "<script>\nexport function load({ fetch } = { fetch: () => ({}) }) {\n  return fetch('url');\n}\n</script>\n",
+            ),
+            (
+                "src/load.vue",
+                "<script>\nexport function load({ fetch } = { fetch: () => ({}) }) {\n  return fetch('url');\n}\n</script>\n",
+            ),
+            (
+                "src/load.astro",
+                "---\nexport function load({ fetch } = { fetch: () => ({}) }) {\n  return fetch('url');\n}\n---\n",
+            ),
+        ] {
+            let parsed = parse_source(Path::new(path), source).unwrap();
+            let load = parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "load" && s.kind == SymbolKind::Function)
+                .unwrap();
+            assert_eq!((load.start_line, load.end_line), (2, 4), "{path}: {load:?}");
+        }
     }
 }

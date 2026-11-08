@@ -64,6 +64,10 @@ fn manifest_cache_repo_uid(store: &GraphStore, repo_path: &Path) -> Option<Strin
 #[error("watcher mutation refused because daemon shutdown has started")]
 pub struct WatchMutationRefused;
 
+#[derive(Debug, thiserror::Error)]
+#[error("vault ignore policy changed; watcher batch must be replanned")]
+struct WatchPolicyChanged;
+
 /// Manifest filenames whose changes should trigger a manifest cache refresh.
 const MANIFEST_FILES: &[&str] = &[
     "package.json",
@@ -214,6 +218,9 @@ pub(crate) enum DebtKind {
     /// V1: another writer held the write transaction past every retry, so
     /// the batch stopped part way; its notes are replayed whole.
     BatchCollision,
+    /// A policy edit invalidated an off-gate batch; replay its exact paths
+    /// after loading the new matcher, even if a full refresh raced the save.
+    PolicyChanged,
 }
 
 #[cfg(test)]
@@ -282,9 +289,11 @@ pub struct BrainWatcher {
     manifests_path: Option<PathBuf>,
     /// Debounce interval in milliseconds for filesystem events.
     debounce_ms: u64,
-    /// Compiled `.brainignore` glob patterns. Loaded once at construction
-    /// from the vault root's `.brainignore` file (or built-in defaults).
+    /// Compiled policy used to prepare the current batch. Reloaded between
+    /// batches; its digest is checked again after mutation admission.
     ignore_set: GlobSet,
+    extra_ignore_patterns: Vec<String>,
+    ignore_policy_digest: Option<String>,
     /// nw-684: why `.brainignore` could not be loaded. When set, `ignore_set`
     /// is an unused placeholder and every `run*` entry refuses to start —
     /// watching without the user's exclusions would index the notes they
@@ -474,6 +483,9 @@ impl BrainWatcher {
         let vault_root: PathBuf = vault_root.into();
         let vault_root = std::fs::canonicalize(&vault_root).unwrap_or(vault_root);
         let (ignore_set, ignore_error) = load_ignore_or_error(&vault_root, &[]);
+        let ignore_policy_digest =
+            watcher_policy_digest(&vault_root, &[], crate::index_limits::NoteLimits::default())
+                .ok();
         Self {
             db_path: db_path.into(),
             vault_root,
@@ -484,6 +496,8 @@ impl BrainWatcher {
             manifests_path: None,
             debounce_ms: 200,
             ignore_set,
+            extra_ignore_patterns: Vec::new(),
+            ignore_policy_digest,
             ignore_error,
             note_limits: crate::index_limits::NoteLimits::default(),
             external_tantivy: None,
@@ -550,6 +564,8 @@ impl BrainWatcher {
     /// Apply the configured markdown-note size limit to watched vault reads.
     pub fn with_note_limits(mut self, limits: crate::index_limits::NoteLimits) -> Self {
         self.note_limits = limits;
+        self.ignore_policy_digest =
+            watcher_policy_digest(&self.vault_root, &self.extra_ignore_patterns, limits).ok();
         self
     }
 
@@ -636,6 +652,7 @@ impl BrainWatcher {
                     );
                     return Err(WatchMutationRefused.into());
                 }
+                self.ensure_policy_current()?;
                 Ok(lease)
             }
             Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
@@ -696,10 +713,53 @@ impl BrainWatcher {
     /// (e.g. from the `--ignore` CLI flag). Reloads the `.brainignore`
     /// file (or defaults) combined with `extra`.
     pub fn with_extra_ignore_patterns(mut self, extra: &[String]) -> Self {
-        if !extra.is_empty() {
-            (self.ignore_set, self.ignore_error) = load_ignore_or_error(&self.vault_root, extra);
-        }
+        self.extra_ignore_patterns = extra.to_vec();
+        (self.ignore_set, self.ignore_error) = load_ignore_or_error(&self.vault_root, extra);
+        self.ignore_policy_digest =
+            watcher_policy_digest(&self.vault_root, extra, self.note_limits).ok();
         self
+    }
+
+    fn ensure_policy_current(&self) -> anyhow::Result<()> {
+        if self.ignore_error.is_some()
+            || watcher_policy_digest(
+                &self.vault_root,
+                &self.extra_ignore_patterns,
+                self.note_limits,
+            )
+            .ok()
+                != self.ignore_policy_digest
+        {
+            return Err(WatchPolicyChanged.into());
+        }
+        Ok(())
+    }
+
+    /// Called on the receive loop's timeout too: an editor may atomically
+    /// replace the policy, or the OS may coalesce its event with a note save.
+    fn reload_ignore_policy(&mut self) -> anyhow::Result<bool> {
+        let digest = watcher_policy_digest(
+            &self.vault_root,
+            &self.extra_ignore_patterns,
+            self.note_limits,
+        )?;
+        if self.ignore_error.is_none() && self.ignore_policy_digest.as_ref() == Some(&digest) {
+            return Ok(false);
+        }
+        let ignore_set =
+            crate::brainignore::load_brain_ignore(&self.vault_root, &self.extra_ignore_patterns)?;
+        anyhow::ensure!(
+            watcher_policy_digest(
+                &self.vault_root,
+                &self.extra_ignore_patterns,
+                self.note_limits,
+            )? == digest,
+            "vault ignore policy changed while it was being loaded"
+        );
+        self.ignore_set = ignore_set;
+        self.ignore_error = None;
+        self.ignore_policy_digest = Some(digest);
+        Ok(true)
     }
 
     /// Returns a handle that can request graceful shutdown from another
@@ -951,6 +1011,24 @@ impl BrainWatcher {
                 tracing::info!("BrainWatcher stop requested; exiting");
                 return Ok(());
             }
+            match self.reload_ignore_policy() {
+                Ok(true) => {
+                    if let Some(owed) = pending.as_mut() {
+                        owed.next_attempt = Instant::now();
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // Retain the previous matcher for diagnostics, but prohibit
+                    // every write until a valid policy can be loaded. Receive
+                    // below still blocks, so invalid policy never busy-loops.
+                    let message = format!("{error:#}");
+                    if self.ignore_error.as_ref() != Some(&message) {
+                        tracing::warn!(%message, "BrainWatcher ignore policy is unavailable");
+                    }
+                    self.ignore_error = Some(message);
+                }
+            }
             // nw-653: retry an owed startup reconciliation once its backoff
             // elapses. Checked every iteration, so an idle vault retries on
             // the receive timeout tick and a busy one between batches.
@@ -965,6 +1043,7 @@ impl BrainWatcher {
                     owed.failures,
                 ) {
                     Ok(next) => pending = next,
+                    Err(error) if error.downcast_ref::<WatchPolicyChanged>().is_some() => {}
                     Err(_) => return Ok(()),
                 }
             }
@@ -1024,6 +1103,7 @@ impl BrainWatcher {
                 subscribed_unwatchable = tree.unwatchable().to_vec();
                 self.disclose_unwatchable_dirs(&store, &subscribed_unwatchable);
             }
+            let replay_paths = batch.clone();
             match self.process_batch(&store, tantivy.as_deref(), &v_uid, batch, &on_change) {
                 Ok(None) => {}
                 // nw-668: committed text, missing code links — owed, disclosed
@@ -1033,6 +1113,10 @@ impl BrainWatcher {
                 }
                 Err(error) if error.downcast_ref::<WatchMutationRefused>().is_some() => {
                     return Ok(());
+                }
+                Err(error) if error.downcast_ref::<WatchPolicyChanged>().is_some() => {
+                    tracing::info!("BrainWatcher replanning after an ignore policy change");
+                    pending = Some(self.owe_policy_replay(&store, pending.take(), replay_paths));
                 }
                 Err(error) => return Err(error),
             }
@@ -1058,6 +1142,7 @@ impl BrainWatcher {
         batch: Vec<PathBuf>,
         on_change: &Option<Box<dyn Fn() + Send>>,
     ) -> Result<Option<SidecarDebt>, anyhow::Error> {
+        self.ensure_policy_current()?;
         let mut unique_paths = batch;
         // A directory rename arrives as the directory, not as each note.
         // Those paths are not markdown, so the batch used to be a no-op
@@ -1537,12 +1622,18 @@ impl BrainWatcher {
                  transaction past every retry; its notes are replayed on the retry backoff \
                  (`nestweaver brain refresh` also heals it)"
             ),
+            DebtKind::PolicyChanged => tracing::info!(
+                vault = %self.vault_root.display(),
+                notes = debt.paths.len(),
+                "BrainWatcher retained the policy-invalidated batch for replay"
+            ),
         }
         // Merged, not replaced: rows an owed startup replay already disclosed
         // keep their own (startup) reason.
         let subject = match debt.kind {
             DebtKind::CodeLinks => crate::index_md::OWED_CODE_LINKS,
             DebtKind::BatchCollision => crate::index_md::OWED_BATCH_COLLISION,
+            DebtKind::PolicyChanged => "brain watcher batch invalidated by an ignore policy change",
         };
         crate::index_md::record_vault_owed_paths(
             store.db_path(),
@@ -1553,6 +1644,25 @@ impl BrainWatcher {
             subject,
         );
         next
+    }
+
+    fn owe_policy_replay(
+        &self,
+        store: &GraphStore,
+        pending: Option<PendingReconciliation>,
+        paths: Vec<PathBuf>,
+    ) -> PendingReconciliation {
+        let mut replay = self.owe_sidecar_retry(
+            store,
+            pending,
+            SidecarDebt {
+                paths,
+                error: WatchPolicyChanged.to_string(),
+                kind: DebtKind::PolicyChanged,
+            },
+        );
+        replay.next_attempt = Instant::now();
+        replay
     }
 
     /// nw-653: diff disk against the graph (`index_md::vault_startup_drift`)
@@ -2239,6 +2349,20 @@ fn path_in_skip_dir(path: &Path) -> bool {
     )
 }
 
+fn watcher_policy_digest(
+    root: &Path,
+    extra: &[String],
+    limits: crate::index_limits::NoteLimits,
+) -> anyhow::Result<String> {
+    Ok(crate::markdown_derivation::coverage_identity(
+        root,
+        extra,
+        limits.max_note_bytes(),
+        crate::markdown_derivation::CoverageScope::FullRegisteredPolicy,
+    )?
+    .policy_digest)
+}
+
 fn ensure_vault(
     store: &GraphStore,
     v_uid: &str,
@@ -2305,6 +2429,98 @@ mod tests {
     use std::time::Duration;
 
     static WATCHER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn watcher_reloads_ignore_policy_and_refuses_stale_policy_mutations() {
+        let (_dir, root) = make_vault(&[("keep.md", "# Keep\n"), ("old.md", "# Old\n")]);
+        let mut watcher = BrainWatcher::new(":memory:", &root, "test", "vault")
+            .with_extra_ignore_patterns(&["always.md".into()]);
+        assert!(watcher.event_targets_graph(&root.join("old.md")));
+        fs::write(root.join(".brainignore"), "old.md\n").unwrap();
+        assert!(
+            watcher
+                .try_acquire_batch_lease(true, "test_policy")
+                .err()
+                .expect("stale policy refused")
+                .downcast_ref::<WatchPolicyChanged>()
+                .is_some()
+        );
+        assert!(watcher.reload_ignore_policy().unwrap());
+        assert!(!watcher.event_targets_graph(&root.join("old.md")));
+        assert!(!watcher.event_targets_graph(&root.join("always.md")));
+        watcher
+            .try_acquire_batch_lease(true, "test_policy")
+            .unwrap();
+        assert!(!watcher.reload_ignore_policy().unwrap());
+
+        fs::write(root.join(".brainignore"), "foo{a,b\n").unwrap();
+        assert!(watcher.reload_ignore_policy().is_err());
+        assert!(
+            watcher
+                .try_acquire_batch_lease(true, "test_policy")
+                .is_err()
+        );
+        fs::remove_file(root.join(".brainignore")).unwrap();
+        assert!(watcher.reload_ignore_policy().unwrap());
+        assert!(watcher.event_targets_graph(&root.join("old.md")));
+        assert!(!watcher.event_targets_graph(&root.join("always.md")));
+    }
+
+    #[test]
+    fn policy_invalidated_batch_replays_a_save_after_the_full_refresh_scan() {
+        let (_dir, root) =
+            make_vault(&[("Keep.md", "# Keep\n\nold text\n"), ("Old.md", "# Old\n")]);
+        let db = root.parent().unwrap().join("graph.lbug");
+        crate::index_md::index_markdown_directory(&root, &db, "test", "vault").unwrap();
+        let store = GraphStore::open(&db).unwrap();
+        let vault = store.list_vaults(None).unwrap().remove(0);
+        let mut watcher = BrainWatcher::new(&db, &root, "test", "vault");
+        fs::write(root.join(".brainignore"), "Old.md\n").unwrap();
+        let reader = crate::index_md::filesystem_vault_reader(&root, watcher.note_limits)
+            .strict_enumeration();
+        crate::index_md::refresh_registered_markdown_policy(&reader, &store, &vault, &[], || {
+            // A note save after the policy refresh's off-gate scan belongs to
+            // the watcher's next batch, not to the captured full-refresh body.
+            fs::write(root.join("Keep.md"), "# Keep\n\nlatest saved text\n")?;
+            Ok(())
+        })
+        .unwrap();
+        let paths = vec![root.join("Keep.md")];
+        assert!(
+            watcher
+                .process_batch(&store, None, &vault.uid, paths.clone(), &None)
+                .unwrap_err()
+                .downcast_ref::<WatchPolicyChanged>()
+                .is_some()
+        );
+        let pending = watcher.owe_policy_replay(&store, None, paths.clone());
+        assert!(
+            crate::index_md::vault_owed_note_paths(&db, &root).contains(&paths[0]),
+            "the rejected save must survive worker restart"
+        );
+        watcher.reload_ignore_policy().unwrap();
+        let next = watcher
+            .attempt_reconciliation(
+                &store,
+                None,
+                &vault.uid,
+                &None,
+                pending.paths,
+                pending.also_replay,
+                pending.failures,
+            )
+            .unwrap();
+        assert!(next.is_none());
+        let note = store.lookup_note(&note_uid(&vault.uid, "Keep.md")).unwrap();
+        let sections = store.sections_in_note(&note.uid).unwrap();
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.text_content.contains("latest saved text"))
+        );
+        assert!(crate::index_md::vault_owed_note_paths(&db, &root).is_empty());
+        assert_eq!(store.list_notes(Some(&vault.uid)).unwrap().len(), 1);
+    }
 
     fn serial_watcher_test() -> MutexGuard<'static, ()> {
         WATCHER_TEST_LOCK

@@ -4,6 +4,40 @@
 
 use crate::*;
 
+/// Per-request identity, distinct from the process's last direct store open.
+/// Only a typed local-dispatch marker authorizes attaching the selected path.
+#[derive(Debug)]
+pub(crate) enum QueryDatabaseIdentity {
+    Local(PathBuf, String),
+    Unknown(String),
+}
+
+impl std::fmt::Display for QueryDatabaseIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(_, message) | Self::Unknown(message) => formatter.write_str(message),
+        }
+    }
+}
+
+fn with_query_database_identity(error: anyhow::Error, selected: Option<&Path>) -> anyhow::Error {
+    let message = error.to_string();
+    let identity = if error
+        .downcast_ref::<nestweaver_client::hybrid::LocalQueryFailure>()
+        .is_some()
+    {
+        match selected {
+            Some(path) => QueryDatabaseIdentity::Local(path.to_path_buf(), message),
+            None => QueryDatabaseIdentity::Unknown(message),
+        }
+    } else if error.chain().any(|cause| cause.is::<tonic::Status>()) {
+        QueryDatabaseIdentity::Unknown(message)
+    } else {
+        return error;
+    };
+    error.context(identity)
+}
+
 /// The daemon's own application-level message, when a failed RPC was
 /// *answered* rather than unreachable.
 ///
@@ -431,6 +465,9 @@ fn try_hybrid_json_rpc_checked_inner(
                         None => hybrid.query(rpc_name, &args).await,
                     }
                 })
+                // This endpoint's logical anchor is verified, but the replica's
+                // materialized backing path is not part of the health contract.
+                .map_err(|error| with_query_database_identity(error, None))
                 .map(Some)
                 .with_context(|| {
                     format!("existing daemon query {rpc_name} failed; refusing direct fallback")
@@ -464,22 +501,25 @@ fn try_hybrid_json_rpc_checked_inner(
     match rt.block_on(nestweaver_client::hybrid::HybridClient::connect(
         db_path, config, &start_dir,
     )) {
-        Ok(mut hybrid) => match rt.block_on(async {
-            match daemon_rpc_timeout(&args) {
-                Some(budget) => tokio::time::timeout(budget, hybrid.query(rpc_name, &args))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!(
-                            "daemon did not answer {rpc_name} within {}s; it may be wedged or \
+        Ok(mut hybrid) => match rt
+            .block_on(async {
+                match daemon_rpc_timeout(&args) {
+                    Some(budget) => tokio::time::timeout(budget, hybrid.query(rpc_name, &args))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!(
+                                "daemon did not answer {rpc_name} within {}s; it may be wedged or \
                              saturated. Raise or disable the ceiling with {RPC_TIMEOUT_ENV} \
                              (0 disables), and see `nestweaver daemon --db {} status`.",
-                            budget.as_secs(),
-                            db_path.display()
-                        ))
-                    }),
-                None => hybrid.query(rpc_name, &args).await,
-            }
-        }) {
+                                budget.as_secs(),
+                                db_path.display()
+                            ))
+                        }),
+                    None => hybrid.query(rpc_name, &args).await,
+                }
+            })
+            .map_err(|error| with_query_database_identity(error, Some(db_path)))
+        {
             Ok(value) => Ok(Some(value)),
             Err(e) => {
                 // nw-700 (7): an owed manifest is the daemon's ANSWER, sent as
@@ -540,6 +580,8 @@ pub(crate) fn try_local_daemon_json_rpc(
     args: serde_json::Value,
 ) -> anyhow::Result<Option<serde_json::Value>> {
     require_existing_db(db_path)?;
+    // Selection supplies error identity only; preserve the caller's routing anchor.
+    let selected = selected_existing_database(db_path)?;
     let local_only_reason = || {
         format!(
             "{rpc_name} with a caller's config or rules is served by the local daemon only and \
@@ -561,20 +603,24 @@ pub(crate) fn try_local_daemon_json_rpc(
         }
     };
     let mut local = nestweaver_client::hybrid::HybridClient::local_only(client);
-    let answer = rt.block_on(async {
-        match daemon_rpc_timeout(&args) {
-            Some(budget) => tokio::time::timeout(budget, local.query_local_only(rpc_name, &args))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(anyhow::anyhow!(
-                        "daemon did not answer {rpc_name} within {}s; raise or disable the \
+    let answer = rt
+        .block_on(async {
+            match daemon_rpc_timeout(&args) {
+                Some(budget) => {
+                    tokio::time::timeout(budget, local.query_local_only(rpc_name, &args))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!(
+                                "daemon did not answer {rpc_name} within {}s; raise or disable the \
                          ceiling with {RPC_TIMEOUT_ENV} (0 disables)",
-                        budget.as_secs()
-                    ))
-                }),
-            None => local.query_local_only(rpc_name, &args).await,
-        }
-    });
+                                budget.as_secs()
+                            ))
+                        })
+                }
+                None => local.query_local_only(rpc_name, &args).await,
+            }
+        })
+        .map_err(|error| with_query_database_identity(error, selected.as_deref()));
     match answer {
         Ok(value) => Ok(Some(value)),
         Err(error) => match daemon_application_error(&error) {
@@ -1392,6 +1438,7 @@ mod replica_existing_read_tests {
         health: Arc<Mutex<nestweaver_proto::HealthCheckResponse>>,
         store: Arc<nestweaver_store::GraphStore>,
         requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        query_error: Arc<Mutex<Option<tonic::Status>>>,
     }
     impl tonic::server::NamedService for ReadEndpoint {
         const NAME: &'static str = "nestweaver.daemon.v1.NestWeaverDaemon";
@@ -1459,6 +1506,9 @@ mod replica_existing_read_tests {
                                     self.1.clone(),
                                     serde_json::from_str(&request.into_inner().args_json).unwrap(),
                                 ));
+                                if let Some(error) = self.0.query_error.lock().unwrap().clone() {
+                                    return std::future::ready(Err(error));
+                                }
                                 let repos = self.0.store.list_repos(None).unwrap().len();
                                 std::future::ready(Ok(tonic::Response::new(nestweaver_proto::JsonResponse {
                                     result_json: serde_json::json!({"replica_read": true, "repos": repos}).to_string(),
@@ -1556,6 +1606,7 @@ mod replica_existing_read_tests {
         owner: Option<std::fs::File>,
         health: Arc<Mutex<nestweaver_proto::HealthCheckResponse>>,
         requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        query_error: Arc<Mutex<Option<tonic::Status>>>,
         stop: Option<tokio::sync::oneshot::Sender<()>>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -1621,10 +1672,12 @@ mod replica_existing_read_tests {
                 ..Default::default()
             }));
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let query_error = Arc::new(Mutex::new(None));
             let endpoint = ReadEndpoint {
                 health: Arc::clone(&health),
                 store,
                 requests: Arc::clone(&requests),
+                query_error: Arc::clone(&query_error),
             };
             let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -1666,6 +1719,7 @@ mod replica_existing_read_tests {
                 owner: Some(owner),
                 health,
                 requests,
+                query_error,
                 stop: Some(stop),
                 thread: Some(thread),
             }
@@ -1693,6 +1747,89 @@ mod replica_existing_read_tests {
                 let _ = std::fs::remove_dir_all(self.socket.parent().unwrap());
             }
         }
+    }
+
+    #[test]
+    fn local_rpc_origin_context_preserves_display_and_mcp_error_envelope() {
+        let replica = Replica::new();
+        let status = tonic::Status::internal("opaque application failure detail");
+        *replica.query_error.lock().unwrap() = Some(status.clone());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut hybrid = runtime
+            .block_on(
+                nestweaver_client::hybrid::HybridClient::connect_existing_verified_read(
+                    &replica.anchor,
+                    None,
+                    replica.dir.path(),
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        let error = runtime
+            .block_on(hybrid.query_local_only("brain_status", &serde_json::json!({})))
+            .unwrap_err();
+        let baseline = anyhow::Error::new(status).context("brain_status RPC failed");
+        assert_eq!(error.to_string(), baseline.to_string());
+        assert!(
+            error
+                .downcast_ref::<nestweaver_client::hybrid::LocalQueryFailure>()
+                .is_some()
+        );
+        assert_eq!(
+            nestweaver_mcp::tools::wrap_tool_failure("brain_status", &error),
+            nestweaver_mcp::tools::wrap_tool_failure("brain_status", &baseline)
+        );
+        let original_display = error.to_string();
+        let attributed = with_query_database_identity(error, None);
+        assert_eq!(attributed.to_string(), original_display);
+        assert_eq!(
+            attributed
+                .chain()
+                .find_map(|source| source.downcast_ref::<tonic::Status>())
+                .unwrap()
+                .message(),
+            "opaque application failure detail"
+        );
+    }
+
+    #[test]
+    fn a_replica_query_failure_does_not_attribute_its_absent_anchor_as_a_corrupt_file() {
+        let replica = Replica::new();
+        *replica.query_error.lock().unwrap() = Some(tonic::Status::internal(
+            "database at /server/private/backing.lbug: Runtime exception: \
+             The database file may be corrupted.",
+        ));
+        assert!(!replica.anchor.exists());
+        let error = try_hybrid_json_rpc_checked(
+            true,
+            &replica.anchor,
+            None,
+            "brain_status",
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<nestweaver_client::hybrid::LocalQueryFailure>()
+                .is_some()
+        );
+        assert!(matches!(
+            error.downcast_ref::<QueryDatabaseIdentity>(),
+            Some(QueryDatabaseIdentity::Unknown(_))
+        ));
+        let report = into_diagnostic(error);
+        assert_eq!(
+            report.code().unwrap().to_string(),
+            "nestweaver::db_identity_unknown"
+        );
+        let rendered = format!("{report:?}");
+        assert!(
+            !rendered.contains("absent-replica-anchor.lbug"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("/server/private"), "{rendered}");
+        assert!(!replica.requests.lock().unwrap().is_empty());
+        assert!(!replica.anchor.exists());
     }
 
     #[test]

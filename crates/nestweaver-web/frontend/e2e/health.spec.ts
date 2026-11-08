@@ -6,6 +6,13 @@ test.describe("App Health", () => {
     expect(response.ok()).toBeTruthy();
     const body = await response.json();
     expect(body).toHaveProperty("status", "ok");
+    expect(body.product_version).toMatch(/^\d+\.\d+\.\d+/);
+    const alias = await request.get("/health");
+    expect(alias.headers()["content-type"]).toContain("application/json");
+    expect(await alias.json()).toEqual(body);
+    const version = await (await request.get("/api/v1/version")).json();
+    expect(version.product_version).toBe(body.product_version);
+    expect(typeof version.graph_generation).toBe("number");
   });
 
   test("SPA loads without errors", async ({ page }) => {

@@ -55,6 +55,8 @@ interface TreeRow {
   expandable: boolean;
   expanded: boolean;
   filePath: string | null;
+  repoUid: string;
+  directoryPath?: string;
   badge?: string;
 }
 
@@ -112,6 +114,8 @@ function visibleRows(
         expandable: !node.isFile,
         expanded: open,
         filePath: node.isFile ? node.fullPath : null,
+        repoUid,
+        directoryPath: node.isFile ? undefined : node.fullPath,
       });
       if (open) walk(repoUid, sortedChildren(node), level + 1, id);
     });
@@ -130,6 +134,7 @@ function visibleRows(
       expandable: true,
       expanded: open,
       filePath: null,
+      repoUid: repo.uid,
       badge: behind > 0 ? `${behind} commit${behind !== 1 ? "s" : ""} behind` : undefined,
     });
     if (open) walk(repo.uid, sortedChildren(tree), 2, id);
@@ -217,8 +222,8 @@ export function FilesTab() {
   }
 
   return (
-    <div aria-busy={loading} className="h-full">
-    {error && errorWorkspace.current === workspaceId && <div role="alert" className="p-2 text-xs text-red-500">{error}</div>}
+    <div aria-busy={loading} className="flex h-full min-h-0 flex-col">
+    {error && errorWorkspace.current === workspaceId && <div role="alert" className="shrink-0 p-2 text-xs text-red-500">{error}</div>}
     <FileTree
       key={workspaceId}
       repoTrees={repoTrees}
@@ -232,7 +237,7 @@ export function FilesTab() {
 /**
  * nw-565: the Files tree is one Tab stop (roving tabindex) navigated with
  * the WAI-ARIA tree keys: Up/Down move, Right opens or enters, Left closes
- * or climbs, Home/End jump, Enter/Space opens a file or toggles a folder,
+ * or climbs, Home/End jump, Enter selects a file/folder, Space toggles a folder,
  * and a printable key jumps to the next item starting with it.
  */
 function FileTree({
@@ -246,14 +251,26 @@ function FileTree({
 }) {
   const [expanded, setExpanded] = useState(() => initialExpanded(repoTrees));
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [directoryId, setDirectoryId] = useState<string | null>(null);
   const itemRefs = useRef(new Map<string, HTMLDivElement>());
-  const rows = useMemo(() => visibleRows(repoTrees, expanded), [repoTrees, expanded]);
+  const allRows = useMemo(() => visibleRows(repoTrees, expanded), [repoTrees, expanded]);
+  const directory = allRows.find((row) => row.id === directoryId && row.directoryPath);
+  const rows = directory
+    ? allRows.filter((row) => row.repoUid === directory.repoUid && (
+        row.id === directory.id || (row.filePath ?? row.directoryPath)?.startsWith(`${directory.directoryPath}/`)
+      )).map((row) => ({ ...row, level: row.level - directory.level + 1,
+        parentId: row.id === directory.id ? null : row.parentId,
+        setSize: row.id === directory.id ? 1 : row.setSize,
+        posInSet: row.id === directory.id ? 1 : row.posInSet,
+      }))
+    : allRows;
   const knownIds = useRef(expandableIds(repoTrees));
   useEffect(() => {
     const valid = expandableIds(repoTrees);
     const addedDefaults = [...initialExpanded(repoTrees)].filter((id) => !knownIds.current.has(id));
     knownIds.current = valid;
     setExpanded((previous) => new Set([...previous].filter((id) => valid.has(id)).concat(addedDefaults)));
+    setDirectoryId((previous) => previous && valid.has(previous) ? previous : null);
   }, [repoTrees]);
 
   const current = rows.find((row) => row.id === activeId) ?? rows[0] ?? null;
@@ -276,7 +293,10 @@ function FileTree({
   const activate = (row: TreeRow) => {
     setActiveId(row.id);
     if (row.filePath) onSelect(row.filePath);
-    else toggle(row, !row.expanded);
+    else if (row.directoryPath) {
+      setDirectoryId(row.id);
+      toggle(row, true);
+    } else toggle(row, !row.expanded);
   };
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>, row: TreeRow) => {
@@ -303,8 +323,11 @@ function FileTree({
         moveTo(rows[rows.length - 1]);
         break;
       case "Enter":
-      case " ":
         activate(row);
+        break;
+      case " ":
+        if (row.expandable) toggle(row, !row.expanded);
+        else activate(row);
         break;
       default:
         // Type-ahead: an unmodified letter or digit that is not an app-wide
@@ -329,14 +352,26 @@ function FileTree({
   };
 
   return (
+    <>
+      {directory && (
+        <div aria-label="Selected folder" className="shrink-0 border-b border-[var(--color-border)] p-2 text-xs">
+          <p className="break-words [overflow-wrap:anywhere]" title={`${directory.repoUid}:${directory.directoryPath}`}>Files in {directory.directoryPath}</p>
+          <button type="button" className="mt-1 text-blue-500 hover:underline" onClick={() => {
+            setDirectoryId(null);
+            requestAnimationFrame(() => itemRefs.current.get(directory.id)?.focus());
+          }}>Show all files</button>
+        </div>
+      )}
     <div
       role="tree"
       aria-label="Files"
-      className="flex h-full flex-col overflow-y-auto py-1"
+      className="flex min-h-0 flex-1 flex-col overflow-y-auto py-1"
     >
       {rows.map((row) => {
-        const isRepo = row.level === 1;
-        const selected = row.filePath != null && row.filePath === selectedPath;
+        const isRepo = row.parentId === null && !row.directoryPath;
+        const selected = directory
+          ? row.id === current?.id
+          : row.filePath != null && row.filePath === selectedPath;
         return (
           <div
             key={row.id}
@@ -349,12 +384,12 @@ function FileTree({
             aria-setsize={row.setSize}
             aria-posinset={row.posInSet}
             aria-expanded={row.expandable ? row.expanded : undefined}
-            aria-selected={row.filePath ? selected : undefined}
+            aria-selected={row.filePath || row.directoryPath ? selected : undefined}
             tabIndex={row.id === current?.id ? 0 : -1}
             onClick={() => activate(row)}
             onFocus={() => setActiveId(row.id)}
             onKeyDown={(event) => onKeyDown(event, row)}
-            title={row.filePath ?? undefined}
+            title={row.filePath ?? (row.directoryPath ? `Show files in ${row.directoryPath}; arrow keys expand or collapse` : `${row.expanded ? "Collapse" : "Expand"} folder ${row.label}`)}
             className={`flex w-full cursor-pointer items-center gap-1 py-0.5 pr-2 text-left text-xs outline-none hover:bg-[var(--color-surface-alt)] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-graph-selection)] ${
               isRepo
                 ? "font-semibold uppercase tracking-wide text-[var(--color-text-muted)]"
@@ -364,7 +399,11 @@ function FileTree({
             } ${selected ? "bg-[var(--color-surface-alt)] text-[var(--color-graph-selection)]" : ""}`}
             style={{ paddingLeft: `${(row.level - 1) * 12 + 8}px` }}
           >
-            <span className="w-3 shrink-0 text-center text-[var(--color-text-muted)]" aria-hidden="true">
+            <span className="w-3 shrink-0 text-center text-[var(--color-text-muted)]" aria-hidden="true" onClick={(event) => {
+              if (!row.expandable) return;
+              event.stopPropagation();
+              toggle(row, !row.expanded);
+            }}>
               {row.expandable ? (row.expanded ? "▾" : "▸") : "◦"}
             </span>
             <span className="truncate">{row.label}</span>
@@ -377,5 +416,6 @@ function FileTree({
         );
       })}
     </div>
+    </>
   );
 }

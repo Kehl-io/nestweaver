@@ -6104,6 +6104,21 @@ fn finish_search_reconciliation(
     }
 }
 
+/// Full vault replacement removes retained notes' code links too. Record debt
+/// after every returned attempt: an error can follow a committed replacement.
+/// Use the same namespace as the daemon's code-link poller and status reader.
+/// This takes no write gate, so callers may already hold one (legacy derivation)
+/// or acquire their postflight gate after this operation (full/policy refresh).
+fn run_full_vault_refresh_with_bridge_debt<T>(
+    state: &DaemonState,
+    reason: &str,
+    refresh: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let result = refresh();
+    nestweaver_engine::code_links::mark_code_links_pending(&state.db_path, reason);
+    result
+}
+
 /// Retry a previously established debt. Durable debt means the precise graph
 /// delta is unknown, so recovery always chooses the safe full rebuild.
 fn reconcile_pending_search_debt(
@@ -7971,7 +7986,7 @@ impl NestWeaverDaemon for DaemonService {
 
         let shutdown_handle = watcher.shutdown_handle();
         let pending_stop = shutdown_handle.clone();
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), (String, bool)>>();
         let ready_sender = Arc::new(std::sync::Mutex::new(Some(ready_tx)));
         let ready_callback_sender = ready_sender.clone();
         watcher = watcher.with_ready_callback(move || {
@@ -8056,7 +8071,8 @@ impl NestWeaverDaemon for DaemonService {
                     .unwrap_or_else(|e| e.into_inner())
                     .take()
                 {
-                    let _ = sender.send(Err(startup_error));
+                    let duplicate = matches!(&result, Ok(Err(error)) if error.downcast_ref::<nestweaver_engine::vault_registration::DuplicateVaultName>().is_some());
+                    let _ = sender.send(Err((startup_error, duplicate)));
                 }
                 let failure = match &result {
                     Ok(Ok(())) => None,
@@ -8113,13 +8129,18 @@ impl NestWeaverDaemon for DaemonService {
                 drain_watcher_tasks(&self.state, &[watcher_id]).await;
                 clear_watcher_registration(&self.state, watcher_id);
                 pending.armed = false;
-                let message = match result {
+                let (message, duplicate) = match result {
                     Ok(Err(error)) => error,
-                    _ => "vault watcher stopped before readiness".to_string(),
+                    _ => ("vault watcher stopped before readiness".to_string(), false),
                 };
                 return Ok(Response::new(WatchVaultResponse {
                     ok: false,
                     message,
+                    refusal_reason: if duplicate {
+                        WatchVaultResponse::REFUSAL_DUPLICATE_VAULT_NAME.to_string()
+                    } else {
+                        String::new()
+                    },
                     ..Default::default()
                 }));
             }
@@ -8132,6 +8153,7 @@ impl NestWeaverDaemon for DaemonService {
                 req.vault_path, vault_name
             ),
             watcher_id,
+            refusal_reason: String::new(),
         }))
     }
 
@@ -9383,26 +9405,29 @@ impl NestWeaverDaemon for DaemonService {
                 }
             };
 
-            let index_result =
-                nestweaver_engine::index_md::index_markdown_directory_with_store_and_write_gate(
-                    &state.store,
-                    &vault_path,
-                    &state.db_path,
-                    &instance_id,
-                    &vault_name,
-                    &extra_patterns,
-                    note_limits,
-                    || acquire_search_mutation_gate(&state, "index_vault", &mut search_admission),
-                );
-            let _postflight_gate = write_lock.blocking_lock("index_vault_postflight");
-            // nw-675: a full vault index recreates every note, and the
-            // cascade takes their code links. Owed, disclosed, and rebuilt
-            // by the code-link reconciler; recorded after the write, as in
-            // IndexRepo.
-            nestweaver_engine::code_links::mark_code_links_pending(
-                &state.db_path,
+            let index_result = run_full_vault_refresh_with_bridge_debt(
+                &state,
                 &format!("full index of vault {}", vault_path.display()),
+                || {
+                    nestweaver_engine::index_md::index_markdown_directory_with_store_and_write_gate(
+                        &state.store,
+                        &vault_path,
+                        &state.db_path,
+                        &instance_id,
+                        &vault_name,
+                        &extra_patterns,
+                        note_limits,
+                        || {
+                            acquire_search_mutation_gate(
+                                &state,
+                                "index_vault",
+                                &mut search_admission,
+                            )
+                        },
+                    )
+                },
             );
+            let _postflight_gate = write_lock.blocking_lock("index_vault_postflight");
 
             match index_result {
                 Ok(result) => {
@@ -11746,9 +11771,16 @@ impl NestWeaverDaemon for DaemonService {
                 .iter()
                 .map(|project| {
                     let mut row = serde_json::to_value(project)?;
-                    let members =
-                        nestweaver_engine::project_member_repos(&state.store, &project.uid)
-                            .unwrap_or_default();
+                    let members = nestweaver_engine::project::project_member_repos_with_config(
+                        &state.store,
+                        &project.uid,
+                        state
+                            .instance_cfg
+                            .as_ref()
+                            .map(|cfg| cfg.repos.as_slice())
+                            .unwrap_or(&[]),
+                    )
+                    .unwrap_or_default();
                     row["repos"] = serde_json::to_value(members)?;
                     Ok(row)
                 })
@@ -19863,6 +19895,218 @@ credential_method = "gh"
         done()
     }
 
+    /// nw-870: actual standard CLI -> UDS -> IndexRepo cached/full route.
+    /// The engine incremental-replan test is a separate seam witness; this
+    /// fixture does not pretend the standard CLI selects that internal route.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual frozen CLI: set NESTWEAVER_870_CLI_PATH to the candidate executable"]
+    async fn frozen_cli_index_refreshes_source_and_spec_after_observed_publication_wait() {
+        use std::os::fd::AsRawFd;
+
+        let binary = std::env::var_os("NESTWEAVER_870_CLI_PATH")
+            .map(PathBuf::from)
+            .expect("manual qualification requires an explicit frozen CLI artifact");
+        assert!(binary.is_absolute() && binary.is_file());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git_empty = root.join("git-empty");
+        std::fs::create_dir(&git_empty).unwrap();
+        let git = |args: &[&str]| {
+            let output = nestweaver_engine::git_cmd::isolated_git()
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgSign=false",
+                ])
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let spec = |operation: &str| {
+            format!(
+                "openapi: 3.0.0\ninfo: {{ title: t, version: \"1\" }}\npaths:\n  /test:\n    get:\n      operationId: {operation}\n      responses: {{ \"200\": {{ description: ok }} }}\n"
+            )
+        };
+        std::fs::write(repo.join("main.js"), "function initial() {}\n").unwrap();
+        std::fs::write(repo.join("openapi.yaml"), spec("initialOperation")).unwrap();
+        git(&["init", "--template", git_empty.to_str().unwrap()]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        let mut state = test_state_with_writer();
+        let instance = lifecycle::instance_id_from_db_path(&state.db_path);
+        Arc::get_mut(&mut state).unwrap().instance_id = instance.clone();
+        // Child-only XDG bindings, with no process-global environment mutation.
+        // The real pidfile flock and matching socket are private to this DB.
+        let runtime = root.join("run");
+        let private_runtime = runtime.join("nestweaver").join(&instance);
+        std::fs::create_dir_all(&private_runtime).unwrap();
+        let socket = private_runtime.join("daemon.sock");
+        assert!(!socket.exists());
+        let pidfile = std::fs::File::create(private_runtime.join("daemon.pid")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(pidfile.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        use std::io::Write;
+        writeln!(&pidfile, "{}", std::process::id()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let svc = tonic::service::interceptor::InterceptedService::new(
+            NestWeaverDaemonServer::new(DaemonService::new(state.clone())),
+            crate::auth::uds_admin_interceptor,
+        );
+        // Abort on assertion failure too; dropping a JoinHandle alone detaches it.
+        struct OwnedServer(tokio::task::JoinHandle<Result<(), tonic::transport::Error>>);
+        impl Drop for OwnedServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut server = OwnedServer(tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::UnixListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                ),
+        ));
+        let cli = |force: bool| {
+            let mut command = tokio::process::Command::new(&binary);
+            command
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("HOME", root.join("home"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .current_dir(root)
+                .args(["index", "--repo"])
+                .arg(&repo)
+                .arg("--db")
+                .arg(&state.db_path)
+                .arg("--json")
+                .kill_on_drop(true);
+            if force {
+                command.arg("--force");
+            }
+            command
+        };
+        let initial = tokio::time::timeout(Duration::from_secs(30), cli(true).output())
+            .await
+            .expect("initial CLI index deadline")
+            .unwrap();
+        assert!(initial.status.success(), "{initial:?}");
+        std::fs::write(repo.join("main.js"), "function before_wait() {}\n").unwrap();
+        std::fs::write(repo.join("openapi.yaml"), spec("beforeWaitOperation")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "prepared changes"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        let held = state.store.acquire_index_publication_lease().unwrap();
+        let mut command = cli(false);
+        let request = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(30), command.output())
+                .await
+                .expect("waiting CLI index deadline")
+                .unwrap()
+        });
+        let store = Arc::clone(&state.store);
+        let observed = tokio::task::spawn_blocking(move || {
+            store.wait_for_index_publication_waiters(1, Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        if observed {
+            assert!(
+                !request.is_finished(),
+                "CLI must still be held at publication"
+            );
+            std::fs::write(repo.join("main.js"), "function after_wait() {}\n").unwrap();
+            std::fs::write(repo.join("openapi.yaml"), spec("afterWaitOperation")).unwrap();
+        }
+        drop(held);
+        let output = request.await.unwrap();
+        assert!(
+            observed,
+            "this CLI request must demonstrably wait: {output:?}"
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            state
+                .store
+                .lookup_symbols_by_name("after_wait")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            state
+                .store
+                .lookup_symbols_by_name("before_wait")
+                .unwrap()
+                .is_empty()
+        );
+        let url = nestweaver_engine::mint_repo_identity(&repo);
+        let (_, oracle) =
+            nestweaver_engine::index_directory_in_memory(&repo, "default", &url, &sha).unwrap();
+        let symbols = |graph: &GraphStore| {
+            let mut rows: Vec<_> = graph
+                .list_all_symbols()
+                .unwrap()
+                .into_iter()
+                .map(|symbol| (symbol.name, symbol.content_hash))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let operations = |graph: &GraphStore| {
+            let mut rows: Vec<_> = graph
+                .list_contracts(None)
+                .unwrap()
+                .into_iter()
+                .filter_map(|contract| contract.operation_id)
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(operations(&state.store), vec!["afterWaitOperation"]);
+        assert_eq!(operations(&state.store), operations(&oracle));
+        assert_eq!(
+            symbols(&state.store),
+            symbols(&oracle),
+            "latest-byte source hashes must match full oracle"
+        );
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), &mut server.0)
+            .await
+            .expect("owned UDS server shutdown deadline")
+            .unwrap()
+            .unwrap();
+        eprintln!(
+            "nw870 actual frozen CLI cached/full route: publication wait observed; source hashes and OpenAPI operation equal later-byte full oracle; binary={}",
+            binary.display()
+        );
+    }
+
     async fn index_repo_via_rpc(state: &Arc<DaemonState>, root: &Path, force: bool) {
         let service = DaemonService::new(state.clone());
         let mut request = Request::new(IndexRepoRequest {
@@ -20150,6 +20394,322 @@ credential_method = "gh"
         reconciler.await.unwrap();
     }
 
+    /// A real, already-settled loop is essential: starting a fresh reconciler
+    /// after the refresh would repair via startup and hide missing debt.
+    struct FullVaultBridgeFixture {
+        state: Arc<DaemonState>,
+        vault: tempfile::TempDir,
+        _repo: tempfile::TempDir,
+        edges: Vec<(String, String, f64, String)>,
+        keep_hash: String,
+        reconciler: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl FullVaultBridgeFixture {
+        async fn warm() -> Self {
+            let state = test_state_with_writer();
+            let vault = tempfile::tempdir().unwrap();
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::write(
+                vault.path().join("Keep.md"),
+                "# Keep\n\n`AlphaWidget` renders.\n",
+            )
+            .unwrap();
+            std::fs::write(vault.path().join("Drop.md"), "# Drop\n\nIndependent.\n").unwrap();
+            std::fs::write(repo.path().join("widget.rs"), "pub struct AlphaWidget;\n").unwrap();
+            nestweaver_engine::index::index_directory_with_store(
+                &state.store,
+                repo.path(),
+                &state.db_path,
+                &state.data_instance_id,
+                "file:///bridge-refresh-fixture",
+                "sha",
+                false,
+                None,
+            )
+            .unwrap();
+            let progress = index_vault_via_rpc(&state, vault.path()).await;
+            assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+            assert!(
+                nestweaver_engine::code_links::load_code_links_state(&state.db_path)
+                    .last_reconciled_at
+                    .is_none(),
+                "no pass has run before this fixture starts its actual loop"
+            );
+            let reconciler = tokio::spawn(run_code_link_reconciler(
+                Arc::clone(&state),
+                Duration::from_millis(20),
+                Duration::ZERO,
+            ));
+            let mut fixture = Self {
+                state,
+                vault,
+                _repo: repo,
+                edges: Vec::new(),
+                keep_hash: String::new(),
+                reconciler: Some(reconciler),
+            };
+            assert!(
+                eventually(|| {
+                    let debt = nestweaver_engine::code_links::load_code_links_state(
+                        &fixture.state.db_path,
+                    );
+                    // last_reconciled_at is written only by completion, not by
+                    // a progress callback or merely creating the two edges.
+                    debt.last_reconciled_at.is_some()
+                        && debt.pending.is_none()
+                        && fixture.state.store.count_references_code_edges().unwrap() == 2
+                })
+                .await,
+                "the actual loop must complete its first pass before policy changes"
+            );
+            fixture.edges = fixture.state.store.list_references_code_edges().unwrap();
+            assert!(fixture.edges.iter().any(|edge| edge.0.starts_with("note:")));
+            assert!(fixture.edges.iter().any(|edge| edge.0.starts_with("sec:")));
+            fixture.keep_hash = fixture.keep().content_hash;
+            fixture
+        }
+
+        fn keep(&self) -> nestweaver_schema::Note {
+            self.state
+                .store
+                .list_notes(None)
+                .unwrap()
+                .into_iter()
+                .find(|note| note.file_path == "Keep.md")
+                .unwrap()
+        }
+
+        fn marks(&self) -> u64 {
+            nestweaver_engine::code_links::load_code_links_state(&self.state.db_path).marks
+        }
+
+        async fn assert_repaired(&self) {
+            assert!(
+                eventually(|| {
+                    !nestweaver_engine::code_links::code_links_pending(&self.state.db_path)
+                        && self.state.store.list_references_code_edges().unwrap() == self.edges
+                })
+                .await,
+                "the warmed loop must restore the same note/section bridges through debt"
+            );
+            assert_eq!(self.keep().content_hash, self.keep_hash);
+        }
+
+        async fn close(mut self) {
+            let _ = self.state.shutdown_tx.send(true);
+            tokio::time::timeout(Duration::from_secs(10), self.reconciler.take().unwrap())
+                .await
+                .expect("owned code-link loop shutdown deadline")
+                .unwrap();
+        }
+    }
+
+    impl Drop for FullVaultBridgeFixture {
+        fn drop(&mut self) {
+            // Assertion failures must stop the owned loop as well.
+            let _ = self.state.shutdown_tx.send(true);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_policy_refresh_repairs_retained_bridges_with_a_recently_settled_loop() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let fixture = FullVaultBridgeFixture::warm().await;
+        let before = fixture.marks();
+        std::fs::write(fixture.vault.path().join(".brainignore"), "Drop.md\n").unwrap();
+        let state = Arc::clone(&fixture.state);
+        let vault_uid = vault_derivation_record(&state).vault_uid;
+        tokio::task::spawn_blocking(move || {
+            vault_derivation::migrate_background(&state, &vault_uid)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fixture.state.store.list_notes(None).unwrap().len(), 1);
+        assert_eq!(
+            vault_derivation_record(&fixture.state).phase,
+            DerivationPhase::Current
+        );
+        assert_eq!(
+            fixture.marks(),
+            before + 1,
+            "one policy replacement owes one repair"
+        );
+        fixture.assert_repaired().await;
+
+        // The existing correct route is a positive control and must not mark
+        // twice when its standalone setter moves into the shared operation.
+        let before = fixture.marks();
+        let progress = index_vault_via_rpc(&fixture.state, fixture.vault.path()).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+        assert_eq!(
+            fixture.marks(),
+            before + 1,
+            "ordinary full index marks exactly once"
+        );
+        fixture.assert_repaired().await;
+
+        // Lost derivation records trigger the legacy indexed-inventory route,
+        // not full-policy reconciliation. Keep its pre-existing scope rules.
+        std::fs::remove_file(nestweaver_engine::markdown_derivation::record_path(
+            &fixture.state.db_path,
+        ))
+        .unwrap();
+        let before = fixture.marks();
+        let state = Arc::clone(&fixture.state);
+        let vault_uid = state.store.list_vaults(None).unwrap().remove(0).uid;
+        tokio::task::spawn_blocking(move || {
+            vault_derivation::migrate_background(&state, &vault_uid)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            fixture.marks(),
+            before + 1,
+            "legacy full derivation owes repair too"
+        );
+        assert_eq!(
+            vault_derivation_record(&fixture.state).coverage.scope,
+            nestweaver_engine::markdown_derivation::CoverageScope::LegacyIndexedInventory
+        );
+        fixture.assert_repaired().await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_vault_bridge_debt_survives_committed_error_and_policy_postflight_failure() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let fixture = FullVaultBridgeFixture::warm().await;
+        let before = fixture.marks();
+        let state = Arc::clone(&fixture.state);
+        let root = fixture.vault.path().to_path_buf();
+        let error = tokio::task::spawn_blocking(move || {
+            run_full_vault_refresh_with_bridge_debt(&state, "postcommit error fixture", || {
+                nestweaver_engine::index_md::index_markdown_directory_with_store_and_write_gate(
+                    &state.store,
+                    &root,
+                    &state.db_path,
+                    &state.data_instance_id,
+                    &state.store.list_vaults(None)?.remove(0).name,
+                    &[],
+                    nestweaver_engine::index_limits::NoteLimits::default(),
+                    || Ok(state.write_gate.blocking_lock("bridge_error_fixture")),
+                )?;
+                assert_eq!(state.store.list_notes(None)?.len(), 2);
+                assert_eq!(
+                    state.store.count_references_code_edges()?,
+                    0,
+                    "a real replacement committed before the injected error"
+                );
+                Err::<(), _>(anyhow::anyhow!(
+                    "distinct error after committed replacement"
+                ))
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "distinct error after committed replacement"
+        );
+        assert_eq!(fixture.marks(), before + 1);
+        fixture.assert_repaired().await;
+
+        // Change a valid policy after the real replacement returns. Its
+        // eligibility stays the same, but the raw policy fingerprint changes,
+        // so the actual postflight must refuse to stamp the captured policy.
+        std::fs::write(fixture.vault.path().join(".brainignore"), "Drop.md\n").unwrap();
+        let before = fixture.marks();
+        let state = Arc::clone(&fixture.state);
+        let vault_uid = vault_derivation_record(&state).vault_uid;
+        let policy_path = fixture.vault.path().join(".brainignore");
+        let observed = Arc::new(AtomicBool::new(false));
+        let reached = Arc::clone(&observed);
+        let error = tokio::task::spawn_blocking(move || {
+            struct ClearPhaseHook;
+            impl Drop for ClearPhaseHook {
+                fn drop(&mut self) {
+                    vault_derivation::tests::set_phase_hook(None);
+                }
+            }
+            let _clear = ClearPhaseHook;
+            let hook_state = Arc::clone(&state);
+            vault_derivation::tests::set_phase_hook(Some(Box::new(move |phase| {
+                if phase == "policy refresh returned" {
+                    assert_eq!(
+                        hook_state.store.list_notes(None).unwrap().len(),
+                        1,
+                        "replacement must actually commit before the policy changes"
+                    );
+                    assert_eq!(
+                        nestweaver_engine::code_links::load_code_links_state(&hook_state.db_path)
+                            .marks,
+                        before + 1,
+                        "the committed attempt must already owe bridge repair"
+                    );
+                    std::fs::write(&policy_path, "Drop.md\n# changed after replacement\n").unwrap();
+                    reached.store(true, Ordering::SeqCst);
+                }
+            })));
+            vault_derivation::migrate_background(&state, &vault_uid)
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "real postflight seam must be reached"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("vault ignore policy changed before derivation stamping"),
+            "{error:#}"
+        );
+        assert_eq!(fixture.state.store.list_notes(None).unwrap().len(), 1);
+        assert_eq!(
+            vault_derivation_record(&fixture.state).phase,
+            DerivationPhase::Blocked
+        );
+        assert_eq!(
+            fixture.marks(),
+            before + 1,
+            "postflight failure cannot skip debt"
+        );
+        fixture.assert_repaired().await;
+        fixture.close().await;
+    }
+
+    #[test]
+    fn full_vault_bridge_debt_uses_the_consumer_namespace_even_on_precommit_error() {
+        let mut state = test_state_with_writer();
+        let endpoint = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state).unwrap().selected_db_path = endpoint.path().join("endpoint.lbug");
+        let before = nestweaver_engine::code_links::load_code_links_state(&state.db_path).marks;
+        let error = run_full_vault_refresh_with_bridge_debt(&state, "precommit refusal", || {
+            Err::<(), _>(anyhow::anyhow!("refused before commit"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "refused before commit");
+        let debt = nestweaver_engine::code_links::load_code_links_state(&state.db_path);
+        assert_eq!(debt.marks, before + 1);
+        assert!(
+            debt.pending.is_some(),
+            "plain Err cannot prove the absence of a commit"
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(
+                &state.selected_db_path,
+                nestweaver_engine::code_links::CODE_LINKS_SIDECAR,
+            )
+            .exists(),
+            "endpoint binding is not the code-link consumer's namespace"
+        );
+    }
+
     /// nw-670 review M4: the loop runs on recorded debt, not on every graph
     /// generation change. A generation bump with nothing owed leaves a
     /// deliberately unlinked note alone; recording the debt relinks it.
@@ -20380,6 +20940,237 @@ repos = ["alpha"]
             ),
         )
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_vault_watch_refusal_keeps_its_permanent_reason() {
+        let state = test_state_with_writer();
+        let original = tempfile::tempdir().unwrap();
+        std::fs::write(original.path().join("seed.md"), "# Seed\n").unwrap();
+        let indexed = index_vault_via_rpc(&state, original.path()).await;
+        assert_eq!(indexed.last().unwrap().phase, Phase::Done as i32);
+        let existing = state.store.list_vaults(None).unwrap().remove(0);
+        let collision = tempfile::tempdir().unwrap();
+        std::fs::write(collision.path().join("other.md"), "# Other\n").unwrap();
+        let response = DaemonService::new(state.clone())
+            .watch_vault(Request::new(WatchVaultRequest {
+                vault_path: collision.path().display().to_string(),
+                vault_name: existing.name,
+                instance_id: existing.instance_id,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.ok);
+        assert_eq!(response.refusal_reason, "duplicate_vault_name");
+        assert_eq!(state.store.list_vaults(None).unwrap().len(), 1);
+        assert!(state.watcher_stop.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ignore_policy_changes_reconcile_inventory_without_manual_refresh() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("backups")).unwrap();
+        std::fs::write(root.join("Keep.md"), "# Keep\n\nkept\n").unwrap();
+        std::fs::write(root.join("backups/Old.md"), "# Old\n\nbackup\n").unwrap();
+        let indexed = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(indexed.last().unwrap().phase, Phase::Done as i32);
+        let service = DaemonService::new(state.clone());
+        let watching = service
+            .watch_vault(Request::new(WatchVaultRequest {
+                vault_path: root.display().to_string(),
+                vault_name_defaulted: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(watching.ok, "{}", watching.message);
+        let migrator = tokio::spawn(vault_derivation::run(Arc::clone(&state)));
+
+        std::fs::write(root.join(".brainignore"), "backups/**\n").unwrap();
+        assert!(
+            eventually(|| {
+                state
+                    .store
+                    .list_notes(None)
+                    .is_ok_and(|notes| notes.len() == 1)
+                    && vault_derivation_record(&state).phase == DerivationPhase::Current
+                    && vault_derivation::inspect_next(&state).unwrap().is_none()
+            })
+            .await,
+            "new exclusion must converge without CLI intervention"
+        );
+        let kept_hash = state.store.list_notes(None).unwrap()[0]
+            .content_hash
+            .clone();
+        std::fs::write(
+            root.join("backups/Old.md"),
+            "# Old\n\nnew excluded contents\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Keep.md"), "# Keep\n\nupdated kept contents\n").unwrap();
+        assert!(
+            eventually(|| {
+                state.store.list_notes(None).is_ok_and(|notes| {
+                    notes.len() == 1
+                        && notes[0].file_path == "Keep.md"
+                        && notes[0].content_hash != kept_hash
+                })
+            })
+            .await,
+            "watcher must keep the new matcher and never reinsert excluded notes"
+        );
+
+        // Atomic replacement and policy deletion both go through polling,
+        // regardless of the OS's exact file-event spelling.
+        std::fs::write(root.join("policy.next"), "# include backups again\n").unwrap();
+        std::fs::rename(root.join("policy.next"), root.join(".brainignore")).unwrap();
+        assert!(
+            eventually(|| {
+                state
+                    .store
+                    .list_notes(None)
+                    .is_ok_and(|notes| notes.len() == 2)
+                    && vault_derivation_record(&state).phase == DerivationPhase::Current
+            })
+            .await
+        );
+        std::fs::remove_file(root.join(".brainignore")).unwrap();
+        assert!(eventually(|| vault_derivation::inspect_next(&state).unwrap().is_none()).await);
+        let mut stop = Request::new(StopWatchRequest {
+            watcher_id: watching.watcher_id,
+        });
+        stop.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(service.stop_watch(stop).await.unwrap().into_inner().ok);
+        let _ = state.shutdown_tx.send(true);
+        migrator.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_inventory_reconciliation_retains_failure_backoff_across_retries() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("Keep.md"), "# Keep\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+        std::fs::write(root.join(".brainignore"), "foo{a,b\n").unwrap();
+        let uid = vault_derivation_record(&state).vault_uid;
+        let work = state.clone();
+        let target = uid.clone();
+        tokio::task::spawn_blocking(move || vault_derivation::migrate_background(&work, &target))
+            .await
+            .unwrap()
+            .expect_err("invalid policy cannot be published");
+        let blocked = vault_derivation_record(&state);
+        assert_eq!(blocked.phase, DerivationPhase::Blocked);
+        assert!(blocked.retry_after_unix_seconds.is_some());
+        let work = state.clone();
+        let target = uid.clone();
+        tokio::task::spawn_blocking(move || vault_derivation::migrate_background(&work, &target))
+            .await
+            .unwrap()
+            .expect_err("same failed policy must wait for backoff");
+        assert_eq!(vault_derivation_record(&state).attempts, blocked.attempts);
+        assert!(vault_derivation::inspect_next(&state).unwrap().is_none());
+        // A corrected policy changes the fingerprint, so it recovers even
+        // before the obsolete failure's backoff elapses.
+        std::fs::write(root.join(".brainignore"), "# corrected\n").unwrap();
+        let work = state.clone();
+        tokio::task::spawn_blocking(move || vault_derivation::migrate_background(&work, &uid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            vault_derivation_record(&state).phase,
+            DerivationPhase::Current
+        );
+        assert_eq!(vault_derivation_record(&state).attempts, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watched_vault_insert_and_delete_settle_the_trigram_outbox() {
+        let state = test_state_with_writer();
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().canonicalize().unwrap();
+        std::fs::write(root.join("Keep.md"), "# Keep\n\nkept body\n").unwrap();
+        std::fs::write(root.join("Drop.md"), "# Drop\n\nDropToken840\n").unwrap();
+        let progress = index_vault_via_rpc(&state, &root).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+        let kinds = vec!["Section".to_string()];
+        let search = || {
+            state
+                .store
+                .regex_search(
+                    "DropToken840|AddedToken840",
+                    None,
+                    Some(&kinds),
+                    Some(100),
+                    Some(5000),
+                )
+                .unwrap()
+        };
+        let before = search();
+        assert_eq!(
+            before.results.len(),
+            1,
+            "exact fallback must find the initial note"
+        );
+        assert!(state.store.pending_regex_scope_count().unwrap() > 0);
+        let service = DaemonService::new(state.clone());
+        let watch = service
+            .watch_vault(Request::new(WatchVaultRequest {
+                vault_path: root.display().to_string(),
+                vault_name_defaulted: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(watch.ok, "{}", watch.message);
+        let relay = tokio::spawn(run_trigram_reconciler(
+            state.clone(),
+            Duration::from_millis(20),
+        ));
+        let settled = |expected| {
+            let result = search();
+            result.results.len() == expected
+                && result.ready_scopes > 0
+                && result.dirty_scopes == 0
+                && result.error_scopes == 0
+                && state.store.pending_regex_scope_count().unwrap() == 0
+        };
+        let initial_settled = eventually(|| settled(1)).await;
+        std::fs::write(root.join("Added.md"), "# Added\n\nAddedToken840\n").unwrap();
+        let inserted_settled = eventually(|| settled(2)).await;
+        std::fs::remove_file(root.join("Drop.md")).unwrap();
+        let deleted_settled = eventually(|| {
+            let result = search();
+            settled(1)
+                && result
+                    .results
+                    .iter()
+                    .all(|row| row.matched == "AddedToken840")
+        })
+        .await;
+        let final_result = search();
+        let mut stop = Request::new(StopWatchRequest {
+            watcher_id: watch.watcher_id,
+        });
+        stop.extensions_mut().insert(crate::auth::IsAdmin(true));
+        assert!(service.stop_watch(stop).await.unwrap().into_inner().ok);
+        let _ = state.shutdown_tx.send(true);
+        relay.await.unwrap();
+        assert!(
+            initial_settled && inserted_settled && deleted_settled,
+            "initial={initial_settled}, insertion={inserted_settled}, deletion={deleted_settled}; {final_result:?}"
+        );
     }
 
     fn block_vault_derivation(state: &DaemonState, retry_after_unix_seconds: u64) {

@@ -143,7 +143,10 @@ pub fn start_existing(instance_id: &str) -> Result<()> {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("already loaded") && !stderr.contains("already bootstrapped") {
-                anyhow::bail!("launchctl bootstrap failed: {stderr}");
+                anyhow::bail!(
+                    "{}",
+                    lifecycle::launchd_bootstrap_failure(&stderr, &format!("gui/{uid}/{label}"))
+                );
             }
         }
     }
@@ -617,7 +620,10 @@ pub fn install_and_start(instance_id: &str, plist_content: &str) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("already loaded") && !stderr.contains("already bootstrapped") {
-            anyhow::bail!("launchctl bootstrap failed: {stderr}");
+            anyhow::bail!(
+                "{}",
+                lifecycle::launchd_bootstrap_failure(&stderr, &format!("gui/{uid}/{label}"))
+            );
         }
     }
 

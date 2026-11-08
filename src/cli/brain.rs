@@ -446,7 +446,7 @@ pub(crate) fn run_brain(
                             .as_u64()
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| "unavailable".into()),
-                        row["last_indexed"].as_str().unwrap_or("(unknown)")
+                        vault_last_indexed_text(row)
                     );
                     if let Some(error) = row["inventory_error"].as_str() {
                         println!("  Warning: {error}");
@@ -575,7 +575,7 @@ pub(crate) fn run_brain(
                             // per-vault `list_notes` fails; `unwrap_or(0)`
                             // printed that as "0 notes".
                             let note_count = render_optional_count(v.get("note_count"));
-                            let last_indexed = v["last_indexed"].as_str().unwrap_or("never");
+                            let last_indexed = vault_last_indexed_text(v);
                             let ambiguous = name_counts.get(name).copied().unwrap_or(0) > 1;
                             let unnamed = name.is_empty();
                             if ambiguous || unnamed {
@@ -837,26 +837,6 @@ pub(crate) fn run_brain(
                 .map_err(|e| anyhow::anyhow!(e))?;
             let repos = store.list_repos(None).map_err(|e| anyhow::anyhow!(e))?;
 
-            /// Resolve last_indexed_at for a vault: prefer the extension-store
-            /// timestamp (actual indexer run), fall back to max(note.modified_at)
-            /// for databases indexed before this feature was added.
-            fn resolve_last_indexed(
-                db_path: &Path,
-                vault_uid: &str,
-                store: &GraphStore,
-            ) -> Option<String> {
-                if let Some(ts) = get_last_indexed_at(db_path, vault_uid) {
-                    return Some(ts);
-                }
-                // Fallback: max(note.modified_at).
-                store
-                    .list_notes(Some(vault_uid))
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|n| n.modified_at.clone())
-                    .max()
-            }
-
             if json {
                 // ONE builder, ONE schema: the direct path serves the same
                 // top-level document the daemon serves, with the fields only
@@ -894,6 +874,7 @@ pub(crate) fn run_brain(
                 // don't render as blank lines.
                 let mut name_counts: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
+                let inventory = nestweaver_engine::index_md::vault_inventory(&store, db_path)?;
                 for v in &vaults {
                     *name_counts.entry(v.name.as_str()).or_insert(0) += 1;
                 }
@@ -928,8 +909,11 @@ pub(crate) fn run_brain(
                                 (render_optional_count(Some(&serde_json::Value::Null)), None)
                             }
                         };
-                    let last_indexed = resolve_last_indexed(db_path, &v.uid, &store)
-                        .unwrap_or_else(|| "never".to_string());
+                    let last_indexed = inventory
+                        .as_array()
+                        .and_then(|rows| rows.iter().find(|row| row["uid"] == v.uid))
+                        .map(vault_last_indexed_text)
+                        .unwrap_or_else(|| "never".into());
                     let ambiguous = name_counts.get(v.name.as_str()).copied().unwrap_or(0) > 1;
                     let unnamed = v.name.is_empty();
                     if ambiguous || unnamed {
@@ -1525,7 +1509,16 @@ pub(crate) fn run_brain(
                 })?;
                 if !resp.ok {
                     eprintln!("Error: {}", resp.message);
-                    return Ok((EXIT_ERROR, None));
+                    return Ok((
+                        if resp.refusal_reason
+                            == nestweaver_proto::WatchVaultResponse::REFUSAL_DUPLICATE_VAULT_NAME
+                        {
+                            EXIT_CONFIG
+                        } else {
+                            EXIT_ERROR
+                        },
+                        None,
+                    ));
                 }
                 out.status(&format!(
                     "Watching {} via daemon (Ctrl-C to stop)",
@@ -1649,6 +1642,12 @@ pub(crate) fn run_brain(
                 // `.brainignore`), or readers keep treating the database as
                 // watched by a process that has exited.
                 let _ = std::fs::remove_file(&lock_path);
+                if e.downcast_ref::<nestweaver_engine::vault_registration::DuplicateVaultName>()
+                    .is_some()
+                {
+                    eprintln!("Error: watcher: {e:#}");
+                    return Ok((EXIT_CONFIG, None));
+                }
                 // A lock failure here means another process (usually a
                 // live daemon) holds the DB — name the remedy.
                 let msg = format!("{e:#}");
@@ -2827,6 +2826,7 @@ pub(crate) fn run_brain(
                     // `total`, `truncated`, `truncated_by` and `_meta` are not
                     // among them, and dropping them here is what made a capped
                     // answer on this route indistinguishable from a complete one.
+                    // Capture response ambiguity before the ranking type drops it.
                     let upstream = UpstreamContextDisclosure::from_wire(&result_json)
                         .with_local_publication(&db_path);
                     let result: nestweaver_engine::BrainContextResult =
@@ -3379,7 +3379,14 @@ pub(crate) fn run_brain(
                     if clusters.is_empty() {
                         println!("No topic clusters found.");
                     } else {
-                        println!("Topic clusters ({}):", clusters.len());
+                        println!(
+                            "Topic clusters ({} of {}):",
+                            clusters.len(),
+                            value["total"]
+                                .as_u64()
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "unknown".into())
+                        );
                         for c in &clusters {
                             println!(
                                 "  [{}] {} ({} note(s))",
@@ -3405,6 +3412,7 @@ pub(crate) fn run_brain(
                         "clusters": clusters,
                         "total": total,
                         "returned": clusters.len(),
+                        "truncated": clusters.len() < total,
                     }))?
                 );
             } else if clusters.is_empty() {
@@ -3455,7 +3463,16 @@ pub(crate) fn run_brain(
                         println!("{}", serde_json::to_string_pretty(&value)?);
                     } else if tag.is_some() {
                         // Single-tag mode: value is a TagGraph directly.
+                        let returned = value["co_occurring"].as_array().map(|rows| rows.len());
+                        let total = value["co_occurring_total"].as_u64();
+                        let lower_bound = value["count_relation"] == "gte";
                         let tg: nestweaver_engine::TagGraph = serde_json::from_value(value)?;
+                        if let (Some(returned), Some(total)) = (returned, total) {
+                            println!(
+                                "Co-occurring tags ({returned} of {}{total}):",
+                                if lower_bound { "at least " } else { "" }
+                            );
+                        }
                         println!("#{} — {} note(s)", tg.tag, tg.count);
                         if tg.co_occurring.is_empty() {
                             println!("  no co-occurring tags");
@@ -3472,6 +3489,19 @@ pub(crate) fn run_brain(
                         if graphs.is_empty() {
                             println!("no tags");
                         } else {
+                            println!(
+                                "Tags ({} of {}{}):",
+                                graphs.len(),
+                                if value["total_relation"] == "gte" {
+                                    "at least "
+                                } else {
+                                    ""
+                                },
+                                value["total"]
+                                    .as_u64()
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|| "unknown".into())
+                            );
                             for tg in &graphs {
                                 let co = if tg.co_occurring.is_empty() {
                                     "—".to_string()
@@ -3494,11 +3524,23 @@ pub(crate) fn run_brain(
             let store = open_store(Some(&db_path))?;
             match tag {
                 Some(tag) => {
-                    let tg = nestweaver_engine::tag_graph(&store, &tag)?;
+                    let mut tg = nestweaver_engine::tag_graph(&store, &tag)?;
+                    let total = tg.co_occurring.len();
+                    let descendants_total = tg.descendants.len();
+                    tg.co_occurring.truncate(limit);
+                    tg.descendants.truncate(limit);
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&tg)?);
+                        let mut value = serde_json::to_value(&tg)?;
+                        value["co_occurring_total"] = serde_json::json!(total);
+                        value["descendants_total"] = serde_json::json!(descendants_total);
+                        value["truncated"] = serde_json::json!(
+                            tg.co_occurring.len() < total
+                                || tg.descendants.len() < descendants_total
+                        );
+                        println!("{}", serde_json::to_string_pretty(&value)?);
                     } else {
                         println!("#{} — {} note(s)", tg.tag, tg.count);
+                        println!("Co-occurring tags ({} of {total}):", tg.co_occurring.len());
                         if tg.co_occurring.is_empty() {
                             println!("  no co-occurring tags");
                         } else {
@@ -3520,11 +3562,13 @@ pub(crate) fn run_brain(
                                 "tags": graphs,
                                 "total": total,
                                 "returned": graphs.len(),
+                                "truncated": graphs.len() < total,
                             }))?
                         );
                     } else if graphs.is_empty() {
                         println!("no tags");
                     } else {
+                        println!("Tags ({} of {total}):", graphs.len());
                         for tg in &graphs {
                             let co = if tg.co_occurring.is_empty() {
                                 "—".to_string()
@@ -3652,7 +3696,14 @@ pub(crate) fn run_brain(
                     if let Some(symbols) = payload["affected_symbols"].as_array()
                         && !symbols.is_empty()
                     {
-                        println!("Affected symbols ({}):", symbols.len());
+                        println!(
+                            "Affected symbols ({} of {}):",
+                            symbols.len(),
+                            payload["affected_symbol_count"]
+                                .as_u64()
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "unknown".into())
+                        );
                         for sym in symbols {
                             println!(
                                 "  {} [{}] {}:{}",
@@ -4566,6 +4617,38 @@ mod vault_source_inventory_tests {
                 &serde_json::json!({"local":{"status":"available"},"upstreams":[{"status":"available"}]})
             ),
             EXIT_SUCCESS
+        );
+    }
+}
+
+fn vault_last_indexed_text(row: &serde_json::Value) -> String {
+    if row["last_indexed_source"] == "unavailable" {
+        return "unavailable".into();
+    }
+    let timestamp = row["last_indexed"].as_str().unwrap_or("never");
+    if row["last_indexed_source"] == "file_mtime" {
+        format!("{timestamp} (newest note modification time; legacy fallback)")
+    } else {
+        timestamp.to_string()
+    }
+}
+
+#[cfg(test)]
+mod timestamp_provenance_tests {
+    use super::vault_last_indexed_text;
+
+    #[test]
+    fn legacy_note_mtime_is_labelled_without_relabelling_completion_time() {
+        let fallback =
+            serde_json::json!({"last_indexed":"2000-01-01", "last_indexed_source":"file_mtime"});
+        assert!(vault_last_indexed_text(&fallback).contains("legacy fallback"));
+        let recorded = serde_json::json!({"last_indexed":"2026-11-08", "last_indexed_source":"extension_store"});
+        assert_eq!(vault_last_indexed_text(&recorded), "2026-11-08");
+        assert_eq!(
+            vault_last_indexed_text(
+                &serde_json::json!({"last_indexed":null, "last_indexed_source":"unavailable"})
+            ),
+            "unavailable"
         );
     }
 }

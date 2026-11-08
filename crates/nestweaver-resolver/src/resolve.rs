@@ -14710,4 +14710,39 @@ func InsideCase(value int) { switch value { case 1: client := inner.New(); clien
             );
         }
     }
+    #[test]
+    fn anonymous_default_body_and_import_calls_have_exact_owners() {
+        for (language, extension) in [(Language::JavaScript, "js"), (Language::TypeScript, "ts")] {
+            for declaration in [
+                "export default function () {",
+                "export default async () => {",
+                "export default function* () {",
+            ] {
+                let exporter =
+                    format!("function helper() {{}}\n{declaration}\n  helper();\n}}\nhelper();\n");
+                let target_path = format!("src/target.{extension}");
+                let app_path = format!("src/app.{extension}");
+                let app = format!(
+                    "import Selected from './target.{extension}';\nfunction app() {{\n  Selected();\n}}\n"
+                );
+                let (files, edges) =
+                    review_edges(&[(&target_path, &exporter), (&app_path, &app)], language);
+                let default = uid(&files, &target_path, "default");
+                let helper = uid(&files, &target_path, "helper");
+                let module = uid(&files, &target_path, "<module>");
+                for (source, target) in [
+                    (default.clone(), helper.clone()),
+                    (module, helper),
+                    (uid(&files, &app_path, "app"), default),
+                ] {
+                    assert!(
+                        edges.iter().any(|e| e.edge_type == EdgeType::Calls
+                            && e.source_uid == source
+                            && e.target_uid == target),
+                        "{extension}: {declaration}: {edges:#?}"
+                    );
+                }
+            }
+        }
+    }
 }

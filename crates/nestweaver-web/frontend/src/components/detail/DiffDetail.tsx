@@ -1,4 +1,14 @@
+import type { BrainContextResult } from "../../api/types";
 import { useStore } from "../../stores";
+
+function SeedLabels({ seeds, snapshot }: { seeds: string[]; snapshot: BrainContextResult }) {
+  const names = new Map([...snapshot.seeds, ...snapshot.connected].map((node) => [node.uid, node.title]));
+  return seeds.map((seed, index) => (
+    <span key={`${index}:${seed}`} title={seed}>
+      {index > 0 ? ", " : ""}{names.get(seed) || seed}
+    </span>
+  ));
+}
 
 export function DiffDetail() {
   const diffState = useStore((s) => s.diffState);
@@ -34,8 +44,8 @@ export function DiffDetail() {
         </button>
       </div>
       <div className="text-xs space-y-1 mb-3">
-        <p>A: {diffState.seedsA.join(", ")}</p>
-        <p>B: {diffState.seedsB.join(", ")}</p>
+        <p className="break-words [overflow-wrap:anywhere]">A: <SeedLabels seeds={diffState.seedsA} snapshot={diffState.snapshotA} /></p>
+        <p className="break-words [overflow-wrap:anywhere]">B: <SeedLabels seeds={diffState.seedsB} snapshot={diffState.snapshotB} /></p>
       </div>
       <div className="flex gap-2 text-xs mb-3">
         <span className="px-2 py-0.5 bg-[var(--color-surface-alt)] rounded">

@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { decodedReplyCount, installDeliveryReceipts, waitForDecodedReply } from "./deliveryBarriers";
 
 function symbolPayload(hit: {
   uid: string;
@@ -684,8 +685,9 @@ test("committed Impact refresh publishes graph data while preserving the Related
   await page.route("**/api/v1/impact/**", async (route) => {
     const actual = await route.fetch();
     expect(actual.ok()).toBe(true);
-    const body = await actual.json() as { target: { uid: string; name: string }; nodes: { uid: string; name: string }[] };
+    const body = await actual.json() as { target: { uid: string; name: string }; nodes: { uid: string; name: string }[]; _meta: { trust: unknown } };
     expect(body.target.uid).toBe(anchor!.uid);
+    expect(body._meta.trust, "real Impact reply carries trust that Related must not restore").toEqual(expect.any(Object));
     if (committed) {
       // Keep the real backend topology; the marker proves the refreshed reply was published.
       body.target.name = refreshedName;
@@ -717,6 +719,8 @@ test("committed Impact refresh publishes graph data while preserving the Related
   await expect.poll(async () => (await read()).active_lens.label).toMatch(/^Related to /);
   const related = await read();
   expect(related.active_lens.lens).toBe("search");
+  expect(related._meta.trust).toBeNull();
+  expect(related._meta.unavailable_reason).toBe("No scene metadata is available; showing current client-side scene state.");
   expect(related.selected_node.uid).toBe(anchor!.uid);
   expect(related.graph.nodes.map((node: { uid: string }) => node.uid).sort()).toEqual(impact.graph.nodes.map((node: { uid: string }) => node.uid).sort());
   expect(related.graph.edges).toEqual(impact.graph.edges);
@@ -729,9 +733,76 @@ test("committed Impact refresh publishes graph data while preserving the Related
     node.uid === anchor!.uid && node.label === refreshedName), { timeout: 15_000 }).toBe(true);
   const after = await read();
   expect(after.active_lens).toEqual(related.active_lens);
+  expect(after._meta.trust).toBe(related._meta.trust);
+  expect(after._meta.unavailable_reason).toBe(related._meta.unavailable_reason);
   expect(after.selected_node).toEqual(related.selected_node);
   expect(after.representation).toBe(related.representation);
   expect(after.graph.nodes.map((node: { uid: string }) => node.uid).sort()).toEqual(related.graph.nodes.map((node: { uid: string }) => node.uid).sort());
   expect(after.graph.edges).toEqual(related.graph.edges);
   expect(new URL(page.url()).searchParams.get("mode")).toBe("impact");
 });
+
+for (const lens of ["impact", "related"] as const) {
+  test(`Impact refresh HTTP errors belong only to the active Impact lens (${lens})`, async ({ page, request }) => {
+    const response = await request.get("/api/v1/search?q=releaseA&limit=8");
+    expect(response.ok()).toBe(true);
+    const rows = await response.json() as { uid: string; name: string; kind: string }[];
+    const anchor = rows.find((row) => row.name === "releaseA");
+    expect(anchor).toBeDefined();
+    await installDeliveryReceipts(page);
+    let fail = false;
+    let deliveredErrors = 0;
+    const message = "Impact ownership regression witness: temporary HTTP failure";
+    await page.route("**/api/v1/impact/**", async (route) => {
+      if (fail) {
+        await route.fulfill({ status: 503, json: { error: "route_capability", message } });
+        deliveredErrors += 1;
+      } else {
+        const actual = await route.fetch();
+        expect(actual.ok()).toBe(true);
+        const body = await actual.json() as { _meta: { trust: unknown } };
+        expect(body._meta.trust).toEqual(expect.any(Object));
+        await route.fulfill({ response: actual });
+      }
+    });
+    const events = { pending: "" };
+    await page.route("**/api/v1/events", (route) => {
+      const body = `retry: 200\n${events.pending}\n`;
+      events.pending = "";
+      return route.fulfill({ status: 200, contentType: "text/event-stream", body });
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`/?mode=impact&node=${encodeURIComponent(anchor!.uid)}&kind=${anchor!.kind}&representation=json&depth=2&confidence=0.5`);
+    const json = page.getByRole("region", { name: "JSON result", exact: true }).locator("code");
+    const read = async () => JSON.parse((await json.textContent()) ?? "{}");
+    await expect.poll(async () => {
+      const scene = await read();
+      return scene.active_lens?.lens === "impact" && scene.graph.nodes.some((node: { uid: string }) => node.uid === anchor!.uid);
+    }, { timeout: 15_000 }).toBe(true);
+    if (lens === "related") {
+      await page.getByTestId("detail-panel").getByRole("group", { name: "Node actions", exact: true }).first().getByRole("button", { name: "Related", exact: true }).click();
+      await expect.poll(async () => (await read()).active_lens.lens).toBe("search");
+    }
+    const before = await read();
+    const path = `/api/v1/impact/${encodeURIComponent(anchor!.uid)}`;
+    const decoded = await decodedReplyCount(page, path);
+    fail = true;
+    events.pending = "event: graph:updated\ndata: {}\n\n";
+    await expect.poll(() => deliveredErrors).toBeGreaterThan(0);
+    await waitForDecodedReply(page, path, {}, decoded);
+    const notifications = page.getByRole("region", { name: "Notifications", exact: true });
+    if (lens === "impact") {
+      await expect(notifications.getByText(message, { exact: true })).toBeVisible();
+      expect((await read())._meta.trust.result).toBe("error");
+    } else {
+      expect(before._meta.trust).toBeNull();
+      await expect(notifications.getByText(message, { exact: true })).toHaveCount(0);
+      expect((await read())._meta).toEqual(before._meta);
+    }
+    const after = await read();
+    expect(after.active_lens).toEqual(before.active_lens);
+    expect(after.selected_node).toEqual(before.selected_node);
+    expect(after.graph.nodes).toEqual(before.graph.nodes);
+    expect(after.graph.edges).toEqual(before.graph.edges);
+  });
+}

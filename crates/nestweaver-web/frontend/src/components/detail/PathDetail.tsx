@@ -43,7 +43,9 @@ export function PathDetail() {
       ) : pathStatus === "empty" || pathResults.length === 0 ? (
         <p className="rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1.5 text-xs text-[var(--color-text-muted)]">
           {pathfindingTo
-            ? "No path was found between these nodes."
+            ? pathfindingTo === pathfindingFrom
+              ? "Source and target are the same node (0 hops)."
+              : "No path was found between these nodes."
             : "Choose a target node to find a path."}
         </p>
       ) : (

@@ -248,8 +248,8 @@ pub const SCAN_BUDGET_NOTE: &str = "Pattern matched no candidates within the sca
 /// scope was scanned directly, and `stale_index` is false only because there
 /// is no index to be stale.
 pub const NO_TRIGRAM_INDEX_NOTE: &str = "No trigram index is available (stale_index does not apply); \
-     every scope was scanned directly. Enable `[indexing] with_trigrams = true` or run \
-     `index --with-trigrams` for faster searches.";
+     every scope was scanned directly. If automatic trigram maintenance is enabled, allow its \
+     next pass to finish. Run `index --with-trigrams` when an inline refresh is required.";
 
 impl RegexSearchResult {
     /// Attach [`SCAN_BUDGET_NOTE`] when this result is empty only because the

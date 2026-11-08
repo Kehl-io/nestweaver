@@ -141,6 +141,8 @@ message WatchVaultResponse {
   bool ok = 1;
   string message = 2;
   uint64 watcher_id = 3;
+  // Stable permanent-refusal reason; empty on success/runtime failure.
+  string refusal_reason = 4;
 }
 
 message WatchCodeRequest {

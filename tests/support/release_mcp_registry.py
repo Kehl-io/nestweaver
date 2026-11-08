@@ -7,10 +7,61 @@ isolated_daemon.py. Never opens a graph directly or changes client settings.
 """
 import argparse
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
+import time
 
 from isolated_daemon import IsolatedDaemon
+
+
+def run_owned_stdio(command, *, cwd, env, input, timeout, grace=2):
+    """Own the foreground launcher and native descendants as one POSIX session.
+
+    The fixture daemon is started separately by IsolatedDaemon and is not in
+    this session. Never discover or signal processes by executable name.
+    """
+    if os.name != "posix":
+        raise RuntimeError("registry smoke descendant ownership requires a POSIX process session")
+    process = subprocess.Popen(command, cwd=cwd, env=env, text=True,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+
+    def stop_group(sig):
+        try:
+            os.killpg(process.pid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+
+    try:
+        stdout, stderr = process.communicate(input, timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except BaseException as error:
+        stop_group(signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=grace)
+        except subprocess.TimeoutExpired:
+            stop_group(signal.SIGKILL)
+            stdout, stderr = process.communicate(timeout=grace)
+        if isinstance(error, subprocess.TimeoutExpired):
+            # Preserve the original failure and all output collected through
+            # cleanup rather than converting a timeout into a successful smoke.
+            raise subprocess.TimeoutExpired(command, timeout, stdout, stderr) from error
+        raise
+    finally:
+        # Also clean up foreground descendants left by an early wrapper exit.
+        if stop_group(signal.SIGTERM):
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(.02)
+            else:
+                stop_group(signal.SIGKILL)
 
 
 def smoke(fixture, launcher, node=None):
@@ -31,9 +82,15 @@ def smoke(fixture, launcher, node=None):
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
             "name": "brain_impact", "arguments": {"symbol": "releaseTarget"}}},
     ]
-    result = subprocess.run(command, cwd=fixture.root, env=fixture.env,
-                            input="".join(json.dumps(frame) + "\n" for frame in frames),
-                            capture_output=True, text=True, timeout=fixture.timeout)
+    try:
+        result = run_owned_stdio(command, cwd=fixture.root, env=fixture.env,
+                                 input="".join(json.dumps(frame) + "\n" for frame in frames),
+                                 timeout=fixture.timeout)
+    except subprocess.TimeoutExpired as error:
+        fixture.record(kind="mcp_registry", request=frames, command=command,
+                       stdout=error.stdout, stderr=error.stderr, timed_out=True,
+                       timeout=fixture.timeout)
+        raise
     fixture.record(kind="mcp_registry", request=frames, command=command,
                    stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode)
     assert result.returncode == 0, result.stderr

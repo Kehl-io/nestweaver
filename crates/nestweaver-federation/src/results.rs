@@ -606,7 +606,17 @@ pub fn compose_tool_results(
         };
     }
     if tool != "read_symbols" {
-        return merge_structured_results_with_vault_mappings(local, server, mappings);
+        let mut result = merge_structured_results_with_vault_mappings(local, server, mappings);
+        // Both successful context tiers rebuild their envelope. Keep preflight
+        // observations separate from RRF/vault identity and ranked-node caps.
+        if tool == "brain_context"
+            && local.get("connected").is_some_and(Value::is_array)
+            && server.get("connected").is_some_and(Value::is_array)
+        {
+            nestweaver_schema::responses::ContextAmbiguityDisclosure::merge(local, server)
+                .stamp_into(&mut result);
+        }
+        return result;
     }
     let rows = |value: &Value| {
         value
@@ -1383,6 +1393,108 @@ mod tests {
     /// `resolver_stale_repos` as a FOURTH, differently-named field rather than
     /// overloading a third meaning onto this one — that precedent is the
     /// intended direction.
+    #[test]
+    fn context_composition_preserves_scoped_ambiguity_without_changing_ranked_rows() {
+        let diagnostic = |uid: &str| {
+            let mut value = nestweaver_schema::responses::name_lookup_ambiguous(
+                "Same",
+                None,
+                json!([{"uid":uid,"name":"Same","file_path":"Same.md","start_line":0}]),
+            );
+            value["seed"] = json!("Same");
+            value["candidate_total"] = json!(55);
+            value["candidates_returned"] = json!(1);
+            value["truncated"] = json!(true);
+            value
+        };
+        let local = json!({"seeds":[],"connected":[{"uid":"note:local","title":"Unique","kind":"Note","location":"Unique.md"}]});
+        let server = json!({"seeds":[],"connected":[{"uid":"note:server","title":"Remote","kind":"Note","location":"Remote.md"}]});
+        let maps = VaultMappings::new();
+        let control = compose_tool_results("brain_context", &local, &server, &maps);
+        for (local_diag, server_diag) in [(true, false), (false, true), (true, true)] {
+            let mut l = local.clone();
+            let mut r = server.clone();
+            if local_diag {
+                l["ambiguous_seeds"] =
+                    json!([diagnostic("note:local-same"), diagnostic("note:local-same")]);
+            }
+            if server_diag {
+                r["ambiguous_seeds"] = json!([diagnostic("note:remote-same")]);
+            }
+            let merged = compose_tool_results("brain_context", &l, &r, &maps);
+            assert_eq!(merged["connected"], control["connected"]);
+            let entries = merged["ambiguous_seeds"].as_array().unwrap();
+            assert_eq!(
+                entries.len(),
+                usize::from(local_diag) + usize::from(server_diag)
+            );
+            for entry in entries {
+                let source = entry["_provenance"].as_str().unwrap();
+                assert_eq!(entry["candidate_total"], 55);
+                assert_eq!(entry["candidates_returned"], 1);
+                assert_eq!(entry["truncated"], true);
+                assert_eq!(
+                    entry["candidate_uids"][0],
+                    if source == "local" {
+                        "note:local-same"
+                    } else {
+                        "note:remote-same"
+                    }
+                );
+            }
+        }
+        assert!(control.get("ambiguous_seeds").is_none());
+        let mut l = local.clone();
+        l["output_budget"] = json!({"cuts":{"/ambiguous_seeds/0/candidates":{"items_omitted":5,"count_kind":"exact_completed_array"}}});
+        let merged = compose_tool_results("brain_context", &l, &server, &maps);
+        assert_eq!(
+            merged["output_budget"]["cuts"]["/local/ambiguous_seeds/0/candidates"]["items_omitted"],
+            5
+        );
+    }
+
+    #[test]
+    fn context_ambiguity_handles_remain_scoped_when_ranked_vaults_are_mapped() {
+        let local_vault = nestweaver_schema::uid::vault_uid("local", "/vault");
+        let server_vault = nestweaver_schema::uid::vault_uid("remote", "/vault");
+        let tier = |vault: &str| {
+            let uid = nestweaver_schema::uid::note_uid(vault, "Same.md");
+            let mut d = nestweaver_schema::responses::name_lookup_ambiguous(
+                "Same",
+                None,
+                json!([
+                {"uid":uid,"name":"Same","file_path":"Same.md","start_line":0}]),
+            );
+            d["seed"] = json!("Same");
+            d["candidate_total"] = json!(2);
+            d["candidates_returned"] = json!(1);
+            d["truncated"] = json!(true);
+            json!({"seeds":[{"uid":uid,"kind":"note","title":"Same"}],"connected":[],"seeds_truncated":false,"seeds_expanded":1,"ambiguous_seeds":[d]})
+        };
+        let local = tier(&local_vault);
+        let server = tier(&server_vault);
+        let mappings = VaultMappings::from([(local_vault, server_vault)]);
+        for maps in [VaultMappings::new(), mappings] {
+            let expected = merge_structured_results_with_vault_mappings(&local, &server, &maps);
+            let merged = compose_tool_results("brain_context", &local, &server, &maps);
+            assert_eq!(merged["seeds"], expected["seeds"]);
+            assert_eq!(merged["connected"], expected["connected"]);
+            let d = merged["ambiguous_seeds"].as_array().unwrap();
+            assert_eq!(d.len(), 2);
+            assert_eq!(
+                d[0]["candidate_uids"],
+                local["ambiguous_seeds"][0]["candidate_uids"]
+            );
+            assert_eq!(
+                d[1]["candidate_uids"],
+                server["ambiguous_seeds"][0]["candidate_uids"]
+            );
+            assert_ne!(d[0]["candidate_uids"], d[1]["candidate_uids"]);
+            assert_eq!(d[0]["_provenance"], "local");
+            assert_eq!(d[1]["_provenance"], "server");
+        }
+    }
+
     #[test]
     fn lookup_composition_preserves_singular_statuses_and_partial_symbol_contract() {
         let maps = VaultMappings::new();

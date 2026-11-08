@@ -383,7 +383,10 @@ use std::path::Path;
 /// 21 — PHP static calls carry namespace-qualified class ownership, inheritance
 ///      and dispatch facts. Cache 15 reparses these facts; force reindex once
 ///      so stored calls no longer retain generic same-name false edges.
-pub const RESOLVER_GENERATION: u32 = 21;
+/// 22 — Anonymous JS/TS default callable owners and complete destructured
+///      component spans change stored call ownership. Cache 16 reparses facts;
+///      force reindex once to replace old module/zero-height ownership edges.
+pub const RESOLVER_GENERATION: u32 = 22;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

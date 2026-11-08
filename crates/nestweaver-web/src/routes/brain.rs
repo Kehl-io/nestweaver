@@ -55,6 +55,7 @@ fn mention_snippet<'a>(content: &'a str, title_lower: &str) -> Option<&'a str> {
     None
 }
 
+/// Indexed-vault counts snapshot; daemon runtime status is a separate surface.
 pub async fn brain_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let vault_count = state.store.list_vaults(None)?.len();
     let note_count = state.store.count_notes()?;

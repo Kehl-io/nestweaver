@@ -233,7 +233,8 @@ class Workflow(unittest.TestCase):
         self.assertLess(publish.index('gh attestation verify'), publish.index('if registry precheck'))
         self.assertIn('publish_status=$publish_status registry=$final_reason', publish)
 
-    def shell_case(self, sequence, publishes, expected, reason, publish_status=0, recovery=False, budget=600):
+    def shell_case(self, sequence, publishes, expected, reason, publish_status=0, recovery=False, budget=600,
+                   native_failure=False, native_missing=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             bin_dir = root / 'bin'; bin_dir.mkdir()
@@ -247,6 +248,16 @@ class Workflow(unittest.TestCase):
             tarball = package / 'nestweaver-1.0.0.tgz'; tarball.write_bytes(b'fixture attested bytes')
             digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
             (package / (tarball.name + '.sha256')).write_text(digest + '  ' + tarball.name + '\n')
+            packages = [META | {'integrity': INTEGRITY, 'filename': tarball.name, 'sha256': digest}]
+            for name in ['nestweaver-linux-x64', 'nestweaver-darwin-arm64',
+                         'nestweaver-linux-arm64', 'nestweaver-darwin-x64']:
+                native_dir = root / 'npm-package' / name
+                native_dir.mkdir()
+                filename = f'{name}-1.0.0.tgz'
+                (native_dir / filename).write_bytes(tarball.read_bytes())
+                (native_dir / (filename + '.sha256')).write_text(digest + '  ' + filename + '\n')
+                packages.append({'name': name, 'version': '1.0.0', 'integrity': INTEGRITY,
+                                 'filename': filename, 'sha256': digest})
             (root / 'sequence.json').write_text(json.dumps(sequence))
             (root / 'count').write_text('0')
             gh = '#!/bin/sh\nif [ "$1" = api ]; then echo \'{"draft":false,"immutable":true,"tag_name":"v1.0.0","target_commitish":"' + SHA + '"}\'; fi\n'
@@ -257,9 +268,20 @@ from pathlib import Path
 p = Path(os.environ['FIXTURE'])
 if sys.argv[1] == 'publish':
     with (p / 'published').open('a') as f: f.write('publish\\n')
+    with (p / 'publication-order').open('a') as f: f.write(sys.argv[2] + '\\n')
+    if 'nestweaver-linux-x64' in sys.argv[2]: raise SystemExit(0)
     raise SystemExit(int(os.environ['PUBLISH_STATUS']))
 if 'dist.attestations' in sys.argv:
     print('null'); raise SystemExit(0)
+name, version = sys.argv[2].rsplit('@', 1)
+if name != 'nestweaver':
+    integrity = os.environ['INTEGRITY']
+    if name == 'nestweaver-linux-x64' and os.environ['NATIVE_FAILURE'] == '1':
+        integrity = os.environ['WRONG']
+    if name == 'nestweaver-linux-x64' and os.environ['NATIVE_MISSING'] == '1' and not (p / 'publication-order').exists():
+        print('{"error":{"code":"E404"}}'); raise SystemExit(1)
+    print(json.dumps({'name': name, 'version': version, 'dist.integrity': integrity}))
+    raise SystemExit(0)
 i = int((p / 'count').read_text()); (p / 'count').write_text(str(i + 1))
 sequence = json.loads((p / 'sequence.json').read_text())
 code, response = sequence[min(i, len(sequence)-1)]
@@ -274,13 +296,19 @@ raise SystemExit(code)
                 'GITHUB_STEP_SUMMARY': str(root / 'summary'), 'GITHUB_REPOSITORY': 'fixture/repo',
                 'RELEASE_MODE': 'resume' if recovery else 'publish', 'RELEASE_ID': '1',
                 'RELEASE_SHA': SHA, 'RELEASE_TAG': 'v1.0.0', 'PUBLISH_STATUS': str(publish_status),
-                'PACKAGES_JSON': json.dumps([META | {'integrity': INTEGRITY, 'filename': tarball.name, 'sha256': digest}])}
+                'INTEGRITY': INTEGRITY, 'WRONG': WRONG,
+                'NATIVE_FAILURE': str(int(native_failure)), 'NATIVE_MISSING': str(int(native_missing)),
+                'PACKAGES_JSON': json.dumps(packages)}
             result = subprocess.run(['bash'], input=step_script('Publish to npm'), env=env,
                                     text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
             actual = (root / 'published').read_text().splitlines() if (root / 'published').exists() else []
             self.assertEqual(len(actual), publishes, result.stdout + result.stderr)
             self.assertIn(reason, (root / 'summary').read_text())
+            order = (root / 'publication-order').read_text().splitlines() if (root / 'publication-order').exists() else []
+            if native_missing:
+                self.assertIn('nestweaver-linux-x64', order[0])
+                self.assertTrue(order[-1].endswith('/nestweaver-1.0.0.tgz'), order)
 
     def test_existing_exact_never_publishes(self):
         self.shell_case([(0, json.dumps(META))], 0, 0, 'publish_status=not-attempted registry=exact')
@@ -306,14 +334,25 @@ raise SystemExit(code)
 
     def test_publish_zero_but_missing_until_deadline(self):
         self.shell_case([(1, '{"error":{"code":"E404"}}')], 1, 1,
-                        'publish_status=0 registry=deadline/missing-version', budget=1)
+                        'publish_status=0 registry=deadline/', budget=1)
 
     def test_publish_nonzero_but_missing_until_deadline(self):
         self.shell_case([(1, '{"error":{"code":"E404"}}')], 2, 1,
-                        'publish_status=17 registry=deadline/missing-version', publish_status=17, budget=1)
+                        'publish_status=17 registry=deadline/', publish_status=17, budget=1)
 
     def test_recovery_uses_current_policy(self):
         self.shell_case([(0, json.dumps(META))], 0, 0, 'registry=exact', recovery=True)
+
+    def test_native_mismatch_withholds_launcher_in_publish_and_recovery(self):
+        for recovery in [False, True]:
+            with self.subTest(recovery=recovery):
+                self.shell_case([(0, json.dumps(META))], 0, 1,
+                                'Launcher withheld', recovery=recovery, native_failure=True)
+
+    def test_missing_native_is_published_before_launcher(self):
+        absent = (1, '{"error":{"code":"E404"}}')
+        self.shell_case([absent, (0, json.dumps(META))], 2, 0,
+                        'registry=exact', native_missing=True)
 
 
 if __name__ == '__main__':

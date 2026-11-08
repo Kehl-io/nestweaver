@@ -1,3 +1,14 @@
+; Anonymous default callable values own their deferred bodies (nw-794).
+; Named defaults retain their declaration symbol; ordinary callbacks and
+; function-valued object properties are deliberately outside this rule.
+(export_statement
+  "default"
+  value: [
+    (function_expression !name)
+    (generator_function !name)
+    (arrow_function)
+  ] @definition.default_function)
+
 ; Function declarations
 (function_declaration
   name: (identifier) @name) @definition.function

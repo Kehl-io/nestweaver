@@ -4,6 +4,11 @@ pub mod nestweaver_daemon_v1 {
 
 pub use nestweaver_daemon_v1::*;
 
+impl WatchVaultResponse {
+    /// Stable wire reason shared by watch refusal producers and consumers.
+    pub const REFUSAL_DUPLICATE_VAULT_NAME: &str = "duplicate_vault_name";
+}
+
 /// Decode note outcomes identically for local MCP and federated clients.
 /// Old found-note responses remain readable; old blank responses cannot be
 /// mistaken for a successful note when their outcome was lost in transit.

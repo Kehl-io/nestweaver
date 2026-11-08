@@ -267,3 +267,39 @@ have committed changes. Ranking commands distinguish unreadable or malformed
 resolver metadata from a missing generation record: text warns that verification
 failed, and JSON carries `resolver_generation_error` with `rankings_stale: true`.
 Cached ranking results cannot hide that verification failure.
+
+## HTTP health, version and counts
+
+`GET /api/v1/health` and its `/health` alias return lightweight JSON health
+with `status` and `product_version`. `GET /api/v1/version` exposes that same
+product version separately from `graph_generation` and `pagerank_generation`.
+The generation numbers describe indexed graph state, not the installed product.
+
+`GET /api/v1/brain/status` is an indexed-vault counts snapshot. It does not
+promise the daemon runtime fields exposed by CLI `brain status`.
+
+A truncated overview preserves its limit and omitted count. It does not
+advertise an available continuation unless a usable cursor is supplied.
+
+## CLI compatibility notes for the next release
+
+An invocation combining `export --scope vault` with a code-only format
+(`msgpack`, `cypher` or `mermaid`) now exits 64 with the existing
+`export_scope_unsupported` diagnostic. It previously exited 1. This combination
+is invalid from its arguments alone, so validation precedes database access and
+uses the usage-error code. Valid requests that fail because of data or runtime
+state retain their existing failure codes.
+
+`extensions set <uid> <key> <value>` accepts a JSON value and routes it through
+the same daemon mutation gate as MCP `set_extension`. For a string value, pass
+JSON quotes, for example `nestweaver extensions set sym:example owner '"team-a"'`.
+There is no direct sidecar-write fallback when the daemon is unavailable.
+
+Crash recurrence diagnostics qualify the exact NestWeaver CLI process name,
+reported package version, a valid report date within the last 30 UTC calendar
+days, and engine frames on the faulting thread. Operator/test termination
+signals are excluded. The report includes its date, signal and thread identity.
+This is a version-scoped check: reported build metadata is recorded, but an
+executable hash or Mach-O build UUID is not verified. A matching version alone
+does not identify one exact compiled artifact. Missing or malformed report
+metadata remains disclosed as incomplete evidence.

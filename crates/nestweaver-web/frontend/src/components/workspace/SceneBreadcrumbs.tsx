@@ -104,11 +104,9 @@ export function SceneBreadcrumbs() {
         <>
           <ChevronRight className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
           <span
-            className="min-w-0 break-all rounded px-1.5 py-1 font-medium text-[var(--color-text)]"
-            // Whole when it fits; otherwise capped to the room left after the
-            // icon-only home crumb, both chevrons and a minimal lens crumb,
-            // so a long name ends in an ellipsis instead of being clipped.
-            style={{ maxWidth: "min(10rem, calc(100% - 6.5rem))" }}
+            className="min-w-0 max-w-[10rem] truncate rounded px-1.5 py-1 font-medium text-[var(--color-text)]"
+            // This may occupy its own flex row in a narrow toolbar. Avoid a
+            // percentage-minus-fixed-width cap that can collapse to padding.
             title={notFound ? `Not found: ${selectedNodeId}` : selectedNodeId ?? undefined}
           >
             {notFound ? "Not found" : compactNodeLabel(selectedNodeId, graphLabel)}

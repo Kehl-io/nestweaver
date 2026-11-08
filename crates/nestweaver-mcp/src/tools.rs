@@ -135,12 +135,14 @@ fn name_lookup_ambiguous_payload(
 }
 
 fn notes_ambiguous_payload(title: &str, notes: &[nestweaver_schema::Note]) -> Value {
+    let mut ordered: Vec<_> = notes.iter().collect();
+    ordered.sort_by(|a, b| (&a.file_path, &a.uid).cmp(&(&b.file_path, &b.uid)));
     let mut payload = nestweaver_schema::responses::name_lookup_ambiguous(
         title,
         None,
         json!(
-            notes
-                .iter()
+            ordered
+                .into_iter()
                 .take(50)
                 .map(|n| json!({
                     "uid": n.uid,
@@ -1738,7 +1740,7 @@ fn compact_tool_description(name: &str) -> &'static str {
             "Most connected callable symbols by degree, with cluster membership. Constants, properties and modules are never scored; rankings_stale means re-index first."
         }
         "bridge_nodes" => {
-            "Architectural chokepoints by betweenness (sampled) and the clusters each bridge joins. Non-callable kinds are never scored; check rankings_stale."
+            "Architectural chokepoints by whole-graph betweenness. Repository filters select returned candidates; sampling_population and sources_sampled disclose global sampling. Check rankings_stale."
         }
         "blast_radius" => {
             "Risk of changed repo-relative files: dependents with impact scores, clusters and risk level. Unknown is never Low; top-level-only files list top_level_callees."
@@ -2281,7 +2283,7 @@ mod tool_schema_validation_tests {
             ),
             (
                 "bridge_nodes",
-                "Architectural chokepoints by betweenness (sampled) and the clusters each bridge joins. Non-callable kinds are never scored; check rankings_stale.",
+                "Architectural chokepoints by whole-graph betweenness. Repository filters select returned candidates; sampling_population and sources_sampled disclose global sampling. Check rankings_stale.",
             ),
             (
                 "blast_radius",
@@ -6830,7 +6832,7 @@ fn tool_brain_topic_clusters(store: &GraphStore, args: Value) -> Result<Value, a
     let total = all_clusters.len();
     let clusters: Vec<_> = all_clusters.into_iter().take(limit).collect();
     Ok(
-        json!({ "clusters": serde_json::to_value(&clusters)?, "total": total, "returned": clusters.len() }),
+        json!({ "clusters": serde_json::to_value(&clusters)?, "total": total, "returned": clusters.len(), "truncated": clusters.len() < total }),
     )
 }
 
@@ -8005,7 +8007,7 @@ fn tool_schema_code_context() -> Value {
 fn tool_schema_brain_context() -> Value {
     json!({
         "name": "brain_context",
-        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- A seed may be qualified: `path::name`, `path::<module>` (a file's top-level code) or `Class::method`, resolved like brain_impact; a qualifier that names nothing does not resolve\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n- Module owners (`path::<module>`, a file's top-level code) rank after every real node; at most 3 are listed and the rest are counted in `module_owners_omitted` (absent when 0), their places refilled with lower-scored real symbols\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- A `brain watcher batch` publication no longer fails this call closed: it SUCCEEDS and discloses the open window on the response with `publication_in_progress: true`, `marker_age_s`, `in_flight_note_paths` (max 20) and `in_flight_note_paths_truncated`. Read those before trusting the result — the answer came from a graph still being written to, and the named notes are mid-publication. KNOWN GAP: those keys reach every MCP route, but CLI `--json` verbs that reshape the response into a typed struct (e.g. `nestweaver hubs --json`) drop them silently\n- A full `index` publication still fails CLOSED with 'index publication TRANSIENT/WEDGED', and so does a WEDGED watcher marker. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
+        "description": "Retrieve PPR-ranked structural context from the knowledge graph, seeded by symbol names, note titles, or keywords. Ambiguous note seeds are reported in ambiguous_seeds while valid seeds still rank; #tag seeds resolve as tags. Returns mixed-kind results (Symbol, Note, Section, Tag, Heading) within a token budget.\n\nGuidelines:\n- Primary entry point for understanding a topic — use before reading files\n- Seed with specific names (e.g. 'AuthService.validate'), not broad terms\n- A seed may be qualified: `path::name`, `path::<module>` (a file's top-level code) or `Class::method`, resolved like brain_impact; a qualifier that names nothing does not resolve\n- Filter with repos, tags, path_prefix, kinds for precision; use response_format 'concise' unless you need full bodies\n- Module owners (`path::<module>`, a file's top-level code) rank after every real node; at most 3 are listed and the rest are counted in `module_owners_omitted` (absent when 0), their places refilled with lower-scored real symbols\n\nLimitations:\n- Only searches indexed repos/vaults — check stale_check if results seem stale\n- Ranked by graph proximity, not recency (use recency_weight to add time decay)\n- A `brain watcher batch` publication no longer fails this call closed: it SUCCEEDS and discloses the open window on the response with `publication_in_progress: true`, `marker_age_s`, `in_flight_note_paths` (max 20) and `in_flight_note_paths_truncated`. Read those before trusting the result — the answer came from a graph still being written to, and the named notes are mid-publication. KNOWN GAP: those keys reach every MCP route, but CLI `--json` verbs that reshape the response into a typed struct (e.g. `nestweaver hubs --json`) drop them silently\n- A full `index` publication still fails CLOSED with 'index publication TRANSIENT/WEDGED', and so does a WEDGED watcher marker. This refers to INDEX PUBLICATION, not a dirty git working tree: editing files in a repo does NOT cause it, and NestWeaver is fully usable while you work. TRANSIENT resolves on its own — retry. WEDGED means a prior indexer died mid-publication; ASK THE OPERATOR to run the `nestweaver repair` command named in the error — repair is a destructive publication recovery with no MCP tool, so it cannot be done from here — or check brain_status.index_publication.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -8328,15 +8330,35 @@ fn tool_brain_context(
     if seeds.is_empty() {
         return Err(anyhow!("'seeds' must contain at least one string"));
     }
-    let seeds = bound_context_seeds(seeds)?;
-    for seed in &seeds {
-        match resolve_note_by_title(store, seed)? {
-            StrictNoteResolve::Ambiguous(notes) => {
-                return Ok(notes_ambiguous_payload(seed, &notes));
-            }
-            StrictNoteResolve::Found(_) | StrictNoteResolve::NotFound => {}
+    let mut seeds = bound_context_seeds(seeds)?;
+    // Explicit tag seeds belong to the engine's tag resolver. Note slug/stem
+    // lookup strips '#', and must not turn a tag into an ambiguous note.
+    let mut ambiguous_seeds = Vec::new();
+    let mut usable_seeds = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        if !seed.trim().starts_with('#')
+            && let StrictNoteResolve::Ambiguous(notes) = resolve_note_by_title(store, &seed)?
+        {
+            let mut diagnostic = notes_ambiguous_payload(&seed, &notes);
+            diagnostic["seed"] = json!(seed);
+            ambiguous_seeds.push(diagnostic);
+        } else {
+            usable_seeds.push(seed);
         }
     }
+    seeds = usable_seeds;
+    let ambiguity_response = |unresolved: &[String]| {
+        // Preserve the single-seed error fields for existing clients, while
+        // naming every ambiguous input instead of stopping at the first one.
+        let mut payload = ambiguous_seeds[0].clone();
+        payload["ambiguous_seeds"] = json!(ambiguous_seeds);
+        if !unresolved.is_empty() {
+            payload["unresolved_seeds"] = json!(
+                nestweaver_engine::query::bound_unresolved_seed_echoes(unresolved)
+            );
+        }
+        payload
+    };
     let token_budget = args
         .get("token_budget")
         .and_then(|v| v.as_u64())
@@ -8449,7 +8471,10 @@ fn tool_brain_context(
     // Hybrid retrieval whenever the Tantivy index is open. When absent
     // (cold start, index missing), falls through to pure-PPR — still
     // correct, just less recall on text-only relevance.
-    let mut result: BrainContextResult = build_brain_context_hybrid_with_aliases(
+    if seeds.is_empty() {
+        return Ok(ambiguity_response(&[]));
+    }
+    let retrieval = build_brain_context_hybrid_with_aliases(
         store,
         &seeds,
         tantivy,
@@ -8459,8 +8484,27 @@ fn tool_brain_context(
         intent,
         embed_model,
         cancel,
-    )
-    .map_err(|error| seeds_not_found(store, error, &seeds, &["No seeds resolved."], visible))?;
+    );
+    let mut result: BrainContextResult = match retrieval {
+        Ok(result) => result,
+        Err(error)
+            if !ambiguous_seeds.is_empty()
+                && error
+                    .chain()
+                    .any(|cause| cause.to_string().starts_with("No seeds resolved.")) =>
+        {
+            return Ok(ambiguity_response(&seeds));
+        }
+        Err(error) => {
+            return Err(seeds_not_found(
+                store,
+                error,
+                &seeds,
+                &["No seeds resolved."],
+                visible,
+            ));
+        }
+    };
 
     // Feature F6 (per-path ranking priors) is a deliberate no-op here: the MCP
     // server holds no InstanceConfig at the call site (same as F8, which uses
@@ -8827,6 +8871,15 @@ fn tool_brain_context(
 
     if !result.unresolved_seeds.is_empty() {
         resp["unresolved_seeds"] = json!(result.unresolved_seeds);
+    }
+    if !ambiguous_seeds.is_empty() {
+        resp["ambiguous_seeds"] = json!(ambiguous_seeds);
+        let disclosure =
+            nestweaver_schema::responses::ContextAmbiguityDisclosure::from_response(&resp);
+        if let Some(object) = resp.as_object_mut() {
+            object.remove("ambiguous_seeds");
+        }
+        disclosure.stamp_into(&mut resp);
     }
 
     // nw-102: how many of `seeds` are semantic nearest-neighbour guesses rather
@@ -13486,6 +13539,9 @@ fn tool_cross_repo_contracts(
     visible: Option<&nestweaver_engine::authz::VisibleRepos>,
 ) -> Result<Value, anyhow::Error> {
     let name_repo = args.get("name_repo").and_then(|v| v.as_str());
+    if let Some(selector) = name_repo {
+        resolve_repo_filter(store, &[selector.to_string()], visible)?;
+    }
     // `uid` is a handle, not a name. Restricted sessions still look the row
     // up by UID and fail closed if it is hidden; they must not route a
     // colon-less fixture UID (or any explicit UID) through name search.
@@ -19287,6 +19343,11 @@ fn tool_brain_diff(
             "files_deleted": 0,
             "changed_files": [],
             "affected_symbols": [],
+            "affected_symbol_count": 0,
+            "affected_symbols_returned": 0,
+            "total": 0,
+            "returned": 0,
+            "truncated": false,
             "message": "graph is up to date with HEAD",
         }));
     }
@@ -19344,6 +19405,9 @@ fn tool_brain_diff(
         "affected_symbols": affected_symbols,
         "affected_symbol_count": total_affected,
         "affected_symbols_returned": affected_symbols.len(),
+        "total": total_affected,
+        "returned": affected_symbols.len(),
+        "truncated": affected_symbols.len() < total_affected,
     }))
 }
 
@@ -21102,6 +21166,9 @@ fn tool_bridge_nodes(
         "total_population": "symbols with at least one code edge (hub/bridge CANDIDATES)",
         "sampled": bridge_sampled,
         "sources_sampled": bridge_sources,
+        "sampling_scope": "whole_code_graph",
+        "sampling_population": found.sampling_population,
+        "candidate_scope": if repo_scope.is_some() { "selected_repositories" } else { "whole_code_graph" },
         "bridges": nodes_json,
     });
     attach_ranking_staleness(&mut resp, store);
@@ -28583,6 +28650,147 @@ mod cache_dispatch_tests {
 
         let by_uid = tool_note_get(&store, json!({"uid": "note:same-b"})).unwrap();
         assert_eq!(by_uid["title"], "Same", "{by_uid}");
+    }
+
+    #[test]
+    fn ambiguous_context_seeds_preserve_valid_results_in_any_order() {
+        let store = two_same_title_notes();
+        let query = |seeds: Value| {
+            tool_brain_context(
+                &store,
+                None,
+                json!({"seeds":seeds,"token_budget":6000}),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let control = query(json!(["Unique"]));
+        for seeds in [
+            json!(["Same", "Unique"]),
+            json!(["Unique", "Same"]),
+            json!(["Same", "Unique", "Same"]),
+        ] {
+            let result = query(seeds);
+            assert_eq!(result["connected"], control["connected"], "{result}");
+            assert_eq!(result["ambiguous_seeds"][0]["seed"], "Same");
+            assert_eq!(result["ambiguous_seeds"].as_array().unwrap().len(), 1);
+            assert_eq!(result["ambiguous_seeds"][0]["candidate_total"], 2);
+            assert!(result.get("error").is_none(), "{result}");
+        }
+        let result = query(json!(["Same", "missing-unresolvable-seed"]));
+        assert_eq!(result["status"], "ambiguous");
+        assert_eq!(result["symbol"], "Same");
+        assert_eq!(result["unresolved_seeds"][0], "missing-unresolvable-seed");
+        assert!(
+            tool_brain_context(
+                &store,
+                None,
+                json!({"seeds":["missing-unresolvable-seed"]}),
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn topic_cluster_limit_discloses_true_total_and_truncation() {
+        let store = two_same_title_notes();
+        let full = tool_brain_topic_clusters(&store, json!({"limit":1000})).unwrap();
+        assert!(
+            full["total"].as_u64().unwrap() > 1,
+            "isolated notes should form separate communities: {full}"
+        );
+        let cut = tool_brain_topic_clusters(&store, json!({"limit":1})).unwrap();
+        assert_eq!(cut["returned"], 1);
+        assert_eq!(cut["total"], full["total"]);
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(full["truncated"], false);
+        let empty =
+            tool_brain_topic_clusters(&GraphStore::in_memory().unwrap(), json!({"limit":1}))
+                .unwrap();
+        assert_eq!(empty["total"], 0);
+        assert_eq!(empty["returned"], 0);
+        assert_eq!(empty["truncated"], false);
+    }
+
+    #[test]
+    fn context_reports_all_ambiguous_inputs_and_keeps_path_and_uid_resolution() {
+        let store = two_same_title_notes();
+        for uid in ["note:other-a", "note:other-b"] {
+            let mut note = note_fixture(uid);
+            note.title = "Other".into();
+            store.insert_note(&note).unwrap();
+        }
+        let result = tool_brain_context(
+            &store,
+            None,
+            json!({"seeds":["Same","Other"]}),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result["status"], "ambiguous");
+        assert_eq!(result["ambiguous_seeds"].as_array().unwrap().len(), 2);
+        assert_eq!(result["ambiguous_seeds"][1]["seed"], "Other");
+        for seed in ["note:same-a", "folder1/Same.md"] {
+            let result =
+                tool_brain_context(&store, None, json!({"seeds":[seed]}), None, None, None)
+                    .unwrap();
+            assert!(result.get("ambiguous_seeds").is_none(), "{result}");
+            assert!(result.get("error").is_none(), "{result}");
+        }
+    }
+
+    #[test]
+    fn explicit_tag_context_seeds_never_use_ambiguous_note_stems() {
+        let store = two_same_title_notes();
+        store
+            .insert_tag(&nestweaver_schema::Tag {
+                uid: "tag:test:same".into(),
+                vault_uid: "vlt:test".into(),
+                // Production Markdown indexing stores canonical lower-case names;
+                // the mixed-case input below must still resolve that exact tag.
+                name: "same".into(),
+            })
+            .unwrap();
+        let result = tool_brain_context(
+            &store,
+            None,
+            json!({"seeds":["#Same","Unique"],"include_seeds":true}),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(result.get("ambiguous_seeds").is_none(), "{result}");
+        assert!(
+            result["seeds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["uid"] == "tag:test:same"),
+            "{result}"
+        );
+        assert!(result.get("unresolved_seeds").is_none(), "{result}");
+        let plain =
+            tool_brain_context(&store, None, json!({"seeds":["Same"]}), None, None, None).unwrap();
+        assert_eq!(plain["status"], "ambiguous", "{plain}");
+        assert_eq!(plain["candidate_total"], 2, "{plain}");
+        let missing = tool_brain_context(
+            &store,
+            None,
+            json!({"seeds":["#SameMissing","Unique"]}),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(missing["unresolved_seeds"][0], "#SameMissing");
     }
 
     // ── nw-214: ranking staleness must reach the AGENT, not just the human ──
@@ -38762,7 +38970,7 @@ mod ambiguous_name_contract_tests {
         assert_eq!(pinned["uid"], "sym:py-ping:ping");
         let uid = tool_cross_repo_contracts(
             &store,
-            json!({"uid": "sym:py-ping:ping", "name_repo": "unrelated"}),
+            json!({"uid": "sym:py-ping:ping", "name_repo": "js-ping"}),
             None,
         )
         .unwrap();
@@ -38772,19 +38980,17 @@ mod ambiguous_name_contract_tests {
         );
         let unique = tool_cross_repo_contracts(
             &store,
-            json!({"name": "ping", "name_repo": "unrelated"}),
+            json!({"name": "ping", "name_repo": "py-ping"}),
             Some(&visible),
         )
         .unwrap();
         assert_eq!(unique["uid"], "sym:py-ping:ping");
-        assert!(
-            tool_cross_repo_contracts(
-                &store,
-                json!({"name": "ping", "name_repo": "unrelated"}),
-                None
-            )
-            .is_err()
-        );
+        for target in [json!({"name":"ping"}), json!({"uid":"sym:py-ping:ping"})] {
+            let mut args = target;
+            args["name_repo"] = json!("unrelated");
+            let error = tool_cross_repo_contracts(&store, args, None).unwrap_err();
+            assert!(repo_filter_failure(&error).is_some(), "{error:#}");
+        }
         assert!(
             tool_cross_repo_contracts(&store, json!({"uid": "sym:js-ping:ping"}), Some(&visible))
                 .is_err()

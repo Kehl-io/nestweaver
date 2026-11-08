@@ -82,12 +82,12 @@ export function useContextMode() {
       previousLayoutRef.current.graph === latest.graphInstance;
     if (!existingScene && !searchPinned && !compareActive) {
       clearGraphData();
+      setActiveLens({ lens: "context", label: "Context", targetUid: seeds[0] ?? null, workspaceId: activeWorkspaceId || "all" });
       setSceneMetadata(seeds.length > 0 ? workspaceSceneMetadataWithResult(
         latest.selectedWorkspace()?._meta,
         "loading",
         `Loading context for ${seeds[0]}.`,
       ) : null);
-      setActiveLens({ lens: "context", label: "Context", targetUid: seeds[0] ?? null, workspaceId: activeWorkspaceId || "all" });
     }
 
     if (seeds.length === 0) {

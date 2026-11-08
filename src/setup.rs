@@ -1051,6 +1051,7 @@ fn setup_codex(ctx: &SetupCtx, items: &mut Items) -> Result<(), anyhow::Error> {
     let agents_status = match wrote {
         crate::guide_section::GuideSectionWrite::Created => "codebase guide written",
         crate::guide_section::GuideSectionWrite::Updated => "generated section updated",
+        crate::guide_section::GuideSectionWrite::Unchanged => "generated section already current",
     };
     items.push(("AGENTS.md".to_string(), agents_status.to_string()));
     Ok(())

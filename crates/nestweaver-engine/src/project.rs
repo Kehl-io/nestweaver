@@ -259,6 +259,39 @@ pub fn project_member_repos(
     Ok(members)
 }
 
+/// Overlay configured display aliases on canonical project members. This never
+/// changes membership or resolves a basename: aliases must identify the exact
+/// stored remote/local root, and conflicting aliases leave the stored label.
+pub fn project_member_repos_with_config(
+    store: &GraphStore,
+    project_uid: &str,
+    repo_configs: &[crate::config::RepoConfig],
+) -> Result<Vec<ProjectMemberRepo>, anyhow::Error> {
+    let mut members = project_member_repos(store, project_uid)?;
+    for member in &mut members {
+        let Some(repo) = store.lookup_repo(&member.uid)? else {
+            continue;
+        };
+        let aliases: std::collections::BTreeSet<&str> = repo_configs
+            .iter()
+            .filter(|config| {
+                crate::config::repo_ref_identifies(
+                    &config.url,
+                    &repo.url,
+                    repo.local_root().map(Path::new),
+                )
+            })
+            .filter_map(|config| config.name.as_deref())
+            .filter(|name| !name.trim().is_empty())
+            .collect();
+        if aliases.len() == 1 {
+            member.name = aliases.into_iter().next().unwrap_or_default().to_string();
+        }
+    }
+    members.sort_by(|a, b| a.name.cmp(&b.name).then(a.uid.cmp(&b.uid)));
+    Ok(members)
+}
+
 /// Outcome of resolving one declared repo reference against indexed repos.
 #[derive(Debug)]
 pub enum DeclaredRepoMatch<'a> {
@@ -1772,6 +1805,68 @@ repos = ["alpha"]
 #[cfg(test)]
 mod tests {
     use super::looks_like_fetch_error;
+
+    #[test]
+    fn member_display_aliases_use_exact_identity_and_preserve_membership() {
+        let store = nestweaver_store::GraphStore::in_memory().unwrap();
+        let project = "proj:test";
+        store
+            .insert_project(&nestweaver_schema::Project {
+                uid: project.into(),
+                name: "test".into(),
+                summary: None,
+                instance_id: "test".into(),
+            })
+            .unwrap();
+        for (uid, url) in [
+            ("repo:a", "https://example.test/a/web-app.git"),
+            ("repo:b", "https://example.test/b/web-app.git"),
+        ] {
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: uid.into(),
+                    url: url.into(),
+                    indexed_sha: String::new(),
+                    staleness_commits_behind: 0,
+                    instance_id: "test".into(),
+                    name: None,
+                    root_path: None,
+                })
+                .unwrap();
+        }
+        store
+            .replace_project_repo_edges(
+                &[project.into()],
+                &[
+                    (project.into(), "repo:a".into()),
+                    (project.into(), "repo:b".into()),
+                ],
+            )
+            .unwrap();
+        let config: Vec<crate::config::RepoConfig> = serde_json::from_value(serde_json::json!([
+            {"url":"https://example.test/a/web-app.git","name":"alpha-web"},
+            {"url":"https://example.test/b/web-app.git","name":"beta-web"}
+        ]))
+        .unwrap();
+        let members = super::project_member_repos_with_config(&store, project, &config).unwrap();
+        assert_eq!(
+            members
+                .iter()
+                .map(|m| (m.uid.as_str(), m.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("repo:a", "alpha-web"), ("repo:b", "beta-web")]
+        );
+        let mut conflicting = config.clone();
+        let mut second = config[0].clone();
+        second.name = Some("conflicting".into());
+        conflicting.push(second);
+        let rows = super::project_member_repos_with_config(&store, project, &conflicting).unwrap();
+        assert_eq!(
+            rows.iter().find(|m| m.uid == "repo:a").unwrap().name,
+            "web-app"
+        );
+        assert_eq!(store.project_member_repo_uids(project).unwrap().len(), 2);
+    }
 
     #[test]
     fn materialize_projects_rejects_duplicate_names() {

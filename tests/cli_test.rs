@@ -7415,9 +7415,11 @@ fn export_rejects_an_invalid_enum_as_a_usage_error() {
             .success();
     }
 
-    // And `msgpack` must still reach its handler, which refuses `--scope vault`
-    // as a SEMANTIC combination rather than an unknown value — a distinction a
-    // `PossibleValuesParser` must not flatten.
+    // nw-360 deliberately supersedes the old semantic-refusal exit 1:
+    // individually valid but incompatible argv also exits 64, with its own
+    // named diagnostic and remedy. A missing DB proves preflight precedes access.
+    let missing_db = dir.path().join("unsupported-pair-must-not-create.lbug");
+    assert!(!missing_db.exists());
     let output = nestweaver_cmd()
         .args([
             "export",
@@ -7426,23 +7428,26 @@ fn export_rejects_an_invalid_enum_as_a_usage_error() {
             "--scope",
             "vault",
             "--db",
-            &db_path.display().to_string(),
+            &missing_db.display().to_string(),
         ])
         .output()
         .unwrap();
-    assert_ne!(
-        output.status.code(),
-        Some(0),
-        "msgpack cannot represent the vault subgraph and must say so"
-    );
-    assert_ne!(
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
         output.status.code(),
         Some(64),
-        "`--scope vault` is a LEGAL value that this format cannot satisfy; \
-         reporting it as a usage error would tell the caller to fix the \
-         spelling of a word that is spelled correctly.\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        "argv-only incompatible combinations are usage errors before DB access, \
+         per nw-360; stderr:\n{stderr}"
     );
+    assert!(
+        stderr.contains("export_scope_unsupported"),
+        "the valid values must produce the named combination refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains("--format graphml") && stderr.contains("--scope vault"),
+        "the remedy must name a supported alternative for this scope: {stderr}"
+    );
+    assert!(!missing_db.exists(), "argv refusal must not create the DB");
 }
 
 /// A read-only `ui` writes nothing, so S2 does not apply to it. Pinned so a
@@ -10276,8 +10281,8 @@ fn clusters_cli_without_repo_is_unscoped_and_unchanged() {
 
 /// nw-360, the residual of nw-312. `d565547f` closed the spelling half — a
 /// bogus `--format` or `--scope` now exits 64 at parse time — and deliberately
-/// preserved this case as a SEMANTIC refusal. That reasoning stands and the
-/// exit code is not changed here.
+/// preserved this case as a semantic refusal. The later nw-360 owner decision
+/// supersedes that exit-1 policy: argv-only incompatible pairs also exit 64.
 ///
 /// What is wrong is the SHAPE. Two individually valid enums whose COMBINATION
 /// is unsupported reached the user as a raw RPC error naming neither value:
@@ -10289,8 +10294,7 @@ fn clusters_cli_without_repo_is_unscoped_and_unchanged() {
 /// `msgpack` (a named diagnostic already, but at exit 1) while `cypher` and
 /// `mermaid` still fell through to the raw RPC error — the same refusal, two
 /// different shapes depending on which code-only format asked. All three now
-/// get the same named diagnostic, at the same exit code `msgpack` already
-/// used.
+/// get the same named diagnostic and argv-only exit 64.
 #[test]
 fn an_unsupported_format_scope_pair_is_named_not_relayed() {
     let dir = tempfile::tempdir().unwrap();
@@ -10329,8 +10333,8 @@ fn an_unsupported_format_scope_pair_is_named_not_relayed() {
         );
         assert_eq!(
             output.status.code(),
-            Some(1),
-            "semantic refusal of a correctly-spelled combination, per d565547f \
+            Some(64),
+            "argv-only incompatible combination is a usage error, per nw-360 \
              ({format}): {combined}"
         );
     }
@@ -16912,4 +16916,142 @@ fn hooks_install_from_a_subdirectory_binds_the_root_database() {
         "{stderr}"
     );
     assert!(!stderr.contains("core.hooksPath"), "{stderr}");
+}
+
+/// nw942: the producer succeeds for Unique, but the CLI used to discard Same
+/// while narrowing the response into the engine's ranking result.
+#[test]
+fn mixed_context_ambiguity_survives_both_daemon_cli_decoders() {
+    let fixture = ExistingDbCliFixture::new();
+    let root = fixture.db.parent().unwrap();
+    let vault = root.join("vault");
+    for (path, body) in [
+        ("a/Same.md", "# Same\n\nFirst ambiguous note.\n"),
+        ("b/Same.md", "# Same\n\nSecond ambiguous note.\n"),
+        ("Unique.md", "# Unique\n\nUseful unique context.\n"),
+    ] {
+        let path = vault.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    let mut config = std::fs::read_to_string(&fixture.config).unwrap();
+    config.push_str(
+        "\n[[features]]\nname = 'mixed'\nrepos = []\nentry_points = ['Same', 'Unique']\n",
+    );
+    std::fs::write(&fixture.config, config).unwrap();
+    let indexed = fixture
+        .command()
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .timeout(std::time::Duration::from_secs(90))
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--config")
+        .arg(&fixture.config)
+        .output()
+        .unwrap();
+    assert_exit(&indexed, 0, "index owned ambiguity fixture");
+    let valid = fixture
+        .command()
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .args([
+            "brain",
+            "context",
+            "Unique",
+            "--json",
+            "--token-budget",
+            "6000",
+            "--config",
+        ])
+        .arg(&fixture.config)
+        .output()
+        .unwrap();
+    assert_exit(&valid, 0, "valid-only control");
+    let valid: serde_json::Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert!(
+        !valid["connected"].as_array().unwrap().is_empty(),
+        "{valid}"
+    );
+    for command in [
+        vec!["brain", "context", "Same", "Unique"],
+        vec!["context", "--feature", "mixed"],
+    ] {
+        for json in [true, false] {
+            let mut invocation = fixture.command();
+            invocation
+                .env_remove("NESTWEAVER_NO_DAEMON")
+                .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+                .args(&command)
+                .args(["--token-budget", "6000", "--config"])
+                .arg(&fixture.config);
+            if json {
+                invocation.arg("--json");
+            }
+            let output = invocation.output().unwrap();
+            assert_exit(&output, 0, "mixed context must preserve success");
+            if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["connected"], valid["connected"], "{value}");
+                assert_eq!(value["ambiguous_seeds"][0]["seed"], "Same", "{value}");
+                assert_eq!(value["ambiguous_seeds"][0]["candidate_total"], 2);
+                assert_eq!(value["ambiguous_seeds"][0]["candidates_returned"], 2);
+                assert!(value.get("unresolved_seeds").is_none(), "{value}");
+                let candidates = value["ambiguous_seeds"][0]["candidates"]
+                    .as_array()
+                    .unwrap();
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|c| c["file_path"].as_str().unwrap().ends_with("a/Same.md"))
+                );
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|c| c["file_path"].as_str().unwrap().ends_with("b/Same.md"))
+                );
+            } else {
+                let text = String::from_utf8(output.stdout).unwrap();
+                for expected in [
+                    "Unique",
+                    "Ambiguous seeds",
+                    "Same",
+                    "2 of 2",
+                    "a/Same.md",
+                    "b/Same.md",
+                ] {
+                    assert!(text.contains(expected), "missing {expected}: {text}");
+                }
+            }
+        }
+    }
+    for (seed, exit) in [("Same", 3), ("absent-never-a-note", 2)] {
+        let output = fixture
+            .command()
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .args([
+                "brain",
+                "context",
+                seed,
+                "--json",
+                "--token-budget",
+                "6000",
+                "--config",
+            ])
+            .arg(&fixture.config)
+            .output()
+            .unwrap();
+        assert_exit(&output, exit, "no-success compatibility control");
+    }
+    let stopped = fixture
+        .command()
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .args(["daemon", "--db"])
+        .arg(&fixture.db)
+        .arg("stop")
+        .output()
+        .unwrap();
+    assert_exit(&stopped, 0, "stop owned ambiguity fixture");
 }

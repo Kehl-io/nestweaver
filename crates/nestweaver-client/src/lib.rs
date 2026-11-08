@@ -1939,17 +1939,25 @@ impl DaemonClient {
         Ok(resp.into_inner())
     }
 
-    /// Remove one extension property from one node, UNDER THE DAEMON WRITE GATE.
-    ///
-    /// nw-462. The CLI's `extensions unset` used to call
-    /// `nestweaver_engine::remove_extension_key_durable` directly, so the
-    /// sidecar read-modify-write ran ungated while its matching WRITE
-    /// (`set_extension`) went to explicit trouble to hold the gate. Routing the
-    /// delete the same way is what makes "the daemon is the single writer" true
-    /// rather than aspirational.
-    ///
-    /// Returns whether a property was actually removed; `false` means it was
-    /// already absent, which is a legitimate outcome rather than an error.
+    /// Set one typed JSON annotation under the owning daemon's write gate.
+    pub async fn set_extension(
+        &mut self,
+        uid: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let args = serde_json::json!({ "uid": uid, "key": key, "value": value }).to_string();
+        let resp = self
+            .inner
+            .set_extension(nestweaver_proto::JsonRequest { args_json: args })
+            .await
+            .context("set_extension RPC failed")?;
+        serde_json::from_str(&resp.into_inner().result_json)
+            .context("decode set_extension response")
+    }
+
+    /// Remove one extension property under the daemon write gate. False means
+    /// the key was already absent; other properties are preserved.
     pub async fn unset_extension(&mut self, uid: &str, key: &str) -> Result<bool> {
         let args = serde_json::json!({ "uid": uid, "key": key }).to_string();
         let resp = self

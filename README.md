@@ -195,9 +195,11 @@ old daemon and back up with the previous binary before upgrading. To downgrade, 
 binary and restore the pre-upgrade backup; do not point it at the upgraded file.
 See the [storage upgrade guidance](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
-Resolver generation **21** and parsed cache **15** include PHP static-method
-ownership and inheritance facts alongside the Dart 0.3 and PowerShell 0.26.6
-grammar updates. Force re-index each repository once after
+The current source uses resolver generation **22** and parsed cache **16**.
+Anonymous JavaScript/TypeScript default functions now own calls in their bodies;
+Svelte, Vue and Astro function spans skip destructured/default parameters.
+Generation 21/cache 15's PHP static-method ownership and inheritance facts and
+the preceding Dart/PowerShell grammar updates remain included. Force re-index each repository once after
 upgrading to publish the new parser facts; invalidating the parse cache alone
 does not replace symbols and edges already stored in the graph.
 
@@ -215,8 +217,8 @@ the same product version disclose skew without automatically replacing a writer.
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
 - For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.5
-  uses resolver generation **21** (12.2.4 used **19**). If your
-  binary reports a generation-stale graph, run
+  uses resolver generation **21** (12.2.4 used **19**); the current source
+  requires generation **22**. If your binary reports a generation-stale graph, run
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - Generation 16 preserves declaring-package origin through Go factory-call
