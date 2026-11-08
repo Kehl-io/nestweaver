@@ -1289,6 +1289,11 @@ jobs:
             --binary ../../../target/debug/nestweaver \
             --node "$(command -v node)" \
             --browser "$browser_executable"
+          python3 ../../../tests/support/release_ui.py \
+            --binary ../../../target/debug/nestweaver \
+            --node "$(command -v node)" \
+            --browser "$browser_executable" \
+            --files-overflow-fixture e2e/files-overflow.spec.ts
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

@@ -158,6 +158,11 @@ Approve these two scoped fixes for the same integration PR, retaining the
 original cohort's explicit residuals. Required CI must qualify the new exact head
 before delivery is reported complete; no merge or release is authorized here.
 
+The subsequent full-PR review found three scoped gaps in CLI disclosure, bridge
+repair debt and folder scrolling. Their corrections and separate artifact/test
+qualifications are in the [review-correction ledger](pr543-review-corrections.md).
+The earlier receipts above remain historical evidence for their original inputs.
+
 Initial manual harness failures are retained. One independent fixture requested
 a different config from its daemon's lifetime binding and correctly received a
 refusal before the intended query. The author harness assumed a generic MCP

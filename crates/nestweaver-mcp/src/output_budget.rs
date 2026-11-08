@@ -65,6 +65,11 @@ fn identity(key: &str) -> bool {
         || key == "cluster_id"
         || key == "refused"
 }
+fn context_ambiguity_path(path: &[Step]) -> bool {
+    path.iter()
+        .any(|step| matches!(step, Step::Key(key) if key == "ambiguous_seeds"))
+}
+
 fn largest(value: &Value, path: &mut Vec<Step>, key: &str, best: &mut Option<Cut>) {
     if key == "output_budget" {
         return;
@@ -78,8 +83,21 @@ fn largest(value: &Value, path: &mut Vec<Step>, key: &str, best: &mut Option<Cut
         return;
     }
     let candidate = match value {
-        Value::Array(items) if items.len() > 1 => Some((escaped_size(value), true)),
-        Value::String(text) if text.len() > 128 && !identity(key) => Some((text.len(), false)),
+        Value::Array(items)
+            if items.len() > 1
+                || (!items.is_empty()
+                    && context_ambiguity_path(path)
+                    && matches!(key, "ambiguous_seeds" | "candidates" | "candidate_uids")) =>
+        {
+            Some((escaped_size(value), true))
+        }
+        Value::String(text)
+            if text.len() > 128
+                && !identity(key)
+                && !(context_ambiguity_path(path) && matches!(key, "seed" | "file_path")) =>
+        {
+            Some((text.len(), false))
+        }
         _ => None,
     };
     if let Some((size, array)) = candidate
@@ -230,7 +248,13 @@ fn shrink(value: &mut Value, omitted: &mut BTreeMap<String, Value>) -> Result<bo
     let label = cut_label(&cut.path);
     if cut.array {
         let items = selected.as_array_mut().unwrap();
-        let keep = shared_keep.unwrap_or_else(|| items.len().div_ceil(2));
+        let keep = shared_keep.unwrap_or_else(|| {
+            if items.len() == 1 && context_ambiguity_path(&cut.path) {
+                0
+            } else {
+                items.len().div_ceil(2)
+            }
+        });
         let count = items.len() - keep;
         items.truncate(keep);
         // Recognized shared contracts have paired identity/alias arrays and
@@ -994,6 +1018,42 @@ mod tests {
             )
         );
         assert!(escaped_size(&result) <= RESULT_BYTES);
+    }
+
+    #[test]
+    fn mixed_context_finalizer_keeps_atomic_handles_or_discloses_whole_omission() {
+        let seed = "\"".repeat(4096);
+        let uid = format!("note:{}", "\"".repeat(4000));
+        let path = "\"".repeat(4096);
+        let diagnostic = json!({"seed":seed,"symbol":seed,"status":"ambiguous",
+            "candidates":[{"uid":uid,"file_path":path,"name":"Same"}],
+            "candidate_uids":[uid],"candidate_total":55,"candidates_returned":1,"truncated":true});
+        let result = finalize(json!({"content":[],"structuredContent":{
+            "connected":[{"uid":"note:valid","title":"Unique"}],
+            "ambiguous_seeds":[diagnostic]},"isError":false}));
+        assert_eq!(result["isError"], false, "{result}");
+        let payload = &result["structuredContent"];
+        assert_eq!(payload["connected"][0]["uid"], "note:valid");
+        let entries = payload["ambiguous_seeds"].as_array().unwrap();
+        for entry in entries {
+            assert_eq!(entry["seed"], seed);
+            let candidates = entry["candidates"].as_array().unwrap();
+            assert_eq!(entry["candidates_returned"], candidates.len());
+            assert_eq!(
+                entry["candidate_uids"],
+                json!(candidates.iter().map(|c| &c["uid"]).collect::<Vec<_>>())
+            );
+            for c in candidates {
+                assert_eq!(c["uid"], uid);
+                assert_eq!(c["file_path"], path);
+            }
+        }
+        assert!(payload["output_budget"]["cuts"].is_object(), "{payload}");
+        assert!(escaped_size(payload) <= LOGICAL_BYTES);
+        assert!(escaped_size(&result) <= RESULT_BYTES);
+        let disclosure =
+            nestweaver_schema::responses::ContextAmbiguityDisclosure::from_response(payload);
+        assert!(disclosure.output_budget().is_some());
     }
 
     #[test]

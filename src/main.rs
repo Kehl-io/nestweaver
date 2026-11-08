@@ -20970,6 +20970,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                             // Same drop as `brain context`'s daemon arm: this
                             // route calls the SAME `brain_context` tool and
                             // narrowed away the `total` it answered with.
+                            // Capture response ambiguity before the ranking type drops it.
                             let upstream = UpstreamContextDisclosure::from_wire(&result_json)
                                 .with_local_publication(&db_path);
                             let result: nestweaver_engine::BrainContextResult =
@@ -34592,6 +34593,70 @@ mod brain_search_renderer_tests {
 #[cfg(test)]
 mod context_json_renderer_tests {
     use super::*;
+
+    #[test]
+    fn mixed_context_ambiguity_survives_wire_decode_in_json_and_human_output() {
+        let mut result = degraded_context();
+        result.unresolved_seeds.clear();
+        result.connected = vec![nestweaver_engine::BrainNode {
+            uid: "note:unique".into(),
+            kind: "Note".into(),
+            title: "Unique".into(),
+            location: "Unique.md".into(),
+            relevance: 1.0,
+            inline_body: None,
+            body_complete: true,
+        }];
+        let mut wire = serde_json::to_value(&result).unwrap();
+        let mut diagnostic = nestweaver_schema::responses::name_lookup_ambiguous(
+            "Same",
+            None,
+            serde_json::json!([
+                {"uid":"note:a","name":"Same","file_path":"a/Same.md","start_line":0},
+                {"uid":"note:b","name":"Same","file_path":"b/Same.md","start_line":0}
+            ]),
+        );
+        diagnostic["seed"] = serde_json::json!("Same");
+        diagnostic["candidate_total"] = serde_json::json!(55);
+        diagnostic["candidates_returned"] = serde_json::json!(2);
+        diagnostic["truncated"] = serde_json::json!(true);
+        diagnostic["_provenance"] = serde_json::json!("server");
+        wire["ambiguous_seeds"] = serde_json::json!([diagnostic]);
+        let upstream = UpstreamContextDisclosure::from_wire(&wire);
+        let decoded: BrainContextResult = serde_json::from_value(wire.clone()).unwrap();
+        let output = brain_context_json_value(&decoded, 1, Some(1), &upstream);
+        assert_eq!(output["ambiguous_seeds"], wire["ambiguous_seeds"]);
+        assert_eq!(output["connected"], wire["connected"]);
+        assert!(output.get("unresolved_seeds").is_none());
+        let mut text = Vec::new();
+        write_context_ambiguity(&mut text, &upstream.ambiguity).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        for expected in [
+            "Ambiguous seeds",
+            "Same [server]",
+            "2 of 55",
+            "truncated",
+            "note:a",
+            "note:b",
+            "a/Same.md",
+            "Disambiguate",
+            "upstream endpoint",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let invalid = UpstreamContextDisclosure::from_wire(
+            &serde_json::json!({"ambiguous_seeds":[{"seed":null}]}),
+        );
+        let mut text = Vec::new();
+        write_context_ambiguity(&mut text, &invalid.ambiguity).unwrap();
+        assert!(
+            String::from_utf8(text)
+                .unwrap()
+                .contains("invalid_ambiguity_disclosure")
+        );
+        let clean = brain_context_json_value(&decoded, 1, None, &Default::default());
+        assert!(clean.get("ambiguous_seeds").is_none());
+    }
 
     fn degraded_context() -> BrainContextResult {
         BrainContextResult {

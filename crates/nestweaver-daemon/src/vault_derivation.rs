@@ -2,6 +2,7 @@
 use super::{
     ConnectionGuard, DaemonState, IndexedSearchMutationScope, establish_search_reconciliation_debt,
     finish_search_reconciliation, indexed_search_mutation, indexed_search_rows_before,
+    run_full_vault_refresh_with_bridge_debt,
 };
 use nestweaver_engine::index_limits::NoteLimits;
 use nestweaver_engine::index_md::MarkdownRefreshResult;
@@ -483,11 +484,17 @@ fn migrate_vault(
         note_limits(state),
     )
     .strict_enumeration();
-    let refresh = nestweaver_engine::index_md::refresh_indexed_markdown_derivation(
-        &reader,
-        &state.store,
-        vault,
-        || cancelled(state),
+    let refresh = run_full_vault_refresh_with_bridge_debt(
+        state,
+        &format!("Markdown derivation of vault {}", vault.root_path),
+        || {
+            nestweaver_engine::index_md::refresh_indexed_markdown_derivation(
+                &reader,
+                &state.store,
+                vault,
+                || cancelled(state),
+            )
+        },
     );
     let result = match refresh {
         Ok(result) => result,
@@ -613,19 +620,27 @@ fn reconcile_policy_named(state: &DaemonState, vault_uid: &str) -> anyhow::Resul
         note_limits(state),
     )
     .strict_enumeration();
-    let result = nestweaver_engine::index_md::refresh_registered_markdown_policy(
-        &reader,
-        &state.store,
-        &vault,
-        &coverage.extra_ignore_patterns,
+    let result = run_full_vault_refresh_with_bridge_debt(
+        state,
+        &format!("ignore policy refresh of vault {}", vault.root_path),
         || {
-            let gate = state.write_gate.blocking_lock("vault_policy_write");
-            anyhow::ensure!(!cancelled(state), "vault policy reconciliation cancelled");
-            // A remove admitted during the off-gate scan must stay removed.
-            state.store.lookup_vault(&vault.uid)?;
-            Ok(gate)
+            nestweaver_engine::index_md::refresh_registered_markdown_policy(
+                &reader,
+                &state.store,
+                &vault,
+                &coverage.extra_ignore_patterns,
+                || {
+                    let gate = state.write_gate.blocking_lock("vault_policy_write");
+                    anyhow::ensure!(!cancelled(state), "vault policy reconciliation cancelled");
+                    // A remove admitted during the off-gate scan must stay removed.
+                    state.store.lookup_vault(&vault.uid)?;
+                    Ok(gate)
+                },
+            )
         },
     );
+    #[cfg(test)]
+    tests::observe_phase(&state.db_path, "policy refresh returned");
     let _gate = state.write_gate.blocking_lock("vault_policy_postflight");
     let finish = (|| {
         let result = result?;

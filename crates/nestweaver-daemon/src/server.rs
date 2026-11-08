@@ -6104,6 +6104,21 @@ fn finish_search_reconciliation(
     }
 }
 
+/// Full vault replacement removes retained notes' code links too. Record debt
+/// after every returned attempt: an error can follow a committed replacement.
+/// Use the same namespace as the daemon's code-link poller and status reader.
+/// This takes no write gate, so callers may already hold one (legacy derivation)
+/// or acquire their postflight gate after this operation (full/policy refresh).
+fn run_full_vault_refresh_with_bridge_debt<T>(
+    state: &DaemonState,
+    reason: &str,
+    refresh: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let result = refresh();
+    nestweaver_engine::code_links::mark_code_links_pending(&state.db_path, reason);
+    result
+}
+
 /// Retry a previously established debt. Durable debt means the precise graph
 /// delta is unknown, so recovery always chooses the safe full rebuild.
 fn reconcile_pending_search_debt(
@@ -9390,26 +9405,29 @@ impl NestWeaverDaemon for DaemonService {
                 }
             };
 
-            let index_result =
-                nestweaver_engine::index_md::index_markdown_directory_with_store_and_write_gate(
-                    &state.store,
-                    &vault_path,
-                    &state.db_path,
-                    &instance_id,
-                    &vault_name,
-                    &extra_patterns,
-                    note_limits,
-                    || acquire_search_mutation_gate(&state, "index_vault", &mut search_admission),
-                );
-            let _postflight_gate = write_lock.blocking_lock("index_vault_postflight");
-            // nw-675: a full vault index recreates every note, and the
-            // cascade takes their code links. Owed, disclosed, and rebuilt
-            // by the code-link reconciler; recorded after the write, as in
-            // IndexRepo.
-            nestweaver_engine::code_links::mark_code_links_pending(
-                &state.db_path,
+            let index_result = run_full_vault_refresh_with_bridge_debt(
+                &state,
                 &format!("full index of vault {}", vault_path.display()),
+                || {
+                    nestweaver_engine::index_md::index_markdown_directory_with_store_and_write_gate(
+                        &state.store,
+                        &vault_path,
+                        &state.db_path,
+                        &instance_id,
+                        &vault_name,
+                        &extra_patterns,
+                        note_limits,
+                        || {
+                            acquire_search_mutation_gate(
+                                &state,
+                                "index_vault",
+                                &mut search_admission,
+                            )
+                        },
+                    )
+                },
             );
+            let _postflight_gate = write_lock.blocking_lock("index_vault_postflight");
 
             match index_result {
                 Ok(result) => {
@@ -20374,6 +20392,322 @@ credential_method = "gh"
 
         let _ = state.shutdown_tx.send(true);
         reconciler.await.unwrap();
+    }
+
+    /// A real, already-settled loop is essential: starting a fresh reconciler
+    /// after the refresh would repair via startup and hide missing debt.
+    struct FullVaultBridgeFixture {
+        state: Arc<DaemonState>,
+        vault: tempfile::TempDir,
+        _repo: tempfile::TempDir,
+        edges: Vec<(String, String, f64, String)>,
+        keep_hash: String,
+        reconciler: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl FullVaultBridgeFixture {
+        async fn warm() -> Self {
+            let state = test_state_with_writer();
+            let vault = tempfile::tempdir().unwrap();
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::write(
+                vault.path().join("Keep.md"),
+                "# Keep\n\n`AlphaWidget` renders.\n",
+            )
+            .unwrap();
+            std::fs::write(vault.path().join("Drop.md"), "# Drop\n\nIndependent.\n").unwrap();
+            std::fs::write(repo.path().join("widget.rs"), "pub struct AlphaWidget;\n").unwrap();
+            nestweaver_engine::index::index_directory_with_store(
+                &state.store,
+                repo.path(),
+                &state.db_path,
+                &state.data_instance_id,
+                "file:///bridge-refresh-fixture",
+                "sha",
+                false,
+                None,
+            )
+            .unwrap();
+            let progress = index_vault_via_rpc(&state, vault.path()).await;
+            assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+            assert!(
+                nestweaver_engine::code_links::load_code_links_state(&state.db_path)
+                    .last_reconciled_at
+                    .is_none(),
+                "no pass has run before this fixture starts its actual loop"
+            );
+            let reconciler = tokio::spawn(run_code_link_reconciler(
+                Arc::clone(&state),
+                Duration::from_millis(20),
+                Duration::ZERO,
+            ));
+            let mut fixture = Self {
+                state,
+                vault,
+                _repo: repo,
+                edges: Vec::new(),
+                keep_hash: String::new(),
+                reconciler: Some(reconciler),
+            };
+            assert!(
+                eventually(|| {
+                    let debt = nestweaver_engine::code_links::load_code_links_state(
+                        &fixture.state.db_path,
+                    );
+                    // last_reconciled_at is written only by completion, not by
+                    // a progress callback or merely creating the two edges.
+                    debt.last_reconciled_at.is_some()
+                        && debt.pending.is_none()
+                        && fixture.state.store.count_references_code_edges().unwrap() == 2
+                })
+                .await,
+                "the actual loop must complete its first pass before policy changes"
+            );
+            fixture.edges = fixture.state.store.list_references_code_edges().unwrap();
+            assert!(fixture.edges.iter().any(|edge| edge.0.starts_with("note:")));
+            assert!(fixture.edges.iter().any(|edge| edge.0.starts_with("sec:")));
+            fixture.keep_hash = fixture.keep().content_hash;
+            fixture
+        }
+
+        fn keep(&self) -> nestweaver_schema::Note {
+            self.state
+                .store
+                .list_notes(None)
+                .unwrap()
+                .into_iter()
+                .find(|note| note.file_path == "Keep.md")
+                .unwrap()
+        }
+
+        fn marks(&self) -> u64 {
+            nestweaver_engine::code_links::load_code_links_state(&self.state.db_path).marks
+        }
+
+        async fn assert_repaired(&self) {
+            assert!(
+                eventually(|| {
+                    !nestweaver_engine::code_links::code_links_pending(&self.state.db_path)
+                        && self.state.store.list_references_code_edges().unwrap() == self.edges
+                })
+                .await,
+                "the warmed loop must restore the same note/section bridges through debt"
+            );
+            assert_eq!(self.keep().content_hash, self.keep_hash);
+        }
+
+        async fn close(mut self) {
+            let _ = self.state.shutdown_tx.send(true);
+            tokio::time::timeout(Duration::from_secs(10), self.reconciler.take().unwrap())
+                .await
+                .expect("owned code-link loop shutdown deadline")
+                .unwrap();
+        }
+    }
+
+    impl Drop for FullVaultBridgeFixture {
+        fn drop(&mut self) {
+            // Assertion failures must stop the owned loop as well.
+            let _ = self.state.shutdown_tx.send(true);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_policy_refresh_repairs_retained_bridges_with_a_recently_settled_loop() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let fixture = FullVaultBridgeFixture::warm().await;
+        let before = fixture.marks();
+        std::fs::write(fixture.vault.path().join(".brainignore"), "Drop.md\n").unwrap();
+        let state = Arc::clone(&fixture.state);
+        let vault_uid = vault_derivation_record(&state).vault_uid;
+        tokio::task::spawn_blocking(move || {
+            vault_derivation::migrate_background(&state, &vault_uid)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fixture.state.store.list_notes(None).unwrap().len(), 1);
+        assert_eq!(
+            vault_derivation_record(&fixture.state).phase,
+            DerivationPhase::Current
+        );
+        assert_eq!(
+            fixture.marks(),
+            before + 1,
+            "one policy replacement owes one repair"
+        );
+        fixture.assert_repaired().await;
+
+        // The existing correct route is a positive control and must not mark
+        // twice when its standalone setter moves into the shared operation.
+        let before = fixture.marks();
+        let progress = index_vault_via_rpc(&fixture.state, fixture.vault.path()).await;
+        assert_eq!(progress.last().unwrap().phase, Phase::Done as i32);
+        assert_eq!(
+            fixture.marks(),
+            before + 1,
+            "ordinary full index marks exactly once"
+        );
+        fixture.assert_repaired().await;
+
+        // Lost derivation records trigger the legacy indexed-inventory route,
+        // not full-policy reconciliation. Keep its pre-existing scope rules.
+        std::fs::remove_file(nestweaver_engine::markdown_derivation::record_path(
+            &fixture.state.db_path,
+        ))
+        .unwrap();
+        let before = fixture.marks();
+        let state = Arc::clone(&fixture.state);
+        let vault_uid = state.store.list_vaults(None).unwrap().remove(0).uid;
+        tokio::task::spawn_blocking(move || {
+            vault_derivation::migrate_background(&state, &vault_uid)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            fixture.marks(),
+            before + 1,
+            "legacy full derivation owes repair too"
+        );
+        assert_eq!(
+            vault_derivation_record(&fixture.state).coverage.scope,
+            nestweaver_engine::markdown_derivation::CoverageScope::LegacyIndexedInventory
+        );
+        fixture.assert_repaired().await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_vault_bridge_debt_survives_committed_error_and_policy_postflight_failure() {
+        use nestweaver_engine::markdown_derivation::DerivationPhase;
+        let fixture = FullVaultBridgeFixture::warm().await;
+        let before = fixture.marks();
+        let state = Arc::clone(&fixture.state);
+        let root = fixture.vault.path().to_path_buf();
+        let error = tokio::task::spawn_blocking(move || {
+            run_full_vault_refresh_with_bridge_debt(&state, "postcommit error fixture", || {
+                nestweaver_engine::index_md::index_markdown_directory_with_store_and_write_gate(
+                    &state.store,
+                    &root,
+                    &state.db_path,
+                    &state.data_instance_id,
+                    &state.store.list_vaults(None)?.remove(0).name,
+                    &[],
+                    nestweaver_engine::index_limits::NoteLimits::default(),
+                    || Ok(state.write_gate.blocking_lock("bridge_error_fixture")),
+                )?;
+                assert_eq!(state.store.list_notes(None)?.len(), 2);
+                assert_eq!(
+                    state.store.count_references_code_edges()?,
+                    0,
+                    "a real replacement committed before the injected error"
+                );
+                Err::<(), _>(anyhow::anyhow!(
+                    "distinct error after committed replacement"
+                ))
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "distinct error after committed replacement"
+        );
+        assert_eq!(fixture.marks(), before + 1);
+        fixture.assert_repaired().await;
+
+        // Change a valid policy after the real replacement returns. Its
+        // eligibility stays the same, but the raw policy fingerprint changes,
+        // so the actual postflight must refuse to stamp the captured policy.
+        std::fs::write(fixture.vault.path().join(".brainignore"), "Drop.md\n").unwrap();
+        let before = fixture.marks();
+        let state = Arc::clone(&fixture.state);
+        let vault_uid = vault_derivation_record(&state).vault_uid;
+        let policy_path = fixture.vault.path().join(".brainignore");
+        let observed = Arc::new(AtomicBool::new(false));
+        let reached = Arc::clone(&observed);
+        let error = tokio::task::spawn_blocking(move || {
+            struct ClearPhaseHook;
+            impl Drop for ClearPhaseHook {
+                fn drop(&mut self) {
+                    vault_derivation::tests::set_phase_hook(None);
+                }
+            }
+            let _clear = ClearPhaseHook;
+            let hook_state = Arc::clone(&state);
+            vault_derivation::tests::set_phase_hook(Some(Box::new(move |phase| {
+                if phase == "policy refresh returned" {
+                    assert_eq!(
+                        hook_state.store.list_notes(None).unwrap().len(),
+                        1,
+                        "replacement must actually commit before the policy changes"
+                    );
+                    assert_eq!(
+                        nestweaver_engine::code_links::load_code_links_state(&hook_state.db_path)
+                            .marks,
+                        before + 1,
+                        "the committed attempt must already owe bridge repair"
+                    );
+                    std::fs::write(&policy_path, "Drop.md\n# changed after replacement\n").unwrap();
+                    reached.store(true, Ordering::SeqCst);
+                }
+            })));
+            vault_derivation::migrate_background(&state, &vault_uid)
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "real postflight seam must be reached"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("vault ignore policy changed before derivation stamping"),
+            "{error:#}"
+        );
+        assert_eq!(fixture.state.store.list_notes(None).unwrap().len(), 1);
+        assert_eq!(
+            vault_derivation_record(&fixture.state).phase,
+            DerivationPhase::Blocked
+        );
+        assert_eq!(
+            fixture.marks(),
+            before + 1,
+            "postflight failure cannot skip debt"
+        );
+        fixture.assert_repaired().await;
+        fixture.close().await;
+    }
+
+    #[test]
+    fn full_vault_bridge_debt_uses_the_consumer_namespace_even_on_precommit_error() {
+        let mut state = test_state_with_writer();
+        let endpoint = tempfile::tempdir().unwrap();
+        Arc::get_mut(&mut state).unwrap().selected_db_path = endpoint.path().join("endpoint.lbug");
+        let before = nestweaver_engine::code_links::load_code_links_state(&state.db_path).marks;
+        let error = run_full_vault_refresh_with_bridge_debt(&state, "precommit refusal", || {
+            Err::<(), _>(anyhow::anyhow!("refused before commit"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "refused before commit");
+        let debt = nestweaver_engine::code_links::load_code_links_state(&state.db_path);
+        assert_eq!(debt.marks, before + 1);
+        assert!(
+            debt.pending.is_some(),
+            "plain Err cannot prove the absence of a commit"
+        );
+        assert!(
+            !nestweaver_engine::sidecar_path(
+                &state.selected_db_path,
+                nestweaver_engine::code_links::CODE_LINKS_SIDECAR,
+            )
+            .exists(),
+            "endpoint binding is not the code-link consumer's namespace"
+        );
     }
 
     /// nw-670 review M4: the loop runs on recorded debt, not on every graph

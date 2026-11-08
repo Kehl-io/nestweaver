@@ -636,6 +636,12 @@ pub(crate) fn print_brain_context_text(
         }
     }
 
+    // Partial success stays success; excluded ambiguous inputs still need action.
+    let mut ambiguity_text = Vec::new();
+    write_context_ambiguity(&mut ambiguity_text, &upstream.ambiguity)
+        .unwrap_or_else(|error| raise_stdout_failure(error));
+    print!("{}", String::from_utf8_lossy(&ambiguity_text));
+
     if !result.connected.is_empty() {
         println!();
         // Same correction as the JSON twin: on the daemon route
@@ -707,6 +713,64 @@ pub(crate) fn owner_order_clause(owners_listed: usize, owners_omitted: usize) ->
 
 /// `brain context`'s `Connected (N of M, ...)` heading. `tokens` is
 /// `(used, budget)` under `--token-budget`.
+/// Writer-based so JSON and actual human output can share a boundary regression.
+pub(crate) fn write_context_ambiguity(
+    writer: &mut impl std::io::Write,
+    disclosure: &nestweaver_schema::responses::ContextAmbiguityDisclosure,
+) -> std::io::Result<()> {
+    if !disclosure.entries().is_empty() {
+        writeln!(
+            writer,
+            "\nAmbiguous seeds ({} scope-specific diagnoses):",
+            disclosure.entries().len()
+        )?;
+    }
+    for entry in disclosure.entries() {
+        let seed = entry["seed"].as_str().unwrap_or("?");
+        let source = entry["_provenance"].as_str();
+        let candidates = entry["candidates"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let total = entry["candidate_total"]
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        writeln!(
+            writer,
+            "  {seed}{}: {} of {total} candidates{}",
+            source.map(|s| format!(" [{s}]")).unwrap_or_default(),
+            candidates.len(),
+            if entry["truncated"] == true {
+                " (truncated)"
+            } else {
+                ""
+            }
+        )?;
+        for candidate in candidates {
+            writeln!(
+                writer,
+                "    {}  {}",
+                candidate["uid"].as_str().unwrap_or("?"),
+                candidate["file_path"].as_str().unwrap_or("?")
+            )?;
+        }
+        if let Some(note) = entry["note"].as_str() {
+            writeln!(writer, "    {note}")?;
+        }
+        if source == Some("server") {
+            writeln!(
+                writer,
+                "    Resolve these handles on the supplying upstream endpoint; a local-only lookup may not resolve them."
+            )?;
+        }
+    }
+    if let Some(budget) = disclosure.output_budget() {
+        writeln!(writer, "\nOutput disclosure: {budget}")?;
+    }
+    Ok(())
+}
+
 pub(crate) fn brain_connected_header(
     shown: usize,
     total: usize,
@@ -1205,6 +1269,8 @@ pub(crate) fn render_project_context_daemon_response(
 /// still read its own pre-cut total off `result.connected`.
 #[derive(Default)]
 pub(crate) struct UpstreamContextDisclosure {
+    /// Preflight ambiguity must survive the engine ranking type's narrow decode.
+    pub(crate) ambiguity: nestweaver_schema::responses::ContextAmbiguityDisclosure,
     pub(crate) truncated_by: Option<String>,
     /// Rows that matched upstream, BEFORE the cut it already applied.
     pub(crate) total: Option<usize>,
@@ -1237,6 +1303,9 @@ impl UpstreamContextDisclosure {
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as usize),
             meta: value.get("_meta").cloned(),
+            ambiguity: nestweaver_schema::responses::ContextAmbiguityDisclosure::from_response(
+                value,
+            ),
             publication: publication_from_wire(value),
             code_links: code_links_from_wire(value),
         }
@@ -1381,6 +1450,7 @@ pub(crate) fn brain_context_json_value(
         resp["code_links_incomplete"] = serde_json::json!(true);
         resp["code_links_pending"] = pending.clone();
     }
+    upstream.ambiguity.stamp_into(&mut resp);
     resp
 }
 

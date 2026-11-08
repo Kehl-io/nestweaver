@@ -16917,3 +16917,141 @@ fn hooks_install_from_a_subdirectory_binds_the_root_database() {
     );
     assert!(!stderr.contains("core.hooksPath"), "{stderr}");
 }
+
+/// nw942: the producer succeeds for Unique, but the CLI used to discard Same
+/// while narrowing the response into the engine's ranking result.
+#[test]
+fn mixed_context_ambiguity_survives_both_daemon_cli_decoders() {
+    let fixture = ExistingDbCliFixture::new();
+    let root = fixture.db.parent().unwrap();
+    let vault = root.join("vault");
+    for (path, body) in [
+        ("a/Same.md", "# Same\n\nFirst ambiguous note.\n"),
+        ("b/Same.md", "# Same\n\nSecond ambiguous note.\n"),
+        ("Unique.md", "# Unique\n\nUseful unique context.\n"),
+    ] {
+        let path = vault.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    let mut config = std::fs::read_to_string(&fixture.config).unwrap();
+    config.push_str(
+        "\n[[features]]\nname = 'mixed'\nrepos = []\nentry_points = ['Same', 'Unique']\n",
+    );
+    std::fs::write(&fixture.config, config).unwrap();
+    let indexed = fixture
+        .command()
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .timeout(std::time::Duration::from_secs(90))
+        .args(["brain", "add"])
+        .arg(&vault)
+        .arg("--config")
+        .arg(&fixture.config)
+        .output()
+        .unwrap();
+    assert_exit(&indexed, 0, "index owned ambiguity fixture");
+    let valid = fixture
+        .command()
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .args([
+            "brain",
+            "context",
+            "Unique",
+            "--json",
+            "--token-budget",
+            "6000",
+            "--config",
+        ])
+        .arg(&fixture.config)
+        .output()
+        .unwrap();
+    assert_exit(&valid, 0, "valid-only control");
+    let valid: serde_json::Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert!(
+        !valid["connected"].as_array().unwrap().is_empty(),
+        "{valid}"
+    );
+    for command in [
+        vec!["brain", "context", "Same", "Unique"],
+        vec!["context", "--feature", "mixed"],
+    ] {
+        for json in [true, false] {
+            let mut invocation = fixture.command();
+            invocation
+                .env_remove("NESTWEAVER_NO_DAEMON")
+                .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+                .args(&command)
+                .args(["--token-budget", "6000", "--config"])
+                .arg(&fixture.config);
+            if json {
+                invocation.arg("--json");
+            }
+            let output = invocation.output().unwrap();
+            assert_exit(&output, 0, "mixed context must preserve success");
+            if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["connected"], valid["connected"], "{value}");
+                assert_eq!(value["ambiguous_seeds"][0]["seed"], "Same", "{value}");
+                assert_eq!(value["ambiguous_seeds"][0]["candidate_total"], 2);
+                assert_eq!(value["ambiguous_seeds"][0]["candidates_returned"], 2);
+                assert!(value.get("unresolved_seeds").is_none(), "{value}");
+                let candidates = value["ambiguous_seeds"][0]["candidates"]
+                    .as_array()
+                    .unwrap();
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|c| c["file_path"].as_str().unwrap().ends_with("a/Same.md"))
+                );
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|c| c["file_path"].as_str().unwrap().ends_with("b/Same.md"))
+                );
+            } else {
+                let text = String::from_utf8(output.stdout).unwrap();
+                for expected in [
+                    "Unique",
+                    "Ambiguous seeds",
+                    "Same",
+                    "2 of 2",
+                    "a/Same.md",
+                    "b/Same.md",
+                ] {
+                    assert!(text.contains(expected), "missing {expected}: {text}");
+                }
+            }
+        }
+    }
+    for (seed, exit) in [("Same", 3), ("absent-never-a-note", 2)] {
+        let output = fixture
+            .command()
+            .env_remove("NESTWEAVER_NO_DAEMON")
+            .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+            .args([
+                "brain",
+                "context",
+                seed,
+                "--json",
+                "--token-budget",
+                "6000",
+                "--config",
+            ])
+            .arg(&fixture.config)
+            .output()
+            .unwrap();
+        assert_exit(&output, exit, "no-success compatibility control");
+    }
+    let stopped = fixture
+        .command()
+        .env_remove("NESTWEAVER_NO_DAEMON")
+        .env_remove("NESTWEAVER_ALLOW_NO_DAEMON")
+        .args(["daemon", "--db"])
+        .arg(&fixture.db)
+        .arg("stop")
+        .output()
+        .unwrap();
+    assert_exit(&stopped, 0, "stop owned ambiguity fixture");
+}

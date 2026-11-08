@@ -16,14 +16,18 @@ import urllib.request
 
 from isolated_daemon import IsolatedDaemon
 
+FILES_OVERFLOW_SPEC = "e2e/files-overflow.spec.ts"
+FILES_OVERFLOW_MARKER = "@files-overflow"
+
 
 class UiDaemon(IsolatedDaemon):
-    def __init__(self, binary, timeout=120):
+    def __init__(self, binary, timeout=120, files_overflow=False):
         super().__init__(binary, timeout=timeout)
         self.ui_child = None
         self.ui_log = None
         self.browser_child = None
         self.wikilink_fixture = False
+        self.files_overflow = files_overflow
 
     def create_repository(self):
         source = Path(__file__).resolve().parents[2] / "testdata" / "js"
@@ -49,6 +53,12 @@ class UiDaemon(IsolatedDaemon):
             directory.mkdir()
             (directory / "entry.js").write_text(
                 f"export function {name}() {{ return '{folder}'; }}\n")
+        if self.files_overflow:
+            directory = self.repo / "ui-folder" / "overflow-folder-with-a-deliberately-long-name-that-wraps-in-the-explorer"
+            directory.mkdir()
+            for index in range(64):
+                (directory / f"file-{index:03}.js").write_text(
+                    f"export function nwFolderOverflow{index:03}() {{ return {index}; }}\n")
         for args in [("init", "--template", str(self.git_empty)), ("add", "."),
                      ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                       "commit", "-m", "fixture")]:
@@ -140,6 +150,8 @@ class UiDaemon(IsolatedDaemon):
             env["NESTWEAVER_UI_WIKILINK_FIXTURE"] = "1"
         command = [str(node), str(frontend / "node_modules/@playwright/test/cli.js"),
                    "test", *specs, "--workers=1", "--retries=0"]
+        if not self.files_overflow:
+            command.extend(["--grep-invert", FILES_OVERFLOW_MARKER])
         if grep:
             command.extend(["--grep", grep])
         self.record(kind="browser_start", request=command, fixture_url=url,
@@ -188,15 +200,22 @@ def main():
                         help="Bounded total browser-suite deadline in seconds (default: 1800)")
     parser.add_argument("--wikilink-fixture", action="store_true",
                         help="Index a tiny private vault for real wikilink browser acceptance")
+    parser.add_argument("--files-overflow-fixture", action="store_true",
+                        help="Run the required focused Files overflow spec with 64 real indexed files")
     parser.add_argument("--grep", help="Run only tests matching this Playwright title regex")
     parser.add_argument("spec", nargs="*", help="Optional specs; default runs the full suite")
     args = parser.parse_args()
     if not 1 <= args.browser_timeout <= 3600:
         parser.error("--browser-timeout must be between 1 and 3600 seconds")
+    if args.files_overflow_fixture:
+        if args.wikilink_fixture or args.spec not in ([], [FILES_OVERFLOW_SPEC]) or args.grep not in (None, FILES_OVERFLOW_MARKER):
+            parser.error("--files-overflow-fixture requires only e2e/files-overflow.spec.ts and --grep @files-overflow")
+        args.spec = [FILES_OVERFLOW_SPEC]
+        args.grep = FILES_OVERFLOW_MARKER
     node = Path(args.node).resolve(strict=True)
     browser = Path(args.browser).resolve(strict=True)
     frontend = Path(__file__).resolve().parents[2] / "crates/nestweaver-web/frontend"
-    fixture = UiDaemon(args.binary, args.timeout)
+    fixture = UiDaemon(args.binary, args.timeout, files_overflow=args.files_overflow_fixture)
     print(f"UI evidence: {fixture.root}", flush=True)
     with fixture:
         fixture.bootstrap()

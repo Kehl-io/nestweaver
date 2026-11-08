@@ -337,6 +337,40 @@ class RuntimeContracts(unittest.TestCase):
             self.assertNotIn(forbidden, browser)
         self.assertIn('tests/support/release_ui.py', browser)
         self.assertIn('--binary ../../../target/debug/nestweaver', browser)
+        runtime = step(browser, 'Run E2E tests')
+        self.assertNotIn('continue-on-error', runtime)
+        self.assertNotIn('if:', runtime)
+        script = textwrap.dedent(runtime.split('run: |\n', 1)[1])
+        # Execute only command dispatch with inert shell functions: both
+        # fixtures are mandatory, and either failure must fail the step.
+        for ordinary_status, overflow_status, expected, count in (
+            (0, 0, 0, 2), (41, 0, 41, 1), (0, 42, 42, 2),
+        ):
+            with self.subTest(ordinary=ordinary_status, overflow=overflow_status):
+                with tempfile.TemporaryDirectory() as temporary:
+                    stubs = textwrap.dedent(f'''\
+                        node() {{ printf '/tmp/fixture-chromium'; }}
+                        python3() {{
+                          printf '%s\\n' "$*" >> calls
+                          if [[ "$*" == *--files-overflow-fixture* ]]; then
+                            return {overflow_status}
+                          fi
+                          return {ordinary_status}
+                        }}
+                    ''')
+                    result = subprocess.run(
+                        ['bash', '-e', '-o', 'pipefail', '-c', stubs + script],
+                        cwd=temporary, capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    calls = (Path(temporary) / 'calls').read_text().splitlines()
+                    self.assertEqual(len(calls), count)
+                    self.assertNotIn('--files-overflow-fixture', calls[0])
+                    if count == 2:
+                        self.assertIn('--files-overflow-fixture e2e/files-overflow.spec.ts', calls[1])
+                    for call in calls:
+                        self.assertIn('--binary ../../../target/debug/nestweaver', call)
+                        self.assertIn('--browser /tmp/fixture-chromium', call)
         config = (ROOT / 'crates/nestweaver-web/frontend/playwright.config.ts').read_text()
         self.assertIn('NESTWEAVER_UI_FIXTURE_URL', config)
         self.assertNotIn('webServer:', config)

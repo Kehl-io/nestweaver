@@ -2826,6 +2826,7 @@ pub(crate) fn run_brain(
                     // `total`, `truncated`, `truncated_by` and `_meta` are not
                     // among them, and dropping them here is what made a capped
                     // answer on this route indistinguishable from a complete one.
+                    // Capture response ambiguity before the ranking type drops it.
                     let upstream = UpstreamContextDisclosure::from_wire(&result_json)
                         .with_local_publication(&db_path);
                     let result: nestweaver_engine::BrainContextResult =

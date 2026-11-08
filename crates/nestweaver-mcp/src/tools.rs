@@ -8874,6 +8874,12 @@ fn tool_brain_context(
     }
     if !ambiguous_seeds.is_empty() {
         resp["ambiguous_seeds"] = json!(ambiguous_seeds);
+        let disclosure =
+            nestweaver_schema::responses::ContextAmbiguityDisclosure::from_response(&resp);
+        if let Some(object) = resp.as_object_mut() {
+            object.remove("ambiguous_seeds");
+        }
+        disclosure.stamp_into(&mut resp);
     }
 
     // nw-102: how many of `seeds` are semantic nearest-neighbour guesses rather

@@ -222,8 +222,8 @@ export function FilesTab() {
   }
 
   return (
-    <div aria-busy={loading} className="h-full">
-    {error && errorWorkspace.current === workspaceId && <div role="alert" className="p-2 text-xs text-red-500">{error}</div>}
+    <div aria-busy={loading} className="flex h-full min-h-0 flex-col">
+    {error && errorWorkspace.current === workspaceId && <div role="alert" className="shrink-0 p-2 text-xs text-red-500">{error}</div>}
     <FileTree
       key={workspaceId}
       repoTrees={repoTrees}
@@ -354,7 +354,7 @@ function FileTree({
   return (
     <>
       {directory && (
-        <div aria-label="Selected folder" className="border-b border-[var(--color-border)] p-2 text-xs">
+        <div aria-label="Selected folder" className="shrink-0 border-b border-[var(--color-border)] p-2 text-xs">
           <p className="break-words [overflow-wrap:anywhere]" title={`${directory.repoUid}:${directory.directoryPath}`}>Files in {directory.directoryPath}</p>
           <button type="button" className="mt-1 text-blue-500 hover:underline" onClick={() => {
             setDirectoryId(null);
@@ -365,7 +365,7 @@ function FileTree({
     <div
       role="tree"
       aria-label="Files"
-      className="flex h-full flex-col overflow-y-auto py-1"
+      className="flex min-h-0 flex-1 flex-col overflow-y-auto py-1"
     >
       {rows.map((row) => {
         const isRepo = row.parentId === null && !row.directoryPath;
