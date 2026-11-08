@@ -1,5 +1,15 @@
 # Changelog
 
+## [12.2.6](https://github.com/Kehl-io/nestweaver/compare/v12.2.5...v12.2.6) (2026-11-08)
+
+
+### Bug Fixes
+
+* **brain:** recover partial context and reconcile vault policies ([fca4fd4](https://github.com/Kehl-io/nestweaver/commit/fca4fd46cea79302b547aac68e7169a0754cb13d))
+* **context:** preserve Related refresh and align export usage tests ([0559714](https://github.com/Kehl-io/nestweaver/commit/055971485d9ba24b5896690f671b039bb42dd82b))
+* preserve ambiguity, bridge repair and folder scrolling ([adb724c](https://github.com/Kehl-io/nestweaver/commit/adb724c237ae81f1b9d7a2da63bcab29be4abf82))
+* retain query database identity and historical Compare evidence ([15b27f0](https://github.com/Kehl-io/nestweaver/commit/15b27f01e1829a9da7b2d48277f89159029e90d0))
+
 ## [12.2.5](https://github.com/Kehl-io/nestweaver/compare/v12.2.4...v12.2.5) (2026-11-06)
 
 
