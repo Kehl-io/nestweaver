@@ -19,9 +19,12 @@ backup. A publication predecessor that the new engine has already opened
 writable is not a substitute for this backup. Keep the backup outside the
 publication directories.
 
-The current resolver generation is 21 and parsed-cache version is 15, covering
-PHP static-method ownership and the preceding Dart/PowerShell grammar changes. Force re-index each
-repository once; cache invalidation alone does not replace existing graph facts.
+The current source uses resolver generation 22 and parsed-cache version 16.
+Anonymous JavaScript/TypeScript default callables own their body calls, and
+Svelte/Vue/Astro function spans skip destructured/default parameters. The PHP
+static-method ownership and preceding Dart/PowerShell grammar changes remain
+included. Force re-index each repository once; cache invalidation alone does
+not replace existing graph facts. Published 12.2.5 uses generation 21/cache 15.
 
 ## Canonical ranking scope
 

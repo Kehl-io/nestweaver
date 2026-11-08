@@ -96,7 +96,7 @@ function SummaryIcon({ summary }: { summary: TrustSummary | null }) {
 }
 
 function metadataFacts(metadata: SceneMetadata | null): string[] {
-  if (!metadata) return ["No scene metadata yet"];
+  if (!metadata) return ["Scene metadata unavailable"];
   const facts = [
     metadata.trust.data_scope,
     metadata.trust.federation,
@@ -104,7 +104,7 @@ function metadataFacts(metadata: SceneMetadata | null): string[] {
     metadata.trust.source_confidence,
   ].filter(Boolean);
   if (metadata.truncation.truncated) facts.push("truncated");
-  if (metadata.continuation.has_more) facts.push("continuation available");
+  if (metadata.continuation.has_more && metadata.continuation.cursor) facts.push("continuation available");
   return Array.from(new Set(facts));
 }
 
@@ -146,7 +146,7 @@ export function LensSummaryPanel({
           <p className="mt-1 leading-5 text-[var(--color-text-muted)]">
             {trustSummary?.message ||
               sceneMetadata?.trust.message ||
-              "Scene metadata will appear as results load."}
+              "Scene metadata is unavailable for this result."}
           </p>
         </div>
       </div>

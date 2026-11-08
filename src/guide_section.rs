@@ -14,6 +14,7 @@ pub const END_MARKER: &str = "<!-- nestweaver:end -->";
 pub enum GuideSectionWrite {
     Created,
     Updated,
+    Unchanged,
 }
 
 pub fn write_status(path: &Path, wrote: GuideSectionWrite) -> String {
@@ -21,6 +22,9 @@ pub fn write_status(path: &Path, wrote: GuideSectionWrite) -> String {
         GuideSectionWrite::Created => format!("Guide written to {}", path.display()),
         GuideSectionWrite::Updated => {
             format!("Updated NestWeaver section in {}", path.display())
+        }
+        GuideSectionWrite::Unchanged => {
+            format!("NestWeaver section already current in {}", path.display())
         }
     }
 }
@@ -44,7 +48,7 @@ pub fn write_marked_section(
         atomic_write(path, &text)?;
         return Ok(GuideSectionWrite::Created);
     }
-    let target = nestweaver_engine::user_config::resolve_for_write(path, "the same command")?;
+    let target = nestweaver_engine::user_config::resolve_guide_for_write(path, "the same command")?;
     let existing = std::fs::read_to_string(&target).with_context(|| {
         format!(
             "read {} before updating the NestWeaver section",
@@ -53,6 +57,9 @@ pub fn write_marked_section(
     })?;
     let updated = splice_marked(&existing, generated)
         .with_context(|| format!("{} was left unchanged", path.display()))?;
+    if updated == existing {
+        return Ok(GuideSectionWrite::Unchanged);
+    }
     atomic_write(&target, &updated)?;
     Ok(GuideSectionWrite::Updated)
 }
@@ -241,7 +248,32 @@ mod tests {
         let link = path_in(&dir, "CLAUDE.md");
         let missing = path_in(&dir, "gone.md");
         std::os::unix::fs::symlink(&missing, &link).unwrap();
-        assert!(write_marked_section(&link, "NEW").is_err());
+        let error = write_marked_section(&link, "NEW").unwrap_err().to_string();
+        assert!(error.contains("Markdown guide"), "{error}");
+        assert!(!error.contains("JSON"), "{error}");
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn identical_marked_guide_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir, "AGENTS.md");
+        assert_eq!(
+            write_marked_section(&path, "body").unwrap(),
+            GuideSectionWrite::Created
+        );
+        let before = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            write_marked_section(&path, "body").unwrap(),
+            GuideSectionWrite::Unchanged
+        );
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(before.ino(), after.ino());
+        }
+        assert!(write_status(&path, GuideSectionWrite::Unchanged).contains("already current"));
     }
 }

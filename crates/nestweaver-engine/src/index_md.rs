@@ -23,7 +23,10 @@ use nestweaver_schema::{
 };
 use nestweaver_store::GraphStore;
 mod derivation;
-pub use derivation::{MARKDOWN_LINK_DERIVATION_VERSION, refresh_indexed_markdown_derivation};
+pub use derivation::{
+    MARKDOWN_LINK_DERIVATION_VERSION, refresh_indexed_markdown_derivation,
+    refresh_registered_markdown_policy,
+};
 // walkdir replaced by ContentReader::list_files() — only sidecar/taxonomy paths
 // still use direct fs access.
 
@@ -5027,7 +5030,18 @@ where
         let (existing, integrity) = store
             .list_notes_with_integrity(Some(&v_uid))
             .context("count indexed notes before the stale-drop")?;
-        if !existing.is_empty() {
+        // An explicit policy exclusion is observed inventory evidence, unlike
+        // an empty mount or failed walk. Permit an empty replacement only
+        // when this scan positively accounted for every incumbent as ignored.
+        let all_observed_ignored = !existing.is_empty()
+            && existing.iter().all(|note| {
+                skipped.iter().any(|skip| {
+                    skip.path == note.file_path
+                        && skip.reason_code == SkipReasonCode::Ignored
+                        && skip.reason == BRAINIGNORE_SKIP_REASON
+                })
+            });
+        if !existing.is_empty() && !all_observed_ignored {
             anyhow::bail!(
                 "refusing to reindex vault '{vault_name}' at {root_str}: the scan found no \
                  note files, but {} note(s) are indexed. Committing this would delete every \
@@ -11563,21 +11577,36 @@ fn vault_inventory_with_notes(
     let rows: Vec<_> = vaults
         .into_iter()
         .map(|v| {
-            let (notes, last, error) = match list_notes(&v.uid) {
-                Ok(notes) => (
-                    Some(notes.len()),
-                    crate::get_last_indexed_at(db_path, &v.uid)
-                        .or_else(|| notes.iter().filter_map(|n| n.modified_at.clone()).max()),
-                    None,
-                ),
-                Err(_) => (
-                    None,
-                    crate::get_last_indexed_at(db_path, &v.uid),
-                    Some("note inventory unavailable; repair the store and retry"),
-                ),
+            let recorded = crate::get_last_indexed_at(db_path, &v.uid);
+            let (notes, last, source, error) = match list_notes(&v.uid) {
+                Ok(notes) => {
+                    let fallback = notes.iter().filter_map(|n| n.modified_at.clone()).max();
+                    let source = if recorded.is_some() {
+                        "extension_store"
+                    } else if fallback.is_some() {
+                        "file_mtime"
+                    } else {
+                        "none"
+                    };
+                    (Some(notes.len()), recorded.or(fallback), source, None)
+                }
+                Err(_) => {
+                    let source = if recorded.is_some() {
+                        "extension_store"
+                    } else {
+                        "unavailable"
+                    };
+                    (
+                        None,
+                        recorded,
+                        source,
+                        Some("note inventory unavailable; repair the store and retry"),
+                    )
+                }
             };
             serde_json::json!({"uid":v.uid,"name":v.name,"root_path":v.root_path,
-            "instance_id":v.instance_id,"notes":notes,"last_indexed":last,"inventory_error":error})
+            "instance_id":v.instance_id,"notes":notes,"last_indexed":last,
+            "last_indexed_source":source,"inventory_error":error})
         })
         .collect();
     Ok(serde_json::json!(rows))
@@ -11586,6 +11615,55 @@ fn vault_inventory_with_notes(
 #[cfg(test)]
 mod hardening_inventory_tests {
     use super::*;
+
+    #[test]
+    fn inventory_timestamp_source_distinguishes_recorded_fallback_and_unavailable() {
+        let store = GraphStore::in_memory().unwrap();
+        let vault = Vault {
+            uid: "vlt:times".into(),
+            name: "times".into(),
+            root_path: "/fixture".into(),
+            instance_id: "fixture".into(),
+        };
+        store.insert_vault(&vault).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.lbug");
+        let note = nestweaver_schema::Note {
+            uid: "note:times".into(),
+            vault_uid: vault.uid.clone(),
+            file_path: "n.md".into(),
+            title: "N".into(),
+            note_kind: nestweaver_schema::NoteKind::General,
+            word_count: 1,
+            content_hash: "h".into(),
+            frontmatter: None,
+            frontmatter_raw: None,
+            created_at: None,
+            modified_at: Some("2000-01-01T00:00:00Z".into()),
+            pagerank_score: None,
+            embedding: None,
+        };
+        let fallback = vault_inventory_with_notes(&store, &db, |_| Ok(vec![note.clone()])).unwrap();
+        assert_eq!(fallback[0]["last_indexed_source"], "file_mtime");
+        assert_eq!(fallback[0]["last_indexed"], "2000-01-01T00:00:00Z");
+        let empty = vault_inventory_with_notes(&store, &db, |_| Ok(vec![])).unwrap();
+        assert_eq!(empty[0]["last_indexed_source"], "none");
+        let failed = || Err(nestweaver_store::StoreError::Query("injected".into()));
+        let unavailable = vault_inventory_with_notes(&store, &db, |_| failed()).unwrap();
+        assert_eq!(unavailable[0]["last_indexed_source"], "unavailable");
+        assert!(unavailable[0]["notes"].is_null());
+        crate::record_last_indexed_at(&db, &vault.uid).unwrap();
+        let recorded = vault_inventory_with_notes(&store, &db, |_| Ok(vec![note.clone()])).unwrap();
+        assert_eq!(recorded[0]["last_indexed_source"], "extension_store");
+        assert_ne!(recorded[0]["last_indexed"], fallback[0]["last_indexed"]);
+        let failed_recorded = vault_inventory_with_notes(&store, &db, |_| failed()).unwrap();
+        assert_eq!(failed_recorded[0]["last_indexed_source"], "extension_store");
+        assert_eq!(
+            failed_recorded[0]["last_indexed"],
+            recorded[0]["last_indexed"]
+        );
+        assert!(failed_recorded[0]["notes"].is_null());
+    }
     #[test]
     fn partial_inventory_keeps_failed_counts_null_and_real_empty_counts_zero() {
         let store = GraphStore::in_memory().unwrap();

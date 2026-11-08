@@ -77,6 +77,7 @@ export function useImpactMode() {
       return (
         requestId === requestIdRef.current &&
         state.graphMode === "impact" &&
+        state.activeLens.lens === "impact" &&
         (state.inspectedSceneTarget?.mode === "impact" && state.inspectedSceneTarget.workspaceId === requestWorkspaceId
           ? state.inspectedSceneTarget.uid : state.selectedNodeId) === targetNodeId &&
         state.activeWorkspaceId === requestWorkspaceId &&

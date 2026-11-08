@@ -12327,6 +12327,101 @@ mod tests {
     }
 
     #[test]
+    fn server_incremental_replans_source_and_spec_after_observed_publication_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let spec = |operation: &str| {
+            format!(
+                "openapi: 3.0.0\ninfo: {{ title: t, version: \"1\" }}\npaths:\n  /test:\n    get:\n      operationId: {operation}\n      responses: {{ \"200\": {{ description: ok }} }}\n"
+            )
+        };
+        fs::write(repo.join("main.js"), "function initial() {}\n").unwrap();
+        fs::write(repo.join("openapi.yaml"), spec("initialOperation")).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let first_sha = git(&["rev-parse", "HEAD"]);
+        let url = "https://example.test/incremental-publication-wait";
+        let (_, store) = index_directory_in_memory(&repo, "test", url, &first_sha).unwrap();
+        fs::write(repo.join("main.js"), "function before_wait() {}\n").unwrap();
+        fs::write(repo.join("openapi.yaml"), spec("beforeWaitOperation")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "prepared changes"]);
+        let second_sha = git(&["rev-parse", "HEAD"]);
+        let reader = crate::content_reader::FilesystemReader::new(&repo);
+        let gate = crate::WriteGate::new();
+        let held = store.acquire_index_publication_lease().unwrap();
+        let (observed_wait, result) = std::thread::scope(|scope| {
+            let request = scope.spawn(|| {
+                incremental_index_with_reader_and_write_gate(
+                    &reader,
+                    &repo,
+                    &store,
+                    "test",
+                    url,
+                    &second_sha,
+                    || Ok(gate.blocking_lock("nw870_incremental")),
+                )
+            });
+            let observed =
+                store.wait_for_index_publication_waiters(1, std::time::Duration::from_secs(10));
+            if observed {
+                // The request has already prepared its first source/spec
+                // plan and yielded publication; these are later accepted
+                // working-tree bytes, without changing either path.
+                fs::write(repo.join("main.js"), "function after_wait() {}\n").unwrap();
+                fs::write(repo.join("openapi.yaml"), spec("afterWaitOperation")).unwrap();
+            }
+            drop(held);
+            (observed, request.join().unwrap())
+        });
+        assert!(
+            observed_wait,
+            "the request must demonstrably wait before the edit"
+        );
+        let result = result.unwrap();
+        assert!(
+            !result.fell_back_to_full,
+            "this must exercise incremental replan"
+        );
+        assert_eq!(store.lookup_symbols_by_name("after_wait").unwrap().len(), 1);
+        assert!(
+            store
+                .lookup_symbols_by_name("before_wait")
+                .unwrap()
+                .is_empty()
+        );
+        let uid = nestweaver_schema::repo_uid("test", url);
+        let operations = |graph: &GraphStore| {
+            let mut operations: Vec<_> = graph
+                .list_contracts(Some(&uid))
+                .unwrap()
+                .into_iter()
+                .filter_map(|contract| contract.operation_id)
+                .collect();
+            operations.sort();
+            operations
+        };
+        assert_eq!(operations(&store), vec!["afterWaitOperation"]);
+        let (_, oracle) = index_directory_in_memory(&repo, "test", url, &second_sha).unwrap();
+        assert_eq!(operations(&store), operations(&oracle));
+        let names = |graph: &GraphStore| {
+            let mut names: Vec<_> = graph
+                .list_all_symbols()
+                .unwrap()
+                .into_iter()
+                .map(|symbol| (symbol.name, symbol.content_hash))
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&store),
+            names(&oracle),
+            "incremental must equal later-byte full-index oracle"
+        );
+    }
+
+    #[test]
     fn server_incremental_retracts_tracked_gitignored_incumbent_at_same_sha() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");

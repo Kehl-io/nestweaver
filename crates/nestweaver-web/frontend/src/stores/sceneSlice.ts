@@ -118,6 +118,11 @@ export const createSceneSlice: StateCreator<
       const keepRelationship = lensKeepsRelationshipResult(nextLens);
       const keepBacklinks = lensKeepsBacklinkResult(nextLens);
 
+      // Impact metadata describes that run, not the graph retained by another lens.
+      if (s.activeLens.lens === "impact" && nextLens.lens !== "impact") {
+        s.sceneMetadata = null;
+        s.trustSummary = null;
+      }
       s.activeLens = nextLens;
       if (nextLens.lens !== "trace") {
         s.flowTraceRoot = null;

@@ -301,6 +301,19 @@ fn link_target(path: &Path) -> String {
 ///
 /// `remedy` is the backtick-quoted command the caller wants re-run afterwards.
 pub fn resolve_for_write(path: &Path, remedy: &str) -> Result<PathBuf, anyhow::Error> {
+    resolve_for_write_inner(path, remedy, false)
+}
+
+/// Resolve Markdown guide targets with a Markdown-specific recovery instruction.
+pub fn resolve_guide_for_write(path: &Path, remedy: &str) -> Result<PathBuf, anyhow::Error> {
+    resolve_for_write_inner(path, remedy, true)
+}
+
+fn resolve_for_write_inner(
+    path: &Path,
+    remedy: &str,
+    guide: bool,
+) -> Result<PathBuf, anyhow::Error> {
     if !probe(path)?.is_symlink {
         return Ok(path.to_path_buf());
     }
@@ -308,6 +321,14 @@ pub fn resolve_for_write(path: &Path, remedy: &str) -> Result<PathBuf, anyhow::E
         Ok(resolved) => Ok(resolved),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let target = link_target(path);
+            if guide {
+                anyhow::bail!(
+                    "{} is a symbolic link to {target}, which is not there. NestWeaver changed nothing. \
+                     Repoint the link to a real Markdown guide with a NestWeaver marked section, \
+                     or remove the dangling link before running {remedy} again.",
+                    path.display()
+                );
+            }
             // Deliberately NOT phrased "path ... does not exist": the CLI's
             // error classifier rewrites any message containing both into
             // `repo_not_found`, retitling this as "Repository path does not

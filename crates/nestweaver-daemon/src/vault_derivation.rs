@@ -1,8 +1,7 @@
 //! Daemon-owned Markdown link derivation records and admission.
 use super::{
-    ConnectionGuard, DaemonState, IndexedSearchMutationScope, MutationWorkerOwnership,
-    establish_search_reconciliation_debt, finish_search_reconciliation, indexed_search_mutation,
-    indexed_search_rows_before,
+    ConnectionGuard, DaemonState, IndexedSearchMutationScope, establish_search_reconciliation_debt,
+    finish_search_reconciliation, indexed_search_mutation, indexed_search_rows_before,
 };
 use nestweaver_engine::index_limits::NoteLimits;
 use nestweaver_engine::index_md::MarkdownRefreshResult;
@@ -102,6 +101,14 @@ fn coverage_for_vault(
         .and_then(|records| records.vaults.get(&vault.uid))
         .map(|record| record.coverage.scope.clone())
         .unwrap_or(default_scope);
+    let recorded_extra = records
+        .and_then(|records| records.vaults.get(&vault.uid))
+        .map(|record| record.coverage.extra_ignore_patterns.as_slice());
+    let extra = if extra.is_empty() {
+        recorded_extra.unwrap_or(extra)
+    } else {
+        extra
+    };
     coverage_identity(
         Path::new(&source.canonical_root),
         extra,
@@ -259,6 +266,7 @@ fn stamp_from_refresh(
     max_note_bytes: u64,
     scope: CoverageScope,
     result: &MarkdownRefreshResult,
+    expected_coverage: Option<&CoverageIdentity>,
 ) -> anyhow::Result<()> {
     if result
         .index
@@ -281,6 +289,12 @@ fn stamp_from_refresh(
         max_note_bytes,
         scope,
     )?;
+    if let Some(expected) = expected_coverage {
+        anyhow::ensure!(
+            &coverage == expected,
+            "vault ignore policy changed before derivation stamping"
+        );
+    }
     let notes = state.store.list_notes(Some(&vault.uid))?;
     heal_ambient_default(state, &identity)?;
     let mut records = load_or_empty(state, &identity)?;
@@ -349,6 +363,7 @@ pub(super) fn stamp_index_success(
         max_note_bytes,
         CoverageScope::FullRegisteredPolicy,
         result,
+        None,
     )?;
     Ok(IndexStamp::Current)
 }
@@ -496,9 +511,15 @@ fn migrate_vault(
     );
     finish_search_reconciliation(state, mutation, "vault_derivation", admission)?;
     progress.phase("stamping");
-    if let Err(error) =
-        stamp_from_refresh(state, vault, extra, max_note_bytes, coverage.scope, &result)
-    {
+    if let Err(error) = stamp_from_refresh(
+        state,
+        vault,
+        &coverage.extra_ignore_patterns,
+        max_note_bytes,
+        coverage.scope.clone(),
+        &result,
+        Some(&coverage),
+    ) {
         // Left Pending, the record would be admitted as retryable again at
         // once and the background loop would rerun a full refresh every few
         // seconds. Blocked retries on the backoff schedule instead.
@@ -513,6 +534,142 @@ fn migrate_vault(
         return Err(error);
     }
     Ok(())
+}
+
+/// A full-policy record is also the durable retry mode: after a failed policy
+/// reconciliation its new digest already matches disk, but the inventory debt
+/// must not fall back to the legacy, indexed-path-only migration.
+fn policy_reconciliation_needed(
+    record: Option<&VaultDerivationRecord>,
+    coverage: &CoverageIdentity,
+) -> bool {
+    record.is_some_and(|record| {
+        record.coverage.policy_digest != coverage.policy_digest
+            || (record.coverage.scope == CoverageScope::FullRegisteredPolicy
+                && record.phase != DerivationPhase::Current)
+    })
+}
+
+fn reconcile_policy_named(state: &DaemonState, vault_uid: &str) -> anyhow::Result<()> {
+    let (vault, coverage, admission, indexed_before) = {
+        let _gate = state.write_gate.blocking_lock("vault_policy_prepare");
+        anyhow::ensure!(!cancelled(state), "vault policy reconciliation cancelled");
+        let vault = state.store.lookup_vault(vault_uid)?;
+        let identity = state
+            .store
+            .publication_identity()?
+            .ok_or_else(|| anyhow::anyhow!("graph publication identity is absent"))?;
+        let source = filesystem_source(Path::new(&vault.root_path))?;
+        anyhow::ensure!(
+            nestweaver_schema::vault_uid(&vault.instance_id, &source.canonical_root) == vault.uid,
+            "vault source identity does not match its UID"
+        );
+        let mut records = load_or_empty(state, &identity)?;
+        let mut coverage = coverage_for_vault(
+            &vault,
+            &source,
+            &extra_ignore(state),
+            note_limits(state).max_note_bytes(),
+            Some(&records),
+            CoverageScope::FullRegisteredPolicy,
+        )?;
+        if markdown_derivation::admit_vault(
+            Some(&records),
+            &expectation(&identity, &record_instance(state)),
+            &vault,
+            &source,
+            &coverage,
+            false,
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        coverage.scope = CoverageScope::FullRegisteredPolicy;
+        let mut record = records.vaults.remove(vault_uid).unwrap_or_else(|| {
+            VaultDerivationRecord::pending(&vault, source.clone(), coverage.clone())
+        });
+        record.source = source;
+        record.coverage = coverage.clone();
+        record.derivation_version = markdown_derivation::DERIVATION_VERSION;
+        record.phase = DerivationPhase::Pending;
+        record.witness = None;
+        record.pending_generation = None;
+        record.completed_generation = None;
+        records.vaults.insert(vault.uid.clone(), record);
+        persist(state, &identity, &records)?;
+        let admission = establish_search_reconciliation_debt(state, "vault_policy")?;
+        (
+            vault,
+            coverage,
+            admission,
+            indexed_search_rows_before(state),
+        )
+    };
+    let progress = InProgressGuard::begin(state, &vault);
+    progress.phase("reconciling ignore policy");
+    let reader = nestweaver_engine::index_md::filesystem_vault_reader(
+        Path::new(&vault.root_path),
+        note_limits(state),
+    )
+    .strict_enumeration();
+    let result = nestweaver_engine::index_md::refresh_registered_markdown_policy(
+        &reader,
+        &state.store,
+        &vault,
+        &coverage.extra_ignore_patterns,
+        || {
+            let gate = state.write_gate.blocking_lock("vault_policy_write");
+            anyhow::ensure!(!cancelled(state), "vault policy reconciliation cancelled");
+            // A remove admitted during the off-gate scan must stay removed.
+            state.store.lookup_vault(&vault.uid)?;
+            Ok(gate)
+        },
+    );
+    let _gate = state.write_gate.blocking_lock("vault_policy_postflight");
+    let finish = (|| {
+        let result = result?;
+        anyhow::ensure!(
+            coverage
+                == coverage_identity(
+                    Path::new(&vault.root_path),
+                    &coverage.extra_ignore_patterns,
+                    note_limits(state).max_note_bytes(),
+                    CoverageScope::FullRegisteredPolicy,
+                )?,
+            "vault ignore policy changed before derivation stamping"
+        );
+        let mutation = indexed_search_mutation(
+            indexed_before,
+            &state.store,
+            IndexedSearchMutationScope::MayIncludeVaultFiles,
+        );
+        finish_search_reconciliation(state, mutation, "vault_policy", admission)?;
+        stamp_from_refresh(
+            state,
+            &vault,
+            &coverage.extra_ignore_patterns,
+            note_limits(state).max_note_bytes(),
+            CoverageScope::FullRegisteredPolicy,
+            &result,
+            Some(&coverage),
+        )
+    })();
+    if finish.is_err() {
+        let identity = state
+            .store
+            .publication_identity()?
+            .ok_or_else(|| anyhow::anyhow!("graph publication identity is absent"))?;
+        let mut records = load_or_empty(state, &identity)?;
+        if let Some(record) = records.vaults.get_mut(&vault.uid) {
+            block_record(
+                record,
+                markdown_derivation::BlockedReason::SourceUnavailable,
+            );
+        }
+        persist(state, &identity, &records)?;
+    }
+    finish
 }
 
 pub(super) fn ensure_current(
@@ -541,6 +698,13 @@ pub(super) fn ensure_current(
         records.as_ref(),
         CoverageScope::FullRegisteredPolicy,
     )?;
+    anyhow::ensure!(
+        !records
+            .as_ref()
+            .and_then(|records| records.vaults.get(&vault.uid))
+            .is_some_and(|record| record.coverage.policy_digest != coverage.policy_digest),
+        "vault ignore policy requires automatic full inventory reconciliation; retry after it completes"
+    );
     match markdown_derivation::admit_vault(
         records.as_ref(),
         &expectation(&identity, &instance),
@@ -757,14 +921,10 @@ pub(super) async fn run(state: Arc<DaemonState>) {
             Ok(guard) => guard,
             Err(_) => break,
         };
-        let lease = state.write_gate.lock("vault_derivation").await;
         let work = Arc::clone(&state);
         let result = tokio::task::spawn_blocking(move || {
-            let _ownership = MutationWorkerOwnership {
-                _write_lease: lease,
-                _connection_guard: guard,
-            };
-            migrate_named(&work, &vault_uid)
+            let _connection_guard = guard;
+            migrate_background(&work, &vault_uid)
         })
         .await;
         delay = match result {
@@ -828,6 +988,45 @@ pub(super) fn inspect_next(state: &DaemonState) -> anyhow::Result<Option<String>
         }
     }
     Ok(None)
+}
+
+pub(super) fn migrate_background(state: &DaemonState, vault_uid: &str) -> anyhow::Result<()> {
+    let gate = state.write_gate.blocking_lock("vault_derivation");
+    let vault = state.store.lookup_vault(vault_uid)?;
+    let identity = state
+        .store
+        .publication_identity()?
+        .ok_or_else(|| anyhow::anyhow!("graph publication identity is absent"))?;
+    let source = filesystem_source(Path::new(&vault.root_path))?;
+    heal_ambient_default(state, &identity)?;
+    let records = load_or_empty(state, &identity)?;
+    let coverage = coverage_for_vault(
+        &vault,
+        &source,
+        &extra_ignore(state),
+        note_limits(state).max_note_bytes(),
+        Some(&records),
+        CoverageScope::LegacyIndexedInventory,
+    )?;
+    if policy_reconciliation_needed(records.vaults.get(&vault.uid), &coverage) {
+        match markdown_derivation::admit_vault(
+            Some(&records),
+            &expectation(&identity, &record_instance(state)),
+            &vault,
+            &source,
+            &coverage,
+            false,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.retryable || blocked_retry_due(Some(&records), &vault.uid) => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Full refresh may yield to a watcher that owns publication. Never
+        // wait for that publication while retaining the daemon write gate.
+        drop(gate);
+        return reconcile_policy_named(state, vault_uid);
+    }
+    migrate_named(state, vault_uid)
 }
 
 pub(super) fn migrate_named(state: &DaemonState, vault_uid: &str) -> anyhow::Result<()> {

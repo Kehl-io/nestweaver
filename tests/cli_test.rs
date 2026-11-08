@@ -10329,8 +10329,8 @@ fn an_unsupported_format_scope_pair_is_named_not_relayed() {
         );
         assert_eq!(
             output.status.code(),
-            Some(1),
-            "semantic refusal of a correctly-spelled combination, per d565547f \
+            Some(64),
+            "argv-only incompatible combination is a usage error, per nw-360 \
              ({format}): {combined}"
         );
     }

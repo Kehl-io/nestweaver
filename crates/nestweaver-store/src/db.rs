@@ -6241,6 +6241,312 @@ impl GraphStore {
 mod tests {
     use super::*;
 
+    /// Manual nw-043 qualification using one process and the production
+    /// GraphStore open/read path. The two databases deliberately share the
+    /// schema while carrying disjoint repository identities.
+    #[test]
+    #[ignore = "manual 2000 alternating durable GraphStore opens"]
+    fn alternating_graphstore_opens_preserve_repository_identity_soak() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [dir.path().join("left.lbug"), dir.path().join("right.lbug")];
+        let identities = ["left", "right"];
+        for (path, name) in paths.iter().zip(identities) {
+            let store = GraphStore::open_or_create(path).unwrap();
+            store
+                .insert_repo(&nestweaver_schema::Repo {
+                    uid: nestweaver_schema::repo_uid("nw043", &format!("file:///{name}")),
+                    url: format!("file:///{name}"),
+                    indexed_sha: format!("sha-{name}"),
+                    staleness_commits_behind: 0,
+                    instance_id: "nw043".into(),
+                    name: Some(name.into()),
+                    root_path: Some(dir.path().join(name).display().to_string()),
+                })
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        for iteration in 0..2000 {
+            let index = iteration % 2;
+            let store = GraphStore::open(&paths[index]).unwrap();
+            let repos = store.list_repos(None).unwrap();
+            assert_eq!(repos.len(), 1, "iteration {iteration}: {repos:?}");
+            assert_eq!(
+                repos[0].name.as_deref(),
+                Some(identities[index]),
+                "cross-open identity contamination at iteration {iteration}: {repos:?}"
+            );
+            assert_eq!(repos[0].url, format!("file:///{}", identities[index]));
+            assert_eq!(repos[0].indexed_sha, format!("sha-{}", identities[index]));
+        }
+        eprintln!(
+            "nw043: 2000 alternating opens, zero wrong identities, {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    /// Companion pressure mode for nw-043's 2000-open serial qualification.
+    /// Two workers alternate private same-schema DB pairs in one process;
+    /// counts are 200 parallel opens total, not 2000 iterations of the old
+    /// hybrid server campaign and not a claim of universal native isolation.
+    #[test]
+    #[ignore = "manual two-worker 200 alternating durable GraphStore opens"]
+    fn parallel_alternating_graphstore_opens_preserve_repository_identity_soak() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixtures = Vec::new();
+        for worker in 0..2 {
+            let mut pair = Vec::new();
+            for side in ["left", "right"] {
+                let name = format!("worker-{worker}-{side}");
+                let path = dir.path().join(format!("{name}.lbug"));
+                let url = format!("file:///{name}");
+                let uid = nestweaver_schema::repo_uid("nw043-parallel", &url);
+                let sha = format!("sha-{name}");
+                let store = GraphStore::open_or_create(&path).unwrap();
+                store
+                    .insert_repo(&nestweaver_schema::Repo {
+                        uid: uid.clone(),
+                        url: url.clone(),
+                        indexed_sha: sha.clone(),
+                        staleness_commits_behind: 0,
+                        instance_id: "nw043-parallel".into(),
+                        name: Some(name.clone()),
+                        root_path: Some(dir.path().join(&name).display().to_string()),
+                    })
+                    .unwrap();
+                pair.push((path, uid, name, url, sha));
+            }
+            fixtures.push(pair);
+        }
+        let ready = std::sync::Barrier::new(2);
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for pair in &fixtures {
+                let ready = &ready;
+                let active = &active;
+                let peak = &peak;
+                scope.spawn(move || {
+                    ready.wait();
+                    for iteration in 0..100 {
+                        let (path, uid, name, url, sha) = &pair[iteration % 2];
+                        let concurrent =
+                            active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        peak.fetch_max(concurrent, std::sync::atomic::Ordering::SeqCst);
+                        let store = GraphStore::open(path).unwrap();
+                        let repos = store.list_repos(None).unwrap();
+                        assert_eq!(repos.len(), 1, "{name} iteration {iteration}: {repos:?}");
+                        assert_eq!(&repos[0].uid, uid, "{name} iteration {iteration}");
+                        assert_eq!(repos[0].name.as_deref(), Some(name.as_str()));
+                        assert_eq!(&repos[0].url, url);
+                        assert_eq!(&repos[0].indexed_sha, sha);
+                        drop(store);
+                        active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the pressure mode must actually overlap open/read requests"
+        );
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        eprintln!(
+            "nw043: 2 workers x 100 alternating opens = 200 parallel opens, peak concurrent requests 2, zero wrong identities, {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    /// nw-718: mutate a real lazy hash-slot chain, leaving every load-time
+    /// header/PIP intact. This is deliberately opt-in and touches scratch only.
+    #[test]
+    #[ignore = "manual targeted lazy primary-key corruption qualification"]
+    fn lazy_primary_key_overflow_corruption_is_reported_after_a_healthy_open() {
+        use std::io::{Seek, SeekFrom, Write};
+        let scratch = tempfile::tempdir().unwrap();
+        let root = std::env::var_os("NESTWEAVER_718_FIXTURE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| scratch.path().to_path_buf());
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("lazy-pk.lbug");
+        assert!(!path.exists(), "fixture requires a fresh scratch database");
+        let store = GraphStore::open_or_create(&path).unwrap();
+        store.ensure_data_instance_id("nw718").unwrap();
+        let repo_uid = nestweaver_schema::repo_uid("nw718", "file:///nw718");
+        store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: repo_uid.clone(),
+                url: "file:///nw718".into(),
+                indexed_sha: "fixture".into(),
+                staleness_commits_behind: 0,
+                instance_id: "nw718".into(),
+                name: Some("nw718".into()),
+                root_path: Some(root.display().to_string()),
+            })
+            .unwrap();
+        let symbols: Vec<_> = (0..10000)
+            .map(|index| {
+                // Twelve bytes fit inline in native string_t and can be identified
+                // without interpreting unrelated string overflow/column pages.
+                let mut symbol =
+                    super::wal_recovery_arm_tests::bulk_copy_symbol(&format!("sym:{index:08}"));
+                symbol.repo_uid = repo_uid.clone();
+                symbol
+            })
+            .collect();
+        store.batch_insert_symbols(&symbols).unwrap();
+        store
+            .insert_file(&nestweaver_schema::File {
+                uid: "file:nw718:src/a.ts".into(),
+                path: "src/a.ts".into(),
+                repo_uid: repo_uid.clone(),
+                content_hash: "fixture".into(),
+            })
+            .unwrap();
+        let repo = store.list_repos(None).unwrap().remove(0);
+        assert!(
+            !store.repo_index_incomplete(&repo).unwrap(),
+            "the CLI control must pass repository-completeness admission"
+        );
+        store.checkpoint().unwrap();
+        let entries: Vec<_> = store.conn().unwrap().query(
+            "CALL storage_info('Symbol') RETURN table_type, data_type, start_page_idx, num_pages"
+        ).unwrap().collect();
+        let mut groups: Vec<(Vec<u64>, Vec<u64>)> = Vec::new();
+        let mut group = (Vec::new(), Vec::new());
+        for entry in entries {
+            let (
+                lbug::Value::String(table),
+                lbug::Value::String(component),
+                lbug::Value::Int64(start),
+                lbug::Value::Int64(count),
+            ) = (&entry[0], &entry[1], &entry[2], &entry[3])
+            else {
+                continue;
+            };
+            if table != "INDEX" {
+                continue;
+            }
+            if component.ends_with(":primary_slots") {
+                if !group.1.is_empty() {
+                    groups.push(std::mem::take(&mut group));
+                }
+                group.0.extend((*start as u64)..((*start + *count) as u64));
+            } else if component.ends_with(":overflow_slots") {
+                group.1.extend((*start as u64)..((*start + *count) as u64));
+            }
+        }
+        if !group.1.is_empty() {
+            groups.push(group);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let u64_at =
+            |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let inline_key = |slot: usize| -> Option<String> {
+            let valid = u32::from_le_bytes(bytes[slot + 20..slot + 24].try_into().unwrap());
+            (0..9)
+                .filter(|entry| valid & (1 << entry) != 0)
+                .find_map(|entry| {
+                    let offset = slot + 32 + entry * 24;
+                    let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                    if len != 12 {
+                        return None;
+                    }
+                    let key = std::str::from_utf8(&bytes[offset + 4..offset + 16]).ok()?;
+                    key.starts_with("sym:").then(|| key.to_string())
+                })
+        };
+        let mut selected = None;
+        'groups: for (primary, overflow) in groups {
+            for page in primary {
+                for slot in 0..16 {
+                    let offset = page as usize * 4096 + slot * 256;
+                    if offset + 256 > bytes.len() {
+                        continue;
+                    }
+                    let next = u64_at(offset + 24);
+                    if next == u64::MAX || next as usize / 16 >= overflow.len() {
+                        continue;
+                    }
+                    let chained =
+                        overflow[next as usize / 16] as usize * 4096 + next as usize % 16 * 256;
+                    if chained + 256 > bytes.len() {
+                        continue;
+                    }
+                    if let (Some(caller), Some(target)) = (inline_key(offset), inline_key(chained))
+                    {
+                        selected = Some((offset + 24, next, caller, target));
+                        break 'groups;
+                    }
+                }
+            }
+        }
+        let (offset, old_next, caller, target) =
+            selected.expect("fixture must locate an actual chained Symbol primary-key slot");
+        assert_ne!(caller, target);
+        assert_eq!(store.lookup_symbol(&target).unwrap().uid, target);
+        store
+            .insert_edge(&nestweaver_schema::ResolvedEdge {
+                source_uid: caller.clone(),
+                target_uid: target.clone(),
+                edge_type: nestweaver_schema::EdgeType::Calls,
+                confidence: 1.0,
+                link_type: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.impact(&target, 1, 0.0).unwrap().len(),
+            1,
+            "healthy control must contain a genuine caller, not a valid empty result"
+        );
+        store.checkpoint().unwrap();
+        drop(store);
+        std::fs::copy(&path, root.join("pristine.lbug")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(before[offset..offset + 8].try_into().unwrap()),
+            old_next,
+            "checkpoint must not move the selected slot before mutation"
+        );
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(&(u64::MAX - 1).to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let graph = GraphStore::open(&path)
+            .expect("slot payload corruption must leave load-time metadata and open healthy");
+        assert_eq!(
+            graph.list_repos(None).unwrap().len(),
+            1,
+            "unrelated metadata reads remain healthy before the lazy lookup"
+        );
+        let error = graph
+            .lookup_symbol(&target)
+            .expect_err("an existing overflow-resident UID must not silently disappear");
+        let message = error.to_string();
+        assert!(
+            message.contains("DiskArray") && message.contains("corrupt"),
+            "{message}"
+        );
+        assert!(!matches!(error, crate::StoreError::NotFound));
+        drop(graph);
+        let receipt = serde_json::json!({
+            "database": path, "target_uid": target, "caller_uid": caller,
+            "mutated_offset": offset, "changed_bytes": 8,
+            "old_overflow_slot": old_next, "new_overflow_slot": u64::MAX - 1,
+            "healthy_impact_callers": 1, "open_after_mutation": "healthy",
+            "metadata_after_mutation": "healthy", "lazy_lookup_error": message,
+        });
+        std::fs::write(
+            root.join("receipt.json"),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+        eprintln!("nw718 targeted lazy-PK fixture: {}", root.display());
+    }
+
     #[test]
     fn native_guard_preserves_multistatement_queries_and_releases_before_rows() {
         let store = GraphStore::in_memory().unwrap();
@@ -10299,7 +10605,7 @@ mod wal_recovery_arm_tests {
         assert!(fresh.reopen_required());
     }
 
-    fn bulk_copy_symbol(uid: &str) -> nestweaver_schema::Symbol {
+    pub(super) fn bulk_copy_symbol(uid: &str) -> nestweaver_schema::Symbol {
         nestweaver_schema::Symbol {
             uid: uid.to_string(),
             name: uid.to_string(),

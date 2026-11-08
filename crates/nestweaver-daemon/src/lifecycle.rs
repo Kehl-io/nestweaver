@@ -4,6 +4,56 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Name launchd's ambiguous errno without claiming it proves an already-loaded agent.
+/// Kept platform independent so the classifier is covered by ordinary Linux tests.
+pub fn launchd_bootstrap_failure(stderr: &str, service: &str) -> String {
+    let errno_five = stderr.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        line.starts_with("5:") || line.starts_with("bootstrap failed: 5:")
+    });
+    if errno_five {
+        format!(
+            "launchctl bootstrap/load failed (errno 5): {stderr}. Inspect `launchctl print {service}`. \
+                 An already-loaded or releasing label is one possible cause; check its state before stopping this instance and retrying."
+        )
+    } else {
+        format!("launchctl bootstrap failed: {stderr}")
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_diagnostic_tests {
+    use super::launchd_bootstrap_failure;
+
+    #[test]
+    fn errno_five_is_named_without_claiming_one_cause() {
+        for stderr in [
+            "Bootstrap failed: 5: Input/output error",
+            "5: localized diagnostic",
+        ] {
+            let message = launchd_bootstrap_failure(stderr, "gui/501/io.kehl.fixture");
+            assert!(message.contains("bootstrap/load failed (errno 5)"));
+            assert!(message.contains("one possible cause"));
+            assert!(message.contains("launchctl print gui/501/io.kehl.fixture"));
+            assert!(message.contains(stderr));
+        }
+    }
+
+    #[test]
+    fn unrelated_errors_are_preserved() {
+        for stderr in [
+            "Bootstrap failed: 15: other error",
+            "permission denied",
+            "unknown localized failure",
+        ] {
+            assert_eq!(
+                launchd_bootstrap_failure(stderr, "fixture"),
+                format!("launchctl bootstrap failed: {stderr}")
+            );
+        }
+    }
+}
+
 pub const EFFECTIVE_CONFIG_BINDING_VERSION: u32 = 1;
 const EFFECTIVE_CONFIG_BINDING_FILE: &str = "effective-config.json";
 const EFFECTIVE_CONFIG_BINDING_MAX_BYTES: u64 = 64 * 1024;

@@ -21,6 +21,22 @@ For security vulnerabilities, see [SECURITY.md](.github/SECURITY.md) instead.
 PRs should be focused — one feature or fix per PR. If a change touches
 multiple crates, that's fine as long as it's one logical change.
 
+## Pull request titles and changelog entries
+
+Use a descriptive plain-language PR title, without a conventional-commit prefix.
+Keep conventional subjects on the individual commits. Release Please walks
+those commits and also parses the merge's PR title as a synthetic commit;
+making both conventional can add a second, differently worded entry for the
+same work. CI checks the PR-title rule before builds. Generated release PRs
+retain their conventional release title. A one-commit PR whose title exactly
+matches that commit also remains supported by the existing exact-description
+dedupe, preserving dependency-bot titles without manual renaming.
+
+For a PR with two conventional change commits, the changelog should retain both
+changes and gain no third change from the merge title. Existing exact-duplicate
+cleanup remains a separate safeguard; do not remove legitimate changes merely
+because they share a PR.
+
 ## Review rule: sibling gaps
 
 **When the same property must hold in two places, make the second place CALL

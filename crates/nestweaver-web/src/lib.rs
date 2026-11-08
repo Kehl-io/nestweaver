@@ -168,6 +168,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/api/v1/health", get(routes::health::health))
+        .route("/health", get(routes::health::health))
         .route("/api/v1/version", get(routes::version::version))
         .route("/api/v1/workspaces", get(routes::workspaces::workspaces))
         .route("/api/v1/overview", get(routes::overview::overview))

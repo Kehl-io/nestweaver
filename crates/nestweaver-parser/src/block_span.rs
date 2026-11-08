@@ -51,6 +51,35 @@ enum Ctx {
 pub(crate) fn brace_block_end(lines: &[&str], start: usize) -> Option<usize> {
     let mut depth: i32 = 0;
     let mut opened = false;
+    let mut parameter_depth: u32 = 0;
+    // Only callable parameter lists hide destructuring/default braces. A Vue
+    // `export default defineComponent({ ... })` opens its component object
+    // inside a call and must retain that object's full span.
+    let declaration = lines.get(start)?.trim_start();
+    let declaration = declaration
+        .strip_prefix("export ")
+        .unwrap_or(declaration)
+        .trim_start();
+    let declaration = declaration
+        .strip_prefix("default ")
+        .unwrap_or(declaration)
+        .trim_start();
+    let declaration = declaration
+        .strip_prefix("async ")
+        .unwrap_or(declaration)
+        .trim_start();
+    let function_parameters = declaration
+        .strip_prefix("function")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == '*' || c == '('));
+    let arrow_parameters = ["const ", "let ", "var "]
+        .iter()
+        .any(|prefix| declaration.starts_with(prefix))
+        && declaration.split_once('=').is_some_and(|(_, value)| {
+            let value = value.trim_start();
+            let value = value.strip_prefix("async ").unwrap_or(value).trim_start();
+            value.starts_with('(') && value.contains("=>")
+        });
+    let skip_parameters = function_parameters || arrow_parameters;
     let mut ctx = Ctx::Code;
 
     for (offset, line) in lines.iter().enumerate().skip(start) {
@@ -96,6 +125,12 @@ pub(crate) fn brace_block_end(lines: &[&str], start: usize) -> Option<usize> {
                     '\'' => ctx = Ctx::Single,
                     '"' => ctx = Ctx::Double,
                     '`' => ctx = Ctx::Template,
+                    '(' if !opened && skip_parameters => parameter_depth += 1,
+                    ')' if !opened && skip_parameters => {
+                        parameter_depth = parameter_depth.saturating_sub(1)
+                    }
+                    '{' if !opened && parameter_depth > 0 => {}
+                    '}' if !opened => {}
                     '{' => {
                         depth += 1;
                         opened = true;
@@ -137,6 +172,25 @@ mod tests {
     fn end_of(src: &str, start: usize) -> Option<usize> {
         let lines: Vec<&str> = src.lines().collect();
         brace_block_end(&lines, start)
+    }
+
+    #[test]
+    fn destructured_and_nested_default_parameters_do_not_open_the_body() {
+        for signature in [
+            "export function load({ fetch }) {",
+            "export function load({ fetch } = make({ fetch: () => ({}) })) {",
+            "export const load = ({ fetch } = { fetch: () => ({}) }) => {",
+        ] {
+            let source = format!("{signature}\n  return fetch('url');\n}}\n");
+            assert_eq!(end_of(&source, 0), Some(2), "{source}");
+        }
+        assert_eq!(
+            end_of(
+                "export default defineComponent({\n  setup() { return {}; }\n})\n",
+                0
+            ),
+            Some(2)
+        );
     }
 
     #[test]

@@ -71,7 +71,9 @@ use serde::{Deserialize, Serialize};
 ///      native-command argument parsing; discard facts from the older grammars.
 /// 15 — PHP static-call and class-owner facts; older records cannot safely
 ///      participate in the dedicated static-method resolver.
-const CACHE_VERSION: u32 = 15;
+/// 16 — Anonymous JS/TS default callable exports own their deferred bodies;
+///      Svelte/Vue/Astro callable spans skip destructured/default parameters.
+const CACHE_VERSION: u32 = 16;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;

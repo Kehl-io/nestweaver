@@ -348,6 +348,9 @@ export function GraphPanel() {
   const viewMode = useStore((s) => s.viewMode);
   const representationMode = useStore((s) => s.representationMode);
   const graphMode = useStore((s) => s.graphMode);
+  const seeds = useStore((s) => s.seeds);
+  const activeLens = useStore((s) => s.activeLens);
+  const setSearchOpen = useStore((s) => s.setSearchOpen);
   const minimapVisible = useStore((s) => s.minimapVisible);
   const layoutMode = useStore((s) => s.layoutMode);
   const graphInstance = useStore((s) => s.graphInstance);
@@ -422,8 +425,17 @@ export function GraphPanel() {
             <GraphMinimap />
           </div>
         )}
+        {graphMode === "context" && activeLens.lens === "context" && seeds.length === 0 && (
+          <section role="region" aria-label="Start context" className="absolute left-3 top-3 z-30 rounded border border-[var(--color-border)] bg-[var(--color-surface)] p-4 text-sm">
+            <p>Pick a symbol to see its context.</p>
+            <button type="button" className="mt-2 rounded border border-[var(--color-border)] px-3 py-1 text-xs focus-visible:outline focus-visible:outline-2" onClick={() => {
+              setSearchOpen(true);
+              document.querySelector<HTMLInputElement>('[data-testid="search-input"]')?.focus();
+            }}>Search symbols</button>
+          </section>
+        )}
         {zeroNodeImpactActive && <ZeroNodeImpactOverlay />}
-        {graphRepresentationActive && graphMode !== "overview" && !focusMap && !zeroNodeImpactActive && (
+        {graphRepresentationActive && graphMode !== "overview" && !focusMap && !zeroNodeImpactActive && !(graphMode === "context" && seeds.length === 0) && (
           <div className="absolute left-3 top-3 z-20 w-[min(320px,calc(100%-1.5rem))]">
             <LensSummaryPanel compact />
           </div>

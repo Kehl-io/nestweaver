@@ -41,6 +41,14 @@ class UiDaemon(IsolatedDaemon):
             "export function releaseD() { return 'unrelated'; }\n"
             "export function releaseTarget(name) { return name; }\n"
             "export function releaseCaller() { return releaseTarget('release'); }\n")
+        # Real directory scope controls include a prefix sibling so selecting
+        # ui-folder cannot accidentally include ui-folder-other.
+        for folder, name in [("ui-folder", "releaseInsideFolder"),
+                             ("ui-folder-other", "releaseOutsideFolder")]:
+            directory = self.repo / folder
+            directory.mkdir()
+            (directory / "entry.js").write_text(
+                f"export function {name}() {{ return '{folder}'; }}\n")
         for args in [("init", "--template", str(self.git_empty)), ("add", "."),
                      ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                       "commit", "-m", "fixture")]:

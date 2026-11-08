@@ -71,6 +71,8 @@ export function SymbolsTab() {
         <input
           type="text"
           placeholder="Filter symbols..."
+          aria-label="Filter symbols by name substring"
+          title="Case-insensitive substring filter; regular expressions are not supported."
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface-alt)] px-2 py-1 text-xs text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-1 focus:ring-[var(--color-graph-selection)]"

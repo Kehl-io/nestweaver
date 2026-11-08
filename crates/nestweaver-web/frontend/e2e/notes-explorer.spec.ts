@@ -1,5 +1,5 @@
 import { expect, test, type Route } from "@playwright/test";
-import { decodedReplyCount, installDeliveryReceipts, waitForDecodedReply } from "./deliveryBarriers";
+import { decodedReplyCount, eventCount, installDeliveryReceipts, waitForDecodedReply } from "./deliveryBarriers";
 
 // nw-648: the live brain had two vaults and ~1918 notes, but the Notes
 // explorer showed "BRAIN 991" and never listed the second vault — it loaded
@@ -329,6 +329,10 @@ test("UI handles mocked wikilink refusal and preserves the selected source note"
 
 test("committed catalog refresh discards a delayed load-more cursor response", async ({ page }) => {
   await installDeliveryReceipts(page);
+  // This is an epoch/cursor race, not the separate >2000-note scale test.
+  // A short scanned page may still carry a next cursor (see fulfillNotes).
+  const raceVault = { ...BRAIN, total: 3 };
+  const oldCursor = note(BRAIN, 1).uid;
   let refreshed = false;
   let releaseMore: (() => void) | undefined;
   let morePending = false;
@@ -339,18 +343,18 @@ test("committed catalog refresh discards a delayed load-more cursor response", a
     events.pending = "";
     return route.fulfill({ status: 200, contentType: "text/event-stream", body });
   });
-  await page.route("**/api/v1/brain/vaults", (route) => fulfillVaults(route, [{ ...BRAIN, total: refreshed ? 1 : BRAIN.total }]));
+  await page.route("**/api/v1/brain/vaults", (route) => fulfillVaults(route, [{ ...raceVault, total: refreshed ? 1 : raceVault.total }]));
   await page.route("**/api/v1/brain/tags", (route) => route.fulfill({ json: [] }));
   await page.route("**/api/v1/brain/notes?**", async (route) => {
     if (new URL(route.request().url()).searchParams.has("after")) {
       morePending = true;
       await new Promise<void>((resolve) => { releaseMore = resolve; });
-      await fulfillNotes(route);
+      await route.fulfill({ json: [note(BRAIN, 2)], headers: { "x-total-count": "3" } });
       obsoleteDelivered = true;
       return;
     }
     return refreshed ? route.fulfill({ json: [{ ...note(BRAIN, 0), title: "Committed catalog note" }], headers: { "x-total-count": "1" } })
-      : fulfillNotes(route);
+      : route.fulfill({ json: [note(BRAIN, 0), note(BRAIN, 1)], headers: { "x-total-count": "3", "x-next-after": encodeURIComponent(oldCursor) } });
   });
   await page.goto("/");
   const explorer = page.getByTestId("explorer-panel");
@@ -358,16 +362,25 @@ test("committed catalog refresh discards a delayed load-more cursor response", a
   const brain = explorer.getByTestId("notes-vault-brain");
   await brain.getByRole("button", { name: "Load more" }).click();
   await expect.poll(() => morePending).toBe(true);
+  const beforeEvent = await eventCount(page, "graph:updated");
+  const committedParams = { vault: BRAIN.uid };
+  const beforeCommit = await decodedReplyCount(page, "/api/v1/brain/notes", committedParams);
   refreshed = true;
   events.pending = "event: graph:updated\ndata: {}\n\n";
+  // This tests stale cursor delivery AFTER committed refresh, not a five-second
+  // SLA covering SSE reconnect, quiet-window scheduling and response decoding.
+  // Observe the native event and the new epoch's decoded catalogue before the
+  // unchanged DOM deadline. The old cursor remains blocked throughout.
+  await expect.poll(() => eventCount(page, "graph:updated")).toBeGreaterThan(beforeEvent);
+  await waitForDecodedReply(page, "/api/v1/brain/notes", committedParams, beforeCommit);
   await expect(brain).toContainText("Committed catalog note");
-  const params = { vault: BRAIN.uid, after: note(BRAIN, PAGE - 1).uid };
+  const params = { vault: BRAIN.uid, after: oldCursor };
   const beforeRelease = await decodedReplyCount(page, "/api/v1/brain/notes", params);
   releaseMore!();
   await expect.poll(() => obsoleteDelivered).toBe(true);
   await waitForDecodedReply(page, "/api/v1/brain/notes", params, beforeRelease);
   await expect(brain.getByRole("listitem")).toHaveCount(1);
-  await expect(brain.getByText("brain note 1000")).toHaveCount(0);
+  await expect(brain.locator('[data-note-uid="note:brain:0002"]')).toHaveCount(0);
 });
 
 

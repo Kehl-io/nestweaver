@@ -218,9 +218,119 @@ pub fn refresh_indexed_markdown_derivation(
     )
 }
 
+/// Reconcile an explicitly changed registered vault policy against the whole
+/// filesystem inventory. Unlike a legacy algorithm migration, changing the
+/// policy authorizes removing newly excluded notes and discovering newly
+/// eligible ones. Keep the normal full-refresh publication and yielding rules.
+pub fn refresh_registered_markdown_policy<G, F>(
+    reader: &dyn ContentReader,
+    store: &GraphStore,
+    vault: &Vault,
+    extra_ignore_patterns: &[String],
+    mut acquire_write_guard: F,
+) -> anyhow::Result<MarkdownRefreshResult>
+where
+    F: FnMut() -> anyhow::Result<G>,
+{
+    use crate::markdown_derivation::{CoverageScope, coverage_identity};
+    let expected = coverage_identity(
+        reader.root(),
+        extra_ignore_patterns,
+        reader.max_source_file_bytes(),
+        CoverageScope::FullRegisteredPolicy,
+    )?;
+    let ignore_set = crate::brainignore::load_brain_ignore(reader.root(), extra_ignore_patterns)?;
+    index_into_store_with_write_gate(
+        reader,
+        store,
+        &vault.instance_id,
+        &vault.name,
+        &ignore_set,
+        None,
+        || {
+            let guard = acquire_write_guard()?;
+            let current = coverage_identity(
+                reader.root(),
+                extra_ignore_patterns,
+                reader.max_source_file_bytes(),
+                CoverageScope::FullRegisteredPolicy,
+            )?;
+            anyhow::ensure!(
+                current == expected,
+                "vault ignore policy changed during inventory reconciliation; retrying"
+            );
+            Ok(guard)
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_policy_refresh_reconciles_exclusions_and_inclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("backups")).unwrap();
+        std::fs::write(root.join("keep.md"), "# Keep\n\n[[Old]]\n").unwrap();
+        std::fs::write(root.join("backups/old.md"), "# Old\n\nbackup\n").unwrap();
+        let (_, store) = index_markdown_directory_in_memory(&root, "test", "vault").unwrap();
+        let vault = store.list_vaults(None).unwrap().remove(0);
+        let reader = filesystem_vault_reader(&root, crate::index_limits::NoteLimits::default())
+            .strict_enumeration();
+        std::fs::write(root.join(".brainignore"), "backups/**\n").unwrap();
+        let legacy = refresh_indexed_markdown_derivation(&reader, &store, &vault, || false);
+        assert!(
+            format!(
+                "{:#}",
+                legacy
+                    .err()
+                    .expect("legacy migration must refuse excluded inventory")
+            )
+            .contains("excluded")
+        );
+        let result =
+            refresh_registered_markdown_policy(&reader, &store, &vault, &[], || Ok(())).unwrap();
+        assert_eq!(result.index.notes_count, 1);
+        let notes = store.list_notes(Some(&vault.uid)).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].file_path, "keep.md");
+
+        std::fs::remove_file(root.join(".brainignore")).unwrap();
+        std::fs::write(root.join("new.md"), "# New\n\nnewly eligible\n").unwrap();
+        let result =
+            refresh_registered_markdown_policy(&reader, &store, &vault, &[], || Ok(())).unwrap();
+        assert_eq!(result.index.notes_count, 3);
+        assert_eq!(store.list_notes(Some(&vault.uid)).unwrap().len(), 3);
+
+        std::fs::write(root.join(".brainignore"), "**/*.md\n*.md\n").unwrap();
+        let result =
+            refresh_registered_markdown_policy(&reader, &store, &vault, &[], || Ok(())).unwrap();
+        assert_eq!(result.index.notes_count, 0);
+        assert!(store.list_notes(Some(&vault.uid)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn registered_policy_refresh_rejects_policy_changes_at_write_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("keep.md"), "# Keep\n").unwrap();
+        let (_, store) = index_markdown_directory_in_memory(&root, "test", "vault").unwrap();
+        let vault = store.list_vaults(None).unwrap().remove(0);
+        let generation = store.graph_generation();
+        let reader = filesystem_vault_reader(&root, crate::index_limits::NoteLimits::default())
+            .strict_enumeration();
+        let error = refresh_registered_markdown_policy(&reader, &store, &vault, &[], || {
+            std::fs::write(root.join(".brainignore"), "keep.md\n")?;
+            Ok(())
+        })
+        .err()
+        .expect("policy change at admission must refuse the refresh");
+        assert!(format!("{error:#}").contains("policy changed"));
+        assert_eq!(store.graph_generation(), generation);
+        assert_eq!(store.list_notes(Some(&vault.uid)).unwrap().len(), 1);
+    }
 
     /// nw-684 review: the derivation migration's `.brainignore` parse used
     /// its own loop and an anonymous "invalid vault ignore policy"; it now

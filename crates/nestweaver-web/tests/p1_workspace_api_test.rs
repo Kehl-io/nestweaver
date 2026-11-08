@@ -508,7 +508,8 @@ async fn p1_workspace_overview_limit_reports_truncation_metadata() {
     assert_eq!(json["_meta"]["truncation"]["truncated"], true);
     assert_eq!(json["_meta"]["truncation"]["limit"], 6);
     assert_eq!(json["_meta"]["truncation"]["omitted_count"], 3);
-    assert_eq!(json["_meta"]["continuation"]["has_more"], true);
+    assert_eq!(json["_meta"]["continuation"]["has_more"], false);
+    assert!(json["_meta"]["continuation"]["cursor"].is_null());
     assert_eq!(json["_meta"]["continuation"]["reason"], "result-limit");
 }
 
@@ -1010,7 +1011,10 @@ async fn p1_workspace_catalog_is_bounded_and_discloses_truncation() {
     assert_eq!(json["_meta"]["truncation"]["limit"], 500);
     // 1 "all" entry + 600 vaults = 601 total, 500 returned.
     assert_eq!(json["_meta"]["truncation"]["omitted_count"], 101);
-    assert_eq!(json["_meta"]["continuation"]["has_more"], true);
+    // The bounded catalog discloses omitted rows but has no paging cursor.
+    assert_eq!(json["_meta"]["continuation"]["has_more"], false);
+    assert!(json["_meta"]["continuation"]["cursor"].is_null());
+    assert_eq!(json["_meta"]["continuation"]["reason"], "result-limit");
 }
 
 /// Bridge-score contract on the overview payload: `bridge_score` is an

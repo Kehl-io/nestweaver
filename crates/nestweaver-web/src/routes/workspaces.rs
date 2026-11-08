@@ -413,7 +413,8 @@ pub fn p1_meta_for_result_set(
     meta.truncation.omitted_count = total_count
         .map(|total_count| total_count.saturating_sub(returned_count))
         .filter(|omitted_count| *omitted_count > 0);
-    meta.continuation.has_more = truncated;
+    // A limited result is not a next page: these routes issue no cursor.
+    meta.continuation.has_more = false;
     meta.continuation.reason = truncated.then(|| "result-limit".to_string());
     meta
 }

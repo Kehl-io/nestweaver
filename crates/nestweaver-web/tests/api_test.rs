@@ -140,6 +140,28 @@ async fn health_check_returns_ok() {
 }
 
 #[tokio::test]
+async fn health_alias_and_version_disclose_product_version() {
+    let app = make_app();
+    for uri in ["/api/v1/health", "/health", "/api/v1/version"] {
+        let (status, content_type, body) = get_raw(&app, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(content_type.starts_with("application/json"), "{uri}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["product_version"], env!("CARGO_PKG_VERSION"));
+        if uri.ends_with("version") {
+            assert!(value["graph_generation"].is_number());
+            assert!(value["pagerank_generation"].is_number());
+        } else {
+            assert_eq!(value["status"], "ok");
+        }
+    }
+    for uri in ["/", "/ordinary-frontend-route"] {
+        let (_, content_type, _) = get_raw(&app, uri).await;
+        assert!(!content_type.starts_with("application/json"), "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn search_returns_matching_symbols() {
     let app = make_app();
     let (status, json) = get_json(&app, "/api/v1/search?q=greet").await;

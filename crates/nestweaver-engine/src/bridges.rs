@@ -114,6 +114,9 @@ pub struct BridgeNodes {
     /// How many BFS sources the betweenness computation actually ran from.
     /// Equal to the node count when the graph is small enough to do exactly.
     pub sources_sampled: usize,
+    /// Whole-code-graph node population from which BFS sources are selected.
+    /// Repository filters affect candidates, not this sampling population.
+    pub sampling_population: usize,
     /// True when `sources_sampled` was a SAMPLE rather than every node — i.e.
     /// every `betweenness_score` in `bridges` is an estimate. This is the
     /// field a program should branch on; the digits in the score itself carry
@@ -185,6 +188,7 @@ pub fn find_bridge_nodes_bounded_in_repos(
                 bridges: vec![],
                 candidate_total: 0,
                 sources_sampled: 0,
+                sampling_population: 0,
                 sampled: false,
             });
         }
@@ -260,6 +264,7 @@ pub fn find_bridge_nodes_bounded_in_repos(
         // result is exact, which callers must be able to say too.
         sampled: sources_sampled < n,
         sources_sampled,
+        sampling_population: n,
     })
 }
 
@@ -667,6 +672,7 @@ mod tests {
         let store = chain_store(10, 0);
 
         let found = find_bridge_nodes_bounded(&store, 5).unwrap();
+        assert_eq!(found.sampling_population, 10);
         assert_eq!(
             found.sources_sampled, 10,
             "every node is a BFS source below the sample limit"
@@ -674,6 +680,52 @@ mod tests {
         assert!(
             !found.sampled,
             "an exact computation must not be labelled a sample"
+        );
+    }
+
+    #[test]
+    fn repository_filter_preserves_global_paths_and_sampling_provenance() {
+        let store = GraphStore::in_memory().unwrap();
+        for (uid, repo) in [
+            ("left", "repo:other"),
+            ("connector", "repo:chosen"),
+            ("right", "repo:other"),
+        ] {
+            let mut symbol = make_symbol(uid, uid, "lib.rs");
+            symbol.repo_uid = repo.into();
+            store.insert_symbol(&symbol).unwrap();
+        }
+        for (source, target) in [("left", "connector"), ("connector", "right")] {
+            store
+                .insert_edge(&ResolvedEdge {
+                    source_uid: source.into(),
+                    target_uid: target.into(),
+                    edge_type: EdgeType::Calls,
+                    confidence: 1.0,
+                    link_type: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        let all = find_bridge_nodes_bounded(&store, 10).unwrap();
+        let chosen = ["repo:chosen".to_string()].into_iter().collect();
+        let scoped = find_bridge_nodes_bounded_in_repos(&store, 10, Some(&chosen)).unwrap();
+        assert_eq!(scoped.candidate_total, 1);
+        assert_eq!(scoped.sampling_population, 3);
+        assert_eq!(scoped.sources_sampled, all.sources_sampled);
+        assert_eq!(scoped.bridges[0].uid, "connector");
+        let global = all
+            .bridges
+            .iter()
+            .find(|node| node.uid == "connector")
+            .unwrap();
+        assert_eq!(
+            scoped.bridges[0].betweenness_score,
+            global.betweenness_score
+        );
+        assert!(
+            scoped.bridges[0].betweenness_score > 0.0,
+            "the in-repo singleton must retain paths through the other repo"
         );
     }
 

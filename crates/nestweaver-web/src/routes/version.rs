@@ -8,12 +8,14 @@ use crate::state::AppState;
 
 #[derive(Serialize)]
 pub struct VersionInfo {
+    pub product_version: &'static str,
     pub graph_generation: u64,
     pub pagerank_generation: u64,
 }
 
 pub async fn version(State(state): State<Arc<AppState>>) -> Json<VersionInfo> {
     Json(VersionInfo {
+        product_version: env!("CARGO_PKG_VERSION"),
         graph_generation: state.store.graph_generation(),
         pagerank_generation: state.store.pagerank_generation(),
     })

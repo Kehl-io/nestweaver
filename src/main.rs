@@ -193,7 +193,6 @@ use nestweaver_engine::{
     embedding::generate_embeddings_batch, export_in_memory_graph, export_text_format,
     filter_by_target, generate_agents_md_with_rules, generate_claude_md_with_rules,
     generate_cursor_rule_with_rules, generate_guide_with_tools, generate_summaries,
-    get_last_indexed_at,
     index_markdown_directory_since_with_ignore_and_write_lease_and_note_limits,
     index_markdown_directory_with_ignore_and_deletion_count_and_write_lease_and_note_limits,
     list_repos, list_services, load_alias_sidecar, load_clusters, load_clusters_with_generation,
@@ -237,6 +236,8 @@ const EXIT_DAEMON_UNHEALTHY: i32 = 69;
 /// because a script that only checks the code would take lower bounds as
 /// totals; not 1, because nothing failed and stdout still holds the counts.
 const EXIT_INCOMPLETE: i32 = 75;
+/// Permanent configuration refusal (sysexits EX_CONFIG).
+const EXIT_CONFIG: i32 = 78;
 const DEFAULT_EXTERNAL_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// Default `server init-tls --validity-days`.
@@ -767,24 +768,9 @@ enum CliDiagnostic {
     /// refused with a bare `anyhow::bail!`, which is invisible to
     /// `diagnostic_inventory` for the same reason `repair`'s `eprintln!` was.
     ///
-    /// Exit code stays 1, deliberately. `d565547f` decided one round ago, with
-    /// its rationale preserved in the item, that this is a SEMANTIC refusal
-    /// rather than a usage error; reversing that without new evidence would
-    /// leave two rounds of contradictory reasoning in the record. The defect
-    /// nw-360 names is the SHAPE of the refusal, and a named condition with a
-    /// followable remedy fixes exactly that.
-    ///
-    /// A 2026-09-04 pass considered moving this to 64 to match the rest of
-    /// that session's sweep (`search --limit`, `blast-radius --limit`, the
-    /// empty-query guards) and reverted the idea on review: 64 means "you
-    /// asked wrongly" (bad spelling/syntax) and 1 means "a legal request
-    /// this build cannot satisfy". `--format msgpack --scope vault` is two
-    /// CORRECTLY SPELLED values; reporting 64 would tell the caller to fix
-    /// the spelling of a word that is already right. That same pass DID
-    /// extend the condition below from `format == "msgpack"` to
-    /// `format != "graphml"`, so `cypher` and `mermaid` get this named
-    /// diagnostic too instead of a raw `export_graph RPC failed: ...` --
-    /// that was the real defect nw-360 named; the exit code was never it.
+    /// Exit code is 64: the unsupported pair can be rejected from argv alone.
+    /// The September 27 nw-360 decision supersedes the earlier exit-1 policy;
+    /// genuine data/state failures remain exit 1.
     #[error("`--format {format}` cannot represent `--scope {scope}`")]
     #[diagnostic(
         code(nestweaver::export_scope_unsupported),
@@ -2066,6 +2052,15 @@ const ENV_REGISTRY: &[EnvVar] = &[
         name: "NESTWEAVER_OLD_ENGINE_FIXTURE_DIR",
         role: EnvRole::Internal,
     },
+    // Opt-in scratch-only qualification inputs; neither changes CLI routing.
+    EnvVar {
+        name: "NESTWEAVER_718_FIXTURE_DIR",
+        role: EnvRole::Internal,
+    },
+    EnvVar {
+        name: "NESTWEAVER_870_CLI_PATH",
+        role: EnvRole::Internal,
+    },
     // Measurement switch: turns off the primary-key display repair in impact
     // traversal, to A/B whether the storage engine still needs it.
     EnvVar {
@@ -2387,6 +2382,169 @@ fn crash_report_matches_signature(file_name: &str, contents: &str) -> bool {
             .any(|frame| contents.contains(frame))
 }
 
+/// Qualify recurrence separately from the raw frame signature. Report timestamps
+/// use a rolling 30 UTC-calendar-day window; unknown metadata is not a clean scan.
+fn qualified_crash_report(contents: &str, today: &str) -> Result<serde_json::Value, String> {
+    let field = |key: &str| {
+        contents
+            .lines()
+            .find_map(|line| line.strip_prefix(key).map(str::trim))
+    };
+    let (version, date, signal, thread, frames, process, build) =
+        if contents.trim_start().starts_with('{') {
+            let values = serde_json::Deserializer::from_str(contents)
+                .into_iter::<serde_json::Value>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "malformed_report".to_string())?;
+            let header = values.first().ok_or("malformed_report")?;
+            let body = values.last().ok_or("malformed_report")?;
+            let text = |value: Option<&serde_json::Value>| {
+                value.and_then(|v| v.as_str()).unwrap_or("").to_string()
+            };
+            let index = body["faultingThread"]
+                .as_u64()
+                .map(|v| v as usize)
+                .or_else(|| {
+                    body["threads"]
+                        .as_array()?
+                        .iter()
+                        .position(|t| t["triggered"].as_bool() == Some(true))
+                })
+                .ok_or("missing_faulting_thread")?;
+            let frames = body["threads"][index]["frames"]
+                .as_array()
+                .ok_or("missing_faulting_frames")?
+                .iter()
+                .filter_map(|f| f["symbol"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (
+                text(
+                    body.pointer("/bundleInfo/CFBundleShortVersionString")
+                        .or_else(|| header.get("app_version")),
+                ),
+                text(body.get("captureTime").or_else(|| header.get("timestamp"))),
+                text(body.pointer("/exception/signal")),
+                index.to_string(),
+                frames,
+                text(body.get("procName").or_else(|| header.get("app_name"))),
+                text(
+                    body.pointer("/bundleInfo/CFBundleVersion")
+                        .or_else(|| header.get("build_version")),
+                ),
+            )
+        } else {
+            let version = field("Version:")
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let date = field("Date/Time:").unwrap_or("").to_string();
+            let signal = field("Exception Type:").unwrap_or("").to_string();
+            let mut thread = String::new();
+            let mut frames = String::new();
+            let mut in_crashed = false;
+            for line in contents.lines() {
+                if line.starts_with("Thread ") {
+                    in_crashed = line.contains(" Crashed:");
+                    if in_crashed {
+                        thread = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    }
+                } else if line.starts_with("Binary Images:") {
+                    in_crashed = false;
+                } else if in_crashed {
+                    frames.push_str(line);
+                    frames.push('\n');
+                }
+            }
+            (
+                version,
+                date,
+                signal,
+                thread,
+                frames,
+                field("Process:").unwrap_or("").to_string(),
+                String::new(),
+            )
+        };
+    if version.is_empty()
+        || date.len() < 10
+        || thread.is_empty()
+        || signal.is_empty()
+        || process.is_empty()
+    {
+        return Err("incomplete_report_metadata".to_string());
+    }
+    if version != env!("CARGO_PKG_VERSION") {
+        return Err("historical_version".to_string());
+    }
+    if !process
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("nestweaver")
+    {
+        return Err("different_process".to_string());
+    }
+    if ["SIGQUIT", "SIGTERM", "SIGINT", "SIGKILL"]
+        .iter()
+        .any(|s| signal.contains(s))
+    {
+        return Err("operator_or_test_signal".to_string());
+    }
+    let report_day = crash_report_calendar_day(&date).ok_or("incomplete_report_metadata")?;
+    let today = crash_report_calendar_day(today).ok_or("incomplete_report_metadata")?;
+    if !(0..=30).contains(&(today - report_day)) {
+        return Err("outside_30_day_window".to_string());
+    }
+    if !LBUG_CRASH_FRAMES.iter().any(|frame| frames.contains(frame)) {
+        return Err("unrelated_crashed_thread".to_string());
+    }
+    Ok(
+        serde_json::json!({"version": version, "build": build, "date": date, "signal": signal, "crashed_thread": thread,
+        "artifact_binding": "reported_version; build recorded when present, executable hash unavailable"}),
+    )
+}
+
+fn crash_report_calendar_day(text: &str) -> Option<i64> {
+    let date = text.get(..10)?;
+    if date.as_bytes()[4] != b'-' || date.as_bytes()[7] != b'-' {
+        return None;
+    }
+    let year: i64 = date.get(..4)?.parse().ok()?;
+    let month: usize = date.get(5..7)?.parse().ok()?;
+    let day: i64 = date.get(8..10)?.parse().ok()?;
+    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1..=months[month - 1]).contains(&day) {
+        return None;
+    }
+    let previous_year = year - 1;
+    Some(
+        365 * previous_year + previous_year / 4 - previous_year / 100
+            + previous_year / 400
+            + months[..month - 1].iter().sum::<i64>()
+            + day,
+    )
+}
+
 /// Outcome of a crash-report sweep.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct CrashRecurrenceScan {
@@ -2400,6 +2558,8 @@ struct CrashRecurrenceScan {
     reports_examined: usize,
     /// Reports carrying the signature.
     matched_reports: Vec<String>,
+    matched_report_details: Vec<serde_json::Value>,
+    excluded_reports: Vec<serde_json::Value>,
 }
 
 impl CrashRecurrenceScan {
@@ -2437,7 +2597,7 @@ fn crash_recurrence_note(scan: &CrashRecurrenceScan) -> String {
             "no crash-report directory could be read, so recurrence is UNKNOWN — this is not a clean bill of health; set {CRASH_REPORT_DIRS_ENV} to point at readable directories"
         ),
         _ if !scan.matched_reports.is_empty() => format!(
-            "AN LBUG CRASH IS FIRING — {} crash report(s) carry an lbug frame. The thread-pool mitigation is not holding. Do NOT assume the nw-073 eviction-vs-read analysis: the captured fault (nw-238) was a NULL deref in VectorVersionInfo::getSelVectorForScan with optimisticRead absent entirely, so read the report before choosing a remedy",
+            "{} recent current-version crash report(s) carry an lbug frame on the crashed thread; read the report before choosing a remedy",
             scan.matched_reports.len()
         ),
         "partial" => format!(
@@ -2446,7 +2606,7 @@ fn crash_recurrence_note(scan: &CrashRecurrenceScan) -> String {
             scan.unreadable.len()
         ),
         _ => format!(
-            "no crash reports carry an lbug frame across {} directories ({} candidate report(s) examined); the mitigation appears to be holding",
+            "no qualifying current-version engine crashes found across {} directories ({} candidate report(s) examined); this does not prove the mitigation is holding",
             scan.directories_read, scan.reports_examined
         ),
     }
@@ -2465,6 +2625,10 @@ fn crash_recurrence_value(scan: &CrashRecurrenceScan) -> serde_json::Value {
             serde_json::Value::Null
         },
         "matched_reports": scan.matched_reports,
+        "running_version": env!("CARGO_PKG_VERSION"),
+        "time_policy": "last 30 UTC calendar days; future dates excluded",
+        "matched_report_details": scan.matched_report_details,
+        "excluded_reports": scan.excluded_reports,
         "reports_examined": scan.reports_examined,
         "directories_read": scan.directories_read,
         "unreadable": scan.unreadable,
@@ -2550,10 +2714,32 @@ fn scan_crash_reports_in(directories: &[PathBuf], supported: bool) -> CrashRecur
             }
             scan.reports_examined += 1;
             match read_crash_report(&entry.path()) {
-                Ok(contents) if crash_report_matches_signature(&name, &contents) => {
-                    scan.matched_reports.push(name);
+                Ok(contents) => {
+                    let today = format_epoch_timestamp(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64(),
+                    );
+                    match qualified_crash_report(&contents, &today[..10]) {
+                        Ok(mut details) if crash_report_matches_signature(&name, &contents) => {
+                            details["file"] = name.clone().into();
+                            scan.matched_report_details.push(details);
+                            scan.matched_reports.push(name);
+                        }
+                        Ok(_) => {}
+                        Err(reason) => {
+                            if reason.starts_with("malformed")
+                                || reason.starts_with("missing_")
+                                || reason == "incomplete_report_metadata"
+                            {
+                                scan.unreadable.push(format!("{name}: {reason}"));
+                            }
+                            scan.excluded_reports
+                                .push(serde_json::json!({"file": name, "reason": reason}));
+                        }
+                    }
                 }
-                Ok(_) => {}
                 Err(error) => scan
                     .unreadable
                     .push(format!("{}: {error}", entry.path().display())),
@@ -3244,6 +3430,7 @@ struct RankingBounds {
     sampled: Option<bool>,
     /// Bridges only: how many BFS sources the estimate actually ran from.
     sources_sampled: Option<usize>,
+    sampling_population: Option<usize>,
 }
 
 impl RankingBounds {
@@ -3262,6 +3449,7 @@ impl RankingBounds {
             truncated: Some(found.truncated()),
             sampled: Some(found.sampled),
             sources_sampled: Some(found.sources_sampled),
+            sampling_population: Some(found.sampling_population),
         }
     }
 
@@ -3280,6 +3468,10 @@ impl RankingBounds {
             sampled: value.get("sampled").and_then(|v| v.as_bool()),
             sources_sampled: value
                 .get("sources_sampled")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize),
+            sampling_population: value
+                .get("sampling_population")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize),
         }
@@ -3450,6 +3642,14 @@ fn ranking_json_payload<T: serde::Serialize>(
             obj.insert(
                 "sources_sampled".to_string(),
                 serde_json::json!(bounds.sources_sampled),
+            );
+            obj.insert(
+                "sampling_scope".to_string(),
+                serde_json::json!("whole_code_graph"),
+            );
+            obj.insert(
+                "sampling_population".to_string(),
+                serde_json::json!(bounds.sampling_population),
             );
         }
         if let Some(meta) = daemon_meta {
@@ -3916,12 +4116,17 @@ fn render_investigate_text(payload: &serde_json::Value) {
 fn direct_projects_with_members(
     store: &nestweaver_store::GraphStore,
     members: &mut ProjectMemberRepos,
+    repo_configs: &[nestweaver_engine::config::RepoConfig],
 ) -> anyhow::Result<Vec<nestweaver_schema::Project>> {
     let projects = store.list_projects().map_err(|e| anyhow::anyhow!(e))?;
     for project in &projects {
         members.insert(
             project.name.clone(),
-            nestweaver_engine::project_member_repos(store, &project.uid)?,
+            nestweaver_engine::project::project_member_repos_with_config(
+                store,
+                &project.uid,
+                repo_configs,
+            )?,
         );
     }
     Ok(projects)
@@ -8687,7 +8892,7 @@ enum Commands {
         /// Deprecated: daemon mode always allows writes. Kept for backward compatibility.
         #[arg(long, hide = true)]
         allow_writes: bool,
-        /// Overwrite existing skill/guide files even if customized
+        /// Overwrite generated skills and rebind MCP databases when permitted; preserve unmarked guide text. Global rebinding requires explicitly selected tools.
         #[arg(long)]
         force: bool,
         /// Path to the NestWeaver database
@@ -9820,6 +10025,28 @@ enum NoteCommands {
 
 #[derive(Subcommand)]
 enum ExtensionCommands {
+    /// Set one annotation through the daemon write gate. VALUE must be JSON.
+    Set {
+        /// Node UID.
+        uid: String,
+        /// Property key to set.
+        key: String,
+        /// JSON value; quote strings as JSON (for example '"reviewed"').
+        #[arg(
+            allow_hyphen_values = true,
+            value_parser = |value: &str| serde_json::from_str::<serde_json::Value>(value)
+        )]
+        value: serde_json::Value,
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+        #[arg(
+            long,
+            help = "Path to the database file [env: NESTWEAVER_DB] [default: ./nestweaver.lbug]"
+        )]
+        db: Option<PathBuf>,
+        #[arg(long, help = "Path to instance config (TOML)")]
+        config: Option<PathBuf>,
+    },
     /// List annotations. With no filter, every annotated node.
     List {
         /// Show only this node's annotations.
@@ -11920,16 +12147,39 @@ fn format_code_links_status(links: &nestweaver_proto::CodeLinksStatus) -> Option
 /// config this database's daemon last started with. The daemon and MCP server
 /// install their own; without this the direct route never saw a declared
 /// link, so a stale repository linked only by one read as unrelated.
-fn install_declared_links_for_direct_route(db_path: &Path, explicit: Option<&Path>) {
+fn install_declared_links_for_direct_route(
+    db_path: &Path,
+    explicit: Option<&Path>,
+) -> Option<serde_json::Value> {
     let path = explicit.map(Path::to_path_buf).or_else(|| {
         nestweaver_daemon::lifecycle::read_last_successful_config(db_path)
             .ok()
             .map(|record| PathBuf::from(record.config_path))
     });
-    let config = path
-        .and_then(|path| nestweaver_engine::InstanceConfig::from_file(&path).ok())
-        .map(std::sync::Arc::new);
-    nestweaver_engine::resolver_generation::set_declared_link_config(config);
+    match path
+        .map(|path| {
+            nestweaver_engine::InstanceConfig::from_file(&path).map_err(|error| (path, error))
+        })
+        .transpose()
+    {
+        Ok(config) => {
+            nestweaver_engine::resolver_generation::set_declared_link_config(
+                config.map(std::sync::Arc::new),
+            );
+            None
+        }
+        Err((path, error)) => {
+            nestweaver_engine::resolver_generation::set_declared_link_config(None);
+            let message = format!(
+                "declared-link configuration {} could not be loaded: {error}; direct-route gate lacks configured link evidence",
+                path.display()
+            );
+            eprintln!("Warning: {message}");
+            Some(
+                serde_json::json!({"kind":"declared_link_config_unavailable", "path":path, "message":message}),
+            )
+        }
+    }
 }
 
 fn load_instance_config_opt(path: Option<&Path>) -> Option<nestweaver_engine::InstanceConfig> {
@@ -17892,6 +18142,9 @@ fn main() {
             // nw-660: a schema violation is the caller's input mistake, so it
             // exits with the usage code clap-rejected values already use.
             let code = if error_is_invalid_tool_arguments(&e)
+                || e.downcast_ref::<CliDiagnostic>().is_some_and(|diagnostic| {
+                    matches!(diagnostic, CliDiagnostic::ExportScopeUnsupported { .. })
+                })
                 || e.downcast_ref::<nestweaver_engine::backup::BackupRefusal>()
                     .is_some()
             {
@@ -18876,6 +19129,36 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         !matches!(cli.command, Commands::Daemon { .. }),
     );
     match cli.command {
+        Commands::Extensions {
+            command:
+                ExtensionCommands::Set {
+                    uid,
+                    key,
+                    value,
+                    json,
+                    db,
+                    config,
+                },
+        } => {
+            let db_path = resolve_db_with_config(db, config.as_deref())?;
+            require_existing_db(&db_path)?;
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut client = rt
+                .block_on(nestweaver_client::DaemonClient::connect(
+                    &db_path,
+                    config.as_deref(),
+                ))
+                .context(
+                    "extensions set requires the daemon write gate; start the daemon and retry",
+                )?;
+            let result = rt.block_on(client.set_extension(&uid, &key, value))?;
+            if json {
+                print_json_payload(&result)?;
+            } else {
+                println!("Set extension property '{key}' on {uid}");
+            }
+            Ok((EXIT_SUCCESS, None))
+        }
         Commands::Extensions {
             command:
                 ExtensionCommands::List {
@@ -21416,6 +21699,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                                 "Top {} bridge nodes (by betweenness centrality):\n",
                                 bounds.header_count(bridges.len())
                             );
+                            println!(
+                                "  Sampling scope: whole code graph ({} nodes); repository filters select returned candidates.\n",
+                                bounds
+                                    .sampling_population
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|| "unknown population".into())
+                            );
                             if let Some(note) = bridge_sampling_note(&bounds) {
                                 println!("  NOTE: {note}\n");
                             }
@@ -21522,6 +21812,13 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 println!(
                     "Top {} bridge nodes (by betweenness centrality):\n",
                     bounds.header_count(bridges.len())
+                );
+                println!(
+                    "  Sampling scope: whole code graph ({} nodes); repository filters select returned candidates.\n",
+                    bounds
+                        .sampling_population
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unknown population".into())
                 );
                 if let Some(note) = bridge_sampling_note(&bounds) {
                     println!("  NOTE: {note}\n");
@@ -22505,7 +22802,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
-            install_declared_links_for_direct_route(&db_path, config.as_deref());
+            let direct_config_warning =
+                install_declared_links_for_direct_route(&db_path, config.as_deref());
 
             let mut args = serde_json::json!({
                 "changed_files": files,
@@ -22565,7 +22863,10 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 }
             };
 
-            let payload = cli::daemon_rpc::reject_incomplete_index_response(payload)?;
+            let mut payload = cli::daemon_rpc::reject_incomplete_index_response(payload)?;
+            if let Some(warning) = direct_config_warning {
+                payload["direct_config_warning"] = warning;
+            }
             if json {
                 print_json_payload(&payload)?;
             } else {
@@ -22591,7 +22892,8 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             };
             let db_path = resolve_db_with_config(db, config.as_deref())?;
             require_existing_db(&db_path)?;
-            install_declared_links_for_direct_route(&db_path, config.as_deref());
+            let direct_config_warning =
+                install_declared_links_for_direct_route(&db_path, config.as_deref());
             // nw-174 added a default cap to the underlying tool. Without a flag
             // here the CLI would inherit the ceiling with no way to raise it,
             // silently truncating output for scripts and CI that parse
@@ -22603,7 +22905,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                 nestweaver_engine::config::DEFAULT_RESULT_LIMIT,
             );
             let args = serde_json::json!({ "changed_files": files, "limit": limit });
-            let payload = match try_hybrid_json_rpc_checked(
+            let mut payload = match try_hybrid_json_rpc_checked(
                 use_daemon,
                 &db_path,
                 config.as_deref(),
@@ -22621,6 +22923,9 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                     nestweaver_mcp::tools::dispatch_cli(&store, None, "detect_changes", args, None)?
                 }
             };
+            if let Some(warning) = direct_config_warning {
+                payload["direct_config_warning"] = warning;
+            }
             if json {
                 print_json_payload(&payload)?;
             } else {
@@ -22954,7 +23259,6 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
         } => {
             let db_default = default_db_path();
             let db_path = db.as_deref().unwrap_or(&db_default);
-            require_existing_db(db_path)?;
 
             // nw-360. ABOVE the route split, deliberately. This is the only
             // placement where the daemon and direct routes cannot diverge, and
@@ -22980,15 +23284,15 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             // empty file reported as success). Checking `!= "graphml"`
             // instead of enumerating the other three means a fifth
             // code-only format added later inherits the refusal instead of
-            // silently reopening this gap. Exit code stays 1 -- see the
-            // variant's doc comment; this is a semantic refusal of a
-            // correctly-spelled combination, not a usage error.
+            // silently reopening this gap. An argv-only incompatible pair is
+            // a usage error (64), even when both enum spellings are valid.
             if format != "graphml" && scope == "vault" {
                 return Err(anyhow::Error::new(CliDiagnostic::ExportScopeUnsupported {
                     format: format.clone(),
                     scope: scope.clone(),
                 }));
             }
+            require_existing_db(db_path)?;
 
             // Route through daemon when available.
             if use_daemon {
@@ -23160,7 +23464,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            install_declared_links_for_direct_route(&db_path, None);
+            let _ = install_declared_links_for_direct_route(&db_path, None);
             let repo_root = detect_repo_root();
 
             // The default (neither --json nor --sarif) is the concise advisory
@@ -23400,7 +23704,7 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
             db,
         } => {
             let db_path = db.unwrap_or_else(default_db_path);
-            install_declared_links_for_direct_route(&db_path, None);
+            let _ = install_declared_links_for_direct_route(&db_path, None);
 
             if files.is_none() && base_ref.is_none() {
                 // nw-252: a USAGE error, so EXIT_USAGE (64, EX_USAGE from
@@ -26141,12 +26445,32 @@ fn run(cli: Cli, out: &OutputConfig) -> anyhow::Result<(i32, Option<String>)> {
                         // instance than the caller named.
                         ensure_direct_store_fallback_allowed(&resolved_db, config.as_deref())?;
                         let store = open_store(Some(&resolved_db))?;
-                        direct_projects_with_members(&store, &mut member_repos)?
+                        direct_projects_with_members(
+                            &store,
+                            &mut member_repos,
+                            config
+                                .as_deref()
+                                .map(nestweaver_engine::InstanceConfig::from_file)
+                                .transpose()?
+                                .as_ref()
+                                .map(|cfg| cfg.repos.as_slice())
+                                .unwrap_or(&[]),
+                        )?
                     }
                 }
             } else {
                 let store = open_store(Some(&resolved_db))?;
-                direct_projects_with_members(&store, &mut member_repos)?
+                direct_projects_with_members(
+                    &store,
+                    &mut member_repos,
+                    config
+                        .as_deref()
+                        .map(nestweaver_engine::InstanceConfig::from_file)
+                        .transpose()?
+                        .as_ref()
+                        .map(|cfg| cfg.repos.as_slice())
+                        .unwrap_or(&[]),
+                )?
             };
 
             // When --config is provided, also surface declared projects from
@@ -30970,6 +31294,7 @@ mod cli_help_contract_tests {
             // `extensions list`/`extensions unset` rather than exposing a
             // literal `extensions_list`/`extensions_unset` tool pair.
             "extensions list" => Tool("query_extensions"),
+            "extensions set" => Tool("set_extension"),
             // nw-215(a) fix: this used to read `Tool("set_extension")`, a
             // stale mapping predating `unset_extension`'s existence (nw-281).
             // `extensions unset` (`ExtensionCommands::Unset`) calls
@@ -31253,6 +31578,63 @@ mod cli_help_contract_tests {
         );
     }
 
+    /// nw-509: cover the reverse direction using the same declared mapping.
+    /// All current tools have CLI twins; a new MCP-only tool must make its
+    /// deliberate exclusion explicit here rather than silently escaping parity.
+    #[test]
+    fn every_registered_mcp_tool_has_a_declared_cli_twin() {
+        let twins = on_big_stack(|| {
+            let root = Cli::command();
+            let mut queue = vec![(&root, Vec::<String>::new())];
+            let mut twins = std::collections::HashSet::new();
+            while let Some((command, path)) = queue.pop() {
+                if let Some(CliMcpTwin::Tool(tool)) = declared_cli_mcp_twin(&path.join(" ")) {
+                    twins.insert(tool);
+                }
+                for subcommand in command.get_subcommands() {
+                    let mut child = path.clone();
+                    child.push(subcommand.get_name().to_string());
+                    queue.push((subcommand, child));
+                }
+            }
+            twins
+        });
+        let listing = nestweaver_mcp::tools::tool_list(false);
+        let tools = listing["tools"].as_array().expect("registered tools");
+        assert!(tools.len() >= 30, "registry coverage must not be vacuous");
+        let missing: Vec<_> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .filter(|name| !twins.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "MCP tools need a CLI twin or an explicit justified exclusion: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_direct_config_failure_is_disclosed_and_valid_config_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        let warning =
+            install_declared_links_for_direct_route(&dir.path().join("test.lbug"), Some(&missing))
+                .unwrap();
+        assert_eq!(warning["kind"], "declared_link_config_unavailable");
+        assert!(
+            warning["message"]
+                .as_str()
+                .unwrap()
+                .contains("link evidence")
+        );
+        let valid = dir.path().join("valid.toml");
+        std::fs::write(&valid, "instance_id = 'test'\n[snapshot_storage]\nbackend='local'\npath='snapshots'\n[workspace]\nbackend='local'\npath='workspace'\n[inference]\nendpoint='http://localhost:11434'\nembedding_model='test'\nsummary_model='test'\n[git]\ncredential_method='gh'\n").unwrap();
+        assert!(
+            install_declared_links_for_direct_route(&dir.path().join("test.lbug"), Some(&valid))
+                .is_none()
+        );
+    }
+
     /// nw-215(a). `declared_cli_mcp_twin("extensions unset")` used to read
     /// `Tool("set_extension")`, a mapping that predates `unset_extension`'s
     /// existence (nw-281) and was never updated once the CLI's `extensions
@@ -31525,6 +31907,10 @@ mod cli_help_contract_tests {
             // beside the database, so it resolves the pair through the same
             // `resolve_db_with_config` helper every other entry here uses.
             "nestweaver extensions list",
+            // nw-505: setting an annotation mutates the same sidecar as unset.
+            // Resolve the config-bound database and assert its expected brain
+            // before connecting to the daemon write gate, as unset does.
+            "nestweaver extensions set",
             // nw-281(b): added deliberately, and it is the first MUTATING
             // entry in this inventory that writes a sidecar rather than the
             // graph. It resolves the pair through `resolve_db_with_config` —
@@ -40870,7 +41256,7 @@ mod diagnostics_cli_tests {
         assert_eq!(value["status"], "scanned");
         assert_eq!(value["crash_reports_matched"], 1);
         let note = value["note"].as_str().unwrap_or_default();
-        assert!(note.contains("IS FIRING"), "note was: {note}");
+        assert!(note.contains("recent current-version"), "note was: {note}");
         // nw-239: the note must NOT assert the old eviction-vs-read diagnosis,
         // which the captured crash falsified. Saying "the mitigation is not
         // holding" is a fact about the alarm; naming a root cause is a claim
@@ -40888,7 +41274,8 @@ mod diagnostics_cli_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let frame = "lbug::storage::BufferManager::optimisticRead(FileHandle&)";
 
-        std::fs::write(dir.path().join("nestweaver-2026-07-28.ips"), frame).expect("write crash");
+        let current = current_crash_fixture("SIGSEGV", frame, env!("CARGO_PKG_VERSION"));
+        std::fs::write(dir.path().join("nestweaver-2026-07-28.ips"), current).expect("write crash");
         std::fs::write(
             dir.path()
                 .join("nestweaver_2026-07-28_Host.cpu_resource.diag"),
@@ -40906,6 +41293,109 @@ mod diagnostics_cli_tests {
             "only the nestweaver .ips is a candidate"
         );
         assert_eq!(scan.matched_reports, vec!["nestweaver-2026-07-28.ips"]);
+    }
+
+    fn current_crash_fixture(signal: &str, frame: &str, version: &str) -> String {
+        let now = format_epoch_timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+        );
+        serde_json::json!({"app_name": "nestweaver", "app_version": version,
+            "timestamp": now, "procName": "nestweaver", "exception": {"signal": signal},
+            "faultingThread": 0, "threads": [{"frames": [{"symbol": frame}]}]})
+        .to_string()
+    }
+
+    #[test]
+    fn recurrence_requires_current_version_faulting_thread_and_nondeliberate_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = "lbug::storage::BufferManager::scan";
+        for (file, text) in [
+            (
+                "nestweaver-current.ips",
+                current_crash_fixture("SIGSEGV", frame, env!("CARGO_PKG_VERSION")),
+            ),
+            (
+                "nestweaver-old.ips",
+                current_crash_fixture("SIGSEGV", frame, "0.0.1"),
+            ),
+            (
+                "nestweaver-deliberate.ips",
+                current_crash_fixture("SIGQUIT", frame, env!("CARGO_PKG_VERSION")),
+            ),
+            (
+                "nestweaver-unrelated.ips",
+                current_crash_fixture("SIGSEGV", "user::panic", env!("CARGO_PKG_VERSION")),
+            ),
+            ("nestweaver-malformed.ips", "{bad".to_string()),
+            (
+                "nestweaver-test-build.ips",
+                current_crash_fixture("SIGSEGV", frame, env!("CARGO_PKG_VERSION")).replace(
+                    "\"procName\":\"nestweaver\"",
+                    "\"procName\":\"nestweaver_engine-test\"",
+                ),
+            ),
+        ] {
+            std::fs::write(dir.path().join(file), text).unwrap();
+        }
+        let scan = scan_crash_reports_in(&[dir.path().to_path_buf()], true);
+        assert_eq!(scan.matched_reports, ["nestweaver-current.ips"]);
+        assert_eq!(scan.status(), "partial");
+        assert_eq!(scan.excluded_reports.len(), 5);
+        assert_eq!(scan.matched_report_details[0]["signal"], "SIGSEGV");
+        assert!(
+            scan.matched_report_details[0]["date"]
+                .as_str()
+                .unwrap()
+                .len()
+                >= 10
+        );
+    }
+
+    #[test]
+    fn legacy_recurrence_ignores_other_threads_and_old_dates() {
+        let now = format_epoch_timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+        );
+        let report = format!(
+            "Process: nestweaver [123]\nVersion: {}\nDate/Time: {now}\nException Type: EXC_BAD_ACCESS (SIGSEGV)\nThread 0 Crashed:\n user::panic\nThread 1:\n lbug::storage::scan\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            qualified_crash_report(&report, &now[..10]).unwrap_err(),
+            "unrelated_crashed_thread"
+        );
+        let valid = report.replace(" user::panic", " lbug::storage::scan");
+        assert!(qualified_crash_report(&valid, &now[..10]).is_ok());
+        assert_eq!(
+            qualified_crash_report(&valid.replace(&now, "2000-01-01"), &now[..10]).unwrap_err(),
+            "outside_30_day_window"
+        );
+    }
+
+    #[test]
+    fn recurrence_calendar_validation_rejects_impossible_dates() {
+        for date in [
+            "2026-10-99",
+            "2026-00-20",
+            "2026-13-01",
+            "2026-02-29",
+            "2026-11-00",
+            "short",
+        ] {
+            assert!(crash_report_calendar_day(date).is_none(), "{date}");
+        }
+        assert_eq!(
+            crash_report_calendar_day("2026-11-08").unwrap()
+                - crash_report_calendar_day("2026-10-09").unwrap(),
+            30
+        );
+        assert!(crash_report_calendar_day("2024-02-29").is_some());
     }
 
     #[test]
@@ -42954,6 +43444,63 @@ mod vault_command_config_parity_tests {
         );
     }
 
+    #[test]
+    fn extension_set_accepts_typed_json_without_changing_list_or_unset() {
+        for value in [
+            "null",
+            "true",
+            "42",
+            "-1",
+            "-1.25",
+            "[true, null, -2]",
+            "\"platform\"",
+            "{\"owner\": [\"team\"]}",
+        ] {
+            let cli = parse(argv(&[
+                "nestweaver",
+                "extensions",
+                "set",
+                "sym:test",
+                "owner",
+                value,
+                "--json",
+            ]))
+            .unwrap();
+            let Commands::Extensions {
+                command:
+                    ExtensionCommands::Set {
+                        uid,
+                        key,
+                        value: raw,
+                        json,
+                        ..
+                    },
+            } = cli.command
+            else {
+                panic!("setter command")
+            };
+            assert_eq!(uid, "sym:test");
+            assert_eq!(key, "owner");
+            assert!(json);
+            assert_eq!(
+                raw,
+                serde_json::from_str::<serde_json::Value>(value).unwrap()
+            );
+        }
+        let invalid = parse(argv(&[
+            "nestweaver",
+            "extensions",
+            "set",
+            "sym:test",
+            "owner",
+            "{bad",
+        ]));
+        assert_eq!(
+            invalid.err().unwrap().kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+    }
+
     /// Filters mirror `query_extensions`: by uid, or by key (+ optional value).
     #[test]
     fn the_filters_match_the_mcp_tools_two_modes() {
@@ -44696,6 +45243,7 @@ mod cli_honesty_sweep_tests {
                 truncated: Some(true),
                 sampled: Some(true),
                 sources_sampled: Some(500),
+                ..RankingBounds::default()
             },
         );
         assert_eq!(payload["sampled"], serde_json::json!(true));
