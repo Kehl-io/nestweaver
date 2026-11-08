@@ -7415,9 +7415,11 @@ fn export_rejects_an_invalid_enum_as_a_usage_error() {
             .success();
     }
 
-    // And `msgpack` must still reach its handler, which refuses `--scope vault`
-    // as a SEMANTIC combination rather than an unknown value — a distinction a
-    // `PossibleValuesParser` must not flatten.
+    // nw-360 deliberately supersedes the old semantic-refusal exit 1:
+    // individually valid but incompatible argv also exits 64, with its own
+    // named diagnostic and remedy. A missing DB proves preflight precedes access.
+    let missing_db = dir.path().join("unsupported-pair-must-not-create.lbug");
+    assert!(!missing_db.exists());
     let output = nestweaver_cmd()
         .args([
             "export",
@@ -7426,23 +7428,26 @@ fn export_rejects_an_invalid_enum_as_a_usage_error() {
             "--scope",
             "vault",
             "--db",
-            &db_path.display().to_string(),
+            &missing_db.display().to_string(),
         ])
         .output()
         .unwrap();
-    assert_ne!(
-        output.status.code(),
-        Some(0),
-        "msgpack cannot represent the vault subgraph and must say so"
-    );
-    assert_ne!(
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
         output.status.code(),
         Some(64),
-        "`--scope vault` is a LEGAL value that this format cannot satisfy; \
-         reporting it as a usage error would tell the caller to fix the \
-         spelling of a word that is spelled correctly.\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        "argv-only incompatible combinations are usage errors before DB access, \
+         per nw-360; stderr:\n{stderr}"
     );
+    assert!(
+        stderr.contains("export_scope_unsupported"),
+        "the valid values must produce the named combination refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains("--format graphml") && stderr.contains("--scope vault"),
+        "the remedy must name a supported alternative for this scope: {stderr}"
+    );
+    assert!(!missing_db.exists(), "argv refusal must not create the DB");
 }
 
 /// A read-only `ui` writes nothing, so S2 does not apply to it. Pinned so a
@@ -10276,8 +10281,8 @@ fn clusters_cli_without_repo_is_unscoped_and_unchanged() {
 
 /// nw-360, the residual of nw-312. `d565547f` closed the spelling half — a
 /// bogus `--format` or `--scope` now exits 64 at parse time — and deliberately
-/// preserved this case as a SEMANTIC refusal. That reasoning stands and the
-/// exit code is not changed here.
+/// preserved this case as a semantic refusal. The later nw-360 owner decision
+/// supersedes that exit-1 policy: argv-only incompatible pairs also exit 64.
 ///
 /// What is wrong is the SHAPE. Two individually valid enums whose COMBINATION
 /// is unsupported reached the user as a raw RPC error naming neither value:
@@ -10289,8 +10294,7 @@ fn clusters_cli_without_repo_is_unscoped_and_unchanged() {
 /// `msgpack` (a named diagnostic already, but at exit 1) while `cypher` and
 /// `mermaid` still fell through to the raw RPC error — the same refusal, two
 /// different shapes depending on which code-only format asked. All three now
-/// get the same named diagnostic, at the same exit code `msgpack` already
-/// used.
+/// get the same named diagnostic and argv-only exit 64.
 #[test]
 fn an_unsupported_format_scope_pair_is_named_not_relayed() {
     let dir = tempfile::tempdir().unwrap();

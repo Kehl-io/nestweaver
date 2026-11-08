@@ -77,7 +77,6 @@ export function useImpactMode() {
       return (
         requestId === requestIdRef.current &&
         state.graphMode === "impact" &&
-        state.activeLens.lens === "impact" &&
         (state.inspectedSceneTarget?.mode === "impact" && state.inspectedSceneTarget.workspaceId === requestWorkspaceId
           ? state.inspectedSceneTarget.uid : state.selectedNodeId) === targetNodeId &&
         state.activeWorkspaceId === requestWorkspaceId &&
@@ -86,6 +85,12 @@ export function useImpactMode() {
         state.impactConfidence === requestConfidence
       );
     };
+    // Related can own the lens while retaining this Impact graph. Its committed
+    // refresh still owns graph data, but must not restore Impact's cleared trust
+    // or replace the newer lens. Local instead changes graphMode and invalidates
+    // the request itself.
+    const ownsImpactPresentation = () =>
+      isCurrentRequest() && useStore.getState().activeLens.lens === "impact";
 
     try {
       // Show the loading scene for a genuinely new query, or when nothing is
@@ -96,7 +101,7 @@ export function useImpactMode() {
       // query (workspace/target/depth/confidence change), keeping the honest
       // loading state and the pre-T6 depth/confidence-change fix intact.
       const hasGraph = (useStore.getState().graphInstance?.order ?? 0) > 0;
-      if (isNewQuery || !hasGraph) {
+      if ((isNewQuery || !hasGraph) && ownsImpactPresentation()) {
         clearGraphData();
         setSceneMetadata(
           workspaceSceneMetadataWithResult(
@@ -133,18 +138,20 @@ export function useImpactMode() {
       if (!isCurrentRequest()) return;
 
       setGraphData(graph);
-      if (!existingScene) setActiveLens({
-        lens: "impact",
-        label: `Impact: ${result.target?.name ?? targetNodeId}`,
-        targetUid: targetNodeId,
-        workspaceId: requestWorkspaceId,
-      });
-      setSceneMetadata(result._meta ?? null);
+      if (ownsImpactPresentation()) {
+        if (!existingScene) setActiveLens({
+          lens: "impact",
+          label: `Impact: ${result.target?.name ?? targetNodeId}`,
+          targetUid: targetNodeId,
+          workspaceId: requestWorkspaceId,
+        });
+        setSceneMetadata(result._meta ?? null);
+      }
       previousLayoutRef.current = { key: queryKey, graph };
     } catch (err) {
       // We aborted this request (superseded query or unmount) — stay silent.
       if (err instanceof DOMException && err.name === "AbortError") return;
-      if (!isCurrentRequest()) return;
+      if (!ownsImpactPresentation()) return;
 
       if (err instanceof ImpactTimeoutError) {
         // The backend is likely still computing ranks for a freshly indexed
