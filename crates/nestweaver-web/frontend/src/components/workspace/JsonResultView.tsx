@@ -4,8 +4,8 @@ import type {
   AffectedTestsResult,
   ImpactLensStates,
 } from "../../api/impactLens";
-import type { BrainContextResult } from "../../api/types";
 import { useStore } from "../../stores";
+import { capBrainContextResult, capList, DIFF_JSON_CAPS } from "./capBrainContextResult";
 
 const JSON_CAPS = {
   graphNodes: 500,
@@ -16,9 +16,7 @@ const JSON_CAPS = {
   gapItems: 100,
   relationshipRows: 100,
   backlinkRows: 100,
-  diffSeeds: 100,
-  diffConnected: 200,
-  diffUnresolved: 100,
+  ...DIFF_JSON_CAPS,
   affectedTestFiles: 100,
   changedSymbols: 100,
 };
@@ -199,38 +197,6 @@ function flowToCappedList(
   };
 }
 
-function capList<T>(items: T[], limit: number) {
-  return {
-    items: items.slice(0, limit),
-    _meta: {
-      total_count: items.length,
-      limit,
-      truncated: items.length > limit,
-      omitted_count: Math.max(0, items.length - limit),
-    },
-  };
-}
-
-function capBrainContextResult(
-  snapshot: BrainContextResult | null,
-): (Omit<BrainContextResult, "_meta"> & { _meta: Record<string, unknown> }) | null {
-  if (!snapshot) return null;
-  const seeds = capList(snapshot.seeds, JSON_CAPS.diffSeeds);
-  const connected = capList(snapshot.connected, JSON_CAPS.diffConnected);
-  const unresolved = capList(snapshot.unresolved_seeds, JSON_CAPS.diffUnresolved);
-  return {
-    seeds: seeds.items,
-    connected: connected.items,
-    unresolved_seeds: unresolved.items,
-    _meta: {
-      capped: true,
-      seeds: seeds._meta,
-      connected: connected._meta,
-      unresolved_seeds: unresolved._meta,
-    },
-  };
-}
-
 export function JsonResultView() {
   const graphVersion = useStore((s) => s.graphVersion);
   const activeLens = useStore((s) => s.activeLens);
@@ -292,6 +258,7 @@ export function JsonResultView() {
             seeds_limit: JSON_CAPS.diffSeeds,
             connected_limit: JSON_CAPS.diffConnected,
             unresolved_limit: JSON_CAPS.diffUnresolved,
+            edges_limit: JSON_CAPS.diffEdges,
           },
         },
       },

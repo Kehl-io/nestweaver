@@ -642,6 +642,20 @@ enum CliDiagnostic {
     )]
     DatabaseCorrupt { path: String, cause: String },
 
+    /// A query reported a storage failure without an attributable local file.
+    /// Untrusted remote prose must not become a local recovery target.
+    #[error("Database query reported {condition}; database identity is unavailable")]
+    #[diagnostic(
+        code(nestweaver::db_identity_unknown),
+        help(
+            "The response does not establish which database failed. Local recovery \
+             instructions and unverified path details are withheld. Ask the owner of \
+             the queried endpoint to inspect its storage diagnostics before restoring \
+             or removing any database."
+        )
+    )]
+    DatabaseIdentityUnknown { condition: &'static str },
+
     /// nw-332. The write-ahead log cannot be READ. Deliberately its own
     /// diagnostic, sitting between `db_wal_unreplayed` (the log is fine, a
     /// replay is owed) and `db_corrupt` (the database file itself is damaged),
@@ -1047,6 +1061,264 @@ fn extract_db_path(message: &str) -> String {
         .unwrap_or_else(|| default_db_path().display().to_string())
 }
 
+fn unattributed_rpc_database(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<QueryDatabaseIdentity>() {
+        Some(QueryDatabaseIdentity::Local(_, _)) => false,
+        Some(QueryDatabaseIdentity::Unknown(_)) => true,
+        None => error.chain().any(|source| source.is::<tonic::Status>()),
+    }
+}
+
+/// An inner attributed store path wins; RPC provenance never consults the
+/// process-global direct-open fallback or a remote path embedded in prose.
+fn diagnostic_database_path(error: &anyhow::Error, message: &str) -> Option<String> {
+    diagnostic_database_path_with(error, || extract_db_path(message))
+}
+
+fn diagnostic_database_path_with(
+    error: &anyhow::Error,
+    direct_open_fallback: impl FnOnce() -> String,
+) -> Option<String> {
+    if let Some(path) = error
+        .chain()
+        .filter_map(|source| source.downcast_ref::<nestweaver_store::StoreError>())
+        .find_map(|store_error| store_error.corruption_path())
+    {
+        return Some(redact_build_paths(&path.display().to_string()));
+    }
+    if let Some(QueryDatabaseIdentity::Local(path, _)) =
+        error.downcast_ref::<QueryDatabaseIdentity>()
+    {
+        return Some(redact_build_paths(&path.display().to_string()));
+    }
+    (!unattributed_rpc_database(error)).then(direct_open_fallback)
+}
+
+fn unknown_database_diagnostic(condition: &'static str) -> miette::Report {
+    CliDiagnostic::DatabaseIdentityUnknown { condition }.into()
+}
+
+fn unknown_corruption_diagnostic(kind: nestweaver_store::CorruptionKind) -> miette::Report {
+    use nestweaver_store::CorruptionKind;
+    unknown_database_diagnostic(match kind {
+        CorruptionKind::WalUnreplayed => "a write-ahead log replay requirement",
+        CorruptionKind::WalUnreadable => "an unreadable write-ahead log",
+        CorruptionKind::FileTruncated => "a storage bounds failure",
+        CorruptionKind::EngineAssertion => "a storage-engine assertion",
+        CorruptionKind::Unclassified => "storage corruption",
+    })
+}
+
+#[cfg(test)]
+mod query_database_diagnostic_tests {
+    use super::*;
+
+    const CORRUPTION: &str = "Runtime exception: idx: 18446744073709551614 of the DiskArray \
+        to be accessed is >= numElements in DiskArray 1. The database file may be corrupted.";
+
+    #[test]
+    fn local_query_identity_ignores_prose_and_the_last_direct_open() {
+        let selected = PathBuf::from("/selected/query.lbug");
+        let error = anyhow::Error::new(tonic::Status::internal(format!(
+            "database at /wrong/prose.lbug: {CORRUPTION}"
+        )))
+        .context(QueryDatabaseIdentity::Local(
+            selected.clone(),
+            "RPC failed".into(),
+        ));
+        assert_eq!(
+            diagnostic_database_path_with(&error, || {
+                panic!("a stale direct-open path must not be consulted")
+            }),
+            Some(selected.display().to_string())
+        );
+        let report = into_diagnostic(error);
+        assert_eq!(report.code().unwrap().to_string(), "nestweaver::db_corrupt");
+        assert!(report.to_string().contains("/selected/query.lbug"));
+        assert!(report.help().unwrap().to_string().contains("DiskArray"));
+        let json = db_problem_json_envelope(false, &report).unwrap();
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("/selected/query.lbug")
+        );
+    }
+
+    #[test]
+    fn inner_store_path_is_authoritative_over_any_outer_query_identity() {
+        for outer in [
+            QueryDatabaseIdentity::Local(PathBuf::from("/outer/query.lbug"), "RPC failed".into()),
+            QueryDatabaseIdentity::Unknown("RPC failed".into()),
+        ] {
+            let error =
+                anyhow::Error::new(nestweaver_store::StoreError::from_engine_message_for_db(
+                    CORRUPTION,
+                    Path::new("/inner/actual.lbug"),
+                ))
+                .context(outer);
+            let report = into_diagnostic(error);
+            assert_eq!(report.code().unwrap().to_string(), "nestweaver::db_corrupt");
+            assert!(report.to_string().contains("/inner/actual.lbug"));
+            assert!(!report.to_string().contains("/outer/query.lbug"));
+        }
+    }
+
+    #[test]
+    fn unattributed_rpc_storage_details_never_supply_a_private_recovery_path() {
+        let rebuild = nestweaver_store::StoreError::RebuildRequired {
+            path: Box::new(PathBuf::from("/server/private/rebuild.lbug")),
+            reason: "was built by an older engine".into(),
+        };
+        for message in [
+            format!("database at /server/private/graph.lbug: {CORRUPTION}"),
+            rebuild.to_string(),
+            "database at /server/private/wal.lbug: Corrupted wal file. Read out invalid WAL record type.".into(),
+            "database at /server/private/schema.lbug: Binder exception: Table Symbol does not exist".into(),
+            "database at /server/private/replay.lbug: Couldn't replay shadow pages under read-only mode".into(),
+        ] {
+            for explicit_unknown in [false, true] {
+                let mut error = anyhow::Error::new(tonic::Status::internal(message.clone()));
+                if explicit_unknown {
+                    error = error.context(QueryDatabaseIdentity::Unknown("RPC failed".into()));
+                }
+                assert!(
+                    diagnostic_database_path_with(&error, || {
+                        panic!("unknown RPC must not consult LAST_OPENED_DB/default")
+                    })
+                    .is_none()
+                );
+                let report = into_diagnostic(error);
+                assert_eq!(report.code().unwrap().to_string(), "nestweaver::db_identity_unknown");
+                let rendered = format!("{report:?}");
+                assert!(!rendered.contains("/server/private"), "{rendered}");
+                assert!(!rendered.contains("./nestweaver.lbug"), "{rendered}");
+                assert!(!rendered.contains("delete this database"), "{rendered}");
+                assert!(!rendered.contains("backup restore"), "{rendered}");
+                assert_eq!(
+                    db_problem_json_envelope(false, &report).unwrap()["code"],
+                    "nestweaver::db_identity_unknown"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn request_context_preserves_not_found_auth_and_transient_status_classification() {
+        for status in [
+            tonic::Status::not_found("no note found with title Missing"),
+            tonic::Status::permission_denied("repository scope refused"),
+            tonic::Status::unauthenticated("credentials required"),
+            tonic::Status::unavailable("daemon temporarily unavailable"),
+            tonic::Status::deadline_exceeded("query deadline exceeded"),
+        ] {
+            let baseline = into_diagnostic(anyhow::Error::new(status.clone()));
+            let error = anyhow::Error::new(status.clone()).context(QueryDatabaseIdentity::Local(
+                PathBuf::from("/selected/query.lbug"),
+                "RPC failed".into(),
+            ));
+            assert_eq!(
+                error
+                    .chain()
+                    .find_map(|source| source.downcast_ref::<tonic::Status>())
+                    .unwrap()
+                    .code(),
+                status.code()
+            );
+            assert_eq!(
+                into_diagnostic(error).code().map(|code| code.to_string()),
+                baseline.code().map(|code| code.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_storage_identity_keeps_wal_replay_and_bounds_distinct() {
+        use nestweaver_store::CorruptionKind;
+        for (kind, condition) in [
+            (CorruptionKind::WalUnreadable, "unreadable write-ahead log"),
+            (CorruptionKind::WalUnreplayed, "replay requirement"),
+            (CorruptionKind::FileTruncated, "storage bounds failure"),
+            (CorruptionKind::EngineAssertion, "storage-engine assertion"),
+        ] {
+            let report = unknown_corruption_diagnostic(kind);
+            assert!(report.to_string().contains(condition));
+            assert!(!report.to_string().contains("storage corruption"));
+            assert!(
+                !report
+                    .help()
+                    .unwrap()
+                    .to_string()
+                    .contains("delete this database")
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_storage_misses_and_checkpoint_states_withhold_private_paths_and_writes() {
+        for (status, condition) in [
+            (
+                tonic::Status::not_found("database not found"),
+                "unavailable database",
+            ),
+            (
+                tonic::Status::not_found(
+                    "failed to open database at /server/private/missing.lbug: No such file",
+                ),
+                "unavailable database",
+            ),
+            (
+                tonic::Status::internal(
+                    "database at /server/private/checkpoint.lbug: Transaction committed successfully, but the post-commit checkpoint failed",
+                ),
+                "committed write with a deferred checkpoint",
+            ),
+            (
+                tonic::Status::internal(
+                    "database at /server/private/recovery.lbug: failed while completing an interrupted checkpoint during recovery",
+                ),
+                "interrupted recovery checkpoint",
+            ),
+            (
+                tonic::Status::internal(
+                    "database at /server/private/frozen.lbug: the frozen WAL of an earlier checkpoint is still pending",
+                ),
+                "committed write with a deferred checkpoint",
+            ),
+            (
+                tonic::Status::internal(
+                    "database at /server/private/applied.lbug: frozen write-ahead log of a checkpoint that already finished",
+                ),
+                "already-applied checkpoint state",
+            ),
+            (
+                tonic::Status::unavailable(
+                    "database at /server/private/pending.lbug: checkpoint recovery is pending",
+                ),
+                "unresolved checkpoint state",
+            ),
+        ] {
+            let report = into_diagnostic(anyhow::Error::new(status));
+            assert_eq!(
+                report.code().unwrap().to_string(),
+                "nestweaver::db_identity_unknown"
+            );
+            assert!(report.to_string().contains(condition), "{report}");
+            let rendered = format!("{report:?}");
+            for forbidden in [
+                "/server/private",
+                "./nestweaver.lbug",
+                "delete this database",
+                "backup restore",
+                "storage corruption",
+                "nestweaver index",
+            ] {
+                assert!(!rendered.contains(forbidden), "{rendered}");
+            }
+        }
+    }
+}
+
 /// THE recovery runbook for an unreadable write-ahead log. ONE definition,
 /// rendered by ONE diagnostic, reached by every path that can detect the
 /// condition.
@@ -1213,11 +1485,31 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // A connection that broke because the daemon died on a fatal signal. Asked
     // before every text arm below: they would read "broken pipe" as an
     // unclassified error and print it with no remedy.
-    if let Some(crash) =
-        nestweaver_store::daemon_exit::crash_behind_broken_connection(&format!("{err:#}"))
+    if !unattributed_rpc_database(&err)
+        && !err
+            .chain()
+            .filter_map(|source| source.downcast_ref::<nestweaver_store::StoreError>())
+            .any(|store_error| {
+                store_error.corruption_path().is_some()
+                    || matches!(
+                        store_error,
+                        nestweaver_store::StoreError::RebuildRequired { .. }
+                    )
+            })
+        && let Some(crash) =
+            nestweaver_store::daemon_exit::crash_behind_broken_connection(&format!("{err:#}"))
     {
-        let path = redact_build_paths(&crash.db_path.display().to_string());
-        return daemon_crash_diagnostic(path, &crash.exit, crash.during_request).into();
+        let matches_request = match err.downcast_ref::<QueryDatabaseIdentity>() {
+            Some(QueryDatabaseIdentity::Local(path, _)) => {
+                nestweaver_daemon::lifecycle::database_path_fingerprint(path)
+                    == nestweaver_daemon::lifecycle::database_path_fingerprint(&crash.db_path)
+            }
+            _ => true,
+        };
+        if matches_request {
+            let path = redact_build_paths(&crash.db_path.display().to_string());
+            return daemon_crash_diagnostic(path, &crash.exit, crash.during_request).into();
+        }
     }
 
     // nw-346. Ask the TYPE before asking the prose. `StoreError::Corruption`
@@ -1239,6 +1531,14 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
         );
     }
     if let Some((path, reason)) = parse_rebuild_required(&format!("{err:#}")) {
+        if unattributed_rpc_database(&err) {
+            return unknown_database_diagnostic("a storage rebuild requirement");
+        }
+        let path = if err.downcast_ref::<QueryDatabaseIdentity>().is_some() {
+            diagnostic_database_path(&err, &reason).unwrap_or(path)
+        } else {
+            path
+        };
         return rebuild_required_diagnostic(path, reason);
     }
     // LadybugDB 0.21's two non-corruption checkpoint states. Their store
@@ -1258,6 +1558,19 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
         || format!("{err:#}")
             .contains("frozen write-ahead log of a checkpoint that already finished")
     {
+        if unattributed_rpc_database(&err) {
+            let condition = match nestweaver_store::classify_checkpoint_failure(&format!("{err:#}"))
+            {
+                Some(nestweaver_store::CheckpointFailure::CommittedCheckpointDeferred) => {
+                    "a committed write with a deferred checkpoint"
+                }
+                Some(nestweaver_store::CheckpointFailure::RecoveryCheckpointInterrupted) => {
+                    "an interrupted recovery checkpoint"
+                }
+                None => "an already-applied checkpoint state",
+            };
+            return unknown_database_diagnostic(condition);
+        }
         return miette::Report::msg(redact_build_paths(&format!("{err:#}")));
     }
 
@@ -1276,7 +1589,10 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     if let Some((kind, typed_path)) = typed {
         let path = typed_path
             .map(|p| redact_build_paths(&p.display().to_string()))
-            .unwrap_or_else(|| extract_db_path(&message));
+            .or_else(|| diagnostic_database_path(&err, &message));
+        let Some(path) = path else {
+            return unknown_corruption_diagnostic(kind);
+        };
         return corruption_diagnostic(kind, path, message);
     }
 
@@ -1311,7 +1627,9 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     if let Some(kind) = nestweaver_store::classify_engine_corruption(&message)
         && kind != nestweaver_store::CorruptionKind::WalUnreplayed
     {
-        let path = extract_db_path(&message);
+        let Some(path) = diagnostic_database_path(&err, &message) else {
+            return unknown_corruption_diagnostic(kind);
+        };
         return corruption_diagnostic(kind, path, message);
     }
 
@@ -1328,7 +1646,9 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     if lower.contains("does not exist")
         && (lower.contains("binder exception") || lower.contains("table "))
     {
-        let path = extract_db_path(&message);
+        let Some(path) = diagnostic_database_path(&err, &message) else {
+            return unknown_database_diagnostic("a missing database schema");
+        };
         let detail = match std::fs::metadata(&path).map(|m| m.len()) {
             Ok(0) => format!("{path} is 0 bytes — an interrupted create leaves exactly this."),
             Ok(bytes) => format!("{path} is {bytes} bytes, but holds no graph tables."),
@@ -1349,13 +1669,22 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     // remedy — and the advice it does give cannot be followed on the path that
     // emitted it, since a read-only open can never perform the replay.
     if lower.contains("shadow pages") || (lower.contains("replay") && lower.contains("read-only")) {
-        let path = message
-            .split("at ")
-            .nth(1)
-            .and_then(|s| s.split(':').next())
-            .unwrap_or("./nestweaver.lbug")
-            .trim()
-            .to_string();
+        let path = if err.downcast_ref::<QueryDatabaseIdentity>().is_some()
+            || unattributed_rpc_database(&err)
+        {
+            let Some(path) = diagnostic_database_path(&err, &message) else {
+                return unknown_database_diagnostic("a storage replay requirement");
+            };
+            path
+        } else {
+            message
+                .split("at ")
+                .nth(1)
+                .and_then(|s| s.split(':').next())
+                .unwrap_or("./nestweaver.lbug")
+                .trim()
+                .to_string()
+        };
         return CliDiagnostic::DatabaseWalUnreplayed {
             wal: format!("{path}.wal"),
             path,
@@ -1385,7 +1714,11 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     if lower.contains("checkpoint is in progress")
         || lower.contains("checkpoint recovery is pending")
     {
-        let path = extract_db_path(&message);
+        let Some(path) = diagnostic_database_path(&err, &message) else {
+            return unknown_database_diagnostic(
+                "an unresolved checkpoint state (corruption unproven)",
+            );
+        };
         if let nestweaver_daemon::lifecycle::CheckpointArtifacts::Debris { artifacts } =
             nestweaver_daemon::lifecycle::checkpoint_artifacts(std::path::Path::new(&path))
         {
@@ -1403,13 +1736,22 @@ fn into_diagnostic(err: anyhow::Error) -> miette::Report {
     {
         // Extract the path from common anyhow context patterns like
         // "failed to open database at ./foo.lbug: No such file ..."
-        let path = message
-            .split("at ")
-            .nth(1)
-            .and_then(|s| s.split(':').next())
-            .unwrap_or("./nestweaver.lbug")
-            .trim()
-            .to_string();
+        let path = if err.downcast_ref::<QueryDatabaseIdentity>().is_some()
+            || unattributed_rpc_database(&err)
+        {
+            let Some(path) = diagnostic_database_path(&err, &message) else {
+                return unknown_database_diagnostic("an unavailable database");
+            };
+            path
+        } else {
+            message
+                .split("at ")
+                .nth(1)
+                .and_then(|s| s.split(':').next())
+                .unwrap_or("./nestweaver.lbug")
+                .trim()
+                .to_string()
+        };
 
         // nw-126: these are TEXT heuristics, and text lies. The daemon's
         // "failed to open database with write access at <path>; another
@@ -16470,6 +16812,17 @@ mod logical_publication_admission_tests {
             Some(graph.clone()),
             "admission must follow CURRENT to the selected graph"
         );
+        let selected = selected_existing_database(&base).unwrap().unwrap();
+        let query_error = anyhow::Error::new(tonic::Status::internal(
+            "Runtime exception: The database file may be corrupted.",
+        ))
+        .context(QueryDatabaseIdentity::Local(selected, "RPC failed".into()));
+        let diagnostic = into_diagnostic(query_error);
+        assert_eq!(
+            diagnostic.to_string(),
+            format!("Database file is corrupt: {}", graph.display()),
+            "a known selected physical slot, not its absent logical anchor, is the recovery subject"
+        );
         require_existing_db(&base).expect("a published brain exists");
         require_openable_db(&base).expect("and its selected graph is a database");
         assert!(
@@ -30852,6 +31205,7 @@ mod cli_help_contract_tests {
             CliDiagnostic::DatabaseUnavailable { .. } => "db_unavailable",
             CliDiagnostic::DatabaseWalUnreplayed { .. } => "db_wal_unreplayed",
             CliDiagnostic::DatabaseCorrupt { .. } => "db_corrupt",
+            CliDiagnostic::DatabaseIdentityUnknown { .. } => "db_identity_unknown",
             CliDiagnostic::DatabaseNoSchema { .. } => "db_no_schema",
             CliDiagnostic::DatabaseWalCorrupt { .. } => "db_wal_corrupt",
             CliDiagnostic::DatabaseCheckpointDebris { .. } => "db_checkpoint_debris",
@@ -30943,6 +31297,14 @@ mod cli_help_contract_tests {
                 Clears::Never,
                 WriteRemedy::Barred,
                 Remedy::Invocation,
+            ),
+            (
+                CliDiagnostic::DatabaseIdentityUnknown {
+                    condition: "storage corruption",
+                },
+                Clears::Never,
+                WriteRemedy::Barred,
+                Remedy::Instruction("identify the queried database with its owner before recovery"),
             ),
             // A file with no schema demonstrably holds no data, so `index`
             // cannot destroy anything here. Documented on the variant itself.
@@ -31104,7 +31466,7 @@ mod cli_help_contract_tests {
         // this equality is what then forces it into the inventory too.
         assert_eq!(
             inventory.len(),
-            14,
+            15,
             "a `CliDiagnostic` variant was added or removed without \
              classifying it here"
         );

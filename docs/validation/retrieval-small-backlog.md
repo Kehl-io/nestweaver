@@ -97,3 +97,8 @@ Two distinct inherited **Medium / Small** follow-ups were groomed in the brain d
 
 - **nw944:** daemon-query corruption diagnostics lose selected database attribution and name the default DB; actual nonzero corruption failure remains correct.
 - **nw945:** bounded Compare JSON export silently omits historical edges/publication metadata even below node caps; preserve explicit caps and endpoint-safe relationships in its separate work package.
+
+The user subsequently authorized both packages in the same PR. Their fixes,
+new artifact qualifications and additional regression round are recorded in the
+[follow-on validation ledger](diagnostic-and-compare-export.md). The historical
+41-item cohort and receipts above remain unchanged.

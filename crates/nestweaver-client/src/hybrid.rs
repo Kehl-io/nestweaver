@@ -121,6 +121,32 @@ struct MaintenanceHandle {
     _task: tokio::task::JoinHandle<()>,
 }
 
+/// Marks an error from dispatch on the local daemon channel, never an upstream.
+/// The private constructor keeps provenance at the dispatch boundary; callers
+/// may attach their selected local database without guessing from error prose.
+#[derive(Debug)]
+pub struct LocalQueryFailure(String);
+
+impl std::fmt::Display for LocalQueryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+async fn dispatch_local_query(
+    local: &mut DaemonClient,
+    tool_name: &str,
+    params: &Value,
+    profile: nestweaver_schema::ToolDeliveryProfile,
+) -> Result<Value> {
+    dispatch_json_rpc_authed_profile(local.inner_mut(), tool_name, params, None, profile)
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            error.context(LocalQueryFailure(message))
+        })
+}
+
 impl HybridClient {
     /// Connect to the local daemon with auto-discovery of upstream servers.
     ///
@@ -624,13 +650,8 @@ impl HybridClient {
         };
 
         // Now borrow self.local mutably for the local query.
-        let local_fut = dispatch_json_rpc_authed_profile(
-            self.local.inner_mut(),
-            tool_name,
-            params,
-            None,
-            self.delivery_profile,
-        );
+        let local_fut =
+            dispatch_local_query(&mut self.local, tool_name, params, self.delivery_profile);
 
         let (local_result, server_result) = tokio::join!(local_fut, server_fut);
         let local = match local_result {
@@ -869,14 +890,7 @@ impl HybridClient {
     }
 
     async fn query_local(&mut self, tool_name: &str, params: &Value) -> Result<Value> {
-        dispatch_json_rpc_authed_profile(
-            self.local.inner_mut(),
-            tool_name,
-            params,
-            None,
-            self.delivery_profile,
-        )
-        .await
+        dispatch_local_query(&mut self.local, tool_name, params, self.delivery_profile).await
     }
 
     /// The set of `repo_uid`s the LOCAL daemon has indexed.

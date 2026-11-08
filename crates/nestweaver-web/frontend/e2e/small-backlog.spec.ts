@@ -1,5 +1,6 @@
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { expect, test, type APIRequestContext, type Page, type TestInfo } from "@playwright/test";
+import type { BrainContextResult } from "../src/api/types";
 
 async function screenshot(page: Page, info: TestInfo, name: string) {
   const path = info.outputPath(name);
@@ -86,12 +87,15 @@ for (const width of [1280, 1440, 1600, 1728]) {
 
 test("small backlog: Compare keeps snapshot names and UID access through layout changes (nw-866)", async ({ page, request }, testInfo) => {
   const replies: unknown[] = [];
+  const contexts: { seeds: string[]; body: BrainContextResult }[] = [];
   const reads: Promise<unknown>[] = [];
   page.on("response", (response) => {
     if (new URL(response.url()).pathname === "/api/v1/brain/context") {
-      reads.push(response.json().then((body) => replies.push({
-        request: response.request().postDataJSON(), status: response.status(), body,
-      })).catch((error) => replies.push({ error: String(error) })));
+      reads.push(response.json().then((body) => {
+        const input = response.request().postDataJSON();
+        replies.push({ request: input, status: response.status(), body });
+        if (response.ok() && input.token_budget === undefined) contexts.push({ seeds: input.seeds, body });
+      }).catch((error) => replies.push({ error: String(error) })));
     }
   });
   const symbol = await selectRelease(page, request);
@@ -107,6 +111,33 @@ test("small backlog: Compare keeps snapshot names and UID access through layout 
   const json = page.getByRole("region", { name: "JSON result view" }).locator("pre");
   const before = JSON.parse(await json.innerText()).analysis.diff;
   await Promise.all(reads);
+  // Compare snapshots retain real historical API evidence in every export
+  // channel; layout stability alone cannot establish completeness (nw-945).
+  for (const [key, seed, count] of [["snapshot_a", symbol.uid, 2], ["snapshot_b", "releaseC", 3]] as const) {
+    const actual = contexts.find((reply) => reply.seeds.length === 1 && reply.seeds[0] === seed)?.body;
+    expect(actual, `captured actual ${key} context`).toBeDefined();
+    expect(actual!.edges).toHaveLength(count);
+    expect(actual!.graph_meta).toMatchObject({ generation: expect.any(Number), edge_scope: "returned_nodes", edge_count_relation: "eq", truncated: false });
+    expect(before[key].edges).toEqual(actual!.edges);
+    expect(before[key].graph_meta).toEqual(actual!.graph_meta);
+    expect(before[key]._meta.edges).toMatchObject({ total_count: count, exported_count: count,
+      filtered_count: 0, omitted_by_limit: 0, omitted_count: 0, truncated: false });
+  }
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  const exports = page.getByRole("region", { name: "JSON result view" });
+  await exports.getByRole("button", { name: "Copy", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Notifications", exact: true }).getByText("JSON copied", { exact: true })).toBeVisible();
+  const copied = JSON.parse(await page.evaluate(() => navigator.clipboard.readText()));
+  expect(copied.analysis.diff).toEqual(before);
+  const downloadPromise = page.waitForEvent("download");
+  await exports.getByRole("button", { name: "Save", exact: true }).click();
+  const download = await downloadPromise;
+  const savedPath = testInfo.outputPath("comparison-scene-saved.json");
+  await download.saveAs(savedPath);
+  const saved = JSON.parse(await readFile(savedPath, "utf8"));
+  expect(saved.analysis.diff).toEqual(before);
+  await testInfo.attach("comparison-scene-saved.json", { path: savedPath, contentType: "application/json" });
+  await jsonArtifact(testInfo, "comparison-scene-copied.json", copied);
   await jsonArtifact(testInfo, "historical-comparison-before.json", before);
   await jsonArtifact(testInfo, "comparison-context-api.json", replies);
   // Layout settings belong to the Graph representation. Use its public
