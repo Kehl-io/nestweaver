@@ -192,12 +192,12 @@ is refused with `nestweaver::db_rebuild_required`. Back it up and follow the
 [publication rebuild guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required)
 and the error's recovery command. A forced re-index alone is not the remedy
 for an incompatible storage format. A compatible format 47 database can still
-migrate to format 49 on a writable open or checkpoint in 12.2.5. Stop the old
+migrate to format 49 on a writable open or checkpoint in 12.2.5 or 12.2.6. Stop the old
 daemon and back up with the previous binary before upgrading. Downgrading after
 migration requires restoring that backup with the previous binary. See the
 [LadybugDB 0.22 storage and rollback guide](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
-For a compatible database, the current **`RESOLVER_GENERATION` is 21**.
+For a compatible database, the current **`RESOLVER_GENERATION` is 22**.
 Compatibility requires an exact match: a graph written by an older or newer
 resolver must be fully re-indexed before you trust its edges and rankings.
 
@@ -207,8 +207,9 @@ nestweaver index --repo /path/to/repo --db /path/to/nestweaver.lbug --force
 ```
 
 `stale-check` reports `outdated_resolver` and exits 2 for a resolver mismatch.
-12.2.5 uses generation 21 and parsed cache 15, covering PHP static-method
-ownership and the Dart and PowerShell grammar changes. Every repository needs
+12.2.6 uses generation 22 and parsed cache 16, covering anonymous JS/TS default
+callable ownership and Svelte/Vue/Astro destructured/default parameter spans.
+LadybugDB 0.22.1 is unchanged from 12.2.5. Every repository needs
 this forced re-index once. **`--force` is required**: incremental indexing
 at git HEAD can report no changes and retain the old generation.
 
