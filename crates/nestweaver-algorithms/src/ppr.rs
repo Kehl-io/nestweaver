@@ -234,8 +234,8 @@ pub fn forward_push_ppr_cancellable(
     // adjacency.incoming[v] contains (u, w) meaning u→v with weight w.
     // We need outgoing[u] = [(v, w)] for forward pushes.
     let mut outgoing: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
-    for v in 0..n {
-        for &(u, w) in &adjacency.incoming[v] {
+    for (v, incoming) in adjacency.incoming[..n].iter().enumerate() {
+        for &(u, w) in incoming {
             outgoing[u].push((v, w));
         }
     }
