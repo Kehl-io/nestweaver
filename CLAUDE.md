@@ -570,7 +570,9 @@ federation          (leaf: schema + proto only)
 
 ### Current resolver upgrade
 
-Resolver generation 22 and parsed-cache version 16 add anonymous JS/TS default
+Resolver generation 23 and parsed-cache version 17 incorporate Scala grammar
+0.26.9 repairs to Scala 2 given/enum identifiers, typed lambdas, inheritance
+and expression boundaries. Generation 22 and cache 16 add anonymous JS/TS default
 callable owners and complete Svelte/Vue/Astro destructured-parameter spans.
 Generation 21 and cache 15's PHP static-call owner, inheritance and dispatch
 facts remain included. Generation 20 and cache 14 cover Dart 0.3 and

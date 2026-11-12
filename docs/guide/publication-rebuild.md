@@ -28,6 +28,13 @@ not replace existing graph facts. Previous release 12.2.5 uses generation 21/cac
 and the same LadybugDB 0.22.1 engine. Markdown derivation remains version 3;
 refresh each registered vault if also crossing the earlier Markdown link upgrade.
 
+Current source uses LadybugDB 0.22.3, resolver generation 23 and
+parsed-cache version 17. LadybugDB 0.22.3 retains storage version 49 and adds
+a torn-WAL read-bounds fix; this patch does not introduce a new storage format.
+Scala grammar 0.26.9 changes declarations and references for unchanged source.
+After upgrading, force re-index each repository once so stored facts match
+fresh parses; rejecting old parse caches alone does not repair stored graphs.
+
 ## Canonical ranking scope
 
 Indexing, code watching, publication rebuild and lazy ranking all use the

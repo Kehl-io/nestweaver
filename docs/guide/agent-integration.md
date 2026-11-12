@@ -52,7 +52,7 @@ six for `--lite`, unless you selected an allowlist. Ask the agent to call
 caller with `brain_impact`. Confirm its repository and path match the CLI graph.
 A CLI command succeeding alone does not establish client MCP activation.
 
-After upgrading a compatible graph, force-index each repo for generation 22.
+After upgrading a compatible graph, force-index each repo for generation 23.
 If also crossing the earlier Markdown derivation upgrade, refresh each vault.
 Check `stale-check` and coverage
 warnings before trusting results. Configured projects require

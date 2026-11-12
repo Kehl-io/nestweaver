@@ -18,8 +18,8 @@
 # Cargo.lock that pins a different lbug version, fails the script.
 set -euo pipefail
 
-LBUG_TAG="v0.22.1"
-LBUG_COMMIT="9e29cf5ef6b793a6d5684c57aa0d5330fd9dc928"
+LBUG_TAG="v0.22.3"
+LBUG_COMMIT="6a3e04a8f28474a258f68fe5030dfd88df26eff6"
 LBUG_REPOSITORY="https://github.com/LadybugDB/ladybug.git"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -204,6 +204,11 @@ the preceding Dart/PowerShell grammar updates remain included. Force re-index ea
 upgrading to publish the new parser facts; invalidating the parse cache alone
 does not replace symbols and edges already stored in the graph.
 
+Current source uses LadybugDB 0.22.3 (the same storage format 49), resolver
+generation **23** and parsed cache **17**. Scala grammar 0.26.9 repairs Scala 2
+`given`/`enum` identifiers and other grammar boundaries. Force-index each
+repository once after upgrading from generation 22 as well.
+
 Canonical publication PageRank now consistently covers the unified code and
 notes graph after indexing, watching and rebuilding. Older canonical sidecars
 with a code-only scope are disclosed and recomputed lazily on the first ranked

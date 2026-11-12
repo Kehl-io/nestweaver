@@ -73,7 +73,10 @@ use serde::{Deserialize, Serialize};
 ///      participate in the dedicated static-method resolver.
 /// 16 — Anonymous JS/TS default callable exports own their deferred bodies;
 ///      Svelte/Vue/Astro callable spans skip destructured/default parameters.
-const CACHE_VERSION: u32 = 16;
+/// 17 — Scala 0.26.9 repairs Scala 2 given/enum identifiers, typed lambdas,
+///      inheritance and expression boundaries. Tree-sitter 0.27.2 also fixes
+///      native traversal and error detection; discard earlier parser facts.
+const CACHE_VERSION: u32 = 17;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -1254,6 +1257,181 @@ mod tests {
         let fresh = tmp.path().join("fresh.lbug");
         index(&fresh);
         assert_eq!(graph(&db), graph(&fresh));
+    }
+
+    #[test]
+    fn scala_0269_rejects_version16_base_and_log_facts() {
+        let source = "object Legacy {\n def given(): Int = 1\n def enum(): Int = 2\n def run(): Int = given() + enum()\n}\n";
+        let fresh = nestweaver_parser::parse_source(Path::new("Legacy.scala"), source).unwrap();
+        assert!(!fresh.has_syntax_errors);
+        let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        let mut stale = CachedParseResult {
+            symbols: fresh.symbols.clone(),
+            references: fresh.references.clone(),
+            type_bindings: fresh.type_bindings.clone(),
+        };
+        // The previous grammar fails to recognize the Scala 2 keyword names.
+        // Preserve unrelated facts under the same content key, so this tests
+        // rejection of a real cache hit rather than an empty-cache miss.
+        stale
+            .symbols
+            .retain(|s| s.name != "given" && s.name != "enum");
+        stale
+            .references
+            .retain(|r| r.name != "given" && r.name != "enum");
+        stale
+            .type_bindings
+            .retain(|b| b.var_name != "given" && b.var_name != "enum");
+        for base in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("scala.parsed_cache.bin");
+            if base {
+                let old = ParsedCacheFile {
+                    version: 16,
+                    entries: HashMap::from([(hash.clone(), stale.clone())]),
+                };
+                std::fs::write(&path, rmp_serde::to_vec_named(&old).unwrap()).unwrap();
+            } else {
+                let old = LogRecord {
+                    version: 16,
+                    hash: std::borrow::Cow::Borrowed(&hash),
+                    entry: std::borrow::Cow::Borrowed(&stale),
+                };
+                let encoded = rmp_serde::to_vec_named(&old).unwrap();
+                let mut bytes = (encoded.len() as u32).to_le_bytes().to_vec();
+                bytes.extend(encoded);
+                std::fs::write(log_path(&path), bytes).unwrap();
+            }
+            assert!(ParsedCache::load(&path).get(&hash).is_none());
+            let mut reader = ParsedCache::empty();
+            reader.refresh(&path);
+            assert!(reader.get(&hash).is_none());
+            reader.insert(
+                hash.clone(),
+                CachedParseResult {
+                    symbols: fresh.symbols.clone(),
+                    references: fresh.references.clone(),
+                    type_bindings: fresh.type_bindings.clone(),
+                },
+            );
+            reader.save(&path).unwrap();
+            let warm = ParsedCache::load(&path);
+            for name in ["given", "enum"] {
+                assert!(
+                    warm.get(&hash)
+                        .unwrap()
+                        .symbols
+                        .iter()
+                        .any(|s| s.name == name)
+                );
+                assert!(
+                    warm.get(&hash)
+                        .unwrap()
+                        .references
+                        .iter()
+                        .any(|r| r.name == name)
+                );
+            }
+        }
+        const { assert!(crate::resolver_generation::RESOLVER_GENERATION >= 23) };
+    }
+
+    #[test]
+    fn scala_0269_force_reindex_repairs_generation22_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let source = "object Legacy {\n def given(): Int = 1\n def enum(): Int = 2\n def run(): Int = given() + enum()\n}\n";
+        std::fs::write(repo.join("Legacy.scala"), source).unwrap();
+        let db = tmp.path().join("graph.lbug");
+        let url = "https://example.test/scala-keyword-cache";
+        let repo_uid = nestweaver_schema::repo_uid("review", url);
+        let index = |force| {
+            crate::index::index_directory_with_options(
+                &repo,
+                &db,
+                "review",
+                url,
+                "unchanged",
+                force,
+                None,
+            )
+            .unwrap();
+        };
+        let graph = || {
+            let store = nestweaver_store::GraphStore::open(&db).unwrap();
+            let mut names: Vec<_> = store
+                .list_all_symbols()
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.uid, s.name, s.start_line, s.end_line))
+                .collect();
+            names.sort();
+            let mut calls: Vec<_> = store
+                .load_typed_edges()
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.2 == "CALLS")
+                .map(|e| (e.0, e.1))
+                .collect();
+            calls.sort();
+            (names, calls)
+        };
+        index(false);
+        let expected = graph();
+        let run = nestweaver_schema::symbol_uid(&repo_uid, "Legacy.scala", "run", 4);
+        for (name, line) in [("given", 2), ("enum", 3)] {
+            let uid = nestweaver_schema::symbol_uid(&repo_uid, "Legacy.scala", name, line);
+            assert!(
+                expected
+                    .0
+                    .iter()
+                    .any(|s| s.0 == uid && s.2 == line && s.3 == line)
+            );
+            assert!(expected.1.contains(&(run.clone(), uid)));
+        }
+        // Model the measured 0.26.3 graph: Legacy/run survive, while both
+        // keyword-named functions and their incoming calls are absent. Keep
+        // filemeta warm to prove a no-op index cannot repair persisted facts.
+        {
+            let store = nestweaver_store::GraphStore::open(&db).unwrap();
+            let conn = store.begin_transaction().unwrap();
+            for (name, line) in [("given", 2), ("enum", 3)] {
+                let uid = nestweaver_schema::symbol_uid(&repo_uid, "Legacy.scala", name, line);
+                let mut stmt = conn
+                    .prepare("MATCH (s:Symbol {uid: $uid}) DETACH DELETE s")
+                    .unwrap();
+                conn.execute(&mut stmt, vec![("uid", uid.into())]).unwrap();
+            }
+            store.commit_transaction(&conn).unwrap();
+        }
+        let mut generations = crate::resolver_generation::load(&db);
+        generations.repos.insert(repo_uid.clone(), 22);
+        std::fs::write(
+            crate::sidecar_path(&db, crate::resolver_generation::RESOLVER_GENERATION_SIDECAR),
+            serde_json::to_vec(&generations).unwrap(),
+        )
+        .unwrap();
+        let stale = graph();
+        assert_ne!(stale, expected);
+        index(false);
+        assert_eq!(graph(), stale);
+        assert_eq!(
+            crate::resolver_generation::load(&db).stale_repos([repo_uid.as_str()]),
+            vec![repo_uid.clone()]
+        );
+        index(true);
+        assert_eq!(graph(), expected);
+        assert_eq!(
+            crate::resolver_generation::load(&db).generation_for(&repo_uid),
+            crate::resolver_generation::RESOLVER_GENERATION
+        );
+        index(false);
+        assert_eq!(
+            graph(),
+            expected,
+            "warm unchanged index preserves repaired graph"
+        );
     }
 
     #[test]

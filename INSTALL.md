@@ -135,7 +135,7 @@ the build compiles Ladybug from source, rather than linking a prebuilt archive
 whose hidden ELF symbols cause zstd link errors.
 
 **Use the pinned `LBUG_SOURCE_DIR`.** The source build uses LadybugDB
-`v0.22.1`, matching the Rust dependency. `scripts/fetch-lbug-source.sh` makes a
+`v0.22.3`, matching the Rust dependency. `scripts/fetch-lbug-source.sh` makes a
 shallow clone of that tag (no submodules) under `target/`, verifies its commit,
 and prints the `export` line; `eval` applies it to the current shell. Pass a
 directory to put the clone elsewhere, or point `LBUG_SOURCE_DIR` at your own
@@ -197,7 +197,7 @@ daemon and back up with the previous binary before upgrading. Downgrading after
 migration requires restoring that backup with the previous binary. See the
 [LadybugDB 0.22 storage and rollback guide](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
-For a compatible database, the current **`RESOLVER_GENERATION` is 22**.
+For a compatible database, the current **`RESOLVER_GENERATION` is 23**.
 Compatibility requires an exact match: a graph written by an older or newer
 resolver must be fully re-indexed before you trust its edges and rankings.
 
@@ -212,6 +212,11 @@ callable ownership and Svelte/Vue/Astro destructured/default parameter spans.
 LadybugDB 0.22.1 is unchanged from 12.2.5. Every repository needs
 this forced re-index once. **`--force` is required**: incremental indexing
 at git HEAD can report no changes and retain the old generation.
+
+Current source uses generation 23/cache 17 with Scala grammar 0.26.9, which
+repairs Scala 2 `given`/`enum` identifiers and other grammar boundaries.
+LadybugDB 0.22.3 retains storage format 49 and adds a torn-WAL read-bounds fix.
+Force-index once after upgrading from generation 22 as well.
 
 If also crossing the earlier Markdown derivation upgrade, run
 `nestweaver brain refresh /path/to/vault` for each registered vault. Markdown
