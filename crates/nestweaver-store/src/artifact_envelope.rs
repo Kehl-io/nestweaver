@@ -303,6 +303,41 @@ mod tests {
         assert_eq!(decoded, payload);
     }
 
+    #[test]
+    fn fractional_ranks_survive_json_round_trip_without_weakening_integrity() {
+        let identity = identity();
+        // Actual ranks from a unified code/note graph. The default JSON float
+        // parser shifts these by one ULP, changing the checksum of a valid
+        // artifact when its payload is serialized again during validation.
+        let payload = HashMap::from([
+            ("note".to_string(), 0.12116885300654819_f64),
+            ("symbol".to_string(), 0.12059244762542065_f64),
+        ]);
+        let envelope = ArtifactEnvelope::new(expectation(&identity), &payload).unwrap();
+        let bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+        let mut restored: ArtifactEnvelope = serde_json::from_slice(&bytes).unwrap();
+        let decoded: HashMap<String, f64> = restored
+            .validate_and_decode(expectation(&identity))
+            .unwrap();
+        for (uid, score) in &payload {
+            assert_eq!(
+                decoded[uid].to_bits(),
+                score.to_bits(),
+                "rank changed: {uid}"
+            );
+        }
+
+        // Even the smallest representable payload change must still fail the
+        // original checksum, rather than becoming an approximate comparison.
+        restored.payload["note"] = serde_json::json!(f64::from_bits(payload["note"].to_bits() + 1));
+        let tampered = serde_json::to_vec_pretty(&restored).unwrap();
+        let restored: ArtifactEnvelope = serde_json::from_slice(&tampered).unwrap();
+        assert!(matches!(
+            restored.validate_and_decode_typed::<HashMap<String, f64>>(expectation(&identity)),
+            Err(ArtifactRejection::Corrupt(message)) if message == "payload checksum mismatch"
+        ));
+    }
+
     /// nw-459: a producer-version bump alone must NOT read as "incompatible".
     ///
     /// `producer_version` was compared by exact string equality, so a cache
