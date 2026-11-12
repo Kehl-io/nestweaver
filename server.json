@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://docs.nestweaver.kehl.io",
-  "version": "12.2.6",
+  "version": "12.2.7",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "nestweaver",
-      "version": "12.2.6",
+      "version": "12.2.7",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

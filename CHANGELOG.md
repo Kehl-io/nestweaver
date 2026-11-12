@@ -1,5 +1,14 @@
 # Changelog
 
+## [12.2.7](https://github.com/Kehl-io/nestweaver/compare/v12.2.6...v12.2.7) (2026-11-12)
+
+
+### Bug Fixes
+
+* **algorithms:** iterate incoming edges without indexed range ([6c20f86](https://github.com/Kehl-io/nestweaver/commit/6c20f862a1a284d3962ae56024445e6d96487869))
+* **deps:** align native source and invalidate old parser facts ([0a67bef](https://github.com/Kehl-io/nestweaver/commit/0a67befe742c6016e9fea1da9d88fe32dedd5790))
+* **store:** preserve fractional ranks through artifact JSON round trips ([4cee56c](https://github.com/Kehl-io/nestweaver/commit/4cee56c626898e669ab59c4d0da2bd1bba818f9c))
+
 ## [12.2.6](https://github.com/Kehl-io/nestweaver/compare/v12.2.5...v12.2.6) (2026-11-08)
 
 
