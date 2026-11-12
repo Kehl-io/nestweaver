@@ -2213,10 +2213,7 @@ pub(crate) fn run_brain(
                 let stored_canon = std::fs::canonicalize(stored)
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| stored.to_string());
-                if stored_canon == *canon_str {
-                    return true;
-                }
-                false
+                stored_canon == *canon_str
             };
 
             // If the caller passed `--instance`, treat it as a precise
