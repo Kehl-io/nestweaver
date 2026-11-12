@@ -5664,9 +5664,9 @@ mod tests {
                 .map(|e| (&e.uid, &e.matched_query))
                 .collect::<Vec<_>>()
         );
-        for i in 0..SEED_NAME_MATCH_LIMIT {
+        for entry in &result.entries[..SEED_NAME_MATCH_LIMIT] {
             assert_eq!(
-                result.entries[i].matched_query,
+                entry.matched_query,
                 Some(MatchedQuery::Exact),
                 "entries 0..{SEED_NAME_MATCH_LIMIT} must all be pinned exact matches"
             );

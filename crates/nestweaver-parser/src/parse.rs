@@ -10797,6 +10797,25 @@ use crate::config::{Settings, load as load_config};
         );
     }
 
+    #[test]
+    fn scala_0269_recovers_scala2_keyword_identifiers() {
+        let source = "object Legacy {\n def given(): Int = 1\n def enum(): Int = 2\n def run(): Int = given() + enum()\n}\n";
+        let parsed = parse_source(Path::new("Legacy.scala"), source).unwrap();
+        assert!(!parsed.has_syntax_errors);
+        for (name, line) in [("given", 2), ("enum", 3), ("run", 4)] {
+            let symbol = parsed.symbols.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(symbol.kind, SymbolKind::Function);
+            assert_eq!((symbol.start_line, symbol.end_line), (line, line));
+        }
+        for name in ["given", "enum"] {
+            assert!(
+                parsed.references.iter().any(|r| {
+                    r.name == name && r.kind == ReferenceKind::Call && r.start_line == 4
+                })
+            );
+        }
+    }
+
     // ── Elixir tests ────────────────────────────────────────────────────
 
     #[test]

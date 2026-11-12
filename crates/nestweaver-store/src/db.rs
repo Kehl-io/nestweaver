@@ -3807,12 +3807,8 @@ impl GraphStore {
                 // Reason alone is not enough: a leftover watcher-batch
                 // payload while `index_repo` holds the write lease for hours
                 // is a full publication, not a debounce window.
-                if crate::index_publication::watcher_batch_ranking_exception_applies(&record)
-                    && matches!(crate::write_lease_state(path), crate::WriteLeaseState::Held)
-                {
-                    return false;
-                }
-                true
+                !(crate::index_publication::watcher_batch_ranking_exception_applies(&record)
+                    && matches!(crate::write_lease_state(path), crate::WriteLeaseState::Held))
             }
         }
     }

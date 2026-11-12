@@ -386,7 +386,11 @@ use std::path::Path;
 /// 22 — Anonymous JS/TS default callable owners and complete destructured
 ///      component spans change stored call ownership. Cache 16 reparses facts;
 ///      force reindex once to replace old module/zero-height ownership edges.
-pub const RESOLVER_GENERATION: u32 = 22;
+/// 23 — Scala grammar 0.26.9 changes declaration and call facts, including
+///      Scala 2 given/enum identifiers; tree-sitter 0.27.2 also fixes native
+///      traversal and error detection. Cache 17 reparses unchanged files;
+///      force reindex once to replace persisted symbols and ownership edges.
+pub const RESOLVER_GENERATION: u32 = 23;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would
