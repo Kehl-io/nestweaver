@@ -79,8 +79,9 @@ If optional dependencies were skipped, `nestweaver` exits 1 and names the platfo
 Before installing, follow [upgrade and backup instructions](https://github.com/Kehl-io/nestweaver/blob/main/INSTALL.md#upgrading-an-existing-database)
 to preserve the old binary and database and check storage rollback limits.
 
-When the resolver generation changes, check the graph and re-index each
-repository with `--force`. A plain `index` can skip a repository already at Git
+Release 12.2.7 uses resolver generation **23** and parsed cache **17**, up from
+22/16 in 12.2.6. LadybugDB 0.22.3 retains storage format 49. Check the graph
+and re-index every repository with `--force` after upgrading. A plain `index` can skip a repository already at Git
 HEAD and leave its old edges in place.
 
 ```sh

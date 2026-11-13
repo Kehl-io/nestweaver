@@ -1352,7 +1352,7 @@ immediately in normal operation.
 > 12.2.6 requires generation 22/cache 16 for anonymous JS/TS default
 > callable ownership and Svelte/Vue/Astro destructured-parameter function spans.
 > Force-reindex repositories once to replace existing ownership edges.
-> Current source uses generation 23/cache 17 for Scala grammar 0.26.9;
+> 12.2.7 uses generation 23/cache 17 for Scala grammar 0.26.9;
 > force-reindex once after upgrading from generation 22 as well. LadybugDB
 > 0.22.3 retains the same storage format 49.
 > Markdown derivation version 3 separately refreshes eligible vault links for

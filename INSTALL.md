@@ -192,7 +192,7 @@ is refused with `nestweaver::db_rebuild_required`. Back it up and follow the
 [publication rebuild guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required)
 and the error's recovery command. A forced re-index alone is not the remedy
 for an incompatible storage format. A compatible format 47 database can still
-migrate to format 49 on a writable open or checkpoint in 12.2.5 or 12.2.6. Stop the old
+migrate to format 49 on a writable open or checkpoint in 12.2.5 or later. Stop the old
 daemon and back up with the previous binary before upgrading. Downgrading after
 migration requires restoring that backup with the previous binary. See the
 [LadybugDB 0.22 storage and rollback guide](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
@@ -213,7 +213,7 @@ LadybugDB 0.22.1 is unchanged from 12.2.5. Every repository needs
 this forced re-index once. **`--force` is required**: incremental indexing
 at git HEAD can report no changes and retain the old generation.
 
-Current source uses generation 23/cache 17 with Scala grammar 0.26.9, which
+12.2.7 uses generation 23/cache 17 with Scala grammar 0.26.9, which
 repairs Scala 2 `given`/`enum` identifiers and other grammar boundaries.
 LadybugDB 0.22.3 retains storage format 49 and adds a torn-WAL read-bounds fix.
 Force-index once after upgrading from generation 22 as well.
