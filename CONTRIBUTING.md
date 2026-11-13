@@ -518,8 +518,9 @@ and deterministically replaces only that release ID's private assets. If that
 source run is incomplete, delete only the explicitly bound private draft and
 then repair/re-run Release Please; cleanup refuses a public release or visible
 tag. If the repair changes the release source, prepare a replacement release PR
-for the still-unpublished version, retaining the generated release-note body
-and `autorelease: pending` label. Require the normal checks on its exact head
+for the still-unpublished version, using its generated `release-please--`
+branch name, title, release-note body and `autorelease: pending` label.
+Require the normal checks on its exact head
 before merging. Release Please then binds the replacement draft to that merge
 commit; do not re-label the old merged PR or move a public tag to newer code.
 If GitHub publication succeeded but npm did not, the npm-only recovery
