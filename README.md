@@ -189,13 +189,13 @@ notes below before using an older database with a new binary.
 
 **Upgrading an existing database?** Check compatibility before querying it:
 
-Builds with LadybugDB **0.22.1** read the 0.21.2 database format, but a
+Builds with LadybugDB **0.22.3** read the 0.21.2 database format, but a
 writable open/checkpoint can upgrade its storage format from 47 to 49. Stop the
 old daemon and back up with the previous binary before upgrading. To downgrade, reinstall that
 binary and restore the pre-upgrade backup; do not point it at the upgraded file.
 See the [storage upgrade guidance](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
-12.2.6 uses resolver generation **22** and parsed cache **16**.
+Previous release 12.2.6 uses resolver generation **22** and parsed cache **16**.
 LadybugDB 0.22.1 is unchanged from 12.2.5.
 Anonymous JavaScript/TypeScript default functions now own calls in their bodies;
 Svelte, Vue and Astro function spans skip destructured/default parameters.
@@ -204,7 +204,7 @@ the preceding Dart/PowerShell grammar updates remain included. Force re-index ea
 upgrading to publish the new parser facts; invalidating the parse cache alone
 does not replace symbols and edges already stored in the graph.
 
-Current source uses LadybugDB 0.22.3 (the same storage format 49), resolver
+12.2.7 uses LadybugDB 0.22.3 (the same storage format 49), resolver
 generation **23** and parsed cache **17**. Scala grammar 0.26.9 repairs Scala 2
 `given`/`enum` identifiers and other grammar boundaries. Force-index each
 repository once after upgrading from generation 22 as well.
@@ -222,8 +222,8 @@ the same product version disclose skew without automatically replacing a writer.
 - A database from before LadybugDB 0.21 needs a **publication rebuild**, not
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
-- For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.6
-  requires resolver generation **22** (12.2.5 used **21**). If your binary reports a generation-stale graph, run
+- For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.7
+  requires resolver generation **23** (12.2.6 used **22**). If your binary reports a generation-stale graph, run
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - Generation 16 preserves declaring-package origin through Go factory-call
@@ -258,7 +258,7 @@ the same product version disclose skew without automatically replacing a writer.
   generation15 additionally handles inferred `var` slices, parenthesized range
   sources and single named factory results. Parsed cache10 reparses unchanged
   declarations for normalized return types and complete var/const/parameter shadow guards.
-- **Upgrading to 12.2.6 needs a forced re-index of every repository.** Run
+- **Upgrading to 12.2.7 needs a forced re-index of every repository.** Run
   `nestweaver index --repo <path> --force` once per repository, using your usual
   `--db` and `--config` bindings. Plain incremental indexing can leave an
   unchanged graph on its old generation. `stale-check` exits 2 until repaired.

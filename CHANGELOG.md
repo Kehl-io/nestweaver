@@ -9,6 +9,44 @@
 * **deps:** align native source and invalidate old parser facts ([0a67bef](https://github.com/Kehl-io/nestweaver/commit/0a67befe742c6016e9fea1da9d88fe32dedd5790))
 * **store:** preserve fractional ranks through artifact JSON round trips ([4cee56c](https://github.com/Kehl-io/nestweaver/commit/4cee56c626898e669ab59c4d0da2bd1bba818f9c))
 
+### Upgrade notes
+
+12.2.7 uses resolver generation **23** and parsed-cache version **17**;
+12.2.6 used 22/16. After upgrading, force re-index every repository once with
+`nestweaver index --repo <path> --force`, retaining the usual `--db` and
+`--config` bindings. An unchanged incremental index can preserve old facts.
+`stale-check` exits 2 until the resolver generation matches.
+
+LadybugDB advances from 0.22.1 to **0.22.3**, retaining storage format **49**.
+This patch adds a torn-WAL read-bounds fix without a new storage-format
+migration. Stop the old daemon and save a backup with the previous binary
+before installing. Keep that binary and backup for rollback; older engines
+crossing storage format 47→49 cannot reopen the upgraded database. See the
+[storage and rollback guide](https://github.com/Kehl-io/nestweaver/blob/v12.2.7/docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
+
+Markdown derivation remains **3**. An otherwise current 12.2.6 vault needs no
+blanket refresh for this release. Refresh affected vaults when crossing an
+earlier derivation upgrade or when diagnostics request it. Installing the
+package does not upgrade or re-index a live vault.
+
+### Release details
+
+- Scala grammar 0.26.9 recovers Scala 2 `given`/`enum` declarations, calls and
+  return bindings; cache invalidation and a resolver bump also cover unchanged
+  source. Tree-sitter advances to 0.27.2, UUID to 1.29.2 and openssl-sys to 0.9.118.
+- Fractional PageRank scores survive JSON round trips exactly, preventing
+  checksum rejection of valid artifacts. One-ULP payload changes still fail
+  integrity validation; the artifact schema and checksum remain unchanged.
+- Native source and ABI pins agree on LadybugDB 0.22.3. Equivalent iterator
+  and Boolean cleanups satisfy Rust 1.100 Clippy without changing ranking,
+  publication admission or vault-path matching.
+
+Validation includes native Scala cache/graph upgrade regressions, exact-float
+and tamper controls, complete parser/store/engine suites and a disposable
+0.22.1→0.22.3 read/write/reopen→0.22.1 read witness. Historical ignored tests,
+manual checkpoint soak and affected-host qualifications remain separate.
+
+
 ## [12.2.6](https://github.com/Kehl-io/nestweaver/compare/v12.2.5...v12.2.6) (2026-11-08)
 
 
