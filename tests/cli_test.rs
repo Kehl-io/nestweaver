@@ -1608,10 +1608,15 @@ fn release_workflow_stages_openssl_outside_build_script_out_dir() {
         !step.contains("OPENSSL_INSTALL=\"$(find"),
         "OpenSSL exports must not reference openssl-sys's self-deleting OUT_DIR\nstep:\n{step}"
     );
+    assert!(
+        !step.contains("$(find"),
+        "OpenSSL source must come from this Cargo invocation, not a layout-dependent cache search\nstep:\n{step}"
+    );
     for required in [
         "TARGET: ${{ matrix.target }}",
         "cargo build --locked --release --target \"$TARGET\" -p openssl-sys",
-        "OPENSSL_SOURCE=\"$(find \"target/$TARGET/release/build\"",
+        "--message-format=json > \"$RUNNER_TEMP/openssl-build.jsonl\"",
+        "OPENSSL_SOURCE=\"$(python3 scripts/release-openssl-source.py \"$RUNNER_TEMP/openssl-build.jsonl\")\"",
         "OPENSSL_INSTALL=\"$RUNNER_TEMP/nestweaver-openssl/$TARGET\"",
         "mkdir -p \"$OPENSSL_INSTALL\"",
         "cp -R \"$OPENSSL_SOURCE/.\" \"$OPENSSL_INSTALL/\"",
@@ -1619,6 +1624,7 @@ fn release_workflow_stages_openssl_outside_build_script_out_dir() {
         "test -f \"$OPENSSL_INSTALL/lib/libcrypto.a\"",
         "test -f \"$OPENSSL_INSTALL/include/openssl/ssl.h\"",
         "test -f \"$OPENSSL_INSTALL/include/openssl/opensslconf.h\"",
+        "test -f \"$OPENSSL_INSTALL/lib/pkgconfig/openssl.pc\"",
         "echo \"OPENSSL_DIR=$OPENSSL_INSTALL\"",
         "echo \"OPENSSL_ROOT_DIR=$OPENSSL_INSTALL\"",
         "echo \"OPENSSL_LIB_DIR=$OPENSSL_INSTALL/lib\"",
