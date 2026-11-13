@@ -1166,6 +1166,8 @@ jobs:
           path: |
             target/**/build/lbug-*/out
             target/**/build/openssl-sys-*/out
+            target/**/build/lbug/*/out
+            target/**/build/openssl-sys/*/out
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ steps.nativekey.outputs.key }}
           restore-keys: native-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
       - name: Build target OpenSSL
@@ -1173,10 +1175,12 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          cargo build --locked --release --target "$TARGET" -p openssl-sys
-          OPENSSL_SOURCE="$(find "target/$TARGET/release/build" -type d -path '*/openssl-sys-*/out/openssl-build/install' -print -quit)"
-          test -n "$OPENSSL_SOURCE"
-          OPENSSL_SOURCE="$(cd "$OPENSSL_SOURCE" && pwd)"
+          # Cargo 1.100 changed build/<crate>-<hash>/out to
+          # build/<crate>/<hash>/out. Use this invocation's metadata rather
+          # than a layout-dependent find that can also select stale caches.
+          cargo build --locked --release --target "$TARGET" -p openssl-sys \
+            --message-format=json > "$RUNNER_TEMP/openssl-build.jsonl"
+          OPENSSL_SOURCE="$(python3 scripts/release-openssl-source.py "$RUNNER_TEMP/openssl-build.jsonl")"
           test -n "$RUNNER_TEMP"
           OPENSSL_INSTALL="$RUNNER_TEMP/nestweaver-openssl/$TARGET"
           mkdir -p "$OPENSSL_INSTALL"
