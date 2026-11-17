@@ -41,7 +41,7 @@ libc = "0.2"
 [build-dependencies]
 # tree-sitter-sequel 0.3.x requires cc ~1.2.1; keep the workspace build
 # dependency on the same resolvable line until that grammar relaxes its bound.
-cc = "~1.2"
+cc = "~1.11"
 serde_json = { workspace = true }
 toml = "1.1"
 
