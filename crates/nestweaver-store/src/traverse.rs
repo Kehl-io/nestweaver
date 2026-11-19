@@ -1123,36 +1123,40 @@ impl GraphStore {
         // storage engine can return garbled non-PK string values from partial
         // string scans after delete+checkpoint cycles (which re-indexing
         // performs routinely) — while PK point lookups return the correct
-        // values for the very same rows. `uid` is the primary key and is
-        // therefore trustworthy; `name`/`file_path` are not. Re-resolve them
-        // through the PK-driven batch lookup so no consumer of impact results
-        // (blast radius, affected tests, flow trace) can surface corrupted
-        // symbol names. One batched query per traversal.
+        // values for the very same rows. Require a complete batch for the
+        // caller UIDs discovered by the walk. A PK probe can also miss an
+        // expected row, so returning scan-projected fields for that UID would
+        // silently bypass the repair.
         // `NESTWEAVER_SKIP_PK_DISPLAY_REPAIR=1` turns the repair off, for an
         // A/B that measures whether the storage engine still needs it. An
         // internal measurement switch, not an operator setting.
         let skip_repair =
             std::env::var_os("NESTWEAVER_SKIP_PK_DISPLAY_REPAIR").is_some_and(|value| value == "1");
-        if !result.nodes.is_empty() && !skip_repair {
-            let uids: Vec<&str> = result.nodes.iter().map(|node| node.uid.as_str()).collect();
-            match self.batch_lookup_symbols(&uids) {
-                Ok(map) => {
-                    for node in &mut result.nodes {
-                        if let Some(sym) = map.get(&node.uid) {
-                            node.name = sym.name.clone();
-                            node.file_path = sym.file_path.clone();
-                            node.start_line = sym.start_line;
-                        }
-                    }
-                }
-                // Non-fatal: the traversal result is still valid, display
-                // fields just keep their scan-provided values.
-                Err(e) => {
-                    tracing::warn!("impact: display-field repair lookup failed: {e}");
-                }
-            }
+        if !skip_repair {
+            self.hydrate_live_impact_nodes(&mut result.nodes)?;
         }
         Ok(result)
+    }
+
+    fn hydrate_live_impact_nodes(&self, nodes: &mut [ImpactNode]) -> Result<(), StoreError> {
+        let uids: Vec<&str> = nodes.iter().map(|node| node.uid.as_str()).collect();
+        let mut fields = self
+            .batch_lookup_symbol_display_fields_exact(&uids)
+            .map_err(|error| {
+                StoreError::Query(format!("live impact symbol hydration failed: {error}"))
+            })?;
+        for node in nodes {
+            let symbol = fields.remove(&node.uid).ok_or_else(|| {
+                StoreError::Query(format!(
+                    "live impact symbol hydration missing UID {}",
+                    node.uid
+                ))
+            })?;
+            node.name = symbol.name;
+            node.file_path = symbol.file_path;
+            node.start_line = symbol.start_line;
+        }
+        Ok(())
     }
 
     /// Internal: fetch all direct callers of `uid` across
@@ -1673,8 +1677,9 @@ mod tests {
 
     use nestweaver_schema::{Symbol, SymbolKind, Visibility};
 
-    use super::{compute_path_factor, kind_rank};
+    use super::{ImpactNode, compute_path_factor, kind_rank};
     use crate::db::GraphStore;
+    use crate::error::StoreError;
     use crate::ranking::{PathDeboostRule, SeedResolutionConfig, default_kind_priority};
     use crate::tantivy_index::SearchTotalRelation;
 
@@ -3437,6 +3442,33 @@ mod tests {
             store.impact_snapshot_cache.lock().unwrap().is_none(),
             "a failed snapshot must not be published"
         );
+    }
+
+    #[test]
+    fn live_impact_hydration_rejects_missing_caller_uid() {
+        let store = GraphStore::in_memory().unwrap();
+        store
+            .insert_symbol(&make_symbol("present", "committed_name"))
+            .unwrap();
+        let mut nodes = ["present", "missing"].map(|uid| ImpactNode {
+            uid: uid.to_string(),
+            name: "scan_name".to_string(),
+            file_path: "scan.rs".to_string(),
+            start_line: 1,
+            edge_type: "CALLS".to_string(),
+            confidence: 0.95,
+            depth: 1,
+            impact_score: 0.95,
+        });
+
+        let error = store
+            .hydrate_live_impact_nodes(&mut nodes)
+            .expect_err("a lookup missing any walked caller must fail");
+
+        assert!(matches!(error, StoreError::Query(message)
+                if message.contains("live impact symbol hydration failed")
+                    && message.contains("missing symbol UID missing")));
+        assert!(nodes.iter().all(|node| node.name == "scan_name"));
     }
 
     #[test]

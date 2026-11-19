@@ -755,6 +755,12 @@ pub(crate) fn row_to_note(row: &[Value]) -> Result<Note, StoreError> {
     })
 }
 
+pub(crate) struct SymbolDisplayFields {
+    pub name: String,
+    pub file_path: String,
+    pub start_line: u32,
+}
+
 impl GraphStore {
     pub fn lookup_symbol(&self, uid: &str) -> Result<Symbol, StoreError> {
         let conn = self.conn()?;
@@ -781,7 +787,10 @@ impl GraphStore {
         &self,
         uids: &[&str],
     ) -> Result<std::collections::HashMap<String, Symbol>, StoreError> {
-        self.batch_lookup_symbols_impl(uids, false)
+        self.batch_lookup_symbols_impl(uids, false, SYMBOL_COLUMNS, |row| {
+            let symbol = row_to_symbol(row)?;
+            Ok((symbol.uid.clone(), symbol))
+        })
     }
 
     /// Exact variant for trust-sensitive snapshots.
@@ -792,14 +801,41 @@ impl GraphStore {
         &self,
         uids: &[&str],
     ) -> Result<std::collections::HashMap<String, Symbol>, StoreError> {
-        self.batch_lookup_symbols_impl(uids, true)
+        self.batch_lookup_symbols_impl(uids, true, SYMBOL_COLUMNS, |row| {
+            let symbol = row_to_symbol(row)?;
+            Ok((symbol.uid.clone(), symbol))
+        })
     }
 
-    fn batch_lookup_symbols_impl(
+    /// Hydrate exactly the fields returned by live impact traversal. A
+    /// malformed full-symbol field, such as a signature, cannot affect them.
+    pub(crate) fn batch_lookup_symbol_display_fields_exact(
+        &self,
+        uids: &[&str],
+    ) -> Result<std::collections::HashMap<String, SymbolDisplayFields>, StoreError> {
+        self.batch_lookup_symbols_impl(
+            uids,
+            true,
+            "s.uid, s.name, s.file_path, s.start_line",
+            |row| {
+                let uid = extract_string(row, 0)?;
+                let fields = SymbolDisplayFields {
+                    name: extract_string(row, 1)?,
+                    file_path: extract_string(row, 2)?,
+                    start_line: u32::try_from(extract_i64(row, 3)?).unwrap_or(0),
+                };
+                Ok((uid, fields))
+            },
+        )
+    }
+
+    fn batch_lookup_symbols_impl<T>(
         &self,
         uids: &[&str],
         require_exact: bool,
-    ) -> Result<std::collections::HashMap<String, Symbol>, StoreError> {
+        columns: &str,
+        decode: impl Fn(&[Value]) -> Result<(String, T), StoreError>,
+    ) -> Result<std::collections::HashMap<String, T>, StoreError> {
         if uids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -833,25 +869,23 @@ impl GraphStore {
             .join(", ");
         let q = format!(
             "UNWIND [{}] AS want_uid \
-             MATCH (s:Symbol {{uid: want_uid}}) RETURN {}",
-            in_list, SYMBOL_COLUMNS
+             MATCH (s:Symbol {{uid: want_uid}}) RETURN {columns}",
+            in_list
         );
         let result = conn
             .query(&q)
             .map_err(|e| StoreError::Query(format!("batch_lookup_symbols: {e}")))?;
         let mut map = std::collections::HashMap::with_capacity(uids.len());
         for row in result {
-            let sym = row_to_symbol(&row)?;
+            let (uid, value) = decode(&row)?;
             if let Some(expected) = &expected
-                && !expected.contains(sym.uid.as_str())
+                && !expected.contains(uid.as_str())
             {
                 return Err(StoreError::Query(format!(
-                    "batch_lookup_symbols_exact: unexpected symbol UID {}",
-                    sym.uid
+                    "batch_lookup_symbols_exact: unexpected symbol UID {uid}"
                 )));
             }
-            let uid = sym.uid.clone();
-            if map.insert(uid.clone(), sym).is_some() && require_exact {
+            if map.insert(uid.clone(), value).is_some() && require_exact {
                 return Err(StoreError::Query(format!(
                     "batch_lookup_symbols_exact: duplicate result row for {uid}"
                 )));
