@@ -1274,19 +1274,68 @@ fn is_stale_checkpoint_error(msg: &str) -> bool {
     msg.contains("wal.checkpoint") && msg.contains("does not match")
 }
 
+/// Atomically move an artifact without replacing an earlier quarantine.
+/// Unsupported platforms or filesystems fail closed.
+fn move_aside_without_replacing(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let result = {
+        use std::os::unix::ffi::OsStrExt;
+        let path = |p: &Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+            })
+        };
+        let source = path(source)?;
+        let destination = path(destination)?;
+        // SAFETY: both C strings are NUL-terminated and remain alive for the call.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        // SAFETY: both C strings are NUL-terminated and remain alive for the call.
+        #[cfg(target_os = "macos")]
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unsupported on this platform",
+    ));
+    result.inspect_err(|error| {
+        tracing::warn!(
+            source = %source.display(),
+            destination = %destination.display(),
+            %error,
+            "leaving recovery artifact in place because quarantine failed"
+        );
+    })
+}
+
 /// Move the stale checkpoint log aside, never delete it, and only in the exact
 /// signature of an aborted checkpoint: `.shadow` absent or empty. A non-empty
 /// shadow could belong to a live mid-checkpoint writer; never touch that.
 /// Returns where the log went (worth a retry).
 ///
-/// WHY A RENAME. The ID-mismatch error this keys on comes from LadybugDB 0.21's
+/// WHY MOVE IT ASIDE. The ID-mismatch error this keys on comes from LadybugDB 0.21's
 /// frozen-log branch for a log WITHOUT a CHECKPOINT record
 /// (`WALReplayer::replayFrozenWAL` in `src/storage/wal/wal_replayer.cpp`), and
 /// that branch holds committed-but-unapplied records. The engine removes
 /// `.shadow` itself on that branch BEFORE comparing IDs, so "shadow absent or
 /// empty" proves nothing about whether the log is worthless; only the engine's
 /// ID comparison does. If that comparison were ever wrong, a delete would
-/// destroy committed data. A timestamped rename keeps every byte.
+/// destroy committed data. A timestamped quarantine keeps every byte.
 ///
 /// DECLINES ON DOUBT. A `.shadow` whose size or existence cannot be determined
 /// (permissions, a symlink loop) is treated as possibly live, not as empty.
@@ -1295,6 +1344,18 @@ fn is_stale_checkpoint_error(msg: &str) -> bool {
 /// held across the failed open, artifact inspection/rename, and retry; missing
 /// or sibling authority leaves every byte untouched.
 fn quarantine_stale_checkpoint(path: &Path, authority: Option<&DbWriteLease>) -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    quarantine_stale_checkpoint_at(path, authority, stamp)
+}
+
+fn quarantine_stale_checkpoint_at(
+    path: &Path,
+    authority: Option<&DbWriteLease>,
+    stamp: u64,
+) -> Option<PathBuf> {
     if !authority.is_some_and(|authority| authority.authorizes(path)) {
         return None;
     }
@@ -1315,15 +1376,12 @@ fn quarantine_stale_checkpoint(path: &Path, authority: Option<&DbWriteLease>) ->
     if !shadow_empty || !matches!(checkpoint.try_exists(), Ok(true)) {
         return None;
     }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let aside = PathBuf::from(format!("{}.wal.checkpoint.stale-{stamp}", path.display()));
-    std::fs::rename(&checkpoint, &aside).ok()?;
+    move_aside_without_replacing(&checkpoint, &aside).ok()?;
     // An empty shadow holds no pages; keep it beside the log it came with.
     if matches!(shadow.try_exists(), Ok(true)) {
-        let _ = std::fs::rename(&shadow, format!("{}.shadow.stale-{stamp}", path.display()));
+        let shadow_aside = PathBuf::from(format!("{}.shadow.stale-{stamp}", path.display()));
+        let _ = move_aside_without_replacing(&shadow, &shadow_aside);
     }
     Some(aside)
 }
@@ -1539,7 +1597,7 @@ fn is_orphaned_wal_error(msg: &str) -> bool {
 
 /// Move an orphaned `<db>.wal` aside so the next open can proceed.
 ///
-/// Deliberately a RENAME, never a delete: a WAL can in principle hold committed
+/// Deliberately preserved, never discarded: a WAL can in principle hold committed
 /// work, and destroying it to fix an outage would trade one data-loss story for
 /// another. Quarantining is reversible and leaves the evidence in place.
 ///
@@ -1553,6 +1611,18 @@ fn is_orphaned_wal_error(msg: &str) -> bool {
 /// [`DbWriteLease`]. A read-write engine open is not itself authority because
 /// it cannot close the check-then-act window around this filesystem mutation.
 fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    quarantine_orphaned_wal_at(path, authority, stamp)
+}
+
+fn quarantine_orphaned_wal_at(
+    path: &Path,
+    authority: Option<&DbWriteLease>,
+    stamp: u64,
+) -> Option<PathBuf> {
     if !authority.is_some_and(|authority| authority.authorizes(path)) {
         return None;
     }
@@ -1570,12 +1640,8 @@ fn quarantine_orphaned_wal(path: &Path, authority: Option<&DbWriteLease>) -> Opt
     ) {
         return None;
     }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let quarantined = PathBuf::from(format!("{}.wal.orphaned-{stamp}", path.display()));
-    std::fs::rename(&wal, &quarantined)
+    move_aside_without_replacing(&wal, &quarantined)
         .ok()
         .map(|()| quarantined)
 }
@@ -7749,7 +7815,52 @@ mod tests {
         assert!(!is_orphaned_wal_error(checkpoint));
     }
 
-    /// The orphan is quarantined by RENAME, never deleted: a WAL can hold
+    #[test]
+    fn orphaned_wal_quarantine_preserves_both_logs_on_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let source = dir.path().join("brain.lbug.wal");
+        let destination = dir.path().join("brain.lbug.wal.orphaned-42");
+        std::fs::write(&source, b"new evidence").unwrap();
+        std::fs::write(&destination, b"previous evidence").unwrap();
+        let authority = acquire_db_write_lease(&db).unwrap();
+
+        assert!(quarantine_orphaned_wal_at(&db, Some(&authority), 42).is_none());
+        assert_eq!(std::fs::read(&source).unwrap(), b"new evidence");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous evidence");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn checkpoint_quarantine_preserves_both_artifacts_on_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.lbug");
+        let checkpoint = dir.path().join("brain.lbug.wal.checkpoint");
+        let shadow = dir.path().join("brain.lbug.shadow");
+        let prior_checkpoint = dir.path().join("brain.lbug.wal.checkpoint.stale-42");
+        let prior_shadow = dir.path().join("brain.lbug.shadow.stale-42");
+        std::fs::write(&checkpoint, b"new checkpoint").unwrap();
+        std::fs::write(&shadow, b"").unwrap();
+        std::fs::write(&prior_checkpoint, b"old checkpoint").unwrap();
+        let authority = acquire_db_write_lease(&db).unwrap();
+
+        assert!(quarantine_stale_checkpoint_at(&db, Some(&authority), 42).is_none());
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), b"new checkpoint");
+        assert_eq!(std::fs::read(&prior_checkpoint).unwrap(), b"old checkpoint");
+        assert!(shadow.exists());
+
+        std::fs::remove_file(&prior_checkpoint).unwrap();
+        std::fs::write(&prior_shadow, b"old shadow").unwrap();
+        assert_eq!(
+            quarantine_stale_checkpoint_at(&db, Some(&authority), 42),
+            Some(prior_checkpoint.clone())
+        );
+        assert_eq!(std::fs::read(&prior_checkpoint).unwrap(), b"new checkpoint");
+        assert_eq!(std::fs::read(&prior_shadow).unwrap(), b"old shadow");
+        assert_eq!(std::fs::read(&shadow).unwrap(), b"");
+    }
+
+    /// The orphan is moved aside, never discarded: a WAL can hold
     /// committed work, and destroying it to clear an outage would swap one
     /// data-loss story for another.
     #[test]
@@ -10391,12 +10502,33 @@ mod wal_recovery_arm_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("brain.lbug");
-        drop(GraphStore::create(&db).unwrap());
+        let target_store = GraphStore::create(&db).unwrap();
+        target_store
+            .insert_repo(&nestweaver_schema::Repo {
+                uid: "repo:target".to_string(),
+                url: "file:///target".to_string(),
+                indexed_sha: "target-sha".to_string(),
+                staleness_commits_behind: 0,
+                instance_id: "default".to_string(),
+                name: None,
+                root_path: None,
+            })
+            .unwrap();
+        drop(target_store);
         std::fs::write(format!("{}.wal.checkpoint", db.display()), &foreign_log).unwrap();
 
         let authority = acquire_db_write_lease(&db).unwrap();
         let store = GraphStore::open_with_authority(&db, &authority)
             .expect("the stale-checkpoint arm must recover the open");
+        let repos = store.list_repos(None).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].uid, "repo:target");
+        assert_eq!(repos[0].url, "file:///target");
+        assert_eq!(repos[0].indexed_sha, "target-sha");
+        assert_eq!(repos[0].staleness_commits_behind, 0);
+        assert_eq!(repos[0].instance_id, "default");
+        assert_eq!(repos[0].name, None);
+        assert_eq!(repos[0].root_path, None);
         drop(store);
 
         assert!(!dir.path().join("brain.lbug.wal.checkpoint").exists());
