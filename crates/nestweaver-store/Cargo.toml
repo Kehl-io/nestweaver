@@ -39,9 +39,9 @@ uuid = { workspace = true }
 libc = "0.2"
 
 [build-dependencies]
-# tree-sitter-sequel 0.3.x requires cc ~1.2.1; keep the workspace build
-# dependency on the same resolvable line until that grammar relaxes its bound.
-cc = "~1.11"
+# Compiles the vendored C++ sources in build.rs. The former `~` pin tracked
+# tree-sitter-sequel's `cc ~1.2.1` bound, which 0.3.13 dropped.
+cc = "1.11"
 serde_json = { workspace = true }
 toml = "1.1"
 

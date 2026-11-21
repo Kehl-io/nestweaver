@@ -9231,15 +9231,27 @@ fn a_genuinely_held_checkpoint_lock_stays_transient() {
         "precondition: this test process holds the checkpoint write lock"
     );
 
+    // Only the CI direct-test artifact honors NESTWEAVER_NO_DAEMON. Elsewhere the
+    // command routes through a daemon, whose writable open waits for the apply
+    // lock this test holds, so without a deadline a local run hangs the whole
+    // test binary instead of failing.
     let output = nestweaver_cmd()
         .args(["brain", "status", "--db"])
         .arg(&db)
+        .timeout(std::time::Duration::from_secs(60))
         .output()
         .unwrap();
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.code().is_some(),
+        "`brain status` did not exit normally (timed out after 60s, or killed by a \
+         signal) while this test held the checkpoint apply lock. A timeout usually \
+         means it was routed through the daemon, because the no-daemon bypass needs \
+         the ci-direct-tests artifact: {combined}"
     );
     assert!(
         combined.contains("checkpoint is in progress")
