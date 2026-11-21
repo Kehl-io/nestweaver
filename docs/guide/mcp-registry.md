@@ -1,6 +1,6 @@
-# Official MCP Registry preparation
+# Official MCP Registry
 
-Proposed listing: **NestWeaver** (`io.github.Kehl-io/nestweaver`).
+Listing: **NestWeaver** (`io.github.Kehl-io/nestweaver`).
 
 > Local code knowledge graph: search symbols, trace callers, and inspect change impact across repos.
 
@@ -80,14 +80,16 @@ active org admins, read through `GET /user/memberships/orgs`, which needs
 registry's GitHub App, whose token sees an organization's memberships only where
 that app is installed. It is not installed on Kehl-io, so that login returns 403.
 Use the OIDC workflow below for later releases; it needs no personal token.
+Dispatching it for an already listed version is a no-op: the prepare job finds
+the matching entry and skips publishing.
 
 ## Maintainer publication checklist (separate approval required)
 
-This preparation does not create a listing or publish an npm release.
-`12.2.3` was already published without `mcpName`; its immutable npm artifact
-cannot satisfy ownership verification. Releases 12.2.4 and 12.2.5 include `mcpName` and matching manifests; verify the
-exact immutable public package before submitting it. Publishing the CLI/npm release does not
-register an MCP listing. Do not overwrite or attempt to republish `12.2.3`.
+Publishing the CLI/npm release does not register or update an MCP listing; each
+release needs its own submission. `12.2.3` was published without `mcpName`, so
+its immutable npm artifact cannot satisfy ownership verification; do not try to
+republish it. Later releases, including the listed 12.2.7, carry `mcpName` and
+matching manifests. Verify the exact immutable public package before submitting.
 
 1. Review and merge this preparation through normal repository controls. Obtain
    separate approval for the npm release and registry submission.
@@ -125,8 +127,8 @@ workflow neither publishes npm packages nor changes the release workflow.
 
 After review, merge, and explicit execution approval, select **Publish MCP
 Registry**, choose **main**, and enter both the exact stable version and its
-full release-tag commit SHA. 12.2.7 is already listed, so use the next release.
-Look up its tag commit with:
+full release-tag commit SHA of a release that is not listed yet (see
+[Current listing](#current-listing)). Look up the tag commit with:
 
 ```sh
 gh api repos/Kehl-io/nestweaver/git/ref/tags/vX.Y.Z --jq .object.sha
