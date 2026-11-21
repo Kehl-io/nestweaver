@@ -1,5 +1,14 @@
 # Changelog
 
+## [12.2.8](https://github.com/Kehl-io/nestweaver/compare/v12.2.7...v12.2.8) (2026-11-21)
+
+
+### Bug Fixes
+
+* **deps:** patch Quinn versions flagged by RustSec ([dc98e25](https://github.com/Kehl-io/nestweaver/commit/dc98e256f53ddbfa0fe365f1c47acd34d840ece9))
+* **store:** preserve existing WAL quarantine artifacts ([aef0921](https://github.com/Kehl-io/nestweaver/commit/aef0921fcb47dc8c4b526de9d7727543a38b0284))
+* **store:** require exact live impact symbol hydration ([11ea01b](https://github.com/Kehl-io/nestweaver/commit/11ea01b65059b3b7c08b2187cb67ed070331362b))
+
 ## [12.2.7](https://github.com/Kehl-io/nestweaver/compare/v12.2.6...v12.2.7) (2026-11-12)
 
 
