@@ -62,6 +62,25 @@ Validate `server.json` against its linked official JSON Schema as well. The npm
 self-test checks identity, launch arguments, and version agreement; it does not
 replace schema validation or the registry's online ownership check.
 
+## Current listing
+
+`io.github.Kehl-io/nestweaver` **12.2.7** is listed in the official registry,
+published 2026-11-21. Check it with:
+
+```sh
+curl -s "https://registry.modelcontextprotocol.io/v0/servers?search=nestweaver"
+```
+
+That listing was submitted before the workflow below existed. An organization
+admin exchanged a classic GitHub token scoped to `read:org` only at
+`POST /v0/auth/github-at`, then posted `server.json` to `POST /v0/publish` with
+the returned registry token. The registry grants `io.github.<org>/*` only to
+active org admins, read through `GET /user/memberships/orgs`, which needs
+`read:org`. The `mcp-publisher login github` device flow signs in through the
+registry's GitHub App, whose token sees an organization's memberships only where
+that app is installed. It is not installed on Kehl-io, so that login returns 403.
+Use the OIDC workflow below for later releases; it needs no personal token.
+
 ## Maintainer publication checklist (separate approval required)
 
 This preparation does not create a listing or publish an npm release.
@@ -85,9 +104,9 @@ register an MCP listing. Do not overwrite or attempt to republish `12.2.3`.
    manifest against the official schema. Ensure its package version exists on
    npm and contains the matching ownership metadata.
 5. For the Kehl-io namespace, use the manual OIDC workflow described below.
-   The standard interactive GitHub device login was tested and returned HTTP
-   403 for organization publication: its credential cannot read organization
-   roles. Owner membership alone does not make that credential sufficient.
+   The interactive device login returns HTTP 403 for organization publication
+   because the registry's GitHub App is not installed on Kehl-io, so its token
+   cannot read the org membership (see [Current listing](#current-listing)).
 6. Obtain separate approval to dispatch the publishing workflow. After it runs,
    verify the exact public version and latest entry, including its command,
    database input, npm version, and documentation link.
@@ -106,17 +125,19 @@ workflow neither publishes npm packages nor changes the release workflow.
 
 After review, merge, and explicit execution approval, select **Publish MCP
 Registry**, choose **main**, and enter both the exact stable version and its
-full release-tag commit SHA. For the first prepared listing these are:
+full release-tag commit SHA. 12.2.7 is already listed, so use the next release.
+Look up its tag commit with:
 
-- Version: `12.2.4`.
-- Release SHA: `8e51e2ee85f248ca190f71ff5e84f5c30634f9e3`.
+```sh
+gh api repos/Kehl-io/nestweaver/git/ref/tags/vX.Y.Z --jq .object.sha
+```
 
 Run preparation without any registry login or OIDC request:
 
 ```sh
 python3 scripts/test-mcp-registry-publishing.py
 python3 scripts/prepare-mcp-registry-release.py \
-  --version 12.2.4 --expected-sha 8e51e2ee85f248ca190f71ff5e84f5c30634f9e3 \
+  --version X.Y.Z --expected-sha <release-tag-commit-sha> \
   --output /tmp/nestweaver-registry-validation
 ```
 
