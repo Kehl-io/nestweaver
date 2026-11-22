@@ -5171,6 +5171,64 @@ pub fn populate_inline_bodies_with_overrides(
     let max_body_chars = max_body_tokens.saturating_mul(4);
     let mut used_tokens = 0usize;
 
+    // One reader call per source file shares read_symbols' parsed-file cache.
+    // Keep the original node order below for the inline token budget.
+    let mut groups: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    for node in nodes.iter().filter(|node| node.uid.starts_with("sym:")) {
+        let eligible = always_include.contains(&node.uid)
+            || (if max_relevance > 0.0 {
+                node.relevance / max_relevance
+            } else {
+                0.0
+            }) >= threshold;
+        if eligible && let Ok(symbol) = store.lookup_symbol(&node.uid) {
+            groups
+                .entry((symbol.repo_uid, symbol.file_path))
+                .or_default()
+                .push(node.uid.clone());
+        }
+    }
+    let mut bodies = std::collections::HashMap::new();
+    for ((repo_uid, _file_path), uids) in groups {
+        let reader = reader_resolver.and_then(|resolve| resolve(&repo_uid));
+        let result = if let Some(reader) = reader {
+            Some(crate::read_symbols::read_symbols(
+                store,
+                &uids,
+                reader.as_ref(),
+                0,
+                None,
+            ))
+        } else {
+            let local_root;
+            let reader_root = if root == std::path::Path::new(OWNING_REPO_SOURCE_ROOT) {
+                local_root = crate::read_symbols::repo_local_root(store, &repo_uid);
+                local_root.as_deref()
+            } else {
+                Some(root)
+            };
+            reader_root.map(|path| {
+                let reader = crate::content_reader::FilesystemReader::new(path);
+                crate::read_symbols::read_symbols(store, &uids, &reader, 0, None)
+            })
+        };
+        if let Some(result) = result {
+            bodies.extend(
+                result
+                    .symbols
+                    .into_iter()
+                    .filter(|window| !window.body.is_empty())
+                    .map(|window| {
+                        (
+                            window.uid,
+                            truncate_body_to_chars(window.body, max_body_chars),
+                        )
+                    }),
+            );
+        }
+    }
+
     for node in nodes.iter_mut() {
         if !always_include.contains(&node.uid) {
             // `max_relevance` can still be `<= 0.0` here (e.g. every OTHER
@@ -5186,17 +5244,16 @@ pub fn populate_inline_bodies_with_overrides(
                 continue;
             }
         }
-        let Some(body) = fetch_node_body(store, &node.uid, root, reader_resolver) else {
+        let body = if node.uid.starts_with("sym:") {
+            bodies.get(&node.uid).cloned()
+        } else {
+            fetch_node_body(store, &node.uid, root, reader_resolver)
+                .filter(|body| !body.is_empty())
+                .map(|body| truncate_body_to_chars(body, max_body_chars))
+        };
+        let Some((body, complete)) = body else {
             continue;
         };
-        if body.is_empty() {
-            continue;
-        }
-        // Truncate to the per-body cap (chars/4 estimate). Bug H: prefer the
-        // last newline within the cap so we never split a statement mid-line;
-        // the returned flag is propagated into BrainNode.body_complete so
-        // downstream consumers know whether the body is full or partial.
-        let (body, complete) = truncate_body_to_chars(body, max_body_chars);
         // Token-budget gate: charge inline bodies ahead of metadata. The first
         // qualifying node is always allowed (mirrors read_symbols), so a single
         // oversized body never starves the whole result.
@@ -6392,6 +6449,55 @@ mod inline_body_tests {
         populate_inline_bodies(&store, &mut nodes, &src, 0.75, 800, None, None);
         let body = nodes[0].inline_body.as_deref().expect("symbol body");
         assert!(body.contains("function greet"), "got: {body:?}");
+    }
+
+    #[test]
+    fn batched_symbols_match_ordered_single_reads_and_budget() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.js"),
+            "function first() { return 1; }\nfunction second() { return 2; }\n",
+        )
+        .unwrap();
+        let (_, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/repo", "abc123")
+                .unwrap();
+        let first = store.lookup_symbols_by_name("first").unwrap()[0]
+            .uid
+            .clone();
+        let second = store.lookup_symbols_by_name("second").unwrap()[0]
+            .uid
+            .clone();
+        for budget in [None, Some(1), Some(100)] {
+            let mut nodes = vec![
+                node(&first, "Symbol/Function", 1.0),
+                node(&second, "Symbol/Function", 0.9),
+            ];
+            let mut expected = Vec::new();
+            let mut used = 0;
+            for uid in [&first, &second] {
+                let body = super::fetch_node_body(&store, uid, dir.path(), None).unwrap();
+                let (body, complete) = super::truncate_body_to_chars(body, 16);
+                let cost = super::estimate_tokens(&body);
+                if budget.is_some_and(|limit| used > 0 && used + cost > limit) {
+                    expected.push(None);
+                } else {
+                    used += cost;
+                    expected.push(Some((body, complete)));
+                }
+            }
+            populate_inline_bodies(&store, &mut nodes, dir.path(), 0.0, 4, budget, None);
+            for (node, expected) in nodes.iter().zip(expected) {
+                assert_eq!(
+                    node.inline_body.as_ref(),
+                    expected.as_ref().map(|(body, _)| body)
+                );
+                if let Some((_, complete)) = expected {
+                    assert_eq!(node.body_complete, complete);
+                }
+            }
+        }
     }
 
     /// In server mode the source lives in a bare clone with no working tree, so

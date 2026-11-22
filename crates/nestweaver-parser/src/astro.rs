@@ -238,6 +238,7 @@ pub fn parse_astro(path: &Path, source: &str) -> ParsedFile {
         type_bindings: Vec::new(),
         // Regex-based parser: no syntax tree, so no error signal (nw-601).
         has_syntax_errors: false,
+        partial_parse_reason: None,
     }
 }
 

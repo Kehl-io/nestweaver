@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+* Reuse lexical information while parsing Rust pointer types and nested
+  macros, and share source parsing across inline symbol bodies.
+* Read unchanged declarations with same-line annotations, PowerShell return
+  types, and Elixir module attributes.
+* Parse CRLF note frontmatter and extract links and tags from Markdown prose
+  while ignoring code, HTML comments, and math.
+
+### Upgrade notes
+
+The next release uses resolver generation **24** and parsed-cache version
+**18**. Cache 18 reparses changed parser queries, while generation 24 marks
+existing graph rows stale. Run `nestweaver index --repo <path> --force` once
+per repository after upgrading to rebuild stored symbols and CALLS edges.
+Pascal declaration spans, SystemVerilog function and task spans, and some
+Objective-C and SQL symbols change. Rust UIDs stay stable. Rust module paths
+can add or correct CALLS edges, with workspace crate aliases inferred from
+conventional crate directory names.
+SQLite trigger grammar failures also disclose a partial-parse warning while
+keeping symbols recovered before the trigger error available.
+
+Markdown derivation version **4** updates eligible vaults on daemon startup.
+If a vault still reports that it needs refreshing, run
+`nestweaver brain refresh <vault>` with its usual configuration and database.
+
 ## [12.2.7](https://github.com/Kehl-io/nestweaver/compare/v12.2.6...v12.2.7) (2026-11-12)
 
 

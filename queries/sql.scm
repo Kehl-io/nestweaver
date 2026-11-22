@@ -21,6 +21,8 @@
 
 ; CREATE TRIGGER
 (create_trigger
+  (keyword_trigger)
+  .
   (object_reference
      name: (identifier) @name)
 ) @definition.function

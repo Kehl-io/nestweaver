@@ -10,7 +10,7 @@ use nestweaver_parser::{
     parse_source,
 };
 use nestweaver_resolver::{
-    discover_workspace_context_with_files, resolve_references_with_file_languages,
+    discover_workspace_context_with_files_for_languages, resolve_references_with_file_languages,
 };
 use nestweaver_schema::{
     File, Language, Repo, Service, Symbol, canonical_symbol_id, file_uid, repo_uid, service_uid,
@@ -1018,6 +1018,7 @@ struct ParsedPublicationFile {
     references: Vec<RawReference>,
     type_bindings: Vec<AstTypeBinding>,
     source: Option<String>,
+    partial_parse_reason: Option<String>,
 }
 
 struct PublicationWriteSet<'a> {
@@ -1095,6 +1096,7 @@ impl PublicationWriteSet<'_> {
             references: raw_references,
             type_bindings: raw_type_bindings,
             source,
+            partial_parse_reason: _,
         } = parsed;
 
         self.present_files.insert(rel_path.clone());
@@ -1377,6 +1379,7 @@ fn rebuild_full_index_write_set_from_disk(
             file_meta: CachedFileMeta,
         },
         Skip(SkippedFile),
+        PartialWarning(SkippedFile),
         Replace(ParsedPublicationFile),
     }
     let mut actions: Vec<Refresh> = Vec::new();
@@ -1469,6 +1472,9 @@ fn rebuild_full_index_write_set_from_disk(
             actions.push(Refresh::Skip(skipped));
             continue;
         }
+        if let Some(partial) = parsed.partial_parse_skip(rel.clone()) {
+            actions.push(Refresh::PartialWarning(partial));
+        }
         const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
         let source = if matches!(lang, Language::TypeScript | Language::JavaScript) {
             Some(source.clone())
@@ -1487,6 +1493,7 @@ fn rebuild_full_index_write_set_from_disk(
             references: parsed.references,
             type_bindings: parsed.type_bindings,
             source,
+            partial_parse_reason: parsed.partial_parse_reason,
         }));
     }
 
@@ -1510,6 +1517,13 @@ fn rebuild_full_index_write_set_from_disk(
                     skipped_files.push(skipped);
                 }
             }
+            Refresh::PartialWarning(skipped) => {
+                if !skipped_files.iter().any(|existing| {
+                    existing.path == skipped.path && existing.reason == skipped.reason
+                }) {
+                    skipped_files.push(skipped);
+                }
+            }
             Refresh::Replace(parsed) => {
                 file_languages.insert(parsed.rel_path.clone(), parsed.lang);
                 if let Some(cache) = parsed_cache.as_deref_mut() {
@@ -1519,6 +1533,7 @@ fn rebuild_full_index_write_set_from_disk(
                             symbols: parsed.symbols.clone(),
                             references: parsed.references.clone(),
                             type_bindings: parsed.type_bindings.clone(),
+                            partial_parse_reason: parsed.partial_parse_reason.clone(),
                         },
                     );
                 }
@@ -4002,6 +4017,7 @@ pub(crate) fn infer_whole_graph_cross_repo_links(
                     symbols: reparsed.symbols,
                     references: reparsed.references,
                     type_bindings: reparsed.type_bindings,
+                    partial_parse_reason: reparsed.partial_parse_reason,
                 },
             );
             reparsed_hashes.push(recorded.clone());
@@ -4566,6 +4582,8 @@ struct PrepareIndexResolution<'a> {
     /// graph's edges into the changed files). They join the resolve filter
     /// under the same rule as the dependency-row dependents.
     extra_dependents: Option<&'a std::collections::HashSet<String>>,
+    /// Proof recorded before the full publication invalidated it.
+    prior_resolver_inputs: Option<&'a str>,
     /// Infer CROSS_REPO_LINK edges into other repositories. The code watcher
     /// leaves them to its whole-graph relinker.
     infer_cross_repo: bool,
@@ -4773,6 +4791,7 @@ fn prepare_index_resolution(
         files_unchanged,
         resolution_deps,
         extra_dependents,
+        prior_resolver_inputs,
         infer_cross_repo,
     } = prep;
 
@@ -4785,8 +4804,12 @@ fn prepare_index_resolution(
     resolve_pb.set_message("Resolving cross-file references...");
     resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let (workspace_ctx, resolver_inputs) =
-        workspace_context_and_resolver_inputs(reader, file_languages.values().copied())?;
+    let include_rust = has_rust_root_targets(file_languages.keys().map(String::as_str));
+    let (workspace_ctx, resolver_inputs) = workspace_context_and_resolver_inputs(
+        reader,
+        file_languages.values().copied(),
+        include_rust,
+    )?;
 
     // A deletion changes its dependents' export view just as an edit does, so
     // it seeds the dependency expansion too (it is then dropped from the
@@ -4795,10 +4818,30 @@ fn prepare_index_resolution(
         .union(removed_files)
         .cloned()
         .collect();
-    let skip_resolution = changed_or_removed.is_empty()
+    // A root Cargo library alias can change without touching any source.
+    // Watcher batches expand config events before arriving here. A warm full
+    // scan must seed the affected context itself, even with a cold parse cache.
+    let cargo_context_changed = extra_dependents.is_none()
+        && file_languages.contains_key("src/main.rs")
+        && (changed_or_removed.contains("src/lib.rs")
+            || include_rust && resolver_inputs.as_deref() != prior_resolver_inputs);
+    let skip_resolution = !cargo_context_changed
+        && changed_or_removed.is_empty()
         && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
 
-    let resolve_filter = if !skip_resolution
+    let resolve_filter = if cargo_context_changed && files_unchanged > 0 {
+        // Re-resolve the full view so simultaneous source changes still
+        // refresh dependents outside the Cargo workspace languages.
+        let affected = file_languages.keys().cloned().collect();
+        let included = include_missing_seeded_importer_parses(
+            reader,
+            parsed_files_for_resolver,
+            &mut type_envs,
+            file_languages,
+            &affected,
+        );
+        Some(included)
+    } else if !skip_resolution
         && !changed_or_removed.is_empty()
         && files_unchanged > 0
         && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid))
@@ -5348,6 +5391,7 @@ where
             /// `ChangeVerdict::Unchanged`. Stored instead of the stale cached
             /// entry so the next run short-circuits at Tier 1.
             refreshed: Option<CachedFileMeta>,
+            partial_warning: Option<SkippedFile>,
         },
         Skipped(SkippedFile),
         /// Deleted between the scan and its read (a checkout or rebase in
@@ -5370,6 +5414,7 @@ where
             /// not fold class/route decorators into symbol signatures (e.g.
             /// TypeScript/NestJS), so framework detection can scan it.
             source: Option<String>,
+            partial_warning: Option<SkippedFile>,
         },
         /// Unchanged file whose symbols were loaded from the durable parsed
         /// cache. Treated as unchanged for filemeta carry-forward and
@@ -5380,6 +5425,7 @@ where
             references: Vec<RawReference>,
             type_bindings: Vec<AstTypeBinding>,
             refreshed: Option<CachedFileMeta>,
+            partial_warning: Option<SkippedFile>,
         },
     }
 
@@ -5431,21 +5477,46 @@ where
                     // Check parsed cache: if we have cached symbols for this
                     // file's content hash, return CachedParsed so symbols are
                     // available for resolution while still counting as unchanged.
-                    if let Some(cached_meta) = cache.get(&display_name)
-                        && let Some(pc) = pc_ref
-                        && let Some(cached_parse) = pc.get(&cached_meta.content_hash)
-                    {
+                    let cached_meta = refreshed.as_ref().or_else(|| cache.get(&display_name));
+                    let cached_parse = cached_meta.and_then(|cached_meta| {
+                        pc_ref.and_then(|pc| pc.get(&cached_meta.content_hash))
+                    });
+                    let partial_warning = if *lang == Language::Sql {
+                        cached_parse
+                            .and_then(|cached| cached.partial_parse_reason.clone())
+                            .or_else(|| {
+                                cached_meta.and_then(|meta| {
+                                    verify_sql_partial_parse(
+                                        reader,
+                                        Path::new(&display_name),
+                                        &meta.content_hash,
+                                    )
+                                })
+                            })
+                            .map(|reason| {
+                                SkippedFile::new(
+                                    display_name.clone(),
+                                    SkipReasonCode::ParseError,
+                                    reason,
+                                )
+                            })
+                    } else {
+                        None
+                    };
+                    if let Some(cached_parse) = cached_parse {
                         return ParseOutcome::CachedParsed {
                             rel_path: display_name,
                             symbols: cached_parse.symbols.clone(),
                             references: cached_parse.references.clone(),
                             type_bindings: cached_parse.type_bindings.clone(),
                             refreshed,
+                            partial_warning,
                         };
                     }
                     return ParseOutcome::Unchanged {
                         rel_path: display_name,
                         refreshed,
+                        partial_warning,
                     };
                 }
                 Ok(ChangeVerdict::Changed {
@@ -5510,6 +5581,7 @@ where
                 if let Some(skipped) = parsed.unparsable_skip(display_name.clone()) {
                     return ParseOutcome::Skipped(skipped);
                 }
+                let partial_warning = parsed.partial_parse_skip(display_name.clone());
                 // Retain source for all languages up to 2 MB so Phase 3
                 // (type env build) can skip redundant disk re-reads.
                 // TS/JS must clone because `source` is still needed below
@@ -5532,6 +5604,7 @@ where
                     references: parsed.references,
                     type_bindings: parsed.type_bindings,
                     source: retained_source,
+                    partial_warning,
                 }
             }
             Err(err) => {
@@ -5588,6 +5661,7 @@ where
     let mut symbols_deleted = 0usize;
     let mut symbols_count = 0usize;
     let mut skipped_files: Vec<SkippedFile> = scan_skipped_files;
+    let mut partial_parse_reasons: HashMap<String, String> = HashMap::new();
     let mut actually_changed_files: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // Every file still present in the working tree this index, regardless of
@@ -5603,7 +5677,11 @@ where
             ParseOutcome::Unchanged {
                 rel_path,
                 refreshed,
+                partial_warning,
             } => {
+                if let Some(warning) = partial_warning {
+                    skipped_files.push(warning);
+                }
                 present_files.insert(rel_path.clone());
                 // Carry the cache entry forward — but prefer the REFRESHED stat
                 // when the content matched despite a moved mtime/size. Storing
@@ -5621,7 +5699,11 @@ where
                 references: raw_references,
                 type_bindings: raw_type_bindings,
                 refreshed,
+                partial_warning,
             } => {
+                if let Some(warning) = partial_warning {
+                    skipped_files.push(warning);
+                }
                 present_files.insert(rel_path.clone());
                 // Same as above: the refreshed stat wins when present.
                 if let Some(ref mut new_cache) = new_filemeta.as_deref_mut()
@@ -5652,7 +5734,15 @@ where
                 references: raw_references,
                 type_bindings: raw_type_bindings,
                 source,
+                partial_warning,
             } => {
+                let partial_parse_reason = partial_warning
+                    .as_ref()
+                    .map(|warning| warning.reason.clone());
+                if let Some(warning) = partial_warning {
+                    partial_parse_reasons.insert(rel_path.clone(), warning.reason.clone());
+                    skipped_files.push(warning);
+                }
                 PublicationWriteSet {
                     r_uid: &r_uid,
                     repo_url,
@@ -5679,6 +5769,7 @@ where
                     references: raw_references,
                     type_bindings: raw_type_bindings,
                     source,
+                    partial_parse_reason,
                 });
             }
         }
@@ -5715,6 +5806,7 @@ where
                             .get(rel_path.as_str())
                             .cloned()
                             .unwrap_or_default(),
+                        partial_parse_reason: partial_parse_reasons.get(rel_path).cloned(),
                     },
                 );
             }
@@ -6121,6 +6213,7 @@ where
                 files_unchanged,
                 resolution_deps: resolution_deps.as_deref(),
                 extra_dependents: None,
+                prior_resolver_inputs: prior_resolver_inputs.as_deref(),
                 infer_cross_repo: true,
             },
             type_envs,
@@ -6317,10 +6410,11 @@ where
                     .iter()
                     .map(|(path, ..)| path.as_str())
                     .collect();
+                let include_rust = has_rust_root_targets(file_languages.keys().map(String::as_str));
                 let covers_workspace = store
                     .list_files_by_repo(&r_uid)?
                     .iter()
-                    .filter(|(_, path)| uses_workspace_context(path))
+                    .filter(|(_, path)| uses_workspace_context(path, include_rust))
                     .all(|(_, path)| {
                         resolved.contains(path.as_str())
                             && resolution
@@ -7666,7 +7760,7 @@ pub struct IncrementalResult {
 }
 
 enum IncrementalFileOutcome {
-    Indexed(usize),
+    Indexed(usize, Option<SkippedFile>),
     PolicySkipped(SkippedFile),
 }
 
@@ -7675,8 +7769,16 @@ fn record_incremental_file_outcome(
     outcome: IncrementalFileOutcome,
 ) -> bool {
     match outcome {
-        IncrementalFileOutcome::Indexed(symbols) => {
+        IncrementalFileOutcome::Indexed(symbols, partial_warning) => {
             result.symbols_added += symbols;
+            if let Some(skipped) = partial_warning
+                && !result.skipped_files.iter().any(|existing| {
+                    existing.path == skipped.path && existing.reason == skipped.reason
+                })
+            {
+                result.files_skipped += 1;
+                result.skipped_files.push(skipped);
+            }
             true
         }
         IncrementalFileOutcome::PolicySkipped(skipped) => {
@@ -7689,6 +7791,77 @@ fn record_incremental_file_outcome(
             false
         }
     }
+}
+
+fn verify_sql_partial_parse(
+    reader: &dyn crate::content_reader::ContentReader,
+    path: &Path,
+    content_hash: &str,
+) -> Option<String> {
+    let unverified =
+        || Some("could not verify partial-parse coverage for published SQL".to_string());
+    let Ok(source) = reader.read_file(path) else {
+        return unverified();
+    };
+    if content_hash_hex(&source) != content_hash {
+        return unverified();
+    }
+    if !source
+        .as_bytes()
+        .windows(b"trigger".len())
+        .any(|word| word.eq_ignore_ascii_case(b"trigger"))
+    {
+        return None;
+    }
+    match parse_source(path, &source) {
+        Ok(parsed) => parsed.partial_parse_reason,
+        Err(_) => unverified(),
+    }
+}
+
+/// Re-emit partial-parse coverage warnings on an unchanged incremental run.
+/// The parsed cache holds the diagnostic next to the recovered symbol prefix,
+/// so a no-op index can retain the warning without reparsing every SQL file.
+fn record_cached_partial_parse_warnings(
+    store: &GraphStore,
+    db_path: Option<&Path>,
+    repo_uid: &str,
+    reader: &dyn crate::content_reader::ContentReader,
+    result: &mut IncrementalResult,
+) -> Result<(), anyhow::Error> {
+    let Some(db_path) = db_path else {
+        return Ok(());
+    };
+    let cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
+    let files = store.list_file_hashes_by_repo(repo_uid)?;
+    if !files
+        .iter()
+        .any(|(path, _)| detect_language(Path::new(path)) == Some(Language::Sql))
+    {
+        return Ok(());
+    }
+    let cache = crate::parsed_cache::ParsedCache::load(&cache_path);
+    for (path, content_hash) in files {
+        if detect_language(Path::new(&path)) != Some(Language::Sql) {
+            continue;
+        }
+        let reason = cache
+            .get(&content_hash)
+            .and_then(|parsed| parsed.partial_parse_reason.clone())
+            // A cache entry without a warning can belong to a different
+            // language that was parsed from identical bytes.
+            .or_else(|| verify_sql_partial_parse(reader, Path::new(&path), &content_hash));
+        let Some(reason) = reason else { continue };
+        record_incremental_file_outcome(
+            result,
+            IncrementalFileOutcome::PolicySkipped(SkippedFile::new(
+                path,
+                SkipReasonCode::ParseError,
+                reason,
+            )),
+        );
+    }
+    Ok(())
 }
 
 /// Drain a reader's prune recorder into an [`IncrementalResult`].
@@ -8081,19 +8254,26 @@ fn incremental_index_with_name_and_io_and_authority(
     // An up-to-date repository does no work, so an inventory failure there is
     // disclosed rather than fatal (nw-287). A changed SHA needs the walk.
     let mut unverified_coverage = None;
-    if let Err(error) = crate::content_reader::ContentReader::list_files(&policy_reader) {
-        let error = error.context("refresh source inventory before incremental policy checks");
-        if old_sha != new_sha {
-            return Err(error);
-        }
-        unverified_coverage = Some(error);
-    }
+    let current_rust_targets =
+        match crate::content_reader::ContentReader::list_files(&policy_reader) {
+            Ok(files) => has_rust_root_targets(files.iter().filter_map(|path| path.to_str())),
+            Err(error) => {
+                let error =
+                    error.context("refresh source inventory before incremental policy checks");
+                if old_sha != new_sha {
+                    return Err(error);
+                }
+                unverified_coverage = Some(error);
+                false
+            }
+        };
     let ignored_files = tracked_ignored_source_paths(&policy_reader);
+    let indexed_files = store.list_files_by_repo(&r_uid)?;
     if store.get_repo_index_policy(&r_uid)?.as_deref()
         != Some(
             crate::content_reader::ContentReader::eligibility_fingerprint(&policy_reader).as_str(),
         )
-        || store.list_files_by_repo(&r_uid)?.iter().any(|(_, path)| {
+        || indexed_files.iter().any(|(_, path)| {
             !policy_reader.accepts_path(Path::new(path)) || ignored_files.contains(Path::new(path))
         })
     {
@@ -8113,6 +8293,41 @@ fn incremental_index_with_name_and_io_and_authority(
                 epilogue_io,
             },
         );
+    }
+
+    let indexed_rust_targets =
+        has_rust_root_targets(indexed_files.iter().map(|(_, path)| path.as_str()));
+    // Cargo aliases are graph inputs, independent of Git's source change list.
+    // Detect manifest edits and target membership changes even at the same HEAD.
+    if unverified_coverage.is_none() && (indexed_rust_targets || current_rust_targets) {
+        let languages = indexed_files
+            .iter()
+            .filter_map(|(_, path)| detect_language(Path::new(path)));
+        let (_, proof) = workspace_context_and_resolver_inputs(&policy_reader, languages, true)?;
+        let prior_proof = store.get_repo_resolver_inputs(&r_uid)?;
+        anyhow::ensure!(
+            proof.is_some() || prior_proof.is_none() || !current_rust_targets,
+            "cannot verify resolver configuration inputs for the indexed Cargo library"
+        );
+        if indexed_rust_targets != current_rust_targets || proof.is_some() && proof != prior_proof {
+            tracing::info!("Cargo resolver inputs changed; rebuilding repository edges");
+            return full_index_fallback(
+                &store,
+                FullIndexFallback {
+                    repo_path,
+                    db_path,
+                    instance_id,
+                    repo_url,
+                    new_sha: &new_sha,
+                    name,
+                    force: true,
+                    limits,
+                    excludes,
+                    unskip,
+                    epilogue_io,
+                },
+            );
+        }
     }
 
     // A prior run can record HEAD while disclosing a committed source it
@@ -8183,9 +8398,19 @@ fn incremental_index_with_name_and_io_and_authority(
         // The missing-source preflight already walked this reader. Reuse its
         // disclosures rather than enumerate the same unchanged tree again.
         let mut result = unchanged_result;
+        let coverage_verified = unverified_coverage.is_none();
         match unverified_coverage {
             Some(error) => record_unverified_unchanged_coverage(&mut result, &error),
             None => drain_pruned_dirs_into_incremental(&policy_reader, &mut result),
+        }
+        if coverage_verified {
+            record_cached_partial_parse_warnings(
+                &store,
+                Some(db_path),
+                &r_uid,
+                &policy_reader,
+                &mut result,
+            )?;
         }
         return Ok(result);
     }
@@ -8590,6 +8815,7 @@ fn incremental_index_with_name_and_io_and_authority(
     )?;
     append_incremental_parses(Some(db_path), &prepared_files);
     append_incremental_parses(Some(db_path), &missing_committed);
+    record_cached_partial_parse_warnings(&store, Some(db_path), &r_uid, &reader, &mut result)?;
 
     Ok(result)
 }
@@ -8620,7 +8846,7 @@ where
         .filter(|sha| !sha.is_empty())
         .ok_or_else(|| anyhow::anyhow!("incremental index requires an existing indexed repo"))?;
 
-    if !repo_policy_matches_reader(store, &r_uid, reader)? {
+    let full_index = |acquire_write_guard| {
         let result = index_with_reader_and_write_gate(
             reader,
             store,
@@ -8631,7 +8857,7 @@ where
             None,
             acquire_write_guard,
         )?;
-        return Ok(IncrementalResult {
+        Ok(IncrementalResult {
             fell_back_to_full: true,
             files_added: result.files_count,
             files_skipped: result.skipped_files.len(),
@@ -8642,7 +8868,10 @@ where
             files_deleted: result.files_deleted,
             symbols_removed: result.symbols_deleted,
             ..Default::default()
-        });
+        })
+    };
+    if !repo_policy_matches_reader(store, &r_uid, reader)? {
+        return full_index(acquire_write_guard);
     }
 
     // An up-to-date repository does no work, so an inventory failure there is
@@ -8697,6 +8926,13 @@ where
             let mut result = IncrementalResult::default();
             record_missing_committed_source_skips(&missing, &mut result);
             drain_pruned_dirs_into_incremental(reader, &mut result);
+            record_cached_partial_parse_warnings(
+                store,
+                store.db_path(),
+                &r_uid,
+                reader,
+                &mut result,
+            )?;
             return Ok(result);
         }
     }
@@ -8710,6 +8946,21 @@ where
 
     let mut changes = crate::git_diff::detect_changes(git_repo_path, &old_sha, new_sha)
         .with_context(|| "detect_changes")?;
+    if changes.iter().any(|change| match change {
+        crate::git_diff::FileChange::Added(path) | crate::git_diff::FileChange::Deleted(path) => {
+            path == Path::new("Cargo.toml") || path == Path::new("src/lib.rs")
+        }
+        crate::git_diff::FileChange::Modified(path) => path == Path::new("Cargo.toml"),
+        crate::git_diff::FileChange::Renamed { from, to } => [from, to]
+            .iter()
+            .any(|path| *path == Path::new("Cargo.toml") || *path == Path::new("src/lib.rs")),
+    }) && store
+        .list_files_by_repo(&r_uid)?
+        .iter()
+        .any(|(_, path)| path == "src/main.rs")
+    {
+        return full_index(acquire_write_guard);
+    }
     changes.retain(|change| match change {
         crate::git_diff::FileChange::Added(path)
         | crate::git_diff::FileChange::Modified(path)
@@ -9132,6 +9383,7 @@ where
     )?;
     append_incremental_parses(store.db_path(), &prepared_files);
     append_incremental_parses(store.db_path(), &missing_committed);
+    record_cached_partial_parse_warnings(store, store.db_path(), &r_uid, reader, &mut result)?;
 
     Ok(result)
 }
@@ -9155,6 +9407,7 @@ fn append_incremental_parses(
                     symbols: file.parsed.symbols.clone(),
                     references: file.parsed.references.clone(),
                     type_bindings: file.parsed.type_bindings.clone(),
+                    partial_parse_reason: file.parsed.partial_parse_reason.clone(),
                 },
             )),
             _ => None,
@@ -9677,7 +9930,10 @@ fn write_prepared_incremental_file_txn(
             .with_context(|| format!("batch_insert_edges {}", rel_str))?;
     }
 
-    Ok(IncrementalFileOutcome::Indexed(sym_count))
+    Ok(IncrementalFileOutcome::Indexed(
+        sym_count,
+        prepared.parsed.partial_parse_skip(rel_str.clone()),
+    ))
 }
 
 /// Split a set of file changes into the parseable files that still exist after
@@ -9897,8 +10153,22 @@ pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
     )
 }
 
-fn uses_workspace_context(path: &str) -> bool {
-    detect_language(Path::new(path)).is_some_and(language_uses_workspace_context)
+pub(crate) fn has_rust_root_targets<'a>(files: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut has_binary = false;
+    let mut has_library = false;
+    for path in files {
+        has_binary |= path == "src/main.rs";
+        has_library |= path == "src/lib.rs";
+        if has_binary && has_library {
+            return true;
+        }
+    }
+    false
+}
+
+fn uses_workspace_context(path: &str, include_rust: bool) -> bool {
+    (include_rust && path == "src/main.rs")
+        || detect_language(Path::new(path)).is_some_and(language_uses_workspace_context)
 }
 
 /// Shared source scope for both type-environment preparation and edge
@@ -9915,6 +10185,11 @@ fn resolution_source_scope(
     extra_dependents: Option<&HashSet<String>>,
 ) -> anyhow::Result<HashSet<String>> {
     let mut affected = deps.affected_files_for_repo(r_uid, changed_or_removed);
+    // The root library's membership enables qualified calls to submodules,
+    // including calls whose graph edge targets a file other than lib.rs.
+    if changed_or_removed.contains("src/lib.rs") && eligible.contains("src/main.rs") {
+        affected.insert("src/main.rs".to_owned());
+    }
     if let Some(extra) = extra_dependents {
         affected.extend(extra.iter().cloned());
     }
@@ -9948,19 +10223,21 @@ fn workspace_context_for_languages(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
 ) -> anyhow::Result<nestweaver_resolver::WorkspaceContext> {
-    discover_resolver_inputs(reader, languages, false).map(|(context, _)| context)
+    discover_resolver_inputs(reader, languages, false, false).map(|(context, _)| context)
 }
 
 fn workspace_context_and_resolver_inputs(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
+    include_rust: bool,
 ) -> anyhow::Result<(nestweaver_resolver::WorkspaceContext, Option<String>)> {
-    discover_resolver_inputs(reader, languages, true)
+    discover_resolver_inputs(reader, languages, include_rust, true)
 }
 
 fn discover_resolver_inputs(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
+    include_rust: bool,
     capture: bool,
 ) -> anyhow::Result<(nestweaver_resolver::WorkspaceContext, Option<String>)> {
     let languages: Vec<_> = languages.into_iter().collect();
@@ -9972,7 +10249,7 @@ fn discover_resolver_inputs(
     } else {
         Vec::new()
     };
-    resolver_context_for_inventory(reader, &languages, &files, capture)
+    resolver_context_for_inventory(reader, &languages, &files, include_rust, capture)
 }
 
 /// Compare the same resolver observations using the startup walk's inventory.
@@ -9980,23 +10257,26 @@ pub(crate) fn resolver_inputs_for_inventory(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
     files: &[PathBuf],
+    include_rust: bool,
 ) -> anyhow::Result<Option<String>> {
     let languages: Vec<_> = languages.into_iter().collect();
-    resolver_context_for_inventory(reader, &languages, files, true).map(|(_, proof)| proof)
+    resolver_context_for_inventory(reader, &languages, files, include_rust, true)
+        .map(|(_, proof)| proof)
 }
 
 fn resolver_context_for_inventory(
     reader: &dyn crate::content_reader::ContentReader,
     languages: &[Language],
     files: &[PathBuf],
+    include_rust: bool,
     capture: bool,
 ) -> anyhow::Result<(nestweaver_resolver::WorkspaceContext, Option<String>)> {
     use std::io::ErrorKind;
-    if !languages
+    let include_standard = languages
         .iter()
         .copied()
-        .any(language_uses_workspace_context)
-    {
+        .any(language_uses_workspace_context);
+    if !include_standard && !include_rust {
         return Ok((nestweaver_resolver::WorkspaceContext::default(), None));
     }
     let capture = capture && reader.version_id() == "local";
@@ -10007,39 +10287,44 @@ fn resolver_context_for_inventory(
     } else {
         &[]
     };
-    let context = discover_workspace_context_with_files(files, |path| {
-        let result = reader.read_file(path);
-        if !capture {
-            return result.map_err(std::io::Error::other);
-        }
-        // Hash the decoded bytes the resolver actually received. The
-        // watcher's admission guard separately checks raw bytes and ABA.
-        let state = match &result {
-            Ok(source) => Some(crate::hash::blake3_hex(source)),
-            Err(error)
-                if error.chain().any(|cause| {
-                    cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                        matches!(io.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
-                    })
-                }) =>
-            {
-                Some("absent".to_owned())
+    let context = discover_workspace_context_with_files_for_languages(
+        files,
+        |path| {
+            let result = reader.read_file(path);
+            if !capture {
+                return result.map_err(std::io::Error::other);
             }
-            Err(_) => None,
-        };
-        if let Some(state) = state {
-            if probes
-                .borrow_mut()
-                .insert(path.to_path_buf(), state.clone())
-                .is_some_and(|prior| prior != state)
-            {
+            // Hash the decoded bytes the resolver actually received. The
+            // watcher's admission guard separately checks raw bytes and ABA.
+            let state = match &result {
+                Ok(source) => Some(crate::hash::blake3_hex(source)),
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                            matches!(io.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+                        })
+                    }) =>
+                {
+                    Some("absent".to_owned())
+                }
+                Err(_) => None,
+            };
+            if let Some(state) = state {
+                if probes
+                    .borrow_mut()
+                    .insert(path.to_path_buf(), state.clone())
+                    .is_some_and(|prior| prior != state)
+                {
+                    unproven.set(true);
+                }
+            } else {
                 unproven.set(true);
             }
-        } else {
-            unproven.set(true);
-        }
-        result.map_err(|error| std::io::Error::other(error.to_string()))
-    });
+            result.map_err(|error| std::io::Error::other(error.to_string()))
+        },
+        include_standard,
+        include_rust,
+    );
     if unproven.get() || !capture {
         return Ok((context, None));
     }
@@ -10651,14 +10936,16 @@ impl WatcherBatchResolution {
 
     /// Only a batch that resolved every workspace caller may advance the proof.
     pub(crate) fn resolver_inputs(&self) -> Option<&str> {
+        let include_rust =
+            has_rust_root_targets(self.resolver_files.iter().map(|(path, ..)| path.as_str()));
         if self.resolution.skip_resolution
             || !self.view_covers_repo
             || self
                 .protected_files
                 .iter()
-                .any(|path| uses_workspace_context(path))
+                .any(|path| uses_workspace_context(path, include_rust))
             || self.resolver_files.iter().any(|(path, ..)| {
-                uses_workspace_context(path)
+                uses_workspace_context(path, include_rust)
                     && self
                         .resolution
                         .resolve_filter
@@ -10826,10 +11113,9 @@ pub(crate) fn prepare_watcher_batch_resolution(
     if changed.is_empty() && removed_files.is_empty() {
         return Ok(None);
     }
-    let has_workspace_sources = existing
-        .difference(&removed_files)
-        .chain(changed)
-        .any(|path| uses_workspace_context(path));
+    let mut remaining = existing.difference(&removed_files).chain(changed);
+    let has_workspace_sources = has_rust_root_targets(remaining.clone().map(String::as_str))
+        || remaining.any(|path| uses_workspace_context(path, false));
     let added_files: HashSet<String> = changed
         .iter()
         .filter(|path| !existing.contains(*path))
@@ -11041,6 +11327,7 @@ pub(crate) fn prepare_watcher_batch_resolution(
             files_unchanged,
             resolution_deps: Some(&resolution_deps),
             extra_dependents: Some(graph_dependents),
+            prior_resolver_inputs: None,
             infer_cross_repo: false,
         },
         type_envs,
@@ -11288,7 +11575,13 @@ fn build_reresolve_edges_unlogged(
         }
     }
 
-    let workspace_ctx = workspace_context_for_languages(reader, file_languages.values().copied())?;
+    let include_rust = has_rust_root_targets(known_files.iter().map(String::as_str));
+    let (workspace_ctx, _) = discover_resolver_inputs(
+        reader,
+        file_languages.values().copied(),
+        include_rust,
+        false,
+    )?;
 
     // Unchanged JS/TS targets need their exact public keys, not just stored
     // symbol visibility. Hydrate direct targets of scoped files, then only
@@ -22608,6 +22901,114 @@ module.exports = { check, plain };\n";
         );
     }
 
+    #[test]
+    fn sqlite_trigger_partial_parse_keeps_prefix_and_repeats_coverage_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("test.lbug");
+        fs::create_dir_all(repo.join("sql")).unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/sql/trigger_sqlite.sql");
+        fs::copy(fixture, repo.join("sql/trigger_sqlite.sql")).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let repo_url = "https://example.com/sqlite-partial-parse";
+        let head = git(&["rev-parse", "HEAD"]);
+        let opts = IndexOptions::new("test", repo_url, &head);
+
+        let first = index_directory_with_opts(&repo, &db, &opts).unwrap();
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert!(
+            store
+                .symbols_in_file("sql/trigger_sqlite.sql")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "a1"),
+            "the parseable prefix stays published"
+        );
+        let assert_warning = |skipped: &[SkippedFile]| {
+            assert!(
+                skipped.iter().any(|file| {
+                    file.path == "sql/trigger_sqlite.sql"
+                        && file.reason_code == SkipReasonCode::ParseError
+                        && file.reason.starts_with("partial_parse:")
+                }),
+                "partial tail loss must remain visible in coverage: {skipped:?}"
+            );
+        };
+        assert_warning(&first.skipped_files);
+        drop(store);
+
+        // The published graph still has the source hash, but the parse cache
+        // may be absent after sidecar loss. The bounded SQL fallback must
+        // reconstruct the warning from matching source bytes.
+        let parse_cache = crate::sidecar_path(&db, ".parsed_cache.bin");
+        fs::remove_file(&parse_cache).unwrap();
+        let warm_full = index_directory_with_opts(&repo, &db, &opts).unwrap();
+        assert_warning(&warm_full.skipped_files);
+        if parse_cache.exists() {
+            fs::remove_file(&parse_cache).unwrap();
+        }
+        let normal = incremental_index_with_name_and_limits(
+            &repo,
+            &db,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert_warning(&normal.skipped_files);
+        let forced = index_directory_with_opts(&repo, &db, &opts.force(true)).unwrap();
+        assert_warning(&forced.skipped_files);
+        let normal_again = incremental_index_with_name_and_limits(
+            &repo,
+            &db,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert_warning(&normal_again.skipped_files);
+        let store = GraphStore::open_read_only(&db).unwrap();
+        assert_eq!(
+            store
+                .symbols_in_file("sql/trigger_sqlite.sql")
+                .unwrap()
+                .iter()
+                .filter(|symbol| symbol.name == "a1")
+                .count(),
+            1,
+            "repeat and force paths must preserve one valid prefix symbol"
+        );
+        drop(store);
+
+        // Once the trigger tail is removed and the source is committed, a
+        // normal incremental parse clears the old partial-coverage warning.
+        fs::write(
+            repo.join("sql/trigger_sqlite.sql"),
+            "CREATE TABLE a1 (id INTEGER);\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "remove unsupported trigger"]);
+        let cleared = incremental_index_with_name_and_limits(
+            &repo,
+            &db,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            !cleared.skipped_files.iter().any(|file| {
+                file.path == "sql/trigger_sqlite.sql" && file.reason.starts_with("partial_parse:")
+            }),
+            "recovered SQL with no swallowed tail clears the warning"
+        );
+    }
+
     /// nw-601, the incremental route (the nw-387/nw-418 lesson: the skip
     /// channel has more than one assembly site).
     #[test]
@@ -25108,6 +25509,100 @@ impl Counter {
         assert!(store.load_typed_edges().unwrap().iter().any(
             |(source, target, kind, _, _)| source == &test && target == &get && kind == "CALLS"
         ));
+    }
+
+    #[test]
+    fn cargo_library_alias_changes_refresh_warm_local_and_bare_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let manifest = repo.join("Cargo.toml");
+        let initial = "[package]\nname='local-library'\nversion='0.1.0'\n";
+        let renamed = "[package]\nname='different-library'\nversion='0.1.0'\n";
+        fs::write(&manifest, initial).unwrap();
+        fs::write(
+            repo.join("src/main.rs"),
+            "fn main() { local_library::target(); }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+        let git = commit_all_in(&repo, "initial alias");
+        let initial_sha = git(&["rev-parse", "HEAD"]);
+
+        let has_edge = |store: &GraphStore| {
+            let callers = store.lookup_symbols_by_name("main").unwrap();
+            let targets = store.lookup_symbols_by_name("target").unwrap();
+            assert_eq!(callers.len(), 1);
+            assert_eq!(targets.len(), 1);
+            store.load_typed_edges().unwrap().iter().any(|edge| {
+                edge.0 == callers[0].uid && edge.1 == targets[0].uid && edge.2 == "CALLS"
+            })
+        };
+
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/cargo-alias";
+        index_directory(&repo, &db, "test", url, &initial_sha).unwrap();
+        assert!(has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        fs::remove_file(&manifest).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        index_directory(&repo, &db, "test", url, &initial_sha).unwrap();
+        assert!(!has_edge(&GraphStore::open_or_create(&db).unwrap()));
+        fs::remove_dir(&manifest).unwrap();
+        fs::write(&manifest, initial).unwrap();
+        index_directory(&repo, &db, "test", url, &initial_sha).unwrap();
+        assert!(has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        fs::write(&manifest, renamed).unwrap();
+        index_directory(&repo, &db, "test", url, &initial_sha).unwrap();
+        assert!(!has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        fs::write(&manifest, initial).unwrap();
+        incremental_index(&repo, &db, "test", url).unwrap();
+        assert!(has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        fs::write(&manifest, renamed).unwrap();
+        git(&["add", "Cargo.toml"]);
+        git(&["commit", "-qm", "rename library only"]);
+        let renamed_sha = git(&["rev-parse", "HEAD"]);
+        incremental_index(&repo, &db, "test", url).unwrap();
+        assert!(!has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        // A failed configuration read cannot establish the current alias.
+        fs::remove_file(&manifest).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        let error = incremental_index(&repo, &db, "test", url).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot verify resolver configuration")
+        );
+
+        let bare = dir.path().join("bare.git");
+        git(&["clone", "--bare", ".", bare.to_str().unwrap()]);
+        let store = GraphStore::in_memory().unwrap();
+        index_with_reader(
+            &crate::content_reader::GitBareReader::new(&bare, &initial_sha),
+            &store,
+            "test",
+            url,
+            &initial_sha,
+            None,
+        )
+        .unwrap();
+        assert!(has_edge(&store));
+        let result = incremental_index_with_reader_and_write_gate(
+            &crate::content_reader::GitBareReader::new(&bare, &renamed_sha),
+            &bare,
+            &store,
+            "test",
+            url,
+            &renamed_sha,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(result.fell_back_to_full);
+        assert!(!has_edge(&store));
     }
 
     #[test]

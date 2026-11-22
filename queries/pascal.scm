@@ -18,13 +18,13 @@
 (interface
   (declProc
     (kProcedure)
-    name: (identifier) @name)) @definition.function
+    name: (identifier) @name) @definition.function)
 
 ; Function declarations in interface section
 (interface
   (declProc
     (kFunction)
-    name: (identifier) @name)) @definition.function
+    name: (identifier) @name) @definition.function)
 
 ; Procedure/function implementations (defProc)
 ; Constructor implementations

@@ -76,7 +76,9 @@ use serde::{Deserialize, Serialize};
 /// 17 — Scala 0.26.9 repairs Scala 2 given/enum identifiers, typed lambdas,
 ///      inheritance and expression boundaries. Tree-sitter 0.27.2 also fixes
 ///      native traversal and error detection; discard earlier parser facts.
-const CACHE_VERSION: u32 = 17;
+/// 18 — Pascal, Elixir, SystemVerilog, SQL and Objective-C query captures
+///      change parsed symbols; discard earlier parser facts.
+const CACHE_VERSION: u32 = 18;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -90,6 +92,8 @@ pub struct CachedParseResult {
     pub symbols: Vec<RawSymbol>,
     pub references: Vec<RawReference>,
     pub type_bindings: Vec<AstTypeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_parse_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -502,6 +506,7 @@ mod tests {
                 line: 1,
                 kind: nestweaver_parser::AstBindingKind::Annotation,
             }],
+            partial_parse_reason: None,
         }
     }
 
@@ -545,6 +550,7 @@ mod tests {
             symbols: parsed.symbols,
             references: parsed.references,
             type_bindings: parsed.type_bindings,
+            partial_parse_reason: parsed.partial_parse_reason,
         };
         for symbol in &mut old.symbols {
             if symbol.name == "Named" {
@@ -597,6 +603,7 @@ mod tests {
             symbols: parsed.symbols,
             references: parsed.references,
             type_bindings: parsed.type_bindings,
+            partial_parse_reason: parsed.partial_parse_reason,
         };
         let local = stale.symbols.iter().find(|s| s.name == "Local").unwrap();
         assert_eq!(local.kind, SymbolKind::Class);
@@ -854,6 +861,7 @@ mod tests {
             symbols: parsed.symbols,
             references: parsed.references,
             type_bindings: parsed.type_bindings,
+            partial_parse_reason: parsed.partial_parse_reason,
         };
         // Version 10 assigned each initializer its enclosing function block.
         // Keep the same source hash and all other facts: only its lifetime is old.
@@ -1269,6 +1277,7 @@ mod tests {
             symbols: fresh.symbols.clone(),
             references: fresh.references.clone(),
             type_bindings: fresh.type_bindings.clone(),
+            partial_parse_reason: fresh.partial_parse_reason.clone(),
         };
         // The previous grammar fails to recognize the Scala 2 keyword names.
         // Preserve unrelated facts under the same content key, so this tests
@@ -1312,6 +1321,7 @@ mod tests {
                     symbols: fresh.symbols.clone(),
                     references: fresh.references.clone(),
                     type_bindings: fresh.type_bindings.clone(),
+                    partial_parse_reason: fresh.partial_parse_reason.clone(),
                 },
             );
             reader.save(&path).unwrap();
@@ -1485,6 +1495,7 @@ mod tests {
                 })
                 .collect(),
             type_bindings: parsed.type_bindings,
+            partial_parse_reason: parsed.partial_parse_reason,
         };
         for base in [true, false] {
             let temp = tempfile::tempdir().unwrap();

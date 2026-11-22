@@ -80,6 +80,7 @@ mod tests {
                 references: Vec::new(),
                 type_bindings: Vec::new(),
                 has_syntax_errors: false,
+                partial_parse_reason: None,
             })
         }
     }

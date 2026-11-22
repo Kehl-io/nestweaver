@@ -51,13 +51,17 @@ pub struct WorkspaceContext {
     /// Go modules declared by the root `go.mod`, the `go.work` `use` list and
     /// local `replace` directives.
     pub go_modules: Vec<GoModule>,
+    /// Root Cargo library crate name, when its manifest proves a conventional library.
+    pub rust_root_library: Option<String>,
 }
 
 impl WorkspaceContext {
-    /// Returns true if there are no workspace packages, no tsconfig aliases
-    /// and no Go modules.
+    /// Returns true when no supported workspace resolution context is present.
     pub fn is_empty(&self) -> bool {
-        self.packages.is_empty() && self.aliases.is_empty() && self.go_modules.is_empty()
+        self.packages.is_empty()
+            && self.aliases.is_empty()
+            && self.go_modules.is_empty()
+            && self.rust_root_library.is_none()
     }
 }
 
@@ -76,6 +80,9 @@ pub fn discover_workspace_context(repo_path: &Path) -> WorkspaceContext {
         packages,
         aliases,
         go_modules,
+        rust_root_library: std::fs::read_to_string(repo_path.join("Cargo.toml"))
+            .ok()
+            .and_then(|s| root_cargo_library_name(&s)),
     }
 }
 
@@ -107,14 +114,65 @@ pub fn discover_workspace_context_with_files<F>(
 where
     F: Fn(&Path) -> Result<String, std::io::Error>,
 {
-    let packages = discover_workspace_packages_with(&read_file);
-    let aliases = load_tsconfig_aliases_with(&read_file);
-    let go_modules = discover_go_modules_with(&read_file, files);
+    discover_workspace_context_with_files_for_languages(files, read_file, true, false)
+}
+
+/// Read only the configuration families needed by the indexed languages.
+pub fn discover_workspace_context_with_files_for_languages<F>(
+    files: &[std::path::PathBuf],
+    read_file: F,
+    include_standard: bool,
+    include_rust: bool,
+) -> WorkspaceContext
+where
+    F: Fn(&Path) -> Result<String, std::io::Error>,
+{
+    let packages = if include_standard {
+        discover_workspace_packages_with(&read_file)
+    } else {
+        Vec::new()
+    };
+    let aliases = if include_standard {
+        load_tsconfig_aliases_with(&read_file)
+    } else {
+        Vec::new()
+    };
+    let go_modules = if include_standard {
+        discover_go_modules_with(&read_file, files)
+    } else {
+        Vec::new()
+    };
     WorkspaceContext {
         packages,
         aliases,
         go_modules,
+        rust_root_library: include_rust
+            .then(|| read_file(Path::new("Cargo.toml")).ok())
+            .flatten()
+            .and_then(|s| root_cargo_library_name(&s)),
     }
+}
+
+fn root_cargo_library_name(source: &str) -> Option<String> {
+    let manifest: toml::Value = toml::from_str(source).ok()?;
+    let package = manifest.get("package")?.as_table()?;
+    let lib = match manifest.get("lib") {
+        Some(lib) => Some(lib.as_table()?),
+        None => None,
+    };
+    if lib.is_none() && package.get("autolib").and_then(toml::Value::as_bool) == Some(false) {
+        return None;
+    }
+    if let Some(path) = lib.and_then(|lib| lib.get("path"))
+        && path.as_str()? != "src/lib.rs"
+    {
+        return None;
+    }
+    let name = match lib.and_then(|lib| lib.get("name")) {
+        Some(name) => name.as_str()?,
+        None => package.get("name")?.as_str()?,
+    };
+    Some(name.replace('-', "_"))
 }
 
 /// Discover the Go modules rooted in the repository.
@@ -1385,5 +1443,55 @@ mod tests {
             try_resolve_with_extensions("./src/stores/auth-store", &known),
             Some("src/stores/auth-store.ts".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod rust_manifest_tests {
+    use super::*;
+    #[test]
+    fn cargo_manifest_is_read_only_when_rust_is_requested() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let read = |path: &Path| {
+            calls.borrow_mut().push(path.to_path_buf());
+            if path == Path::new("Cargo.toml") {
+                Ok("[package]\nname='package'\n[lib]\nname='actual_library'\n".to_string())
+            } else {
+                Err(std::io::ErrorKind::NotFound.into())
+            }
+        };
+        let absent = discover_workspace_context_with_files_for_languages(&[], read, true, false);
+        assert_eq!(absent.rust_root_library, None);
+        assert!(
+            !calls
+                .borrow()
+                .iter()
+                .any(|path| path == Path::new("Cargo.toml"))
+        );
+        calls.borrow_mut().clear();
+        let present = discover_workspace_context_with_files_for_languages(&[], read, false, true);
+        assert_eq!(present.rust_root_library.as_deref(), Some("actual_library"));
+        assert_eq!(&*calls.borrow(), &[std::path::PathBuf::from("Cargo.toml")]);
+    }
+
+    #[test]
+    fn library_name_requires_valid_conventional_manifest() {
+        assert_eq!(
+            root_cargo_library_name("[package]\nname='my-package'\n"),
+            Some("my_package".into())
+        );
+        assert_eq!(
+            root_cargo_library_name("[package]\nname='my-package'\n[lib]\nname='actual_library'\n"),
+            Some("actual_library".into())
+        );
+        assert_eq!(
+            root_cargo_library_name("[package]\nname='my-package'\n[lib]\npath='custom.rs'\n"),
+            None
+        );
+        assert_eq!(
+            root_cargo_library_name("[package]\nname='my-package'\nautolib=false\n"),
+            None
+        );
+        assert_eq!(root_cargo_library_name("[workspace]\nmembers=[]\n"), None);
     }
 }

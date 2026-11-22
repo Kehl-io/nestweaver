@@ -1,9 +1,11 @@
 ; @interface ClassName — class interface declaration
 (class_interface
+  .
   (identifier) @name) @definition.interface
 
 ; @implementation ClassName — class implementation
 (class_implementation
+  .
   (identifier) @name) @definition.class
 
 ; @protocol ProtocolName — protocol declaration

@@ -223,14 +223,20 @@ pub fn parse_markdown(rel_path: &str, source: &str) -> Result<ParsedNote, Markdo
     }
 
     // 8. Extract wikilinks per section + tags (inline + frontmatter).
-    let mut wikilinks = extract_wikilinks(&sections);
-    wikilinks.extend(extract_md_links(body, &sections));
+    let masked_body = mask_non_prose(body);
+    let masked_lines: Vec<&str> = masked_body.lines().collect();
+    let mut masked_sections = sections.clone();
+    for section in &mut masked_sections {
+        section.text = slice_lines(&masked_lines, section.start_line, section.end_line);
+    }
+    let mut wikilinks = extract_wikilinks(&masked_sections);
+    wikilinks.extend(extract_md_links(&masked_body, &sections));
     // Frontmatter links attach to the preamble section; see
     // extract_frontmatter_wikilinks for why they cannot be note-scoped today.
     if !sections.is_empty() {
         wikilinks.extend(extract_frontmatter_wikilinks(&frontmatter_json, 0));
     }
-    let mut tags = extract_inline_tags(&sections);
+    let mut tags = extract_inline_tags(&masked_sections);
     tags.extend(extract_frontmatter_tags(&frontmatter_json));
 
     // 9. Aliases from frontmatter `aliases:`.
@@ -484,7 +490,7 @@ fn sha256_hex(text: &str) -> String {
 ///
 /// Obsidian/Jekyll convention: file must START with `---\n`, and the next
 /// matching `---\n` ends the block.
-fn split_frontmatter(source: &str) -> (Option<&str>, &str) {
+pub fn split_frontmatter(source: &str) -> (Option<&str>, &str) {
     let trimmed = source.strip_prefix('\u{feff}').unwrap_or(source);
     let Some(rest) = trimmed
         .strip_prefix("---\n")
@@ -493,21 +499,12 @@ fn split_frontmatter(source: &str) -> (Option<&str>, &str) {
         return (None, source);
     };
 
-    // Find the closing `---` line.
     let mut offset = 0;
-    for line in rest.lines() {
-        if line.trim_end() == "---" {
-            let frontmatter = &rest[..offset];
-            // Skip past the closing line including its newline.
-            let body_start_in_rest = offset + line.len();
-            let body = &rest[body_start_in_rest..];
-            let body = body
-                .strip_prefix('\n')
-                .or_else(|| body.strip_prefix("\r\n"))
-                .unwrap_or(body);
-            return (Some(frontmatter), body);
+    for segment in rest.split_inclusive('\n') {
+        if segment.trim_end() == "---" {
+            return (Some(&rest[..offset]), &rest[offset + segment.len()..]);
         }
-        offset += line.len() + 1; // +1 for the line terminator
+        offset += segment.len();
     }
 
     // No closing delimiter — treat as no frontmatter to avoid swallowing the body.
@@ -759,8 +756,7 @@ fn push_wikilinks_from_line(
 fn extract_wikilinks(sections: &[RawSection]) -> Vec<RawWikilink> {
     let mut out = Vec::new();
     for (sec_idx, sec) in sections.iter().enumerate() {
-        let stripped = strip_code(&sec.text);
-        for (line_offset, line_text) in stripped.lines().enumerate() {
+        for (line_offset, line_text) in sec.text.lines().enumerate() {
             push_wikilinks_from_line(
                 line_text,
                 sec_idx,
@@ -788,61 +784,99 @@ fn find_close(bytes: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// Remove fenced code blocks (triple-backtick) and inline code spans
-/// (single-backtick) from `text` so that wikilink / tag scanners don't
-/// match inside them. Preserves line numbers by emitting blank lines for
-/// removed content.
-fn strip_code(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_fence = false;
-    for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            out.push('\n');
+/// Mask code blocks, code spans, HTML comments and dollar math while retaining
+/// byte offsets and newlines. Block boundaries follow the CommonMark parser.
+fn mask_non_prose(text: &str) -> String {
+    use comrak::{Arena, Options, nodes::NodeValue, parse_document};
+    let arena = Arena::new();
+    let mut options = Options::default();
+    options.extension.math_dollars = true;
+    options.extension.math_dollars_block = true;
+    let root = parse_document(&arena, text, &options);
+    let mut bytes = text.as_bytes().to_vec();
+    let mut starts = vec![0];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    for node in root.descendants() {
+        let data = node.data.borrow();
+        let block = matches!(
+            data.value,
+            NodeValue::CodeBlock(_) | NodeValue::MathBlock(_)
+        );
+        let html = matches!(
+            &data.value,
+            NodeValue::HtmlInline(_) | NodeValue::HtmlBlock(_)
+        );
+        let masked =
+            block || html || matches!(&data.value, NodeValue::Code(_) | NodeValue::Math(_));
+        if !masked {
             continue;
         }
-        if in_fence {
-            out.push('\n');
+        let Some(&line_start) = starts.get(data.sourcepos.start.line.saturating_sub(1)) else {
+            continue;
+        };
+        let Some(&end_start) = starts.get(data.sourcepos.end.line.saturating_sub(1)) else {
+            continue;
+        };
+        let mut start = if block {
+            line_start
+        } else {
+            line_start
+                .saturating_add(data.sourcepos.start.column.saturating_sub(1))
+                .min(bytes.len())
+        };
+        let mut end = if block {
+            starts
+                .get(data.sourcepos.end.line)
+                .copied()
+                .unwrap_or(bytes.len())
+        } else {
+            end_start
+                .saturating_add(data.sourcepos.end.column)
+                .min(bytes.len())
+        };
+        while start > 0 && !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        if start > end {
             continue;
         }
-        // Strip inline code spans: replace `...` with spaces of equal length.
-        //
-        // Operate on `str`, never on raw bytes. This loop used to copy the line
-        // through with `buf.push(bytes[i] as char)`, and `u8 as char` maps a
-        // byte to the code point of the same value — Latin-1 decoding. Pushing
-        // that into a UTF-8 `String` re-encoded it, so an em dash `e2 80 94`
-        // came back out as `c3 a2 c2 80 c2 94` and every wikilink or tag
-        // containing non-ASCII was silently corrupted (nw-099).
-        //
-        // Backticks are ASCII, so every index `find` returns is on a character
-        // boundary and the slices below are safe.
-        let mut buf = String::with_capacity(line.len());
-        let mut rest = line;
-        while let Some(open) = rest.find('`') {
-            buf.push_str(&rest[..open]);
-            let after_open = &rest[open + 1..];
-            match after_open.find('`') {
-                Some(close) => {
-                    // Blank the span, both backticks included, one space per
-                    // CHARACTER so column positions survive multi-byte text.
-                    let span_end = open + 1 + close + 1;
-                    for _ in rest[open..span_end].chars() {
-                        buf.push(' ');
+        if html {
+            // HTML tags remain searchable; only comment spans are excluded.
+            // An unclosed comment consumes the remainder of the HTML node.
+            let mut pos = start;
+            while let Some(open) = text[pos..end].find("<!--") {
+                let first = pos + open;
+                let last = text[first + 4..end]
+                    .find("-->")
+                    .map_or(end, |n| first + 4 + n + 3);
+                for b in &mut bytes[first..last] {
+                    if *b != b'\n' && *b != b'\r' {
+                        *b = b' ';
                     }
-                    rest = &rest[span_end..];
                 }
-                None => {
-                    // Unmatched backtick: keep it literally and carry on.
-                    buf.push('`');
-                    rest = after_open;
+                pos = last;
+                if pos == end {
+                    break;
+                }
+            }
+        } else {
+            for b in &mut bytes[start..end] {
+                if *b != b'\n' && *b != b'\r' {
+                    *b = b' ';
                 }
             }
         }
-        buf.push_str(rest);
-        out.push_str(&buf);
-        out.push('\n');
     }
-    out
+    // Masking complete UTF-8 characters with ASCII preserves validity.
+    // All ranges were adjusted to character boundaries above.
+    String::from_utf8(bytes).unwrap_or_else(|_| unreachable!("mask preserves UTF-8"))
 }
 
 /// Extract inline `#tag` and `#nested/tag` strings from section bodies.
@@ -851,8 +885,7 @@ fn strip_code(text: &str) -> String {
 fn extract_inline_tags(sections: &[RawSection]) -> Vec<RawTag> {
     let mut out = Vec::new();
     for (sec_idx, sec) in sections.iter().enumerate() {
-        let stripped = strip_code(&sec.text);
-        for (line_offset, line_text) in stripped.lines().enumerate() {
+        for (line_offset, line_text) in sec.text.lines().enumerate() {
             // Scan by CHARACTER, not by byte. Testing each byte with
             // `is_ascii_alphanumeric` stopped at the first non-ASCII byte, so
             // `#café` indexed as `caf` and `#日本語` was dropped outright — its
@@ -1230,7 +1263,10 @@ pub fn code_mentions(source: &str) -> Vec<CodeMention> {
     }
 
     let arena = Arena::new();
-    let root = parse_document(&arena, body, &Options::default());
+    let mut options = Options::default();
+    options.extension.math_dollars = true;
+    options.extension.math_dollars_block = true;
+    let root = parse_document(&arena, body, &options);
     let mut prose_lines: std::collections::BTreeMap<u32, String> = Default::default();
     for node in root.descendants() {
         let data = node.data.borrow();
@@ -1723,6 +1759,105 @@ mod code_mention_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn crlf_frontmatter_matches_lf_and_preserves_lines() {
+        for count in 1..=8 {
+            let mut fm = String::from("---\n");
+            for n in 0..count {
+                fm.push_str(&format!("field{n}: value{n}\n"));
+            }
+            fm.push_str("tags: [alpha, beta]\n---\n# Title\n[[Target]] #visible\n");
+            let lf = parse_markdown("note.md", &fm).unwrap();
+            let crlf = parse_markdown("note.md", &fm.replace('\n', "\r\n")).unwrap();
+            assert_eq!(lf.frontmatter, crlf.frontmatter);
+            assert_eq!(lf.title, crlf.title);
+            assert_eq!(lf.wikilinks[0].line, crlf.wikilinks[0].line);
+            assert_eq!(
+                lf.tags
+                    .iter()
+                    .map(|t| (&t.name, t.line))
+                    .collect::<Vec<_>>(),
+                crlf.tags
+                    .iter()
+                    .map(|t| (&t.name, t.line))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(lf.headings[0].start_line, crlf.headings[0].start_line);
+        }
+        assert_eq!(
+            split_frontmatter("\u{feff}---\r\na: b\n---\r\n"),
+            (Some("a: b\n"), "")
+        );
+        assert_eq!(
+            split_frontmatter("---\r\na: b\r\n"),
+            (None, "---\r\na: b\r\n")
+        );
+    }
+
+    #[test]
+    fn prose_links_and_tags_exclude_code_comments_and_math() {
+        let source = concat!(
+            "~~~rust\n[[Tilde]] #tilde\n~~~\n",
+            "````\n[[Four]] #four\n```\n````\n",
+            "> ```\n> [[Quote]] #quote\n> ```\n\n",
+            "    [[Indented]] #indented\n\n",
+            "<!-- [[Comment]] #comment -->\n\n",
+            "$$ [[Math]] #math $$\n\n",
+            "```inline``` [[Visible]] #visible `[[Code]] #code`\n",
+            "`` [[Long]] #long ` nested `` [[After]] #after\n",
+        );
+        let note = parse_markdown("note.md", source).unwrap();
+        let links: Vec<_> = note.wikilinks.iter().map(|w| w.target.as_str()).collect();
+        assert_eq!(links, ["Visible", "After"]);
+        let tags: Vec<_> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tags, ["visible", "after"]);
+        assert_eq!(note.wikilinks[0].line, 18);
+    }
+
+    #[test]
+    fn delimiters_do_not_hide_unrelated_prose() {
+        let text = concat!(
+            "---\ntitle: Example\n---\n",
+            "Prices $5 and $10 [[Price]] #price\n\n",
+            "Unmatched ` [[First]] #first\n\n",
+            "Second ` [[Second]] #second\n\n",
+            "Escaped \\` [[Escaped]] #escaped\n\n",
+            "# Heading\n[[Section]] #section\n",
+        );
+        let note = parse_markdown("note.md", text).unwrap();
+        let links: Vec<_> = note
+            .wikilinks
+            .iter()
+            .map(|w| (w.target.as_str(), w.line))
+            .collect();
+        assert_eq!(
+            links,
+            [
+                ("Price", 4),
+                ("First", 6),
+                ("Second", 8),
+                ("Escaped", 10),
+                ("Section", 13)
+            ]
+        );
+        let tags: Vec<_> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tags, ["price", "first", "second", "escaped", "section"]);
+    }
+
+    #[test]
+    fn inline_containers_and_html_comments_preserve_visible_utf8() {
+        let source = concat!(
+            "> café `[[Hidden]] #hidden` [[Visible]] #café\n\n",
+            "- item `[[ListHidden]] #listhidden` [[ListVisible]] #listvisible\n\n",
+            "<span>[[Html]] #html</span> <!-- [[Comment]] #comment --> [[After]] #after\n",
+        );
+        let note = parse_markdown("note.md", source).unwrap();
+        let links: Vec<_> = note.wikilinks.iter().map(|w| w.target.as_str()).collect();
+        assert_eq!(links, ["Visible", "ListVisible", "Html", "After"]);
+        let tags: Vec<_> = note.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tags, ["café", "listvisible", "html", "after"]);
+    }
 
     /// nw-164: links in the frontmatter block must reach the graph. 20% of the
     /// reference vault's links live there, including every backlog

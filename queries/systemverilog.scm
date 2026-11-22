@@ -56,13 +56,13 @@
 (module_declaration
   (function_declaration
     (function_body_declaration
-      name: (simple_identifier) @name))) @definition.function
+      name: (simple_identifier) @name)) @definition.function)
 
 ; Module-level task declarations
 (module_declaration
   (task_declaration
     (task_body_declaration
-      name: (simple_identifier) @name))) @definition.function
+      name: (simple_identifier) @name)) @definition.function)
 
 ; Package import declarations
 (package_import_declaration

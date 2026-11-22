@@ -288,9 +288,22 @@ pub struct ParsedFile {
     /// this alone is not a skip — see [`ParsedFile::unparsable_skip`].
     #[serde(default)]
     pub has_syntax_errors: bool,
+    /// A recoverable parser boundary that left this file's extracted prefix
+    /// usable but incomplete. Reported as a coverage warning alongside the
+    /// file's symbols; unlike `unparsable_skip`, it does not exclude the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_parse_reason: Option<String>,
 }
 
 impl ParsedFile {
+    /// Return a coverage warning for a recoverable partial parse, preserving
+    /// any symbols extracted before the parser boundary.
+    pub fn partial_parse_skip(&self, display_path: impl Into<String>) -> Option<SkippedFile> {
+        self.partial_parse_reason.as_ref().map(|reason| {
+            SkippedFile::new(display_path, SkipReasonCode::ParseError, reason.clone())
+        })
+    }
+
     /// nw-601. A file whose parse tree has errors AND contributes no symbols
     /// was indexed as an empty file: `skipped_count: 0`, coverage `complete`,
     /// `index --fail-on-skip` exit 0, while `search` could never find it.
@@ -1048,10 +1061,10 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language, exported: bool)
                 Visibility::Public
             }
         }
-        // Elixir: defp = private, def = public
+        // Elixir private function, macro and guard forms.
         Language::Elixir => {
             let sig = first_line(node_text);
-            if sig.contains("defp ") || sig.contains("defmacrop ") {
+            if sig.contains("defp ") || sig.contains("defmacrop ") || sig.contains("defguardp ") {
                 Visibility::Private
             } else {
                 Visibility::Public
@@ -2677,13 +2690,65 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let type_bindings =
         extract_types_from_tree(&tree, &ts_lang, source_bytes, lang, &local_bindings);
 
+    let partial_parse_reason = if lang == Language::Sql
+        && tree.root_node().has_error()
+        && sqlite_trigger_error_tail(&tree, source, &symbols)
+    {
+        Some("partial_parse: SQL trigger grammar error may omit later statements".into())
+    } else {
+        None
+    };
+
     Ok(ParsedFile {
         path: path.to_string_lossy().into_owned(),
         symbols,
         references,
         type_bindings,
         has_syntax_errors: tree.root_node().has_error(),
+        partial_parse_reason,
     })
+}
+
+/// tree-sitter-sequel 0.3.13 represents SQLite's `CREATE TRIGGER ... BEGIN
+/// ... END` region as an ERROR that can swallow all following SQL statements.
+/// Disclose only when that ERROR actually extends past the last captured
+/// symbol, so a recovered trigger that retains the full suffix is not warned.
+fn sqlite_trigger_error_tail(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    symbols: &[RawSymbol],
+) -> bool {
+    let last_symbol_end = symbols
+        .iter()
+        .filter(|symbol| !symbol.is_module_owner())
+        .map(|symbol| symbol.end_line)
+        .max()
+        .unwrap_or(0);
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for node in root.named_children(&mut cursor) {
+        let error_end_row = node.end_position().row as u32;
+        if node.kind() != "ERROR" || error_end_row < last_symbol_end {
+            continue;
+        }
+        let mut child_cursor = node.walk();
+        if !node
+            .named_children(&mut child_cursor)
+            .any(|child| child.kind() == "keyword_trigger")
+        {
+            continue;
+        }
+        let Ok(error_text) = node.utf8_text(source.as_bytes()) else {
+            continue;
+        };
+        let has_begin_token = error_text
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|token| token.eq_ignore_ascii_case("begin"));
+        if has_begin_token {
+            return true;
+        }
+    }
+    false
 }
 
 /// nw-113: the per-file `<module>` owner, when some call line lies outside
@@ -3436,11 +3501,19 @@ fn collect_rust_macro_calls(
             let mut inner = child.walk();
             for part in child.children(&mut inner) {
                 if part.kind() == "token_tree" {
-                    collect_calls_in_token_tree(part, source_bytes, references);
+                    collect_calls_in_token_tree(
+                        part,
+                        source_bytes,
+                        references,
+                        lexical_scope(child),
+                        child.start_byte(),
+                    );
                 }
             }
         }
-        collect_rust_macro_calls(child, source_bytes, references);
+        if child.kind() != "token_tree" {
+            collect_rust_macro_calls(child, source_bytes, references);
+        }
     }
 }
 
@@ -3448,10 +3521,22 @@ fn collect_calls_in_token_tree(
     tree_node: tree_sitter::Node<'_>,
     source_bytes: &[u8],
     references: &mut Vec<RawReference>,
+    scope: Option<LexicalScope>,
+    invocation_start: usize,
 ) {
     let mut cursor = tree_node.walk();
-    let children: Vec<tree_sitter::Node<'_>> = tree_node.children(&mut cursor).collect();
-    for (index, child) in children.iter().enumerate() {
+    let children = tree_node.children(&mut cursor).collect::<Vec<_>>();
+    let mut pending = vec![(children, 0usize)];
+    while let Some((siblings, index)) = pending.last_mut() {
+        if *index == siblings.len() {
+            pending.pop();
+            continue;
+        }
+        let children = siblings;
+        let current = *index;
+        *index += 1;
+        let index = current;
+        let child = &children[index];
         if child.kind() == "identifier"
             && let Ok(name) = child.utf8_text(source_bytes)
         {
@@ -3470,7 +3555,13 @@ fn collect_calls_in_token_tree(
                 // bare call. The receiver is the tokens before the `.` or
                 // `::`, so the resolver can refuse an unrelated `fn len`.
                 references.push(RawReference {
-                    scope: lexical_scope(*child),
+                    scope: scope.map(|mut scope| {
+                        if scope.initialized_at == invocation_start {
+                            scope.initialized_at = child.start_byte();
+                        }
+                        scope.position = child.start_byte();
+                        scope
+                    }),
                     name: name.to_string(),
                     kind: if macro_call {
                         ReferenceKind::Macro
@@ -3482,13 +3573,15 @@ fn collect_calls_in_token_tree(
                     receiver: if macro_call {
                         None
                     } else {
-                        token_tree_receiver(&children, index, source_bytes)
+                        token_tree_receiver(children, index, source_bytes)
                     },
                 });
             }
         }
         if child.kind() == "token_tree" {
-            collect_calls_in_token_tree(*child, source_bytes, references);
+            let mut cursor = child.walk();
+            let nested = child.children(&mut cursor).collect();
+            pending.push((nested, 0));
         }
     }
 }
@@ -4716,13 +4809,15 @@ pub fn scoped_rust_assignment_evidence(
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    let tuple_origins: std::collections::HashMap<_, _> =
-        rust_tuple_factory_bindings(source.as_bytes(), &lexical_items, &local_bindings)
-            .into_iter()
-            .filter_map(|(binding, origin)| {
-                Some((binding.scope?.position, (binding.type_name, origin)))
-            })
-            .collect();
+    let tuple_origins: std::collections::HashMap<_, _> = rust_tuple_factory_bindings(
+        source.as_bytes(),
+        &lexical_items,
+        &local_bindings,
+        &std::cell::OnceCell::new(),
+    )
+    .into_iter()
+    .filter_map(|(binding, origin)| Some((binding.scope?.position, (binding.type_name, origin))))
+    .collect();
     let origins = bindings
         .iter()
         .filter_map(|binding| {
@@ -4961,6 +5056,7 @@ fn extract_types_from_tree(
     let lexical_items =
         (lang == Language::Rust).then(|| RustLexicalItems::new(tree.root_node(), source));
 
+    let rust_origins = std::cell::OnceCell::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source);
     'type_matches: while let Some(m) = matches.next() {
         let mut var_name: Option<String> = None;
@@ -4990,7 +5086,7 @@ fn extract_types_from_tree(
                 }
                 "var.type" => {
                     var_type = Some(if lang == Language::Rust {
-                        rust_receiver_type(capture.node, source)
+                        rust_receiver_type(capture.node, source, &rust_origins)
                             .unwrap_or_else(|| extract_base_type(text))
                     } else {
                         extract_base_type(text)
@@ -5037,7 +5133,7 @@ fn extract_types_from_tree(
                             .map(|result| extract_base_type(&result))
                     } else {
                         Some(if lang == Language::Rust {
-                            rust_receiver_type(capture.node, source)
+                            rust_receiver_type(capture.node, source, &rust_origins)
                                 .unwrap_or_else(|| extract_base_type(text))
                         } else {
                             extract_base_type(text)
@@ -5062,7 +5158,7 @@ fn extract_types_from_tree(
                 }
                 "param.type" => {
                     var_type = Some(if lang == Language::Rust {
-                        rust_receiver_type(capture.node, source)
+                        rust_receiver_type(capture.node, source, &rust_origins)
                             .unwrap_or_else(|| extract_base_type(text))
                     } else {
                         extract_base_type(text)
@@ -5101,6 +5197,7 @@ fn extract_types_from_tree(
             source,
             lexical_items.as_ref().expect("Rust evidence"),
             local_bindings,
+            &rust_origins,
             &mut bindings,
         );
         collect_rust_unit_constructor_bindings(
@@ -5605,21 +5702,25 @@ fn collect_rust_unit_constructor_bindings(
 
 /// Known Rust pointer wrappers preserve the target's method set through Deref.
 /// Other generic containers retain their own base type.
-fn rust_receiver_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+fn rust_receiver_type(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    origins: &std::cell::OnceCell<RustPointerOrigins>,
+) -> Option<String> {
     if node.kind() == "reference_type" {
-        return rust_receiver_type(node.child_by_field_name("type")?, source);
+        return rust_receiver_type(node.child_by_field_name("type")?, source, origins);
     }
     if node.kind() == "generic_type" {
         let ty = node.child_by_field_name("type")?;
         let name = ty.utf8_text(source).ok()?.rsplit("::").next()?;
-        if rust_standard_pointer_origin(ty, source) {
+        if rust_standard_pointer_origin(ty, source, origins) {
             let arguments = node.child_by_field_name("type_arguments")?;
             let mut cursor = arguments.walk();
             let types: Vec<_> = arguments.named_children(&mut cursor).collect();
             if types.len() != 1 {
                 return None;
             }
-            return rust_receiver_type(types[0], source);
+            return rust_receiver_type(types[0], source, origins);
         }
         return Some(name.into());
     }
@@ -5634,7 +5735,175 @@ fn rust_receiver_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
 
 /// Pointer transparency requires its real std/alloc origin. A custom Arc,
 /// Rc or Box has its own method set and must retain its own receiver type.
-fn rust_standard_pointer_origin(ty: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+#[derive(Default)]
+struct RustPointerOrigins {
+    globs: Vec<(usize, usize)>,
+    resolved: std::collections::HashMap<String, Vec<(usize, usize, bool)>>,
+}
+
+fn rust_pointer_is_standard(path: &str) -> bool {
+    matches!(
+        path.trim_start_matches("::"),
+        "std::sync::Arc"
+            | "alloc::sync::Arc"
+            | "std::rc::Rc"
+            | "alloc::rc::Rc"
+            | "std::boxed::Box"
+            | "alloc::boxed::Box"
+    )
+}
+
+impl RustPointerOrigins {
+    fn build(ty: tree_sitter::Node<'_>, source: &[u8]) -> Self {
+        let mut root = ty;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        let mut result = Self::default();
+        let mut by_name: std::collections::HashMap<String, Vec<(usize, usize, bool)>> =
+            std::collections::HashMap::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "use_wildcard"
+                && let Some(scope) = lexical_scope(node)
+            {
+                result.globs.push((scope.start, scope.end));
+            }
+            if matches!(node.kind(), "struct_item" | "enum_item" | "type_item")
+                && let Some(name) = node.child_by_field_name("name")
+                && let Ok(spelling) = name.utf8_text(source)
+                && let Some(scope) = lexical_scope(name)
+            {
+                by_name
+                    .entry(spelling.into())
+                    .or_default()
+                    .push((scope.start, scope.end, false));
+            }
+            if node.kind() == "use_declaration"
+                && let Some(scope) = lexical_scope(node)
+            {
+                let mut references = Vec::new();
+                expand_rust_use_paths(&node, source, &mut references);
+                let aliases: Vec<_> = references
+                    .iter()
+                    .filter(|r| r.kind == ReferenceKind::ImportAlias)
+                    .collect();
+                for reference in &references {
+                    let entry = if reference.kind == ReferenceKind::ImportAlias {
+                        Some((
+                            reference.name.as_str(),
+                            rust_pointer_is_standard(&reference.context),
+                        ))
+                    } else if reference.kind == ReferenceKind::Import
+                        && !aliases.iter().any(|a| a.context == reference.name)
+                    {
+                        reference
+                            .name
+                            .rsplit("::")
+                            .next()
+                            .map(|name| (name, rust_pointer_is_standard(&reference.name)))
+                    } else {
+                        None
+                    };
+                    if let Some((name, standard)) = entry {
+                        by_name.entry(name.into()).or_default().push((
+                            scope.start,
+                            scope.end,
+                            standard,
+                        ));
+                    }
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        // Compile lexical ranges into non-overlapping intervals. The active
+        // set retains original DFS order to preserve equal-width tie behavior.
+        for (name, origins) in &by_name {
+            let mut events = Vec::with_capacity(origins.len() * 2);
+            for (index, &(start, end, _)) in origins.iter().enumerate() {
+                if start >= end {
+                    continue;
+                }
+                events.push((start, true, index));
+                events.push((end, false, index));
+            }
+            events.sort_unstable();
+            let mut active = std::collections::BTreeSet::new();
+            let mut counts = std::collections::HashMap::<(usize, usize), usize>::new();
+            let mut intervals = Vec::new();
+            let mut i = 0;
+            while i < events.len() {
+                let at = events[i].0;
+                while i < events.len() && events[i].0 == at {
+                    let (_, entering, index) = events[i];
+                    let (start, end, _) = origins[index];
+                    let key = (end - start, index);
+                    if entering {
+                        active.insert(key);
+                        *counts.entry((start, end)).or_default() += 1;
+                    } else {
+                        active.remove(&key);
+                        if let Some(count) = counts.get_mut(&(start, end)) {
+                            *count -= 1;
+                        }
+                    }
+                    i += 1;
+                }
+                if let (Some(&(.., index)), Some(&(end, _, _))) = (active.first(), events.get(i)) {
+                    let (start, stop, standard) = origins[index];
+                    intervals.push((at, end, standard && counts[&(start, stop)] == 1));
+                }
+            }
+            result.resolved.insert(name.clone(), intervals);
+        }
+        result.globs.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for &(start, end) in &result.globs {
+            if start >= end {
+                continue;
+            }
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        result.globs = merged;
+        result
+    }
+}
+
+fn rust_standard_pointer_origin(
+    ty: tree_sitter::Node<'_>,
+    source: &[u8],
+    cache: &std::cell::OnceCell<RustPointerOrigins>,
+) -> bool {
+    let Ok(spelling) = ty.utf8_text(source) else {
+        return false;
+    };
+    if spelling.contains("::") {
+        return rust_pointer_is_standard(spelling);
+    }
+    let index = cache.get_or_init(|| RustPointerOrigins::build(ty, source));
+    let at = ty.start_byte();
+    if let Some(intervals) = index.resolved.get(spelling) {
+        let next = intervals.partition_point(|(start, _, _)| *start <= at);
+        if next > 0 {
+            let (_, end, standard) = intervals[next - 1];
+            if at < end {
+                return standard;
+            }
+        }
+    }
+    let next = index.globs.partition_point(|(start, _)| *start <= at);
+    spelling == "Box" && (next == 0 || at >= index.globs[next - 1].1)
+}
+
+#[cfg(test)]
+fn original_rust_standard_pointer_origin(ty: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     fn standard(path: &str) -> bool {
         matches!(
             path.trim_start_matches("::"),
@@ -5721,10 +5990,11 @@ fn collect_rust_tuple_factory_bindings(
     source: &[u8],
     lexical_items: &RustLexicalItems<'_>,
     local_bindings: &[RawReference],
+    rust_origins: &std::cell::OnceCell<RustPointerOrigins>,
     bindings: &mut Vec<AstTypeBinding>,
 ) {
     bindings.extend(
-        rust_tuple_factory_bindings(source, lexical_items, local_bindings)
+        rust_tuple_factory_bindings(source, lexical_items, local_bindings, rust_origins)
             .into_iter()
             .map(|(binding, _)| binding),
     );
@@ -5736,6 +6006,7 @@ fn rust_tuple_factory_bindings<'tree>(
     source: &[u8],
     lexical_items: &RustLexicalItems<'tree>,
     local_bindings: &[RawReference],
+    rust_origins: &std::cell::OnceCell<RustPointerOrigins>,
 ) -> Vec<(AstTypeBinding, tree_sitter::Node<'tree>)> {
     let mut result = Vec::new();
     for declaration in &lexical_items.lets {
@@ -5842,9 +6113,10 @@ fn rust_tuple_factory_bindings<'tree>(
             if !is_bindable_name(var_name) {
                 continue;
             }
-            let (Some(type_name), Some(scope)) =
-                (rust_receiver_type(ty, source), lexical_scope(name))
-            else {
+            let (Some(type_name), Some(scope)) = (
+                rust_receiver_type(ty, source, rust_origins),
+                lexical_scope(name),
+            ) else {
                 continue;
             };
             result.push((
@@ -6650,10 +6922,15 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
 
     for (path, source) in files {
         match parse_source(path, source) {
-            Ok(parsed) => match parsed.unparsable_skip(path.to_string_lossy()) {
-                Some(skipped) => result.skipped.push(skipped),
-                None => result.files.push(parsed),
-            },
+            Ok(parsed) => {
+                if let Some(partial) = parsed.partial_parse_skip(path.to_string_lossy()) {
+                    result.skipped.push(partial);
+                }
+                match parsed.unparsable_skip(path.to_string_lossy()) {
+                    Some(skipped) => result.skipped.push(skipped),
+                    None => result.files.push(parsed),
+                }
+            }
             Err(e) => {
                 let path_str = path.to_string_lossy().into_owned();
                 tracing::warn!(path = %path_str, error = %e, "skipping file due to parse error");
@@ -6686,6 +6963,158 @@ fn local_scopes(parsed: &ParsedFile, name: &str) -> Vec<LexicalScope> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn macro_scope_matches_direct_ancestor_walk() {
+        let source = "mod m { fn f() { let x = wrap!(outer!(first()), second()); let c = || wrap!(third()); } }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&build_ts_language(Language::Rust, Path::new("a.rs")))
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut refs = Vec::new();
+        collect_rust_macro_calls(tree.root_node(), source.as_bytes(), &mut refs);
+        assert_eq!(
+            refs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["outer", "first", "second", "third"]
+        );
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" {
+                for reference in &refs {
+                    if reference
+                        .scope
+                        .is_some_and(|scope| scope.position == node.start_byte())
+                    {
+                        assert_eq!(reference.scope, lexical_scope(node));
+                    }
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+    }
+
+    #[test]
+    fn nested_macro_walk_uses_bounded_stack() {
+        let depth = 1200;
+        let source = format!(
+            "fn f() {{ {}leaf(){}; }}",
+            "vec![".repeat(depth),
+            "]".repeat(depth)
+        );
+        let parsed = parse_source(Path::new("deep.rs"), &source).unwrap();
+        assert!(parsed.references.iter().any(|r| r.name == "leaf"));
+    }
+
+    #[test]
+    fn indexed_rust_origins_match_original_scope_selection() {
+        let source = r#"use std::sync::Arc as A; use std::boxed::Box;
+            fn outer(x: A<u8>, y: Box<u8>, z: Vec<u8>) {
+                mod one { use custom::*; fn f(x: Box<u8>, y: A<u8>) {} }
+                mod two { struct A; use custom::Box; fn f(x: A<u8>, y: Box<u8>) {} }
+                { use custom::A; let _: A<u8>; }
+            }"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&build_ts_language(Language::Rust, Path::new("a.rs")))
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let cache = std::cell::OnceCell::new();
+        let mut stack = vec![tree.root_node()];
+        let mut checked = 0;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "generic_type"
+                && let Some(ty) = node.child_by_field_name("type")
+            {
+                assert_eq!(
+                    rust_standard_pointer_origin(ty, source.as_bytes(), &cache),
+                    original_rust_standard_pointer_origin(ty, source.as_bytes()),
+                    "{}",
+                    ty.utf8_text(source.as_bytes()).unwrap()
+                );
+                checked += 1;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert!(checked >= 8);
+    }
+
+    #[test]
+    fn pointer_origin_index_stays_linear_for_sibling_scopes() {
+        let source = (0..400)
+            .map(|i| format!("mod m{i} {{ use std::sync::Arc; fn f(x: Arc<u8>) {{}} }}\n"))
+            .collect::<String>();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&build_ts_language(Language::Rust, Path::new("a.rs")))
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let index = RustPointerOrigins::build(tree.root_node(), source.as_bytes());
+        let intervals = &index.resolved["Arc"];
+        assert_eq!(intervals.len(), 400);
+        assert!(
+            intervals
+                .iter()
+                .all(|(start, end, standard)| start < end && *standard)
+        );
+    }
+
+    /// Opt-in corpus differential: set NW_RUST_ORIGIN_CORPUS to a source tree.
+    #[test]
+    fn rust_origin_corpus_matches_original() {
+        let Some(root) = std::env::var_os("NW_RUST_ORIGIN_CORPUS") else {
+            return;
+        };
+        let mut paths = vec![std::path::PathBuf::from(root)];
+        let mut checked = 0usize;
+        while let Some(path) = paths.pop() {
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                if matches!(
+                    path.file_name().and_then(|s| s.to_str()),
+                    Some("target" | ".git")
+                ) {
+                    continue;
+                }
+                paths.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                let mut parser = tree_sitter::Parser::new();
+                parser
+                    .set_language(&build_ts_language(Language::Rust, &path))
+                    .unwrap();
+                let tree = parser.parse(&source, None).unwrap();
+                let cache = std::cell::OnceCell::new();
+                let mut stack = vec![tree.root_node()];
+                while let Some(node) = stack.pop() {
+                    if node.kind() == "generic_type"
+                        && let Some(ty) = node.child_by_field_name("type")
+                    {
+                        assert_eq!(
+                            rust_standard_pointer_origin(ty, source.as_bytes(), &cache),
+                            original_rust_standard_pointer_origin(ty, source.as_bytes()),
+                            "{}:{}",
+                            path.display(),
+                            ty.start_position().row + 1
+                        );
+                        checked += 1;
+                    }
+                    let mut cursor = node.walk();
+                    stack.extend(node.named_children(&mut cursor));
+                }
+            }
+        }
+        assert!(checked > 0, "no generic types in corpus");
+    }
 
     /// QA (post-#515): a `//go:build ignore` generator must be marked so the
     /// resolver keeps it out of its directory's package.
@@ -16093,6 +16522,7 @@ export function G(a) {\n\
             references: Vec::new(),
             type_bindings: Vec::new(),
             has_syntax_errors: true,
+            partial_parse_reason: None,
         };
         assert!(parsed.unparsable_skip("G.js").is_some());
     }

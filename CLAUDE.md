@@ -570,10 +570,13 @@ federation          (leaf: schema + proto only)
 
 ### Current resolver upgrade
 
-Resolver generation 23 and parsed-cache version 17 incorporate Scala grammar
-0.26.9 repairs to Scala 2 given/enum identifiers, typed lambdas, inheritance
-and expression boundaries. Generation 22 and cache 16 add anonymous JS/TS default
-callable owners and complete Svelte/Vue/Astro destructured-parameter spans.
+Resolver generation 24 and parsed-cache version 18 incorporate Pascal,
+Elixir, SystemVerilog, SQL and Objective-C query-capture repairs, plus Rust
+module-path resolution for `mod.rs` and crate-root `lib.rs`/`main.rs` files.
+Generation 23 and cache 17 include Scala grammar 0.26.9 repairs to Scala 2
+given/enum identifiers, typed lambdas, inheritance and expression boundaries.
+Generation 22 and cache 16 add anonymous JS/TS default callable owners and
+complete Svelte/Vue/Astro destructured-parameter spans.
 Generation 21 and cache 15's PHP static-call owner, inheritance and dispatch
 facts remain included. Generation 20 and cache 14 cover Dart 0.3 and
 PowerShell 0.26.6 grammar changes. Generation 19 and cache 13 add repo-wide PHP function
@@ -587,10 +590,10 @@ remain included; the resolution-dependency sidecar format is unchanged.
 PHP declaration edits/additions/removals conservatively revisit repository PHP
 callers, reusing valid parses; unresolved names and ambiguity are negative
 dependencies absent from the file-edge/import-specifier cache.
-Markdown derivation version 3 separately re-derives eligible vault links for
-percent-encoded URL paths and root-contained absolute note paths. Run
-`nestweaver brain refresh <vault>` after upgrading; repository force indexing
-does not refresh vault links.
+Markdown derivation version 4 re-derives eligible vault notes for CRLF
+frontmatter and link/tag extraction that ignores code, HTML comments, and
+dollar-delimited math. If a vault still reports that it needs refreshing,
+run `nestweaver brain refresh <vault>` with its configuration and database.
 
 ## Conventions
 

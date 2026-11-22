@@ -238,20 +238,78 @@ fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -
     if file_component {
         return true;
     }
-    let objective_c =
-        nestweaver_parser::detect_language(Path::new(file_path)) == Some(Language::ObjectiveC);
-    let decl = declaration_start(&lines, objective_c);
-    // Inspect the declaration header only. A call or comment inside the body
-    // can mention the old name while this span now belongs to another method.
-    for line in lines.iter().skip(decl).take(HEADER_LINES) {
-        if names_symbol(line, name) {
+    let language = nestweaver_parser::detect_language(Path::new(file_path));
+    let declaration = declaration_start(body, language);
+    // Inspect only the remainder after annotations, never their arguments.
+    let mut header_groups = Vec::new();
+    for line in declaration.lines().take(HEADER_LINES) {
+        let end = declaration_body_boundary(line, language, &mut header_groups);
+        let header = end.map_or(line, |end| &line[..end]);
+        if names_symbol(header, name) {
             return true;
         }
-        if line.contains('{') || line.contains(';') || line.contains("=>") {
+        if end.is_some() {
             break;
         }
     }
     signature.starts_with("typedef") && lines.last().is_some_and(|l| names_symbol(l, name))
+}
+
+// Ignore delimiters in quoted header values (e.g. default arguments).
+fn declaration_body_boundary(
+    line: &str,
+    language: Option<Language>,
+    groups: &mut Vec<u8>,
+) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut quote = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(q) = quote {
+            if byte == b'\\' {
+                i += 2;
+                continue;
+            }
+            if byte == q {
+                quote = None;
+            }
+        } else if byte == b'"'
+            || byte == b'\''
+                && bytes[i + 1..].contains(&byte)
+                && !(language == Some(Language::Rust)
+                    && bytes
+                        .get(i + 1)
+                        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                    && bytes.get(i + 2) != Some(&b'\''))
+        {
+            quote = Some(byte);
+        } else if matches!(byte, b'(' | b'[')
+            || byte == b'{'
+                && (!groups.is_empty()
+                    || ["const", "let", "var"].iter().any(|keyword| {
+                        line[..i]
+                            .trim_end()
+                            .rsplit(|c: char| !is_ident_char(c))
+                            .next()
+                            == Some(*keyword)
+                    }))
+        {
+            groups.push(byte);
+        } else if matches!(byte, b')' | b']' | b'}') {
+            if groups.last().is_some_and(|open| {
+                matches!((*open, byte), (b'(', b')') | (b'[', b']') | (b'{', b'}'))
+            }) {
+                groups.pop();
+            }
+        } else if groups.is_empty()
+            && (byte == b'{' || byte == b';' || bytes.get(i..i + 2) == Some(b"=>"))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn file_stem(file_path: &str) -> &str {
@@ -262,46 +320,93 @@ fn file_stem(file_path: &str) -> &str {
     }
 }
 
-/// Index of the first line after a leading block of annotations/attributes
-/// (`@Foo(...)`, `#[attr]`, C# `[Attr]`), blank lines and comments. Bracket
-/// depth is tracked so a multi-line annotation argument list is skipped whole.
-/// Skipping only moves where the name is looked for; it never accepts a span
-/// on its own.
-fn declaration_start(lines: &[&str], objective_c: bool) -> usize {
-    let mut depth: i32 = 0;
-    for (i, line) in lines.iter().enumerate() {
-        let t = line.trim_start();
-        let is_comment = t.starts_with("//") || t.starts_with("/*") || t.starts_with('*');
-        // Objective-C uses @ for declarations as well as directives. These
-        // headers name the symbol itself, unlike Java/Dart annotations. Keep
-        // the distinction language- and token-aware so decorators still skip.
-        let is_objc_declaration = objective_c
+/// Skip leading annotation groups, retaining the declaration remainder on the
+/// same line. Names inside annotation arguments cannot validate a stale span.
+fn declaration_start(body: &str, language: Option<Language>) -> &str {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i..i + 2) == Some(b"//") {
+            i = body[i..].find('\n').map_or(bytes.len(), |n| i + n + 1);
+            continue;
+        }
+        if bytes.get(i..i + 2) == Some(b"/*") {
+            i = body[i + 2..].find("*/").map_or(bytes.len(), |n| i + n + 4);
+            continue;
+        }
+        let rest = &body[i..];
+        let objc_decl = language == Some(Language::ObjectiveC)
             && ["@protocol", "@interface", "@implementation"]
                 .iter()
-                .any(|&keyword| {
-                    t.strip_prefix(keyword)
-                        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                .any(|keyword| {
+                    rest.strip_prefix(keyword)
+                        .is_some_and(|r| r.starts_with(char::is_whitespace))
                 });
-        let is_prefix = depth > 0
-            || t.is_empty()
-            || is_comment
-            || (t.starts_with('@') && !is_objc_declaration)
-            || t.starts_with("#[")
-            || t.starts_with('[');
-        if !is_prefix {
-            return i;
+        if objc_decl || language == Some(Language::Elixir) && rest.starts_with('@') {
+            return rest;
         }
-        if !is_comment {
-            for c in t.chars() {
-                match c {
-                    '(' | '[' | '{' => depth += 1,
-                    ')' | ']' | '}' => depth = (depth - 1).max(0),
-                    _ => {}
+        let opener = if rest.starts_with("#[") {
+            i += 1;
+            Some(b'[')
+        } else if rest.starts_with("#![") {
+            i += 2;
+            Some(b'[')
+        } else if rest.starts_with('[') {
+            Some(b'[')
+        } else if rest.starts_with('@') {
+            i += 1;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.' | b'$'))
+            {
+                i += 1;
+            }
+            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                i += 1;
+            }
+            if bytes.get(i) == Some(&b'(') {
+                Some(b'(')
+            } else {
+                continue;
+            }
+        } else {
+            return rest;
+        };
+        if let Some(open) = opener {
+            let mut stack = vec![open];
+            i += 1;
+            let mut quote = None;
+            while i < bytes.len() && !stack.is_empty() {
+                let c = bytes[i];
+                if let Some(q) = quote {
+                    if c == b'\\' {
+                        i = (i + 2).min(bytes.len());
+                        continue;
+                    }
+                    if c == q {
+                        quote = None;
+                    }
+                } else if c == b'"' || c == b'\'' {
+                    quote = Some(c);
+                } else if bytes.get(i..i + 2) == Some(b"//") {
+                    i = body[i..].find('\n').map_or(bytes.len(), |n| i + n + 1);
+                    continue;
+                } else if bytes.get(i..i + 2) == Some(b"/*") {
+                    i = body[i + 2..].find("*/").map_or(bytes.len(), |n| i + n + 4);
+                    continue;
+                } else if matches!(c, b'(' | b'[' | b'{') {
+                    stack.push(c);
+                } else if stack.last().is_some_and(|open| {
+                    matches!((*open, c), (b'(', b')') | (b'[', b']') | (b'{', b'}'))
+                }) {
+                    stack.pop();
                 }
+                i += 1;
             }
         }
     }
-    lines.len()
 }
 
 /// Keywords that, immediately before a name, make a line a definition of it.
@@ -1062,6 +1167,63 @@ pub(crate) fn repo_local_root(store: &GraphStore, repo_uid: &str) -> Option<std:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn header_destructuring_does_not_hide_parameter_symbol() {
+        assert!(super::span_holds_symbol(
+            "const Header = ({ title }: { title: string }) => { return title; };",
+            "title",
+            "simple.tsx",
+            ""
+        ));
+        assert!(super::span_holds_symbol(
+            "const { title } = props;",
+            "title",
+            "simple.tsx",
+            ""
+        ));
+        assert!(!super::span_holds_symbol(
+            "function renamed({ value }) { old(); }",
+            "old",
+            "simple.tsx",
+            ""
+        ));
+    }
+
+    #[test]
+    fn annotation_remainders_validate_only_the_declaration() {
+        for (path, body, name) in [
+            (
+                "A.java",
+                "@Override public String toString() { return \"x\"; }",
+                "toString",
+            ),
+            ("A.java", "@A @B void f() {}", "f"),
+            ("a.ts", "@Component({}) class X {}", "X"),
+            ("a.rs", "#[cfg(test)] #[test] fn t() {}", "t"),
+            ("a.cs", "[A][B] void M() {}", "M"),
+            ("a.ps1", "[string] ToString() { return 'x' }", "ToString"),
+            ("a.ex", "@answer 42", "answer"),
+            ("A.java", "@Named(\"({\")\npublic void f() {}", "f"),
+        ] {
+            assert!(
+                super::span_holds_symbol(body, name, path, ""),
+                "{path}: {body}"
+            );
+        }
+        assert!(!super::span_holds_symbol(
+            "@Named(\"toString\") void foo() { toString(); }",
+            "toString",
+            "A.java",
+            ""
+        ));
+        assert!(!super::span_holds_symbol(
+            "@A\nvoid renamed() { old(); }",
+            "old",
+            "A.java",
+            ""
+        ));
+    }
+
     use super::*;
     use crate::content_reader::FilesystemReader;
     use crate::index::index_directory_in_memory;
