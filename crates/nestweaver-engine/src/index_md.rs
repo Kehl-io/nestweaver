@@ -6588,7 +6588,8 @@ fn load_taxonomy_aliases(vault_root: &Path) -> HashMap<String, Vec<String>> {
 /// Shared by both the filesystem and reader-based taxonomy loaders.
 fn parse_taxonomy_content(content: &str, aliases: &mut HashMap<String, Vec<String>>) {
     // Parse YAML frontmatter for `aliases:` mapping.
-    if let Some(fm) = extract_frontmatter(content)
+    let (frontmatter, body) = nestweaver_parser::markdown::split_frontmatter(content);
+    if let Some(fm) = frontmatter
         && let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(fm)
         && let Some(mapping) = yaml.get("aliases").and_then(|v| v.as_mapping())
     {
@@ -6610,7 +6611,6 @@ fn parse_taxonomy_content(content: &str, aliases: &mut HashMap<String, Vec<Strin
     }
 
     // Parse inline `Alias -> CanonicalName` lines from the body.
-    let body = skip_frontmatter(content);
     for line in body.lines() {
         let trimmed = line.trim();
         if let Some((alias_part, canonical_part)) = trimmed.split_once("->") {
@@ -6626,50 +6626,20 @@ fn parse_taxonomy_content(content: &str, aliases: &mut HashMap<String, Vec<Strin
     }
 }
 
-/// Extract the YAML frontmatter string (between `---` delimiters) from a
-/// markdown source. Returns `None` when no frontmatter block is present.
-fn extract_frontmatter(source: &str) -> Option<&str> {
-    let rest = source
-        .strip_prefix("---\n")
-        .or_else(|| source.strip_prefix("---\r\n"))?;
-    let mut offset = 0;
-    for line in rest.lines() {
-        if line.trim_end() == "---" {
-            return Some(&rest[..offset]);
-        }
-        offset += line.len() + 1;
-    }
-    None
-}
-
-/// Return the body portion of a markdown source (after frontmatter, if any).
-fn skip_frontmatter(source: &str) -> &str {
-    let Some(rest) = source
-        .strip_prefix("---\n")
-        .or_else(|| source.strip_prefix("---\r\n"))
-    else {
-        return source;
-    };
-    let mut offset = 0;
-    for line in rest.lines() {
-        if line.trim_end() == "---" {
-            let body_start = offset + line.len();
-            let body = &rest[body_start..];
-            return body
-                .strip_prefix('\n')
-                .or_else(|| body.strip_prefix("\r\n"))
-                .unwrap_or(body);
-        }
-        offset += line.len() + 1;
-    }
-    // No closing delimiter — treat entire source as body.
-    source
-}
-
 // ── tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crlf_taxonomy_frontmatter_and_body() {
+        let mut aliases = std::collections::HashMap::new();
+        super::parse_taxonomy_content(
+            "---\r\naliases:\r\n  Canonical: [First, Second]\r\n---\r\nThird -> Canonical\r\n",
+            &mut aliases,
+        );
+        assert_eq!(aliases["Canonical"], ["First", "Second", "Third"]);
+    }
+
     #[test]
     fn legacy_flat_skipped_notes_stay_visible_until_a_full_index() {
         let dir = tempfile::tempdir().unwrap();

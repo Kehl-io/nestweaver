@@ -587,10 +587,11 @@ remain included; the resolution-dependency sidecar format is unchanged.
 PHP declaration edits/additions/removals conservatively revisit repository PHP
 callers, reusing valid parses; unresolved names and ambiguity are negative
 dependencies absent from the file-edge/import-specifier cache.
-Markdown derivation version 3 separately re-derives eligible vault links for
-percent-encoded URL paths and root-contained absolute note paths. Run
-`nestweaver brain refresh <vault>` after upgrading; repository force indexing
-does not refresh vault links.
+Markdown derivation version 4 re-derives eligible vault notes for CRLF
+frontmatter and link/tag extraction that ignores code, HTML comments, and
+dollar-delimited math. If automatic migration cannot finish, run
+`nestweaver brain refresh <vault>`; repository force indexing does not
+refresh vault notes.
 
 ## Conventions
 
