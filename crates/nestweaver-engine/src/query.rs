@@ -3412,7 +3412,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
 ) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
-    let alias_to_canonical: std::collections::HashMap<(String, String), Vec<String>> = {
+    let alias_to_canonical: std::collections::HashMap<String, Vec<String>> = {
         let mut map: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for (canonical, alias_list) in aliases {
