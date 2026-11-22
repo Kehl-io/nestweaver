@@ -3412,7 +3412,7 @@ pub(crate) fn build_brain_context_hybrid_with_aliases_capped(
 ) -> Result<BrainContextResult, anyhow::Error> {
     // Build a reverse lookup: alias (lowercase) → canonical name.
     // A single alias may appear under multiple canonicals — we collect all.
-    let alias_to_canonical: std::collections::HashMap<String, Vec<String>> = {
+    let alias_to_canonical: std::collections::HashMap<(String, String), Vec<String>> = {
         let mut map: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for (canonical, alias_list) in aliases {
@@ -5171,9 +5171,9 @@ pub fn populate_inline_bodies_with_overrides(
     let max_body_chars = max_body_tokens.saturating_mul(4);
     let mut used_tokens = 0usize;
 
-    // One reader call per repository shares read_symbols' parsed-file cache.
+    // One reader call per source file shares read_symbols' parsed-file cache.
     // Keep the original node order below for the inline token budget.
-    let mut groups: std::collections::HashMap<String, Vec<String>> =
+    let mut groups: std::collections::HashMap<(String, String), Vec<String>> =
         std::collections::HashMap::new();
     for node in nodes.iter().filter(|node| node.uid.starts_with("sym:")) {
         let eligible = always_include.contains(&node.uid)
@@ -5184,13 +5184,13 @@ pub fn populate_inline_bodies_with_overrides(
             }) >= threshold;
         if eligible && let Ok(symbol) = store.lookup_symbol(&node.uid) {
             groups
-                .entry(symbol.repo_uid)
+                .entry((symbol.repo_uid, symbol.file_path))
                 .or_default()
                 .push(node.uid.clone());
         }
     }
     let mut bodies = std::collections::HashMap::new();
-    for (repo_uid, uids) in groups {
+    for ((repo_uid, _file_path), uids) in groups {
         let reader = reader_resolver.and_then(|resolve| resolve(&repo_uid));
         let result = if let Some(reader) = reader {
             Some(crate::read_symbols::read_symbols(
@@ -5218,7 +5218,13 @@ pub fn populate_inline_bodies_with_overrides(
                 result
                     .symbols
                     .into_iter()
-                    .map(|window| (window.uid, window.body)),
+                    .filter(|window| !window.body.is_empty())
+                    .map(|window| {
+                        (
+                            window.uid,
+                            truncate_body_to_chars(window.body, max_body_chars),
+                        )
+                    }),
             );
         }
     }
@@ -5242,18 +5248,12 @@ pub fn populate_inline_bodies_with_overrides(
             bodies.get(&node.uid).cloned()
         } else {
             fetch_node_body(store, &node.uid, root, reader_resolver)
+                .filter(|body| !body.is_empty())
+                .map(|body| truncate_body_to_chars(body, max_body_chars))
         };
-        let Some(body) = body else {
+        let Some((body, complete)) = body else {
             continue;
         };
-        if body.is_empty() {
-            continue;
-        }
-        // Truncate to the per-body cap (chars/4 estimate). Bug H: prefer the
-        // last newline within the cap so we never split a statement mid-line;
-        // the returned flag is propagated into BrainNode.body_complete so
-        // downstream consumers know whether the body is full or partial.
-        let (body, complete) = truncate_body_to_chars(body, max_body_chars);
         // Token-budget gate: charge inline bodies ahead of metadata. The first
         // qualifying node is always allowed (mirrors read_symbols), so a single
         // oversized body never starves the whole result.
