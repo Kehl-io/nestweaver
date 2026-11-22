@@ -592,9 +592,8 @@ callers, reusing valid parses; unresolved names and ambiguity are negative
 dependencies absent from the file-edge/import-specifier cache.
 Markdown derivation version 4 re-derives eligible vault notes for CRLF
 frontmatter and link/tag extraction that ignores code, HTML comments, and
-dollar-delimited math. If automatic migration cannot finish, run
-`nestweaver brain refresh <vault>`; repository force indexing does not
-refresh vault notes.
+dollar-delimited math. If a vault still reports that it needs refreshing,
+run `nestweaver brain refresh <vault>` with its configuration and database.
 
 ## Conventions
 
