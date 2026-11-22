@@ -242,10 +242,7 @@ fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -
     let declaration = declaration_start(body, language);
     // Inspect only the remainder after annotations, never their arguments.
     for line in declaration.lines().take(HEADER_LINES) {
-        let end = [line.find('{'), line.find(';'), line.find("=>")]
-            .into_iter()
-            .flatten()
-            .min();
+        let end = declaration_body_boundary(line, language);
         let header = end.map_or(line, |end| &line[..end]);
         if names_symbol(header, name) {
             return true;
@@ -255,6 +252,39 @@ fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -
         }
     }
     signature.starts_with("typedef") && lines.last().is_some_and(|l| names_symbol(l, name))
+}
+
+// Ignore delimiters in quoted header values (e.g. default arguments).
+fn declaration_body_boundary(line: &str, language: Option<Language>) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut quote = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(q) = quote {
+            if byte == b'\\' {
+                i += 2;
+                continue;
+            }
+            if byte == q {
+                quote = None;
+            }
+        } else if byte == b'"'
+            || byte == b'\''
+                && bytes[i + 1..].contains(&byte)
+                && !(language == Some(Language::Rust)
+                    && bytes
+                        .get(i + 1)
+                        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                    && bytes.get(i + 2) != Some(&b'\''))
+        {
+            quote = Some(byte);
+        } else if byte == b'{' || byte == b';' || bytes.get(i..i + 2) == Some(b"=>") {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn file_stem(file_path: &str) -> &str {
