@@ -2727,7 +2727,8 @@ fn sqlite_trigger_error_tail(
     let root = tree.root_node();
     let mut cursor = root.walk();
     for node in root.named_children(&mut cursor) {
-        if node.kind() != "ERROR" || node.end_position().row as u32 + 1 <= last_symbol_end {
+        let error_end_row = node.end_position().row as u32;
+        if node.kind() != "ERROR" || error_end_row < last_symbol_end {
             continue;
         }
         let mut child_cursor = node.walk();
@@ -3554,7 +3555,7 @@ fn collect_calls_in_token_tree(
                 // bare call. The receiver is the tokens before the `.` or
                 // `::`, so the resolver can refuse an unrelated `fn len`.
                 references.push(RawReference {
-                    scope: scope.clone().map(|mut scope| {
+                    scope: scope.map(|mut scope| {
                         if scope.initialized_at == invocation_start {
                             scope.initialized_at = child.start_byte();
                         }
@@ -3572,7 +3573,7 @@ fn collect_calls_in_token_tree(
                     receiver: if macro_call {
                         None
                     } else {
-                        token_tree_receiver(&children, index, source_bytes)
+                        token_tree_receiver(children, index, source_bytes)
                     },
                 });
             }

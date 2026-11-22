@@ -398,12 +398,10 @@ fn declaration_start(body: &str, language: Option<Language>) -> &str {
                     continue;
                 } else if matches!(c, b'(' | b'[' | b'{') {
                     stack.push(c);
-                } else if matches!(c, b')' | b']' | b'}') {
-                    if stack.last().is_some_and(|open| {
-                        matches!((*open, c), (b'(', b')') | (b'[', b']') | (b'{', b'}'))
-                    }) {
-                        stack.pop();
-                    }
+                } else if stack.last().is_some_and(|open| {
+                    matches!((*open, c), (b'(', b')') | (b'[', b']') | (b'{', b'}'))
+                }) {
+                    stack.pop();
                 }
                 i += 1;
             }
