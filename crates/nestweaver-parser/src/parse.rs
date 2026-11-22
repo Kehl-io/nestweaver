@@ -4961,6 +4961,7 @@ fn extract_types_from_tree(
     let lexical_items =
         (lang == Language::Rust).then(|| RustLexicalItems::new(tree.root_node(), source));
 
+    let rust_origins = std::cell::OnceCell::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source);
     'type_matches: while let Some(m) = matches.next() {
         let mut var_name: Option<String> = None;
@@ -4990,7 +4991,7 @@ fn extract_types_from_tree(
                 }
                 "var.type" => {
                     var_type = Some(if lang == Language::Rust {
-                        rust_receiver_type(capture.node, source)
+                        rust_receiver_type(capture.node, source, &rust_origins)
                             .unwrap_or_else(|| extract_base_type(text))
                     } else {
                         extract_base_type(text)
@@ -5037,7 +5038,7 @@ fn extract_types_from_tree(
                             .map(|result| extract_base_type(&result))
                     } else {
                         Some(if lang == Language::Rust {
-                            rust_receiver_type(capture.node, source)
+                            rust_receiver_type(capture.node, source, &rust_origins)
                                 .unwrap_or_else(|| extract_base_type(text))
                         } else {
                             extract_base_type(text)
@@ -5062,7 +5063,7 @@ fn extract_types_from_tree(
                 }
                 "param.type" => {
                     var_type = Some(if lang == Language::Rust {
-                        rust_receiver_type(capture.node, source)
+                        rust_receiver_type(capture.node, source, &rust_origins)
                             .unwrap_or_else(|| extract_base_type(text))
                     } else {
                         extract_base_type(text)
@@ -5605,21 +5606,25 @@ fn collect_rust_unit_constructor_bindings(
 
 /// Known Rust pointer wrappers preserve the target's method set through Deref.
 /// Other generic containers retain their own base type.
-fn rust_receiver_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+fn rust_receiver_type(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    origins: &std::cell::OnceCell<RustPointerOrigins>,
+) -> Option<String> {
     if node.kind() == "reference_type" {
-        return rust_receiver_type(node.child_by_field_name("type")?, source);
+        return rust_receiver_type(node.child_by_field_name("type")?, source, origins);
     }
     if node.kind() == "generic_type" {
         let ty = node.child_by_field_name("type")?;
         let name = ty.utf8_text(source).ok()?.rsplit("::").next()?;
-        if rust_standard_pointer_origin(ty, source) {
+        if rust_standard_pointer_origin(ty, source, origins) {
             let arguments = node.child_by_field_name("type_arguments")?;
             let mut cursor = arguments.walk();
             let types: Vec<_> = arguments.named_children(&mut cursor).collect();
             if types.len() != 1 {
                 return None;
             }
-            return rust_receiver_type(types[0], source);
+            return rust_receiver_type(types[0], source, origins);
         }
         return Some(name.into());
     }
@@ -5634,85 +5639,125 @@ fn rust_receiver_type(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
 
 /// Pointer transparency requires its real std/alloc origin. A custom Arc,
 /// Rc or Box has its own method set and must retain its own receiver type.
-fn rust_standard_pointer_origin(ty: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    fn standard(path: &str) -> bool {
-        matches!(
-            path.trim_start_matches("::"),
-            "std::sync::Arc"
-                | "alloc::sync::Arc"
-                | "std::rc::Rc"
-                | "alloc::rc::Rc"
-                | "std::boxed::Box"
-                | "alloc::boxed::Box"
-        )
+#[derive(Default)]
+struct RustPointerOrigins {
+    by_name: std::collections::HashMap<String, Vec<(usize, usize, bool)>>,
+    globs: Vec<(usize, usize)>,
+}
+
+fn rust_pointer_is_standard(path: &str) -> bool {
+    matches!(
+        path.trim_start_matches("::"),
+        "std::sync::Arc"
+            | "alloc::sync::Arc"
+            | "std::rc::Rc"
+            | "alloc::rc::Rc"
+            | "std::boxed::Box"
+            | "alloc::boxed::Box"
+    )
+}
+
+impl RustPointerOrigins {
+    fn build(ty: tree_sitter::Node<'_>, source: &[u8]) -> Self {
+        let mut root = ty;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        let mut result = Self::default();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "use_wildcard"
+                && let Some(scope) = lexical_scope(node)
+            {
+                result.globs.push((scope.start, scope.end));
+            }
+            if matches!(node.kind(), "struct_item" | "enum_item" | "type_item")
+                && let Some(name) = node.child_by_field_name("name")
+                && let Ok(spelling) = name.utf8_text(source)
+                && let Some(scope) = lexical_scope(name)
+            {
+                result.by_name.entry(spelling.into()).or_default().push((
+                    scope.start,
+                    scope.end,
+                    false,
+                ));
+            }
+            if node.kind() == "use_declaration"
+                && let Some(scope) = lexical_scope(node)
+            {
+                let mut references = Vec::new();
+                expand_rust_use_paths(&node, source, &mut references);
+                let aliases: Vec<_> = references
+                    .iter()
+                    .filter(|r| r.kind == ReferenceKind::ImportAlias)
+                    .collect();
+                for reference in &references {
+                    let entry = if reference.kind == ReferenceKind::ImportAlias {
+                        Some((
+                            reference.name.as_str(),
+                            rust_pointer_is_standard(&reference.context),
+                        ))
+                    } else if reference.kind == ReferenceKind::Import
+                        && !aliases.iter().any(|a| a.context == reference.name)
+                    {
+                        reference
+                            .name
+                            .rsplit("::")
+                            .next()
+                            .map(|name| (name, rust_pointer_is_standard(&reference.name)))
+                    } else {
+                        None
+                    };
+                    if let Some((name, standard)) = entry {
+                        result.by_name.entry(name.into()).or_default().push((
+                            scope.start,
+                            scope.end,
+                            standard,
+                        ));
+                    }
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        result
     }
+}
+
+fn rust_standard_pointer_origin(
+    ty: tree_sitter::Node<'_>,
+    source: &[u8],
+    cache: &std::cell::OnceCell<RustPointerOrigins>,
+) -> bool {
     let Ok(spelling) = ty.utf8_text(source) else {
         return false;
     };
     if spelling.contains("::") {
-        return standard(spelling);
+        return rust_pointer_is_standard(spelling);
     }
-    let mut root = ty;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
+    let index = cache.get_or_init(|| RustPointerOrigins::build(ty, source));
     let at = ty.start_byte();
-    let mut origins = Vec::new();
-    let mut visible_glob = false;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "use_wildcard"
-            && lexical_scope(node).is_some_and(|scope| scope.start <= at && at < scope.end)
-        {
-            visible_glob = true;
-        }
-        if matches!(node.kind(), "struct_item" | "enum_item" | "type_item")
-            && let Some(name) = node.child_by_field_name("name")
-            && name.utf8_text(source) == Ok(spelling)
-            && lexical_scope(name).is_some_and(|scope| scope.start <= at && at < scope.end)
-            && let Some(scope) = node.child_by_field_name("name").and_then(lexical_scope)
-        {
-            origins.push((scope.start, scope.end, false));
-        }
-        if node.kind() == "use_declaration"
-            && let Some(scope) =
-                lexical_scope(node).filter(|scope| scope.start <= at && at < scope.end)
-        {
-            let mut references = Vec::new();
-            expand_rust_use_paths(&node, source, &mut references);
-            let aliases: Vec<_> = references
+    let visible = |(start, end, _): &&(usize, usize, bool)| *start <= at && at < *end;
+    let Some(origins) = index.by_name.get(spelling) else {
+        return spelling == "Box"
+            && !index
+                .globs
                 .iter()
-                .filter(|reference| reference.kind == ReferenceKind::ImportAlias)
-                .collect();
-            for reference in &references {
-                if reference.kind == ReferenceKind::ImportAlias && reference.name == spelling {
-                    origins.push((scope.start, scope.end, standard(&reference.context)));
-                } else if reference.kind == ReferenceKind::Import
-                    && reference.name.rsplit("::").next() == Some(spelling)
-                    && !aliases.iter().any(|alias| alias.context == reference.name)
-                {
-                    origins.push((scope.start, scope.end, standard(&reference.name)));
-                }
-            }
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    let Some((start, end, _)) = origins
-        .iter()
-        .min_by_key(|(start, end, _)| end - start)
-        .copied()
-    else {
-        // A visible glob can override the prelude Box with a custom type.
-        return spelling == "Box" && !visible_glob;
+                .any(|(start, end)| *start <= at && at < *end);
     };
-    let selected: Vec<_> = origins
+    let Some(&(start, end, _)) = origins
         .iter()
-        .filter(|(candidate_start, candidate_end, _)| {
-            *candidate_start == start && *candidate_end == end
-        })
-        .collect();
-    selected.len() == 1 && selected[0].2
+        .filter(visible)
+        .min_by_key(|(start, end, _)| end - start)
+    else {
+        return spelling == "Box"
+            && !index
+                .globs
+                .iter()
+                .any(|(start, end)| *start <= at && at < *end);
+    };
+    let mut selected = origins.iter().filter(|(a, b, _)| *a == start && *b == end);
+    selected.next().is_some_and(|origin| origin.2) && selected.next().is_none()
 }
 
 /// Destructuring an exact local function's tuple return supplies each binding's
@@ -5738,6 +5783,7 @@ fn rust_tuple_factory_bindings<'tree>(
     local_bindings: &[RawReference],
 ) -> Vec<(AstTypeBinding, tree_sitter::Node<'tree>)> {
     let mut result = Vec::new();
+    let rust_origins = std::cell::OnceCell::new();
     for declaration in &lexical_items.lets {
         let (Some(pattern), Some(mut value)) = (
             declaration.child_by_field_name("pattern"),
@@ -5842,9 +5888,10 @@ fn rust_tuple_factory_bindings<'tree>(
             if !is_bindable_name(var_name) {
                 continue;
             }
-            let (Some(type_name), Some(scope)) =
-                (rust_receiver_type(ty, source), lexical_scope(name))
-            else {
+            let (Some(type_name), Some(scope)) = (
+                rust_receiver_type(ty, source, &rust_origins),
+                lexical_scope(name),
+            ) else {
                 continue;
             };
             result.push((
