@@ -1715,6 +1715,7 @@ fn resolve_single_reference(
                                 sym,
                                 qualifier,
                                 graph,
+                                reference,
                             )
                             || rust_imported_ownerless_path(
                                 file_path,
@@ -3443,7 +3444,15 @@ fn candidate_matches(
                 source_file,
                 reference.receiver.as_deref().unwrap_or_default(),
             )
-            .any(|binding| binding.source_file.as_deref() == Some(candidate_file))
+            .any(|binding| {
+                binding.source_file.as_deref() == Some(candidate_file)
+                    && match (binding.scope, reference.scope) {
+                        (Some(binding), Some(call)) => {
+                            binding.start <= call.position && call.position < binding.end
+                        }
+                        _ => true,
+                    }
+            })
     {
         return false;
     }
@@ -3453,7 +3462,14 @@ fn candidate_matches(
         && let Some(receiver) = reference.receiver.as_deref()
         && !receiver.contains("::")
         && !rust_qualifier_denotes(source_file, candidate_file, sym, receiver)
-        && !rust_imported_qualified_path(source_file, candidate_file, sym, receiver, graph)
+        && !rust_imported_qualified_path(
+            source_file,
+            candidate_file,
+            sym,
+            receiver,
+            graph,
+            reference,
+        )
     {
         return false;
     }
@@ -3468,6 +3484,7 @@ fn candidate_matches(
                         sym,
                         receiver,
                         graph,
+                        reference,
                     )
                 || language == Language::Rust
                     && rust_imported_ownerless_path(
@@ -4143,6 +4160,7 @@ fn rust_imported_qualified_path(
     sym: &RawSymbol,
     qualifier: &str,
     graph: &ImportGraph,
+    reference: &RawReference,
 ) -> bool {
     let mut segments = qualifier.split("::");
     let Some(module) = segments.next() else {
@@ -4157,7 +4175,14 @@ fn rust_imported_qualified_path(
         return false;
     }
     graph.bindings_named(source_file, module).any(|binding| {
-        binding.original_name == "*" && binding.source_file.as_deref() == Some(candidate_file)
+        binding.original_name == "*"
+            && binding.source_file.as_deref() == Some(candidate_file)
+            && match (binding.scope, reference.scope) {
+                (Some(binding), Some(call)) => {
+                    binding.start <= call.position && call.position < binding.end
+                }
+                _ => true,
+            }
     })
 }
 
@@ -4280,6 +4305,11 @@ fn rust_qualifier_denotes(
         let mut relative = rust_relative_module_names(source_file);
         relative.extend(module_path.iter().cloned());
         relative == rust_relative_module_names(candidate_file)
+            // A root crate has no directory-derived name; retain the unique
+            // root alias inference with a full path after its first segment.
+            || rust_crate_name(candidate_file).is_none()
+                && module_path.len() == 2
+                && module_path[1..] == rust_relative_module_names(candidate_file)
     } else if explicit_crate_alias {
         let candidate_relative = rust_relative_module_names(candidate_file);
         let requested_relative = module_path.iter().skip(1).cloned().collect::<Vec<_>>();
@@ -5017,34 +5047,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bare_rust_type_path_accepts_explicitly_imported_owner() {
-        let mut caller = make_symbol("main", 5);
-        caller.end_line = 20;
-        let mut call = make_ref("len", ReferenceKind::Call, 10);
-        call.receiver = Some("Vec".into());
-        let mut method = make_symbol("len", 5);
-        method.kind = SymbolKind::Method;
-        method.parent_name = Some("Vec".into());
-        let files = vec![
-            (
-                "src/main.rs".to_string(),
-                vec![caller],
-                vec![
-                    make_ref("crate::custom::Vec", ReferenceKind::Import, 1),
-                    call,
-                ],
-            ),
-            ("src/custom.rs".to_string(), vec![method], vec![]),
-        ];
-        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
-        let expected = symbol_uid("repo:test:abc", "src/custom.rs", "len", 5);
-        assert!(
-            edges.iter().any(|edge| edge.target_uid == expected),
-            "{edges:?}"
-        );
-    }
-
     /// Where else does this property hold? Priority 3 (re-exports) has the
     /// identical shape and the identical omission — one hop further out.
     #[test]
@@ -5522,6 +5524,7 @@ mod tests {
                     call,
                 ],
             ),
+            ("src/alpha/mod.rs".into(), vec![], vec![]),
             (
                 "src/alpha/beta.rs".into(),
                 vec![make_symbol("f", 1)],
@@ -8986,6 +8989,29 @@ mod namespace {
                 uid(&files, "src/consumer.rs", "bare_user"),
                 uid(&files, "src/consumer.rs", "module_user")
             ]),
+            "{edges:#?}"
+        );
+    }
+
+    #[test]
+    fn rust_explicit_imported_custom_vec_keeps_its_method() {
+        let (files, edges) = review_edges(
+            &[
+                ("src/lib.rs", "mod consumer; mod custom;"),
+                (
+                    "src/consumer.rs",
+                    "use crate::custom::Vec; fn user() { Vec::len(); }",
+                ),
+                (
+                    "src/custom.rs",
+                    "pub struct Vec; impl Vec { pub fn len() {} }",
+                ),
+            ],
+            Language::Rust,
+        );
+        assert_eq!(
+            review_callers(&files, &edges, "src/custom.rs", "len"),
+            std::collections::BTreeSet::from([uid(&files, "src/consumer.rs", "user")]),
             "{edges:#?}"
         );
     }
