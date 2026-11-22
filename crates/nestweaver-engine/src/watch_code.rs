@@ -1655,6 +1655,7 @@ impl CodeWatcher {
         // must precede generation invalidation so interruption cannot leave a
         // valid-looking cache for old package inputs.
         let mut manifest_changed = false;
+        let mut admitted_cargo = false;
         for path in relevant {
             let Ok(relative) = path.strip_prefix(&self.repo_root) else {
                 continue;
@@ -1665,6 +1666,7 @@ impl CodeWatcher {
                 && path_not_gitignored(&self.repo_root, relative)?
             {
                 manifest_changed = true;
+                admitted_cargo |= relative == Path::new("Cargo.toml");
             }
         }
         // Capture all existing and graphed source extents before expansion.
@@ -1683,7 +1685,9 @@ impl CodeWatcher {
             .iter()
             .filter(|path| {
                 path.strip_prefix(&self.repo_root).is_ok_and(|rel| {
-                    resolver_probes.contains(*path)
+                    (admitted_cargo
+                        && rel == Path::new("Cargo.toml")
+                        && resolver_probes.contains(*path))
                         || !crate::manifest::is_manifest_input(rel)
                         || is_supported_source(path)
                         || crate::contracts::is_spec_file(&path.to_string_lossy())
@@ -2426,17 +2430,16 @@ impl CodeWatcher {
         self.ensure_not_stopping()?;
         let probed = std::cell::RefCell::new(HashSet::new());
         let event_only = std::cell::RefCell::new(HashSet::new());
-        let include_standard =
-            files
+        // Only a conventional root binary and library use Cargo metadata for
+        // call resolution. Preserve standard probes even without source files:
+        // absent and symlinked config paths still participate in admission.
+        let include_rust =
+            crate::index::has_rust_root_targets(files.iter().filter_map(|path| path.to_str()));
+        let include_standard = !include_rust
+            || files
                 .iter()
                 .filter_map(|path| detect_language(path))
-                .any(|language| {
-                    crate::index::language_uses_workspace_context(language)
-                        && language != nestweaver_schema::Language::Rust
-                });
-        let include_rust = files
-            .iter()
-            .any(|path| detect_language(path) == Some(nestweaver_schema::Language::Rust));
+                .any(crate::index::language_uses_workspace_context);
         let _ = nestweaver_resolver::discover_workspace_context_with_files_for_languages(
             files,
             |relative| {
@@ -2790,15 +2793,20 @@ impl CodeWatcher {
             .keys()
             .filter_map(|path| detect_language(Path::new(path)))
             .collect();
-        if languages
-            .iter()
-            .copied()
-            .any(crate::index::language_uses_workspace_context)
+        let include_rust = crate::index::has_rust_root_targets(indexed.keys().map(String::as_str));
+        if include_rust
+            || languages
+                .iter()
+                .copied()
+                .any(crate::index::language_uses_workspace_context)
         {
-            let current = crate::index::resolver_inputs_for_inventory(&reader, languages, &listed)?
-                .context(
-                    "resolver configuration inputs are unavailable for startup reconciliation",
-                )?;
+            let current = crate::index::resolver_inputs_for_inventory(
+                &reader,
+                languages,
+                &listed,
+                include_rust,
+            )?
+            .context("resolver configuration inputs are unavailable for startup reconciliation")?;
             drift.resolver_config_changed =
                 store.get_repo_resolver_inputs(r_uid)?.as_deref() != Some(current.as_str());
             // The source scan deliberately does not infer mass deletion from
@@ -9357,10 +9365,81 @@ mod tests {
         );
         std::fs::write(&manifest, cargo("different_library")).unwrap();
         assert!(matches!(
-            process_fixture_batch(&watcher, &store, &uid, &root, &[manifest]),
+            process_fixture_batch(
+                &watcher,
+                &store,
+                &uid,
+                &root,
+                std::slice::from_ref(&manifest)
+            ),
             WatchBatchOutcome::Published { .. }
         ));
         assert!(store.callees_of(&caller).unwrap().is_empty());
+        assert!(
+            crate::manifest::manifest_debt_revision(&watcher.db_path)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::write(&manifest, cargo("actual_library")).unwrap();
+        assert!(matches!(
+            process_fixture_batch(
+                &watcher,
+                &store,
+                &uid,
+                &root,
+                std::slice::from_ref(&manifest)
+            ),
+            WatchBatchOutcome::Published { .. }
+        ));
+        assert_eq!(
+            store.callees_of(&caller).unwrap()[0].file_path,
+            "src/alpha.rs"
+        );
+        std::fs::remove_file(&manifest).unwrap();
+        assert!(matches!(
+            process_fixture_batch(
+                &watcher,
+                &store,
+                &uid,
+                &root,
+                std::slice::from_ref(&manifest)
+            ),
+            WatchBatchOutcome::Published { .. }
+        ));
+        assert!(store.callees_of(&caller).unwrap().is_empty());
+
+        std::fs::write(&manifest, cargo("actual_library")).unwrap();
+        assert!(matches!(
+            process_fixture_batch(&watcher, &store, &uid, &root, &[manifest]),
+            WatchBatchOutcome::Published { .. }
+        ));
+        assert_eq!(
+            store.callees_of(&caller).unwrap()[0].file_path,
+            "src/alpha.rs"
+        );
+        let library = root.join("src/lib.rs");
+        std::fs::remove_file(&library).unwrap();
+        assert!(matches!(
+            process_fixture_batch(
+                &watcher,
+                &store,
+                &uid,
+                &root,
+                std::slice::from_ref(&library)
+            ),
+            WatchBatchOutcome::Published { .. }
+        ));
+        assert!(store.get_repo_resolver_inputs(&uid).unwrap().is_none());
+        assert!(store.callees_of(&caller).unwrap().is_empty());
+        std::fs::write(&library, "pub mod alpha;\n").unwrap();
+        assert!(matches!(
+            process_fixture_batch(&watcher, &store, &uid, &root, &[library]),
+            WatchBatchOutcome::Published { .. }
+        ));
+        assert_eq!(
+            store.callees_of(&caller).unwrap()[0].file_path,
+            "src/alpha.rs"
+        );
     }
 
     #[test]

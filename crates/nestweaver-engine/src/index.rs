@@ -4582,6 +4582,8 @@ struct PrepareIndexResolution<'a> {
     /// graph's edges into the changed files). They join the resolve filter
     /// under the same rule as the dependency-row dependents.
     extra_dependents: Option<&'a std::collections::HashSet<String>>,
+    /// Proof recorded before the full publication invalidated it.
+    prior_resolver_inputs: Option<&'a str>,
     /// Infer CROSS_REPO_LINK edges into other repositories. The code watcher
     /// leaves them to its whole-graph relinker.
     infer_cross_repo: bool,
@@ -4789,6 +4791,7 @@ fn prepare_index_resolution(
         files_unchanged,
         resolution_deps,
         extra_dependents,
+        prior_resolver_inputs,
         infer_cross_repo,
     } = prep;
 
@@ -4801,8 +4804,12 @@ fn prepare_index_resolution(
     resolve_pb.set_message("Resolving cross-file references...");
     resolve_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let (workspace_ctx, resolver_inputs) =
-        workspace_context_and_resolver_inputs(reader, file_languages.values().copied())?;
+    let include_rust = has_rust_root_targets(file_languages.keys().map(String::as_str));
+    let (workspace_ctx, resolver_inputs) = workspace_context_and_resolver_inputs(
+        reader,
+        file_languages.values().copied(),
+        include_rust,
+    )?;
 
     // A deletion changes its dependents' export view just as an edit does, so
     // it seeds the dependency expansion too (it is then dropped from the
@@ -4814,15 +4821,10 @@ fn prepare_index_resolution(
     // A root Cargo library alias can change without touching any source.
     // Watcher batches expand config events before arriving here. A warm full
     // scan must seed the affected context itself, even with a cold parse cache.
-    let cargo_context_changed = if extra_dependents.is_none()
+    let cargo_context_changed = extra_dependents.is_none()
         && file_languages.contains_key("src/main.rs")
-        && file_languages.contains_key("src/lib.rs")
-        && let Some(proof) = resolver_inputs.as_deref()
-    {
-        store.get_repo_resolver_inputs(r_uid)?.as_deref() != Some(proof)
-    } else {
-        false
-    };
+        && (changed_or_removed.contains("src/lib.rs")
+            || include_rust && resolver_inputs.as_deref() != prior_resolver_inputs);
     let skip_resolution = !cargo_context_changed
         && changed_or_removed.is_empty()
         && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
@@ -6211,6 +6213,7 @@ where
                 files_unchanged,
                 resolution_deps: resolution_deps.as_deref(),
                 extra_dependents: None,
+                prior_resolver_inputs: prior_resolver_inputs.as_deref(),
                 infer_cross_repo: true,
             },
             type_envs,
@@ -6407,10 +6410,11 @@ where
                     .iter()
                     .map(|(path, ..)| path.as_str())
                     .collect();
+                let include_rust = has_rust_root_targets(file_languages.keys().map(String::as_str));
                 let covers_workspace = store
                     .list_files_by_repo(&r_uid)?
                     .iter()
-                    .filter(|(_, path)| uses_workspace_context(path))
+                    .filter(|(_, path)| uses_workspace_context(path, include_rust))
                     .all(|(_, path)| {
                         resolved.contains(path.as_str())
                             && resolution
@@ -8250,13 +8254,19 @@ fn incremental_index_with_name_and_io_and_authority(
     // An up-to-date repository does no work, so an inventory failure there is
     // disclosed rather than fatal (nw-287). A changed SHA needs the walk.
     let mut unverified_coverage = None;
-    if let Err(error) = crate::content_reader::ContentReader::list_files(&policy_reader) {
-        let error = error.context("refresh source inventory before incremental policy checks");
-        if old_sha != new_sha {
-            return Err(error);
-        }
-        unverified_coverage = Some(error);
-    }
+    let current_rust_targets =
+        match crate::content_reader::ContentReader::list_files(&policy_reader) {
+            Ok(files) => has_rust_root_targets(files.iter().filter_map(|path| path.to_str())),
+            Err(error) => {
+                let error =
+                    error.context("refresh source inventory before incremental policy checks");
+                if old_sha != new_sha {
+                    return Err(error);
+                }
+                unverified_coverage = Some(error);
+                false
+            }
+        };
     let ignored_files = tracked_ignored_source_paths(&policy_reader);
     let indexed_files = store.list_files_by_repo(&r_uid)?;
     if store.get_repo_index_policy(&r_uid)?.as_deref()
@@ -8285,22 +8295,21 @@ fn incremental_index_with_name_and_io_and_authority(
         );
     }
 
+    let indexed_rust_targets =
+        has_rust_root_targets(indexed_files.iter().map(|(_, path)| path.as_str()));
     // Cargo aliases are graph inputs, independent of Git's source change list.
-    // Detect manifest edits both before and after commit, including removals.
-    if unverified_coverage.is_none()
-        && indexed_files.iter().any(|(_, path)| path == "src/main.rs")
-        && indexed_files.iter().any(|(_, path)| path == "src/lib.rs")
-    {
+    // Detect manifest edits and target membership changes even at the same HEAD.
+    if unverified_coverage.is_none() && (indexed_rust_targets || current_rust_targets) {
         let languages = indexed_files
             .iter()
             .filter_map(|(_, path)| detect_language(Path::new(path)));
-        let (_, proof) = workspace_context_and_resolver_inputs(&policy_reader, languages)?;
+        let (_, proof) = workspace_context_and_resolver_inputs(&policy_reader, languages, true)?;
         let prior_proof = store.get_repo_resolver_inputs(&r_uid)?;
         anyhow::ensure!(
-            proof.is_some() || prior_proof.is_none(),
+            proof.is_some() || prior_proof.is_none() || !current_rust_targets,
             "cannot verify resolver configuration inputs for the indexed Cargo library"
         );
-        if proof.is_some() && proof != prior_proof {
+        if indexed_rust_targets != current_rust_targets || proof.is_some() && proof != prior_proof {
             tracing::info!("Cargo resolver inputs changed; rebuilding repository edges");
             return full_index_fallback(
                 &store,
@@ -8938,12 +8947,13 @@ where
     let mut changes = crate::git_diff::detect_changes(git_repo_path, &old_sha, new_sha)
         .with_context(|| "detect_changes")?;
     if changes.iter().any(|change| match change {
-        crate::git_diff::FileChange::Added(path)
-        | crate::git_diff::FileChange::Modified(path)
-        | crate::git_diff::FileChange::Deleted(path) => path == Path::new("Cargo.toml"),
-        crate::git_diff::FileChange::Renamed { from, to } => {
-            from == Path::new("Cargo.toml") || to == Path::new("Cargo.toml")
+        crate::git_diff::FileChange::Added(path) | crate::git_diff::FileChange::Deleted(path) => {
+            path == Path::new("Cargo.toml") || path == Path::new("src/lib.rs")
         }
+        crate::git_diff::FileChange::Modified(path) => path == Path::new("Cargo.toml"),
+        crate::git_diff::FileChange::Renamed { from, to } => [from, to]
+            .iter()
+            .any(|path| *path == Path::new("Cargo.toml") || *path == Path::new("src/lib.rs")),
     }) && store
         .list_files_by_repo(&r_uid)?
         .iter()
@@ -10140,12 +10150,25 @@ pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
             | Language::Astro
             // `go.mod` / `go.work` map Go import paths onto directories.
             | Language::Go
-            | Language::Rust
     )
 }
 
-fn uses_workspace_context(path: &str) -> bool {
-    detect_language(Path::new(path)).is_some_and(language_uses_workspace_context)
+pub(crate) fn has_rust_root_targets<'a>(files: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut has_binary = false;
+    let mut has_library = false;
+    for path in files {
+        has_binary |= path == "src/main.rs";
+        has_library |= path == "src/lib.rs";
+        if has_binary && has_library {
+            return true;
+        }
+    }
+    false
+}
+
+fn uses_workspace_context(path: &str, include_rust: bool) -> bool {
+    (include_rust && path == "src/main.rs")
+        || detect_language(Path::new(path)).is_some_and(language_uses_workspace_context)
 }
 
 /// Shared source scope for both type-environment preparation and edge
@@ -10162,6 +10185,11 @@ fn resolution_source_scope(
     extra_dependents: Option<&HashSet<String>>,
 ) -> anyhow::Result<HashSet<String>> {
     let mut affected = deps.affected_files_for_repo(r_uid, changed_or_removed);
+    // The root library's membership enables qualified calls to submodules,
+    // including calls whose graph edge targets a file other than lib.rs.
+    if changed_or_removed.contains("src/lib.rs") && eligible.contains("src/main.rs") {
+        affected.insert("src/main.rs".to_owned());
+    }
     if let Some(extra) = extra_dependents {
         affected.extend(extra.iter().cloned());
     }
@@ -10195,19 +10223,21 @@ fn workspace_context_for_languages(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
 ) -> anyhow::Result<nestweaver_resolver::WorkspaceContext> {
-    discover_resolver_inputs(reader, languages, false).map(|(context, _)| context)
+    discover_resolver_inputs(reader, languages, false, false).map(|(context, _)| context)
 }
 
 fn workspace_context_and_resolver_inputs(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
+    include_rust: bool,
 ) -> anyhow::Result<(nestweaver_resolver::WorkspaceContext, Option<String>)> {
-    discover_resolver_inputs(reader, languages, true)
+    discover_resolver_inputs(reader, languages, include_rust, true)
 }
 
 fn discover_resolver_inputs(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
+    include_rust: bool,
     capture: bool,
 ) -> anyhow::Result<(nestweaver_resolver::WorkspaceContext, Option<String>)> {
     let languages: Vec<_> = languages.into_iter().collect();
@@ -10219,7 +10249,7 @@ fn discover_resolver_inputs(
     } else {
         Vec::new()
     };
-    resolver_context_for_inventory(reader, &languages, &files, capture)
+    resolver_context_for_inventory(reader, &languages, &files, include_rust, capture)
 }
 
 /// Compare the same resolver observations using the startup walk's inventory.
@@ -10227,23 +10257,26 @@ pub(crate) fn resolver_inputs_for_inventory(
     reader: &dyn crate::content_reader::ContentReader,
     languages: impl IntoIterator<Item = Language>,
     files: &[PathBuf],
+    include_rust: bool,
 ) -> anyhow::Result<Option<String>> {
     let languages: Vec<_> = languages.into_iter().collect();
-    resolver_context_for_inventory(reader, &languages, files, true).map(|(_, proof)| proof)
+    resolver_context_for_inventory(reader, &languages, files, include_rust, true)
+        .map(|(_, proof)| proof)
 }
 
 fn resolver_context_for_inventory(
     reader: &dyn crate::content_reader::ContentReader,
     languages: &[Language],
     files: &[PathBuf],
+    include_rust: bool,
     capture: bool,
 ) -> anyhow::Result<(nestweaver_resolver::WorkspaceContext, Option<String>)> {
     use std::io::ErrorKind;
-    if !languages
+    let include_standard = languages
         .iter()
         .copied()
-        .any(language_uses_workspace_context)
-    {
+        .any(language_uses_workspace_context);
+    if !include_standard && !include_rust {
         return Ok((nestweaver_resolver::WorkspaceContext::default(), None));
     }
     let capture = capture && reader.version_id() == "local";
@@ -10289,10 +10322,8 @@ fn resolver_context_for_inventory(
             }
             result.map_err(|error| std::io::Error::other(error.to_string()))
         },
-        languages.iter().copied().any(|language| {
-            language_uses_workspace_context(language) && language != Language::Rust
-        }),
-        languages.contains(&Language::Rust),
+        include_standard,
+        include_rust,
     );
     if unproven.get() || !capture {
         return Ok((context, None));
@@ -10905,14 +10936,16 @@ impl WatcherBatchResolution {
 
     /// Only a batch that resolved every workspace caller may advance the proof.
     pub(crate) fn resolver_inputs(&self) -> Option<&str> {
+        let include_rust =
+            has_rust_root_targets(self.resolver_files.iter().map(|(path, ..)| path.as_str()));
         if self.resolution.skip_resolution
             || !self.view_covers_repo
             || self
                 .protected_files
                 .iter()
-                .any(|path| uses_workspace_context(path))
+                .any(|path| uses_workspace_context(path, include_rust))
             || self.resolver_files.iter().any(|(path, ..)| {
-                uses_workspace_context(path)
+                uses_workspace_context(path, include_rust)
                     && self
                         .resolution
                         .resolve_filter
@@ -11080,10 +11113,9 @@ pub(crate) fn prepare_watcher_batch_resolution(
     if changed.is_empty() && removed_files.is_empty() {
         return Ok(None);
     }
-    let has_workspace_sources = existing
-        .difference(&removed_files)
-        .chain(changed)
-        .any(|path| uses_workspace_context(path));
+    let mut remaining = existing.difference(&removed_files).chain(changed);
+    let has_workspace_sources = has_rust_root_targets(remaining.clone().map(String::as_str))
+        || remaining.any(|path| uses_workspace_context(path, false));
     let added_files: HashSet<String> = changed
         .iter()
         .filter(|path| !existing.contains(*path))
@@ -11295,6 +11327,7 @@ pub(crate) fn prepare_watcher_batch_resolution(
             files_unchanged,
             resolution_deps: Some(&resolution_deps),
             extra_dependents: Some(graph_dependents),
+            prior_resolver_inputs: None,
             infer_cross_repo: false,
         },
         type_envs,
@@ -11542,7 +11575,13 @@ fn build_reresolve_edges_unlogged(
         }
     }
 
-    let workspace_ctx = workspace_context_for_languages(reader, file_languages.values().copied())?;
+    let include_rust = has_rust_root_targets(known_files.iter().map(String::as_str));
+    let (workspace_ctx, _) = discover_resolver_inputs(
+        reader,
+        file_languages.values().copied(),
+        include_rust,
+        false,
+    )?;
 
     // Unchanged JS/TS targets need their exact public keys, not just stored
     // symbol visibility. Hydrate direct targets of scoped files, then only
@@ -25502,6 +25541,15 @@ impl Counter {
 
         let db = dir.path().join("graph.lbug");
         let url = "https://example.test/cargo-alias";
+        index_directory(&repo, &db, "test", url, &initial_sha).unwrap();
+        assert!(has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        fs::remove_file(&manifest).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        index_directory(&repo, &db, "test", url, &initial_sha).unwrap();
+        assert!(!has_edge(&GraphStore::open_or_create(&db).unwrap()));
+        fs::remove_dir(&manifest).unwrap();
+        fs::write(&manifest, initial).unwrap();
         index_directory(&repo, &db, "test", url, &initial_sha).unwrap();
         assert!(has_edge(&GraphStore::open_or_create(&db).unwrap()));
 
