@@ -1709,6 +1709,13 @@ fn resolve_single_reference(
                 candidate_matches(reference, file_path, candidate_file, sym, language, graph)
                     && if language == Language::Rust && candidate_file.ends_with(".rs") {
                         rust_qualifier_denotes(file_path, candidate_file, sym, qualifier)
+                            || rust_root_library_qualifier_denotes(
+                                file_path,
+                                candidate_file,
+                                sym,
+                                qualifier,
+                                graph,
+                            )
                             || rust_imported_qualified_path(
                                 file_path,
                                 candidate_file,
@@ -3462,6 +3469,7 @@ fn candidate_matches(
         && let Some(receiver) = reference.receiver.as_deref()
         && !receiver.contains("::")
         && !rust_qualifier_denotes(source_file, candidate_file, sym, receiver)
+        && !rust_root_library_qualifier_denotes(source_file, candidate_file, sym, receiver, graph)
         && !rust_imported_qualified_path(
             source_file,
             candidate_file,
@@ -3477,6 +3485,14 @@ fn candidate_matches(
         None => true,
         Some(receiver) if is_path_receiver(receiver) => {
             path_denotes(source_file, candidate_file, sym, receiver, language)
+                || language == Language::Rust
+                    && rust_root_library_qualifier_denotes(
+                        source_file,
+                        candidate_file,
+                        sym,
+                        receiver,
+                        graph,
+                    )
                 || language == Language::Rust
                     && rust_imported_qualified_path(
                         source_file,
@@ -3498,6 +3514,14 @@ fn candidate_matches(
         Some(receiver) if is_self_receiver(receiver) => source_file == candidate_file,
         Some(receiver) => {
             receiver_denotes(source_file, candidate_file, sym, Some(receiver), language)
+                || language == Language::Rust
+                    && rust_root_library_qualifier_denotes(
+                        source_file,
+                        candidate_file,
+                        sym,
+                        receiver,
+                        graph,
+                    )
         }
     }
 }
@@ -4225,6 +4249,32 @@ fn rust_imported_ownerless_path(
         })
 }
 
+/// A root package's binary may call its conventional library by the crate
+/// name proved by Cargo.toml. Unknown manifests never supply this evidence.
+fn rust_root_library_qualifier_denotes(
+    source_file: &str,
+    candidate_file: &str,
+    sym: &RawSymbol,
+    qualifier: &str,
+    graph: &ImportGraph,
+) -> bool {
+    if source_file != "src/main.rs"
+        || candidate_file == "src/main.rs"
+        || rust_crate_identity(candidate_file).as_deref() != Some("")
+    {
+        return false;
+    }
+    let Some((name, rest)) = qualifier.split_once("::") else {
+        return candidate_file == "src/lib.rs"
+            && sym.parent_name.is_none()
+            && graph.rust_root_library.as_deref() == Some(qualifier);
+    };
+    if graph.rust_root_library.as_deref() != Some(name) {
+        return false;
+    }
+    rust_qualifier_denotes(source_file, candidate_file, sym, &format!("crate::{rest}"))
+}
+
 /// A Rust qualifier must contain a module name for the candidate, followed
 /// only by the candidate symbol's declaring type (if any). Prefix segments
 /// may be crate/self/super markers or real ancestor module names. Built-in
@@ -4304,12 +4354,10 @@ fn rust_qualifier_denotes(
     } else if same_crate {
         let mut relative = rust_relative_module_names(source_file);
         relative.extend(module_path.iter().cloned());
+        // A root crate has no directory-derived name. An arbitrary leading
+        // segment could name an external dependency, so it is not evidence of
+        // a local crate alias.
         relative == rust_relative_module_names(candidate_file)
-            // A root crate has no directory-derived name; retain the unique
-            // root alias inference with a full path after its first segment.
-            || rust_crate_name(candidate_file).is_none()
-                && module_path.len() == 2
-                && module_path[1..] == rust_relative_module_names(candidate_file)
     } else if explicit_crate_alias {
         let candidate_relative = rust_relative_module_names(candidate_file);
         let requested_relative = module_path.iter().skip(1).cloned().collect::<Vec<_>>();
@@ -5353,7 +5401,18 @@ mod tests {
             ),
         ];
 
-        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let context = WorkspaceContext {
+            rust_root_library: Some("nestweaver_engine".into()),
+            ..Default::default()
+        };
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Rust,
+            "repo:test:abc",
+            &context,
+            None,
+            None,
+        );
         let calls: Vec<_> = edges
             .iter()
             .filter(|e| e.edge_type == EdgeType::Calls)
@@ -5489,6 +5548,114 @@ mod tests {
             &function,
             "super::sibling"
         ));
+    }
+
+    #[test]
+    fn rust_root_library_bare_qualifier_resolves_only_library_ownerless_items() {
+        let mut caller = make_symbol("run", 1);
+        caller.end_line = 10;
+        let mut call = make_ref("helper", ReferenceKind::Call, 3);
+        call.receiver = Some("actual_library".into());
+        let files = vec![
+            ("src/main.rs".into(), vec![caller], vec![call]),
+            ("src/lib.rs".into(), vec![make_symbol("helper", 1)], vec![]),
+        ];
+        let context = WorkspaceContext {
+            rust_root_library: Some("actual_library".into()),
+            ..Default::default()
+        };
+        let target = symbol_uid("repo:test:abc", "src/lib.rs", "helper", 1);
+        let edges = resolve_references_with_context(
+            &files,
+            Language::Rust,
+            "repo:test:abc",
+            &context,
+            None,
+            None,
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target),
+            "{edges:?}"
+        );
+        let without_manifest = resolve_references(&files, Language::Rust, "repo:test:abc");
+        assert!(
+            !without_manifest
+                .iter()
+                .any(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target),
+            "{without_manifest:?}"
+        );
+    }
+
+    #[test]
+    fn rust_external_qualifier_does_not_invent_root_crate_alias() {
+        let mut caller = make_symbol("external_call", 1);
+        caller.end_line = 3;
+        let mut local_caller = make_symbol("local_call", 4);
+        local_caller.end_line = 6;
+        let mut external = make_ref("helper", ReferenceKind::Call, 2);
+        external.receiver = Some("external::alpha".into());
+        let mut local = make_ref("helper", ReferenceKind::Call, 5);
+        local.receiver = Some("alpha".into());
+        let target = symbol_uid("repo:test:abc", "src/alpha/mod.rs", "helper", 1);
+        let files = vec![
+            (
+                "src/lib.rs".into(),
+                vec![caller, local_caller],
+                vec![external, local],
+            ),
+            (
+                "src/alpha/mod.rs".into(),
+                vec![make_symbol("helper", 1)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == target)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the local alpha call should resolve: {edges:?}"
+        );
+        assert_eq!(
+            calls[0].source_uid,
+            symbol_uid("repo:test:abc", "src/lib.rs", "local_call", 4)
+        );
+    }
+
+    #[test]
+    fn rust_local_module_and_workspace_crate_with_same_name_are_ambiguous() {
+        let mut caller = make_symbol("run", 1);
+        caller.end_line = 10;
+        let mut call = make_ref("helper", ReferenceKind::Call, 3);
+        call.receiver = Some("external::alpha".into());
+        let files = vec![
+            ("src/lib.rs".into(), vec![caller], vec![call]),
+            (
+                "src/external/alpha.rs".into(),
+                vec![make_symbol("helper", 1)],
+                vec![],
+            ),
+            (
+                "crates/external/src/alpha.rs".into(),
+                vec![make_symbol("helper", 1)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        for path in ["src/external/alpha.rs", "crates/external/src/alpha.rs"] {
+            let candidate = symbol_uid("repo:test:abc", path, "helper", 1);
+            assert!(
+                !edges
+                    .iter()
+                    .any(|edge| edge.edge_type == EdgeType::Calls && edge.target_uid == candidate),
+                "ambiguous same-named local and workspace modules must stay unresolved: {edges:?}"
+            );
+        }
     }
 
     #[test]

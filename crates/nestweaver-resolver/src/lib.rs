@@ -15,6 +15,7 @@ pub use resolve::*;
 pub use workspace::{
     GoModule, TsconfigAlias, WorkspaceContext, WorkspacePackage, discover_workspace_context,
     discover_workspace_context_with, discover_workspace_context_with_files,
+    discover_workspace_context_with_files_for_languages,
 };
 
 #[cfg(test)]

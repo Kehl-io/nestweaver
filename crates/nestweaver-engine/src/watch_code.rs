@@ -1667,17 +1667,6 @@ impl CodeWatcher {
                 manifest_changed = true;
             }
         }
-        let code_events: Vec<_> = relevant
-            .iter()
-            .filter(|path| {
-                path.strip_prefix(&self.repo_root).is_ok_and(|rel| {
-                    !crate::manifest::is_manifest_input(rel)
-                        || is_supported_source(path)
-                        || crate::contracts::is_spec_file(&path.to_string_lossy())
-                })
-            })
-            .cloned()
-            .collect();
         // Capture all existing and graphed source extents before expansion.
         // A deleted/excluded incumbent must have an explicit initial signature;
         // adding a missing signature after discovery would admit an ABA gap.
@@ -1690,6 +1679,18 @@ impl CodeWatcher {
                 Ok(snapshot) => snapshot,
                 Err(reason) => return Ok(WatchBatchOutcome::Skipped { reason }),
             };
+        let code_events: Vec<_> = relevant
+            .iter()
+            .filter(|path| {
+                path.strip_prefix(&self.repo_root).is_ok_and(|rel| {
+                    resolver_probes.contains(*path)
+                        || !crate::manifest::is_manifest_input(rel)
+                        || is_supported_source(path)
+                        || crate::contracts::is_spec_file(&path.to_string_lossy())
+                })
+            })
+            .cloned()
+            .collect();
         let relevant = match self.expand_event_paths_with_snapshot(
             store,
             r_uid,
@@ -2425,28 +2426,44 @@ impl CodeWatcher {
         self.ensure_not_stopping()?;
         let probed = std::cell::RefCell::new(HashSet::new());
         let event_only = std::cell::RefCell::new(HashSet::new());
-        let _ = nestweaver_resolver::discover_workspace_context_with_files(files, |relative| {
-            let normalized = preparation_relative_path(relative).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "workspace input escapes watcher root",
-                )
-            })?;
-            self.ensure_not_stopping().map_err(std::io::Error::other)?;
-            let logical = self.repo_root.join(normalized);
-            probed.borrow_mut().insert(logical.clone());
-            // Preserve the reader's authority, then trace the original path:
-            // canonicalization alone loses symlink and traversal-directory
-            // dependencies. Directory events never become file signatures.
-            reader
-                .contained_path(relative)
-                .map_err(std::io::Error::other)?;
-            let (physical, directories) = resolver_config_event_path(&self.repo_root, &logical)
-                .map_err(std::io::Error::other)?;
-            probed.borrow_mut().insert(physical);
-            event_only.borrow_mut().extend(directories);
-            reader.read_file(relative).map_err(std::io::Error::other)
-        });
+        let include_standard =
+            files
+                .iter()
+                .filter_map(|path| detect_language(path))
+                .any(|language| {
+                    crate::index::language_uses_workspace_context(language)
+                        && language != nestweaver_schema::Language::Rust
+                });
+        let include_rust = files
+            .iter()
+            .any(|path| detect_language(path) == Some(nestweaver_schema::Language::Rust));
+        let _ = nestweaver_resolver::discover_workspace_context_with_files_for_languages(
+            files,
+            |relative| {
+                let normalized = preparation_relative_path(relative).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "workspace input escapes watcher root",
+                    )
+                })?;
+                self.ensure_not_stopping().map_err(std::io::Error::other)?;
+                let logical = self.repo_root.join(normalized);
+                probed.borrow_mut().insert(logical.clone());
+                // Preserve the reader's authority, then trace the original path:
+                // canonicalization alone loses symlink and traversal-directory
+                // dependencies. Directory events never become file signatures.
+                reader
+                    .contained_path(relative)
+                    .map_err(std::io::Error::other)?;
+                let (physical, directories) = resolver_config_event_path(&self.repo_root, &logical)
+                    .map_err(std::io::Error::other)?;
+                probed.borrow_mut().insert(physical);
+                event_only.borrow_mut().extend(directories);
+                reader.read_file(relative).map_err(std::io::Error::other)
+            },
+            include_standard,
+            include_rust,
+        );
         self.ensure_not_stopping()?;
         Ok((probed.into_inner(), event_only.into_inner()))
     }
@@ -9301,6 +9318,49 @@ mod tests {
             "{outcome:?}"
         );
         assert!(repo_symbol_names(&store, &uid).contains("replacement"));
+    }
+
+    #[test]
+    fn cargo_manifest_only_edit_re_resolves_rust_library_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let manifest = root.join("Cargo.toml");
+        let cargo =
+            |name: &str| format!("[package]\nname='demo'\nversion='0.1.0'\n[lib]\nname='{name}'\n");
+        std::fs::write(&manifest, cargo("actual_library")).unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn caller() { actual_library::alpha::helper(); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub mod alpha;\n").unwrap();
+        std::fs::write(root.join("src/alpha.rs"), "pub fn helper() {}\n").unwrap();
+        let url = format!("file://{}", root.display());
+        let uid = nestweaver_schema::repo_uid("test", &url);
+        let (_, store) =
+            crate::index::index_directory_in_memory(&root, "test", &url, "sha").unwrap();
+        let watcher = CodeWatcher::new(dir.path().join("watch.lbug"), &root, "test");
+        let reader = watcher.reader_for(&url).unwrap();
+        let snapshot = watcher.batch_input_snapshot(&reader, &[]).unwrap();
+        assert!(
+            snapshot
+                .get(&manifest)
+                .and_then(|value| readable_signature(value))
+                .is_some()
+        );
+        let caller = nestweaver_schema::symbol_uid(&uid, "src/main.rs", "caller", 1);
+        assert_eq!(
+            store.callees_of(&caller).unwrap()[0].file_path,
+            "src/alpha.rs"
+        );
+        std::fs::write(&manifest, cargo("different_library")).unwrap();
+        assert!(matches!(
+            process_fixture_batch(&watcher, &store, &uid, &root, &[manifest]),
+            WatchBatchOutcome::Published { .. }
+        ));
+        assert!(store.callees_of(&caller).unwrap().is_empty());
     }
 
     #[test]

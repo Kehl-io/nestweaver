@@ -63,6 +63,7 @@ impl From<Vec<NamedBinding>> for FileBindings {
 
 /// Tracks what each file exports and what it imports.
 pub struct ImportGraph {
+    pub(crate) rust_root_library: Option<String>,
     /// file → [(specifier, resolved_file)]
     resolved_imports: HashMap<String, Vec<(String, String)>>,
     /// file → [exported_symbol_names]
@@ -949,6 +950,10 @@ pub(crate) fn build_import_graph_with_languages(
     follow_python_reexported_bindings(&mut named_bindings, files, &language_of);
 
     ImportGraph {
+        rust_root_library: known_files
+            .contains("src/lib.rs")
+            .then(|| workspace_ctx.rust_root_library.clone())
+            .flatten(),
         resolved_imports,
         exports,
         named_bindings,
@@ -1434,6 +1439,7 @@ mod tests {
             }],
         );
         let graph = ImportGraph {
+            rust_root_library: None,
             literal_export_lines: HashMap::new(),
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),
@@ -1543,6 +1549,7 @@ mod tests {
             start_line: line,
         };
         let graph = ImportGraph {
+            rust_root_library: None,
             literal_export_lines: HashMap::new(),
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),
@@ -1590,6 +1597,7 @@ mod tests {
     #[test]
     fn review_star_walk_budget_fails_closed_after_a_known_target() {
         let mut graph = ImportGraph {
+            rust_root_library: None,
             literal_export_lines: HashMap::new(),
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),
@@ -1620,6 +1628,7 @@ mod tests {
     #[test]
     fn review_star_walk_duplicate_paths_keep_one_target() {
         let graph = ImportGraph {
+            rust_root_library: None,
             literal_export_lines: HashMap::new(),
             resolved_imports: HashMap::new(),
             exports: HashMap::new(),

@@ -10,7 +10,7 @@ use nestweaver_parser::{
     parse_source,
 };
 use nestweaver_resolver::{
-    discover_workspace_context_with_files, resolve_references_with_file_languages,
+    discover_workspace_context_with_files_for_languages, resolve_references_with_file_languages,
 };
 use nestweaver_schema::{
     File, Language, Repo, Service, Symbol, canonical_symbol_id, file_uid, repo_uid, service_uid,
@@ -4811,10 +4811,39 @@ fn prepare_index_resolution(
         .union(removed_files)
         .cloned()
         .collect();
-    let skip_resolution = changed_or_removed.is_empty()
+    // A root Cargo library alias can change without touching any source.
+    // Watcher batches expand config events before arriving here. A warm full
+    // scan must seed the affected context itself, even with a cold parse cache.
+    let cargo_context_changed = if extra_dependents.is_none()
+        && file_languages.contains_key("src/main.rs")
+        && file_languages.contains_key("src/lib.rs")
+        && let Some(proof) = resolver_inputs.as_deref()
+    {
+        store.get_repo_resolver_inputs(r_uid)?.as_deref() != Some(proof)
+    } else {
+        false
+    };
+    let skip_resolution = !cargo_context_changed
+        && changed_or_removed.is_empty()
         && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
 
-    let resolve_filter = if !skip_resolution
+    let resolve_filter = if cargo_context_changed && files_unchanged > 0 {
+        let mut affected = changed_or_removed.clone();
+        affected.extend(
+            file_languages
+                .iter()
+                .filter(|(_, language)| language_uses_workspace_context(**language))
+                .map(|(path, _)| path.clone()),
+        );
+        let included = include_missing_seeded_importer_parses(
+            reader,
+            parsed_files_for_resolver,
+            &mut type_envs,
+            file_languages,
+            &affected,
+        );
+        Some(included)
+    } else if !skip_resolution
         && !changed_or_removed.is_empty()
         && files_unchanged > 0
         && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid))
@@ -8233,11 +8262,12 @@ fn incremental_index_with_name_and_io_and_authority(
         unverified_coverage = Some(error);
     }
     let ignored_files = tracked_ignored_source_paths(&policy_reader);
+    let indexed_files = store.list_files_by_repo(&r_uid)?;
     if store.get_repo_index_policy(&r_uid)?.as_deref()
         != Some(
             crate::content_reader::ContentReader::eligibility_fingerprint(&policy_reader).as_str(),
         )
-        || store.list_files_by_repo(&r_uid)?.iter().any(|(_, path)| {
+        || indexed_files.iter().any(|(_, path)| {
             !policy_reader.accepts_path(Path::new(path)) || ignored_files.contains(Path::new(path))
         })
     {
@@ -8257,6 +8287,42 @@ fn incremental_index_with_name_and_io_and_authority(
                 epilogue_io,
             },
         );
+    }
+
+    // Cargo aliases are graph inputs, independent of Git's source change list.
+    // Detect manifest edits both before and after commit, including removals.
+    if unverified_coverage.is_none()
+        && indexed_files.iter().any(|(_, path)| path == "src/main.rs")
+        && indexed_files.iter().any(|(_, path)| path == "src/lib.rs")
+    {
+        let languages = indexed_files
+            .iter()
+            .filter_map(|(_, path)| detect_language(Path::new(path)));
+        let (_, proof) = workspace_context_and_resolver_inputs(&policy_reader, languages)?;
+        let prior_proof = store.get_repo_resolver_inputs(&r_uid)?;
+        anyhow::ensure!(
+            proof.is_some() || prior_proof.is_none(),
+            "cannot verify resolver configuration inputs for the indexed Cargo library"
+        );
+        if proof.is_some() && proof != prior_proof {
+            tracing::info!("Cargo resolver inputs changed; rebuilding repository edges");
+            return full_index_fallback(
+                &store,
+                FullIndexFallback {
+                    repo_path,
+                    db_path,
+                    instance_id,
+                    repo_url,
+                    new_sha: &new_sha,
+                    name,
+                    force: true,
+                    limits,
+                    excludes,
+                    unskip,
+                    epilogue_io,
+                },
+            );
+        }
     }
 
     // A prior run can record HEAD while disclosing a committed source it
@@ -8775,7 +8841,7 @@ where
         .filter(|sha| !sha.is_empty())
         .ok_or_else(|| anyhow::anyhow!("incremental index requires an existing indexed repo"))?;
 
-    if !repo_policy_matches_reader(store, &r_uid, reader)? {
+    let full_index = |acquire_write_guard| {
         let result = index_with_reader_and_write_gate(
             reader,
             store,
@@ -8786,7 +8852,7 @@ where
             None,
             acquire_write_guard,
         )?;
-        return Ok(IncrementalResult {
+        Ok(IncrementalResult {
             fell_back_to_full: true,
             files_added: result.files_count,
             files_skipped: result.skipped_files.len(),
@@ -8797,7 +8863,10 @@ where
             files_deleted: result.files_deleted,
             symbols_removed: result.symbols_deleted,
             ..Default::default()
-        });
+        })
+    };
+    if !repo_policy_matches_reader(store, &r_uid, reader)? {
+        return full_index(acquire_write_guard);
     }
 
     // An up-to-date repository does no work, so an inventory failure there is
@@ -8872,6 +8941,20 @@ where
 
     let mut changes = crate::git_diff::detect_changes(git_repo_path, &old_sha, new_sha)
         .with_context(|| "detect_changes")?;
+    if changes.iter().any(|change| match change {
+        crate::git_diff::FileChange::Added(path)
+        | crate::git_diff::FileChange::Modified(path)
+        | crate::git_diff::FileChange::Deleted(path) => path == Path::new("Cargo.toml"),
+        crate::git_diff::FileChange::Renamed { from, to } => {
+            from == Path::new("Cargo.toml") || to == Path::new("Cargo.toml")
+        }
+    }) && store
+        .list_files_by_repo(&r_uid)?
+        .iter()
+        .any(|(_, path)| path == "src/main.rs")
+    {
+        return full_index(acquire_write_guard);
+    }
     changes.retain(|change| match change {
         crate::git_diff::FileChange::Added(path)
         | crate::git_diff::FileChange::Modified(path)
@@ -10061,6 +10144,7 @@ pub(crate) fn language_uses_workspace_context(language: Language) -> bool {
             | Language::Astro
             // `go.mod` / `go.work` map Go import paths onto directories.
             | Language::Go
+            | Language::Rust
     )
 }
 
@@ -10174,39 +10258,46 @@ fn resolver_context_for_inventory(
     } else {
         &[]
     };
-    let context = discover_workspace_context_with_files(files, |path| {
-        let result = reader.read_file(path);
-        if !capture {
-            return result.map_err(std::io::Error::other);
-        }
-        // Hash the decoded bytes the resolver actually received. The
-        // watcher's admission guard separately checks raw bytes and ABA.
-        let state = match &result {
-            Ok(source) => Some(crate::hash::blake3_hex(source)),
-            Err(error)
-                if error.chain().any(|cause| {
-                    cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                        matches!(io.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
-                    })
-                }) =>
-            {
-                Some("absent".to_owned())
+    let context = discover_workspace_context_with_files_for_languages(
+        files,
+        |path| {
+            let result = reader.read_file(path);
+            if !capture {
+                return result.map_err(std::io::Error::other);
             }
-            Err(_) => None,
-        };
-        if let Some(state) = state {
-            if probes
-                .borrow_mut()
-                .insert(path.to_path_buf(), state.clone())
-                .is_some_and(|prior| prior != state)
-            {
+            // Hash the decoded bytes the resolver actually received. The
+            // watcher's admission guard separately checks raw bytes and ABA.
+            let state = match &result {
+                Ok(source) => Some(crate::hash::blake3_hex(source)),
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                            matches!(io.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+                        })
+                    }) =>
+                {
+                    Some("absent".to_owned())
+                }
+                Err(_) => None,
+            };
+            if let Some(state) = state {
+                if probes
+                    .borrow_mut()
+                    .insert(path.to_path_buf(), state.clone())
+                    .is_some_and(|prior| prior != state)
+                {
+                    unproven.set(true);
+                }
+            } else {
                 unproven.set(true);
             }
-        } else {
-            unproven.set(true);
-        }
-        result.map_err(|error| std::io::Error::other(error.to_string()))
-    });
+            result.map_err(|error| std::io::Error::other(error.to_string()))
+        },
+        languages.iter().copied().any(|language| {
+            language_uses_workspace_context(language) && language != Language::Rust
+        }),
+        languages.contains(&Language::Rust),
+    );
     if unproven.get() || !capture {
         return Ok((context, None));
     }
@@ -25383,6 +25474,91 @@ impl Counter {
         assert!(store.load_typed_edges().unwrap().iter().any(
             |(source, target, kind, _, _)| source == &test && target == &get && kind == "CALLS"
         ));
+    }
+
+    #[test]
+    fn cargo_library_alias_changes_refresh_warm_local_and_bare_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let manifest = repo.join("Cargo.toml");
+        let initial = "[package]\nname='local-library'\nversion='0.1.0'\n";
+        let renamed = "[package]\nname='different-library'\nversion='0.1.0'\n";
+        fs::write(&manifest, initial).unwrap();
+        fs::write(
+            repo.join("src/main.rs"),
+            "fn main() { local_library::target(); }\n",
+        )
+        .unwrap();
+        fs::write(repo.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+        let git = commit_all_in(&repo, "initial alias");
+        let initial_sha = git(&["rev-parse", "HEAD"]);
+
+        let has_edge = |store: &GraphStore| {
+            let callers = store.lookup_symbols_by_name("main").unwrap();
+            let targets = store.lookup_symbols_by_name("target").unwrap();
+            assert_eq!(callers.len(), 1);
+            assert_eq!(targets.len(), 1);
+            store.load_typed_edges().unwrap().iter().any(|edge| {
+                edge.0 == callers[0].uid && edge.1 == targets[0].uid && edge.2 == "CALLS"
+            })
+        };
+
+        let db = dir.path().join("graph.lbug");
+        let url = "https://example.test/cargo-alias";
+        index_directory(&repo, &db, "test", url, &initial_sha).unwrap();
+        assert!(has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        fs::write(&manifest, renamed).unwrap();
+        index_directory(&repo, &db, "test", url, &initial_sha).unwrap();
+        assert!(!has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        fs::write(&manifest, initial).unwrap();
+        incremental_index(&repo, &db, "test", url).unwrap();
+        assert!(has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        fs::write(&manifest, renamed).unwrap();
+        git(&["add", "Cargo.toml"]);
+        git(&["commit", "-qm", "rename library only"]);
+        let renamed_sha = git(&["rev-parse", "HEAD"]);
+        incremental_index(&repo, &db, "test", url).unwrap();
+        assert!(!has_edge(&GraphStore::open_or_create(&db).unwrap()));
+
+        // A failed configuration read cannot establish the current alias.
+        fs::remove_file(&manifest).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        let error = incremental_index(&repo, &db, "test", url).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot verify resolver configuration")
+        );
+
+        let bare = dir.path().join("bare.git");
+        git(&["clone", "--bare", ".", bare.to_str().unwrap()]);
+        let store = GraphStore::in_memory().unwrap();
+        index_with_reader(
+            &crate::content_reader::GitBareReader::new(&bare, &initial_sha),
+            &store,
+            "test",
+            url,
+            &initial_sha,
+            None,
+        )
+        .unwrap();
+        assert!(has_edge(&store));
+        let result = incremental_index_with_reader_and_write_gate(
+            &crate::content_reader::GitBareReader::new(&bare, &renamed_sha),
+            &bare,
+            &store,
+            "test",
+            url,
+            &renamed_sha,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(result.fell_back_to_full);
+        assert!(!has_edge(&store));
     }
 
     #[test]
