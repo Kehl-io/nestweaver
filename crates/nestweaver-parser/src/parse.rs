@@ -3436,11 +3436,19 @@ fn collect_rust_macro_calls(
             let mut inner = child.walk();
             for part in child.children(&mut inner) {
                 if part.kind() == "token_tree" {
-                    collect_calls_in_token_tree(part, source_bytes, references);
+                    collect_calls_in_token_tree(
+                        part,
+                        source_bytes,
+                        references,
+                        lexical_scope(child),
+                        child.start_byte(),
+                    );
                 }
             }
         }
-        collect_rust_macro_calls(child, source_bytes, references);
+        if child.kind() != "token_tree" {
+            collect_rust_macro_calls(child, source_bytes, references);
+        }
     }
 }
 
@@ -3448,10 +3456,22 @@ fn collect_calls_in_token_tree(
     tree_node: tree_sitter::Node<'_>,
     source_bytes: &[u8],
     references: &mut Vec<RawReference>,
+    scope: Option<LexicalScope>,
+    invocation_start: usize,
 ) {
     let mut cursor = tree_node.walk();
-    let children: Vec<tree_sitter::Node<'_>> = tree_node.children(&mut cursor).collect();
-    for (index, child) in children.iter().enumerate() {
+    let children = tree_node.children(&mut cursor).collect::<Vec<_>>();
+    let mut pending = vec![(children, 0usize)];
+    while let Some((siblings, index)) = pending.last_mut() {
+        if *index == siblings.len() {
+            pending.pop();
+            continue;
+        }
+        let children = siblings;
+        let current = *index;
+        *index += 1;
+        let index = current;
+        let child = &children[index];
         if child.kind() == "identifier"
             && let Ok(name) = child.utf8_text(source_bytes)
         {
@@ -3470,7 +3490,13 @@ fn collect_calls_in_token_tree(
                 // bare call. The receiver is the tokens before the `.` or
                 // `::`, so the resolver can refuse an unrelated `fn len`.
                 references.push(RawReference {
-                    scope: lexical_scope(*child),
+                    scope: scope.clone().map(|mut scope| {
+                        if scope.initialized_at == invocation_start {
+                            scope.initialized_at = child.start_byte();
+                        }
+                        scope.position = child.start_byte();
+                        scope
+                    }),
                     name: name.to_string(),
                     kind: if macro_call {
                         ReferenceKind::Macro
@@ -3488,7 +3514,9 @@ fn collect_calls_in_token_tree(
             }
         }
         if child.kind() == "token_tree" {
-            collect_calls_in_token_tree(*child, source_bytes, references);
+            let mut cursor = child.walk();
+            let nested = child.children(&mut cursor).collect();
+            pending.push((nested, 0));
         }
     }
 }
@@ -6733,6 +6761,49 @@ fn local_scopes(parsed: &ParsedFile, name: &str) -> Vec<LexicalScope> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn macro_scope_matches_direct_ancestor_walk() {
+        let source = "mod m { fn f() { let x = wrap!(outer!(first()), second()); let c = || wrap!(third()); } }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&build_ts_language(Language::Rust, Path::new("a.rs")))
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut refs = Vec::new();
+        collect_rust_macro_calls(tree.root_node(), source.as_bytes(), &mut refs);
+        assert_eq!(
+            refs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["outer", "first", "second", "third"]
+        );
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" {
+                for reference in &refs {
+                    if reference
+                        .scope
+                        .is_some_and(|scope| scope.position == node.start_byte())
+                    {
+                        assert_eq!(reference.scope, lexical_scope(node));
+                    }
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+    }
+
+    #[test]
+    fn nested_macro_walk_uses_bounded_stack() {
+        let depth = 1200;
+        let source = format!(
+            "fn f() {{ {}leaf(){}; }}",
+            "vec![".repeat(depth),
+            "]".repeat(depth)
+        );
+        let parsed = parse_source(Path::new("deep.rs"), &source).unwrap();
+        assert!(parsed.references.iter().any(|r| r.name == "leaf"));
+    }
 
     /// QA (post-#515): a `//go:build ignore` generator must be marked so the
     /// resolver keeps it out of its directory's package.
