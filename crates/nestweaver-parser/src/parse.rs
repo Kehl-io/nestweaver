@@ -4744,13 +4744,15 @@ pub fn scoped_rust_assignment_evidence(
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    let tuple_origins: std::collections::HashMap<_, _> =
-        rust_tuple_factory_bindings(source.as_bytes(), &lexical_items, &local_bindings)
-            .into_iter()
-            .filter_map(|(binding, origin)| {
-                Some((binding.scope?.position, (binding.type_name, origin)))
-            })
-            .collect();
+    let tuple_origins: std::collections::HashMap<_, _> = rust_tuple_factory_bindings(
+        source.as_bytes(),
+        &lexical_items,
+        &local_bindings,
+        &std::cell::OnceCell::new(),
+    )
+    .into_iter()
+    .filter_map(|(binding, origin)| Some((binding.scope?.position, (binding.type_name, origin))))
+    .collect();
     let origins = bindings
         .iter()
         .filter_map(|binding| {
@@ -5130,6 +5132,7 @@ fn extract_types_from_tree(
             source,
             lexical_items.as_ref().expect("Rust evidence"),
             local_bindings,
+            &rust_origins,
             &mut bindings,
         );
         collect_rust_unit_constructor_bindings(
@@ -5916,10 +5919,11 @@ fn collect_rust_tuple_factory_bindings(
     source: &[u8],
     lexical_items: &RustLexicalItems<'_>,
     local_bindings: &[RawReference],
+    rust_origins: &std::cell::OnceCell<RustPointerOrigins>,
     bindings: &mut Vec<AstTypeBinding>,
 ) {
     bindings.extend(
-        rust_tuple_factory_bindings(source, lexical_items, local_bindings)
+        rust_tuple_factory_bindings(source, lexical_items, local_bindings, rust_origins)
             .into_iter()
             .map(|(binding, _)| binding),
     );
@@ -5931,9 +5935,9 @@ fn rust_tuple_factory_bindings<'tree>(
     source: &[u8],
     lexical_items: &RustLexicalItems<'tree>,
     local_bindings: &[RawReference],
+    rust_origins: &std::cell::OnceCell<RustPointerOrigins>,
 ) -> Vec<(AstTypeBinding, tree_sitter::Node<'tree>)> {
     let mut result = Vec::new();
-    let rust_origins = std::cell::OnceCell::new();
     for declaration in &lexical_items.lets {
         let (Some(pattern), Some(mut value)) = (
             declaration.child_by_field_name("pattern"),
@@ -6039,7 +6043,7 @@ fn rust_tuple_factory_bindings<'tree>(
                 continue;
             }
             let (Some(type_name), Some(scope)) = (
-                rust_receiver_type(ty, source, &rust_origins),
+                rust_receiver_type(ty, source, rust_origins),
                 lexical_scope(name),
             ) else {
                 continue;
