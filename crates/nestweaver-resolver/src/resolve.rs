@@ -1724,8 +1724,8 @@ fn resolve_single_reference(
             })
             .collect();
         qualified.sort_by_key(|(path, _)| *path);
-        let selected = if language == Language::Rust {
-            (qualified.len() == 1).then(|| qualified[0])
+        let selected = if language == Language::Rust && qualified.len() != 1 {
+            None
         } else {
             qualified.into_iter().next()
         };
@@ -5214,17 +5214,17 @@ mod tests {
 
     #[test]
     fn rust_module_names_cover_mod_and_crate_root_files() {
-        assert_eq!(rust_module_names("src/c/mod.rs"), ["c"]);
-        assert_eq!(rust_module_names("src/a/b/mod.rs"), ["a", "b"]);
+        assert_eq!(rust_module_names("src/c/mod.rs"), vec!["c"]);
+        assert_eq!(rust_module_names("src/a/b/mod.rs"), vec!["a", "b"]);
         assert_eq!(
             rust_module_names("crates/my-crate/src/lib.rs"),
-            ["my_crate"]
+            vec!["my_crate"]
         );
         assert_eq!(
             rust_module_names("crates/my-crate/src/main.rs"),
-            ["my_crate"]
+            vec!["my_crate"]
         );
-        assert_eq!(rust_module_names("src/a.rs"), ["a"]);
+        assert_eq!(rust_module_names("src/a.rs"), vec!["a"]);
     }
 
     #[test]
