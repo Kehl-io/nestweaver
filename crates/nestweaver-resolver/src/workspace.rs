@@ -163,10 +163,10 @@ fn root_cargo_library_name(source: &str) -> Option<String> {
     if lib.is_none() && package.get("autolib").and_then(toml::Value::as_bool) == Some(false) {
         return None;
     }
-    if let Some(path) = lib.and_then(|lib| lib.get("path")) {
-        if path.as_str()? != "src/lib.rs" {
-            return None;
-        }
+    if let Some(path) = lib.and_then(|lib| lib.get("path"))
+        && path.as_str()? != "src/lib.rs"
+    {
+        return None;
     }
     let name = match lib.and_then(|lib| lib.get("name")) {
         Some(name) => name.as_str()?,
@@ -1460,7 +1460,7 @@ mod rust_manifest_tests {
                 Err(std::io::ErrorKind::NotFound.into())
             }
         };
-        let absent = discover_workspace_context_with_files_for_languages(&[], &read, true, false);
+        let absent = discover_workspace_context_with_files_for_languages(&[], read, true, false);
         assert_eq!(absent.rust_root_library, None);
         assert!(
             !calls
@@ -1469,7 +1469,7 @@ mod rust_manifest_tests {
                 .any(|path| path == Path::new("Cargo.toml"))
         );
         calls.borrow_mut().clear();
-        let present = discover_workspace_context_with_files_for_languages(&[], &read, false, true);
+        let present = discover_workspace_context_with_files_for_languages(&[], read, false, true);
         assert_eq!(present.rust_root_library.as_deref(), Some("actual_library"));
         assert_eq!(&*calls.borrow(), &[std::path::PathBuf::from("Cargo.toml")]);
     }
