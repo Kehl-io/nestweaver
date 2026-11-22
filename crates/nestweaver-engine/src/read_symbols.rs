@@ -242,10 +242,15 @@ fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -
     let declaration = declaration_start(body, language);
     // Inspect only the remainder after annotations, never their arguments.
     for line in declaration.lines().take(HEADER_LINES) {
-        if names_symbol(line, name) {
+        let end = [line.find('{'), line.find(';'), line.find("=>")]
+            .into_iter()
+            .flatten()
+            .min();
+        let header = end.map_or(line, |end| &line[..end]);
+        if names_symbol(header, name) {
             return true;
         }
-        if line.contains('{') || line.contains(';') || line.contains("=>") {
+        if end.is_some() {
             break;
         }
     }
