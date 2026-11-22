@@ -125,11 +125,14 @@ fn postgres_trigger_captures_only_the_trigger_name() {
 
 #[test]
 fn sqlite_trigger_tail_loss_keeps_prefix_and_discloses_partial_parse() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../testdata/sql/trigger_sqlite.sql");
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/sql/trigger_sqlite.sql");
     let source = std::fs::read_to_string(&fixture).unwrap();
     let parsed = parse_source(Path::new("sql/trigger_sqlite.sql"), &source).unwrap();
-    assert!(parsed.has_syntax_errors, "fixture must exercise the grammar boundary");
+    assert!(
+        parsed.has_syntax_errors,
+        "fixture must exercise the grammar boundary"
+    );
     assert!(parsed.symbols.iter().any(|symbol| symbol.name == "a1"));
     assert!(parsed.unparsable_skip("sql/trigger_sqlite.sql").is_none());
     let partial = parsed
@@ -140,7 +143,11 @@ fn sqlite_trigger_tail_loss_keeps_prefix_and_discloses_partial_parse() {
 
     let batch = parse_batch(&[(Path::new("sql/trigger_sqlite.sql"), &source)]);
     assert_eq!(batch.files.len(), 1, "partial parse prefix remains usable");
-    assert_eq!(batch.skipped.len(), 1, "coverage warning travels beside the file");
+    assert_eq!(
+        batch.skipped.len(),
+        1,
+        "coverage warning travels beside the file"
+    );
     assert!(batch.skipped[0].reason.starts_with("partial_parse:"));
 }
 
