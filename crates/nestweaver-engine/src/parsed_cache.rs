@@ -76,7 +76,9 @@ use serde::{Deserialize, Serialize};
 /// 17 — Scala 0.26.9 repairs Scala 2 given/enum identifiers, typed lambdas,
 ///      inheritance and expression boundaries. Tree-sitter 0.27.2 also fixes
 ///      native traversal and error detection; discard earlier parser facts.
-const CACHE_VERSION: u32 = 17;
+/// 18 — Pascal, Elixir, SystemVerilog, SQL and Objective-C query captures
+///      change parsed symbols; discard earlier parser facts.
+const CACHE_VERSION: u32 = 18;
 
 /// A log larger than this (and than the base) is folded into the base.
 const LOG_COMPACT_MIN_BYTES: u64 = 64 * 1024 * 1024;

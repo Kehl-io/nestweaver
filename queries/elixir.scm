@@ -5,37 +5,22 @@
     (alias) @name)
   (#eq? @_defmodule "defmodule")) @definition.module
 
-; Public function definitions: def func_name(...) do ... end
+; Function-like declarations accept parenthesized calls, zero-arity names,
+; guarded heads, and keyword-bodied declarations (def two, do: ...).
 (call
   target: (identifier) @_def
   (arguments
-    (call
-      target: (identifier) @name))
-  (#eq? @_def "def")) @definition.function
-
-; Private function definitions: defp func_name(...) do ... end
-(call
-  target: (identifier) @_defp
-  (arguments
-    (call
-      target: (identifier) @name))
-  (#eq? @_defp "defp")) @definition.function
-
-; Macro definitions: defmacro macro_name(...) do ... end
-(call
-  target: (identifier) @_defmacro
-  (arguments
-    (call
-      target: (identifier) @name))
-  (#eq? @_defmacro "defmacro")) @definition.function
-
-; Private macro definitions: defmacrop macro_name(...) do ... end
-(call
-  target: (identifier) @_defmacrop
-  (arguments
-    (call
-      target: (identifier) @name))
-  (#eq? @_defmacrop "defmacrop")) @definition.function
+    [
+      (call target: (identifier) @name)
+      (identifier) @name
+      (binary_operator
+        left: [
+          (call target: (identifier) @name)
+          (identifier) @name
+        ]
+        operator: "when")
+    ])
+  (#match? @_def "^(def|defp|defmacro|defmacrop|defguard|defguardp|defdelegate)$")) @definition.function
 
 ; Function calls
 (call

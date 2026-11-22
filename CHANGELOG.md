@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Upgrade notes
+
+The next release uses resolver generation **24** and parsed-cache version
+**18**. Cache 18 reparses changed parser queries, while generation 24 marks
+existing graph rows stale. Run `nestweaver index --repo <path> --force` once
+per repository after upgrading; a normal index of an unchanged repository
+does not replace the stored symbols or CALLS edges. Pascal declaration spans,
+SystemVerilog function/task spans and some Objective-C/SQL symbols change;
+Rust UIDs remain unchanged while module-qualified CALLS edges may be added or
+corrected.
+
 ## [12.2.7](https://github.com/Kehl-io/nestweaver/compare/v12.2.6...v12.2.7) (2026-11-12)
 
 

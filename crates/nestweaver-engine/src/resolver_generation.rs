@@ -390,7 +390,10 @@ use std::path::Path;
 ///      Scala 2 given/enum identifiers; tree-sitter 0.27.2 also fixes native
 ///      traversal and error detection. Cache 17 reparses unchanged files;
 ///      force reindex once to replace persisted symbols and ownership edges.
-pub const RESOLVER_GENERATION: u32 = 23;
+/// 24 — Parser query repairs and Rust module-path matching change stored
+///      symbols and CALLS edges. Cache 18 reparses; force reindex once to
+///      replace persisted parser facts and resolver edges.
+pub const RESOLVER_GENERATION: u32 = 24;
 
 /// An unrecorded repo reads as generation 0, so the current generation must
 /// stay above it — otherwise the pre-fix data this module exists to flag would

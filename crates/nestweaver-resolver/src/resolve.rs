@@ -1695,23 +1695,41 @@ fn resolve_single_reference(
     // because matching those against a same-named file would invent edges
     // rather than recover them.
     if let Some(qualifier) = reference.receiver.as_deref()
-        && is_path_receiver(qualifier)
+        && (is_path_receiver(qualifier)
+            || language == Language::Rust
+                && !qualifier.is_empty()
+                && qualifier
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_'))
         && let Some(syms) = &candidates
-        && let Some(module) = qualifier.rsplit("::").find(|segment| !segment.is_empty())
     {
         let mut qualified: Vec<_> = syms
             .iter()
             .filter(|(candidate_file, sym)| {
                 candidate_matches(reference, file_path, candidate_file, sym, language, graph)
-                    && candidate_file
-                        .rsplit('/')
-                        .next()
-                        .and_then(|base| base.split('.').next())
-                        .is_some_and(|stem| stem == module)
+                    && if language == Language::Rust && candidate_file.ends_with(".rs") {
+                        rust_qualifier_denotes(file_path, candidate_file, sym, qualifier)
+                    } else {
+                        qualifier
+                            .rsplit("::")
+                            .find(|segment| !segment.is_empty())
+                            .is_some_and(|module| {
+                                candidate_file
+                                    .rsplit('/')
+                                    .next()
+                                    .and_then(|base| base.split('.').next())
+                                    == Some(module)
+                            })
+                    }
             })
             .collect();
         qualified.sort_by_key(|(path, _)| *path);
-        if let Some((candidate_file, sym)) = qualified.into_iter().next() {
+        let selected = if language == Language::Rust {
+            (qualified.len() == 1).then(|| qualified[0])
+        } else {
+            qualified.into_iter().next()
+        };
+        if let Some((candidate_file, sym)) = selected {
             let target_uid = symbol_uid(repo_uid, candidate_file, &sym.name, sym.start_line);
             let confidence = confidence_score(MatchType::ImportResolved, language);
             return Some(ResolvedEdge {
@@ -3401,9 +3419,13 @@ fn candidate_matches(
     }
     match reference.receiver.as_deref() {
         None => true,
-        Some(receiver) if is_path_receiver(receiver) => path_denotes(candidate_file, sym, receiver),
+        Some(receiver) if is_path_receiver(receiver) => {
+            path_denotes(source_file, candidate_file, sym, receiver, language)
+        }
         Some(receiver) if is_self_receiver(receiver) => source_file == candidate_file,
-        Some(receiver) => receiver_denotes(candidate_file, sym, Some(receiver)),
+        Some(receiver) => {
+            receiver_denotes(source_file, candidate_file, sym, Some(receiver), language)
+        }
     }
 }
 
@@ -3438,7 +3460,16 @@ fn is_self_receiver(receiver: &str) -> bool {
 /// A path receiver denotes a candidate when any of its segments is the
 /// candidate's file stem (`store::GraphStore` → `store.rs`) or its last
 /// segment is the candidate's declaring type.
-fn path_denotes(candidate_file: &str, sym: &RawSymbol, qualifier: &str) -> bool {
+fn path_denotes(
+    source_file: &str,
+    candidate_file: &str,
+    sym: &RawSymbol,
+    qualifier: &str,
+    language: Language,
+) -> bool {
+    if language == Language::Rust && candidate_file.ends_with(".rs") {
+        return rust_qualifier_denotes(source_file, candidate_file, sym, qualifier);
+    }
     let segments: Vec<&str> = qualifier
         .split("::")
         .filter(|segment| !segment.is_empty())
@@ -3972,7 +4003,13 @@ fn is_path_receiver(receiver: &str) -> bool {
 /// DECLARING TYPE (`Logger.write()` -> a method whose `parent_name` is
 /// `Logger`). A path receiver containing `::` is excluded here because the
 /// path-qualified tier above already handles it.
-fn receiver_denotes(candidate_file: &str, sym: &RawSymbol, receiver: Option<&str>) -> bool {
+fn receiver_denotes(
+    source_file: &str,
+    candidate_file: &str,
+    sym: &RawSymbol,
+    receiver: Option<&str>,
+    language: Language,
+) -> bool {
     let Some(receiver) = receiver else {
         return true;
     };
@@ -3982,6 +4019,16 @@ fn receiver_denotes(candidate_file: &str, sym: &RawSymbol, receiver: Option<&str
     else {
         return false;
     };
+    if language == Language::Rust && candidate_file.ends_with(".rs") {
+        return rust_module_names(candidate_file)
+            .last()
+            .is_some_and(|name| name == denoted)
+            && sym.parent_name.is_none()
+            || sym.parent_name.as_deref() == Some(denoted)
+            || (rust_crate_name(source_file).as_deref() == Some(denoted)
+                && rust_crate_name(candidate_file).as_deref() == Some(denoted)
+                && sym.parent_name.is_none());
+    }
     let stem = candidate_file
         .rsplit('/')
         .next()
@@ -3990,6 +4037,160 @@ fn receiver_denotes(candidate_file: &str, sym: &RawSymbol, receiver: Option<&str
         return true;
     }
     sym.parent_name.as_deref() == Some(denoted)
+}
+
+/// Names by which a Rust source file can appear in a module path. This covers
+/// ordinary `foo.rs` modules, every directory component of `a/b/mod.rs`, and
+/// the crate-directory name for `.../crate-name/src/lib.rs` / `main.rs`.
+fn rust_module_names(candidate_file: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let components: Vec<_> = candidate_file
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(file_name) = components.last().copied() else {
+        return names;
+    };
+    let stem = file_name.strip_suffix(".rs").unwrap_or(file_name);
+    let src_index = components[..components.len().saturating_sub(1)]
+        .iter()
+        .rposition(|part| *part == "src");
+    if let Some(src_index) = src_index {
+        if src_index > 0 {
+            names.push(components[src_index - 1].replace('-', "_"));
+        }
+        let module_dirs = &components[src_index + 1..components.len() - 1];
+        names.extend(module_dirs.iter().map(|part| (*part).to_string()));
+        if !matches!(stem, "mod" | "lib" | "main") {
+            names.push(stem.to_string());
+        }
+    } else if components.len() > 1 {
+        names.extend(
+            components[..components.len() - 1]
+                .iter()
+                .map(|part| (*part).to_string()),
+        );
+        if !matches!(stem, "mod" | "lib" | "main") {
+            names.push(stem.to_string());
+        }
+    } else if !matches!(stem, "mod" | "lib" | "main") {
+        names.push(stem.to_string());
+    }
+    names
+}
+
+/// A Rust qualifier must contain a module name for the candidate, followed
+/// only by the candidate symbol's declaring type (if any). Prefix segments
+/// may be crate/self/super markers or real ancestor module names. Built-in
+/// crate roots are never local module evidence.
+fn rust_qualifier_denotes(
+    source_file: &str,
+    candidate_file: &str,
+    sym: &RawSymbol,
+    qualifier: &str,
+) -> bool {
+    let segments: Vec<_> = qualifier
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty()
+        || matches!(
+            segments[0],
+            "std" | "core" | "alloc" | "proc_macro" | "test"
+        )
+    {
+        return false;
+    }
+    let (mut module_path, candidate_path, exact) = match segments[0] {
+        "crate" => {
+            if rust_crate_identity(source_file) != rust_crate_identity(candidate_file) {
+                return false;
+            }
+            (
+                segments[1..]
+                    .iter()
+                    .map(|part| (*part).to_string())
+                    .collect(),
+                rust_relative_module_names(candidate_file),
+                true,
+            )
+        }
+        "self" => {
+            if rust_crate_identity(source_file) != rust_crate_identity(candidate_file) {
+                return false;
+            }
+            let mut path = rust_relative_module_names(source_file);
+            path.extend(segments[1..].iter().map(|part| (*part).to_string()));
+            (path, rust_relative_module_names(candidate_file), true)
+        }
+        "super" => {
+            if rust_crate_identity(source_file) != rust_crate_identity(candidate_file) {
+                return false;
+            }
+            let mut path = rust_relative_module_names(source_file);
+            let ups = segments.iter().take_while(|part| **part == "super").count();
+            for _ in 0..ups {
+                if path.pop().is_none() {
+                    return false;
+                }
+            }
+            path.extend(segments[ups..].iter().map(|part| (*part).to_string()));
+            (path, rust_relative_module_names(candidate_file), true)
+        }
+        _ => (
+            segments.iter().map(|part| (*part).to_string()).collect(),
+            rust_module_names(candidate_file),
+            false,
+        ),
+    };
+    let type_tail = module_path
+        .last()
+        .is_some_and(|last| sym.parent_name.as_deref() == Some(last));
+    if type_tail {
+        module_path.pop();
+    }
+    let path_matches = if exact {
+        module_path == candidate_path
+    } else {
+        module_path.len() <= candidate_path.len()
+            && candidate_path[candidate_path.len() - module_path.len()..] == module_path
+    };
+    let root_crate_alias = !exact
+        && module_path.len() == 1
+        && segments.len() == 2
+        && rust_crate_identity(source_file) == rust_crate_identity(candidate_file)
+        && rust_crate_name(candidate_file).is_none()
+        && module_path == candidate_path;
+    (path_matches || root_crate_alias) && (!type_tail || sym.parent_name.is_some())
+}
+
+fn rust_crate_name(path: &str) -> Option<String> {
+    let components: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let src_index = components[..components.len().saturating_sub(1)]
+        .iter()
+        .rposition(|part| *part == "src")?;
+    (src_index > 0).then(|| components[src_index - 1].replace('-', "_"))
+}
+
+/// Crate identity includes the whole directory prefix before `src`, not only
+/// the leaf name: two workspace members named `a` in separate subtrees are
+/// still distinct when interpreting `crate`, `self`, or `super`.
+fn rust_crate_identity(path: &str) -> Option<String> {
+    let components: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let src_index = components[..components.len().saturating_sub(1)]
+        .iter()
+        .rposition(|part| *part == "src")?;
+    Some(components[..src_index].join("/"))
+}
+
+fn rust_relative_module_names(path: &str) -> Vec<String> {
+    let mut names = rust_module_names(path);
+    if let Some(crate_name) = rust_crate_name(path)
+        && names.first() == Some(&crate_name)
+    {
+        names.remove(0);
+    }
+    names
 }
 
 /// What is actually known about the source of a reference.
@@ -4996,6 +5197,168 @@ mod tests {
         assert!(
             qualified.is_empty(),
             "a bare receiver must not resolve via the path-qualified tier: {qualified:?}"
+        );
+    }
+
+    #[test]
+    fn rust_module_names_cover_mod_and_crate_root_files() {
+        assert_eq!(rust_module_names("src/c/mod.rs"), ["c"]);
+        assert_eq!(rust_module_names("src/a/b/mod.rs"), ["a", "b"]);
+        assert_eq!(
+            rust_module_names("crates/my-crate/src/lib.rs"),
+            ["my_crate"]
+        );
+        assert_eq!(
+            rust_module_names("crates/my-crate/src/main.rs"),
+            ["my_crate"]
+        );
+        assert_eq!(rust_module_names("src/a.rs"), ["a"]);
+    }
+
+    #[test]
+    fn rust_qualifiers_follow_module_order_and_boundaries() {
+        let function = make_symbol("helper_beta", 1);
+        assert!(rust_qualifier_denotes(
+            "src/main.rs",
+            "src/alpha/beta/mod.rs",
+            &function,
+            "alpha::beta"
+        ));
+        assert!(rust_qualifier_denotes(
+            "src/main.rs",
+            "src/alpha/beta/mod.rs",
+            &function,
+            "beta"
+        ));
+        assert!(!rust_qualifier_denotes(
+            "src/main.rs",
+            "src/alpha/beta/mod.rs",
+            &function,
+            "alpha"
+        ));
+        assert!(!rust_qualifier_denotes(
+            "src/main.rs",
+            "src/alpha/beta/mod.rs",
+            &function,
+            "beta::alpha"
+        ));
+        assert!(!rust_qualifier_denotes(
+            "src/main.rs",
+            "src/alpha/beta/mod.rs",
+            &function,
+            "other::alpha::beta"
+        ));
+        assert!(rust_qualifier_denotes(
+            "src/parent.rs",
+            "src/parent/child.rs",
+            &function,
+            "self::child"
+        ));
+        assert!(rust_qualifier_denotes(
+            "src/parent/child.rs",
+            "src/parent/sibling.rs",
+            &function,
+            "super::sibling"
+        ));
+        assert!(!rust_qualifier_denotes(
+            "crates/a/src/main.rs",
+            "crates/b/src/beta.rs",
+            &function,
+            "crate::beta"
+        ));
+    }
+
+    #[test]
+    fn rust_path_qualified_calls_resolve_mod_and_lib_files() {
+        let mut caller = make_symbol("run", 1);
+        caller.end_line = 10;
+        let mut mod_call = make_ref("helper_c", ReferenceKind::Call, 3);
+        mod_call.receiver = Some("crate::c".to_string());
+        let mut lib_call = make_ref("helper_a", ReferenceKind::Call, 4);
+        lib_call.receiver = Some("a".to_string());
+
+        let files = vec![
+            (
+                "app/src/main.rs".to_string(),
+                vec![caller],
+                vec![mod_call, lib_call],
+            ),
+            (
+                "app/src/c/mod.rs".to_string(),
+                vec![make_symbol("helper_c", 1)],
+                vec![],
+            ),
+            (
+                "crates/a/src/lib.rs".to_string(),
+                vec![make_symbol("helper_a", 1)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        for (name, file, line) in [
+            ("helper_c", "app/src/c/mod.rs", 1),
+            ("helper_a", "crates/a/src/lib.rs", 1),
+        ] {
+            let edge = edges
+                .iter()
+                .find(|edge| {
+                    edge.edge_type == EdgeType::Calls
+                        && edge.target_uid == symbol_uid("repo:test:abc", file, name, line)
+                })
+                .unwrap_or_else(|| panic!("missing path-qualified {name} edge: {edges:?}"));
+            assert!(
+                edge.evidence
+                    .iter()
+                    .any(|evidence| evidence.kind == "path_qualified")
+            );
+        }
+    }
+
+    #[test]
+    fn rust_builtin_paths_and_ambiguous_module_names_do_not_guess_a_target() {
+        let mut caller = make_symbol("run", 1);
+        caller.end_line = 10;
+        let mut vec_call = make_ref("len", ReferenceKind::Call, 3);
+        vec_call.receiver = Some("Vec".to_string());
+        let mut std_call = make_ref("read", ReferenceKind::Call, 4);
+        std_call.receiver = Some("std::fs".to_string());
+        let mut ambiguous_call = make_ref("same", ReferenceKind::Call, 5);
+        ambiguous_call.receiver = Some("a".to_string());
+
+        let mut vec_method = make_symbol("len", 1);
+        vec_method.kind = SymbolKind::Method;
+        vec_method.parent_name = Some("Vec".to_string());
+        let files = vec![
+            (
+                "app/src/main.rs".to_string(),
+                vec![caller],
+                vec![vec_call, std_call, ambiguous_call],
+            ),
+            ("app/src/Vec.rs".to_string(), vec![vec_method], vec![]),
+            (
+                "app/src/std/fs.rs".to_string(),
+                vec![make_symbol("read", 1)],
+                vec![],
+            ),
+            (
+                "crates/a/src/lib.rs".to_string(),
+                vec![make_symbol("same", 1)],
+                vec![],
+            ),
+            (
+                "other/a/src/lib.rs".to_string(),
+                vec![make_symbol("same", 1)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        assert!(
+            edges.iter().all(|edge| edge.edge_type != EdgeType::Calls
+                || edge
+                    .evidence
+                    .iter()
+                    .all(|evidence| evidence.kind != "path_qualified")),
+            "built-in and ambiguous Rust paths must not select a local decoy: {edges:?}"
         );
     }
 
