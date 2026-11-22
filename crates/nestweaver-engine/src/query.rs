@@ -5171,6 +5171,58 @@ pub fn populate_inline_bodies_with_overrides(
     let max_body_chars = max_body_tokens.saturating_mul(4);
     let mut used_tokens = 0usize;
 
+    // One reader call per repository shares read_symbols' parsed-file cache.
+    // Keep the original node order below for the inline token budget.
+    let mut groups: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for node in nodes.iter().filter(|node| node.uid.starts_with("sym:")) {
+        let eligible = always_include.contains(&node.uid)
+            || (if max_relevance > 0.0 {
+                node.relevance / max_relevance
+            } else {
+                0.0
+            }) >= threshold;
+        if eligible && let Ok(symbol) = store.lookup_symbol(&node.uid) {
+            groups
+                .entry(symbol.repo_uid)
+                .or_default()
+                .push(node.uid.clone());
+        }
+    }
+    let mut bodies = std::collections::HashMap::new();
+    for (repo_uid, uids) in groups {
+        let reader = reader_resolver.and_then(|resolve| resolve(&repo_uid));
+        let result = if let Some(reader) = reader {
+            Some(crate::read_symbols::read_symbols(
+                store,
+                &uids,
+                reader.as_ref(),
+                0,
+                None,
+            ))
+        } else {
+            let local_root;
+            let reader_root = if root == std::path::Path::new(OWNING_REPO_SOURCE_ROOT) {
+                local_root = crate::read_symbols::repo_local_root(store, &repo_uid);
+                local_root.as_deref()
+            } else {
+                Some(root)
+            };
+            reader_root.map(|path| {
+                let reader = crate::content_reader::FilesystemReader::new(path);
+                crate::read_symbols::read_symbols(store, &uids, &reader, 0, None)
+            })
+        };
+        if let Some(result) = result {
+            bodies.extend(
+                result
+                    .symbols
+                    .into_iter()
+                    .map(|window| (window.uid, window.body)),
+            );
+        }
+    }
+
     for node in nodes.iter_mut() {
         if !always_include.contains(&node.uid) {
             // `max_relevance` can still be `<= 0.0` here (e.g. every OTHER
@@ -5186,7 +5238,12 @@ pub fn populate_inline_bodies_with_overrides(
                 continue;
             }
         }
-        let Some(body) = fetch_node_body(store, &node.uid, root, reader_resolver) else {
+        let body = if node.uid.starts_with("sym:") {
+            bodies.get(&node.uid).cloned()
+        } else {
+            fetch_node_body(store, &node.uid, root, reader_resolver)
+        };
+        let Some(body) = body else {
             continue;
         };
         if body.is_empty() {
