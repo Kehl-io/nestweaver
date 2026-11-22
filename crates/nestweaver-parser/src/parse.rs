@@ -6965,6 +6965,30 @@ mod tests {
         assert!(checked >= 8);
     }
 
+    #[test]
+    fn pointer_origin_index_stays_linear_for_sibling_scopes() {
+        let source = (0..400)
+            .map(|i| format!("mod m{i} {{ use std::sync::Arc; fn f(x: Arc<u8>) {{}} }}\n"))
+            .collect::<String>();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&build_ts_language(Language::Rust, Path::new("a.rs")))
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let index = RustPointerOrigins::build(tree.root_node(), source.as_bytes());
+        let origins = &index.by_name["Arc"];
+        let intervals = &index.resolved["Arc"];
+        assert_eq!(origins.len(), 400);
+        assert!(intervals.len() <= origins.len() * 2);
+        for (start, end, _) in origins {
+            assert!(
+                intervals
+                    .iter()
+                    .any(|(a, b, standard)| a == start && b == end && *standard)
+            );
+        }
+    }
+
     /// QA (post-#515): a `//go:build ignore` generator must be marked so the
     /// resolver keeps it out of its directory's package.
     #[test]
