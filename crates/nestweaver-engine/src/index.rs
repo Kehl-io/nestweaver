@@ -4828,13 +4828,9 @@ fn prepare_index_resolution(
         && resolution_deps.is_some_and(|rd| !rd.is_empty_for_repo(r_uid));
 
     let resolve_filter = if cargo_context_changed && files_unchanged > 0 {
-        let mut affected = changed_or_removed.clone();
-        affected.extend(
-            file_languages
-                .iter()
-                .filter(|(_, language)| language_uses_workspace_context(**language))
-                .map(|(path, _)| path.clone()),
-        );
+        // Re-resolve the full view so simultaneous source changes still
+        // refresh dependents outside the Cargo workspace languages.
+        let affected = file_languages.keys().cloned().collect();
         let included = include_missing_seeded_importer_parses(
             reader,
             parsed_files_for_resolver,
