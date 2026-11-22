@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use nestweaver_parser::parse_source;
+use nestweaver_parser::{SkipReasonCode, parse_batch, parse_source};
 use nestweaver_schema::{SymbolKind, Visibility};
 
 fn parse_fixture(relative: &str) -> nestweaver_parser::ParsedFile {
@@ -121,6 +121,27 @@ fn postgres_trigger_captures_only_the_trigger_name() {
             && symbol.start_line == 3
             && matches!(symbol.name.as_str(), "users" | "audit_fn")
     }));
+}
+
+#[test]
+fn sqlite_trigger_tail_loss_keeps_prefix_and_discloses_partial_parse() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/sql/trigger_sqlite.sql");
+    let source = std::fs::read_to_string(&fixture).unwrap();
+    let parsed = parse_source(Path::new("sql/trigger_sqlite.sql"), &source).unwrap();
+    assert!(parsed.has_syntax_errors, "fixture must exercise the grammar boundary");
+    assert!(parsed.symbols.iter().any(|symbol| symbol.name == "a1"));
+    assert!(parsed.unparsable_skip("sql/trigger_sqlite.sql").is_none());
+    let partial = parsed
+        .partial_parse_skip("sql/trigger_sqlite.sql")
+        .expect("trigger tail loss is disclosed without hiding the valid prefix");
+    assert_eq!(partial.reason_code, SkipReasonCode::ParseError);
+    assert!(partial.reason.starts_with("partial_parse:"));
+
+    let batch = parse_batch(&[(Path::new("sql/trigger_sqlite.sql"), &source)]);
+    assert_eq!(batch.files.len(), 1, "partial parse prefix remains usable");
+    assert_eq!(batch.skipped.len(), 1, "coverage warning travels beside the file");
+    assert!(batch.skipped[0].reason.starts_with("partial_parse:"));
 }
 
 #[test]

@@ -288,9 +288,22 @@ pub struct ParsedFile {
     /// this alone is not a skip — see [`ParsedFile::unparsable_skip`].
     #[serde(default)]
     pub has_syntax_errors: bool,
+    /// A recoverable parser boundary that left this file's extracted prefix
+    /// usable but incomplete. Reported as a coverage warning alongside the
+    /// file's symbols; unlike `unparsable_skip`, it does not exclude the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_parse_reason: Option<String>,
 }
 
 impl ParsedFile {
+    /// Return a coverage warning for a recoverable partial parse, preserving
+    /// any symbols extracted before the parser boundary.
+    pub fn partial_parse_skip(&self, display_path: impl Into<String>) -> Option<SkippedFile> {
+        self.partial_parse_reason.as_ref().map(|reason| {
+            SkippedFile::new(display_path, SkipReasonCode::ParseError, reason.clone())
+        })
+    }
+
     /// nw-601. A file whose parse tree has errors AND contributes no symbols
     /// was indexed as an empty file: `skipped_count: 0`, coverage `complete`,
     /// `index --fail-on-skip` exit 0, while `search` could never find it.
@@ -2677,13 +2690,64 @@ pub fn parse_source(path: &Path, source: &str) -> Result<ParsedFile, ParseError>
     let type_bindings =
         extract_types_from_tree(&tree, &ts_lang, source_bytes, lang, &local_bindings);
 
+    let partial_parse_reason = if lang == Language::Sql
+        && tree.root_node().has_error()
+        && sqlite_trigger_error_tail(&tree, source, &symbols)
+    {
+        Some("partial_parse: SQL trigger grammar error may omit later statements".into())
+    } else {
+        None
+    };
+
     Ok(ParsedFile {
         path: path.to_string_lossy().into_owned(),
         symbols,
         references,
         type_bindings,
         has_syntax_errors: tree.root_node().has_error(),
+        partial_parse_reason,
     })
+}
+
+/// tree-sitter-sequel 0.3.13 represents SQLite's `CREATE TRIGGER ... BEGIN
+/// ... END` region as an ERROR that can swallow all following SQL statements.
+/// Disclose only when that ERROR actually extends past the last captured
+/// symbol, so a recovered trigger that retains the full suffix is not warned.
+fn sqlite_trigger_error_tail(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    symbols: &[RawSymbol],
+) -> bool {
+    let last_symbol_end = symbols
+        .iter()
+        .filter(|symbol| !symbol.is_module_owner())
+        .map(|symbol| symbol.end_line)
+        .max()
+        .unwrap_or(0);
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for node in root.named_children(&mut cursor) {
+        if node.kind() != "ERROR" || node.end_position().row as u32 + 1 <= last_symbol_end {
+            continue;
+        }
+        let mut child_cursor = node.walk();
+        if !node
+            .named_children(&mut child_cursor)
+            .any(|child| child.kind() == "keyword_trigger")
+        {
+            continue;
+        }
+        let Ok(error_text) = node.utf8_text(source.as_bytes()) else {
+            continue;
+        };
+        let has_begin_token = error_text
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|token| token.eq_ignore_ascii_case("begin"));
+        if has_begin_token {
+            return true;
+        }
+    }
+    false
 }
 
 /// nw-113: the per-file `<module>` owner, when some call line lies outside
@@ -6857,10 +6921,15 @@ pub fn parse_batch(files: &[(&Path, &str)]) -> ParseResult {
 
     for (path, source) in files {
         match parse_source(path, source) {
-            Ok(parsed) => match parsed.unparsable_skip(path.to_string_lossy()) {
-                Some(skipped) => result.skipped.push(skipped),
-                None => result.files.push(parsed),
-            },
+            Ok(parsed) => {
+                if let Some(partial) = parsed.partial_parse_skip(path.to_string_lossy()) {
+                    result.skipped.push(partial);
+                }
+                match parsed.unparsable_skip(path.to_string_lossy()) {
+                    Some(skipped) => result.skipped.push(skipped),
+                    None => result.files.push(parsed),
+                }
+            }
             Err(e) => {
                 let path_str = path.to_string_lossy().into_owned();
                 tracing::warn!(path = %path_str, error = %e, "skipping file due to parse error");
@@ -16452,6 +16521,7 @@ export function G(a) {\n\
             references: Vec::new(),
             type_bindings: Vec::new(),
             has_syntax_errors: true,
+            partial_parse_reason: None,
         };
         assert!(parsed.unparsable_skip("G.js").is_some());
     }

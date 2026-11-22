@@ -1018,6 +1018,7 @@ struct ParsedPublicationFile {
     references: Vec<RawReference>,
     type_bindings: Vec<AstTypeBinding>,
     source: Option<String>,
+    partial_parse_reason: Option<String>,
 }
 
 struct PublicationWriteSet<'a> {
@@ -1095,6 +1096,7 @@ impl PublicationWriteSet<'_> {
             references: raw_references,
             type_bindings: raw_type_bindings,
             source,
+            partial_parse_reason: _,
         } = parsed;
 
         self.present_files.insert(rel_path.clone());
@@ -1377,6 +1379,7 @@ fn rebuild_full_index_write_set_from_disk(
             file_meta: CachedFileMeta,
         },
         Skip(SkippedFile),
+        PartialWarning(SkippedFile),
         Replace(ParsedPublicationFile),
     }
     let mut actions: Vec<Refresh> = Vec::new();
@@ -1469,6 +1472,9 @@ fn rebuild_full_index_write_set_from_disk(
             actions.push(Refresh::Skip(skipped));
             continue;
         }
+        if let Some(partial) = parsed.partial_parse_skip(rel.clone()) {
+            actions.push(Refresh::PartialWarning(partial));
+        }
         const SOURCE_RETENTION_CAP: usize = 2 * 1024 * 1024;
         let source = if matches!(lang, Language::TypeScript | Language::JavaScript) {
             Some(source.clone())
@@ -1487,6 +1493,7 @@ fn rebuild_full_index_write_set_from_disk(
             references: parsed.references,
             type_bindings: parsed.type_bindings,
             source,
+            partial_parse_reason: parsed.partial_parse_reason,
         }));
     }
 
@@ -1510,6 +1517,13 @@ fn rebuild_full_index_write_set_from_disk(
                     skipped_files.push(skipped);
                 }
             }
+            Refresh::PartialWarning(skipped) => {
+                if !skipped_files.iter().any(|existing| {
+                    existing.path == skipped.path && existing.reason == skipped.reason
+                }) {
+                    skipped_files.push(skipped);
+                }
+            }
             Refresh::Replace(parsed) => {
                 file_languages.insert(parsed.rel_path.clone(), parsed.lang);
                 if let Some(cache) = parsed_cache.as_deref_mut() {
@@ -1519,6 +1533,7 @@ fn rebuild_full_index_write_set_from_disk(
                             symbols: parsed.symbols.clone(),
                             references: parsed.references.clone(),
                             type_bindings: parsed.type_bindings.clone(),
+                            partial_parse_reason: parsed.partial_parse_reason.clone(),
                         },
                     );
                 }
@@ -4002,6 +4017,7 @@ pub(crate) fn infer_whole_graph_cross_repo_links(
                     symbols: reparsed.symbols,
                     references: reparsed.references,
                     type_bindings: reparsed.type_bindings,
+                    partial_parse_reason: reparsed.partial_parse_reason,
                 },
             );
             reparsed_hashes.push(recorded.clone());
@@ -5348,6 +5364,7 @@ where
             /// `ChangeVerdict::Unchanged`. Stored instead of the stale cached
             /// entry so the next run short-circuits at Tier 1.
             refreshed: Option<CachedFileMeta>,
+            partial_warning: Option<SkippedFile>,
         },
         Skipped(SkippedFile),
         /// Deleted between the scan and its read (a checkout or rebase in
@@ -5370,6 +5387,7 @@ where
             /// not fold class/route decorators into symbol signatures (e.g.
             /// TypeScript/NestJS), so framework detection can scan it.
             source: Option<String>,
+            partial_warning: Option<SkippedFile>,
         },
         /// Unchanged file whose symbols were loaded from the durable parsed
         /// cache. Treated as unchanged for filemeta carry-forward and
@@ -5380,6 +5398,7 @@ where
             references: Vec<RawReference>,
             type_bindings: Vec<AstTypeBinding>,
             refreshed: Option<CachedFileMeta>,
+            partial_warning: Option<SkippedFile>,
         },
     }
 
@@ -5431,21 +5450,32 @@ where
                     // Check parsed cache: if we have cached symbols for this
                     // file's content hash, return CachedParsed so symbols are
                     // available for resolution while still counting as unchanged.
-                    if let Some(cached_meta) = cache.get(&display_name)
-                        && let Some(pc) = pc_ref
-                        && let Some(cached_parse) = pc.get(&cached_meta.content_hash)
-                    {
+                    let cached_parse = cache.get(&display_name).and_then(|cached_meta| {
+                        pc_ref.and_then(|pc| pc.get(&cached_meta.content_hash))
+                    });
+                    let partial_warning = cached_parse
+                        .and_then(|cached| cached.partial_parse_reason.as_ref())
+                        .map(|reason| {
+                            SkippedFile::new(
+                                display_name.clone(),
+                                SkipReasonCode::ParseError,
+                                reason.clone(),
+                            )
+                        });
+                    if let Some(cached_parse) = cached_parse {
                         return ParseOutcome::CachedParsed {
                             rel_path: display_name,
                             symbols: cached_parse.symbols.clone(),
                             references: cached_parse.references.clone(),
                             type_bindings: cached_parse.type_bindings.clone(),
                             refreshed,
+                            partial_warning,
                         };
                     }
                     return ParseOutcome::Unchanged {
                         rel_path: display_name,
                         refreshed,
+                        partial_warning,
                     };
                 }
                 Ok(ChangeVerdict::Changed {
@@ -5510,6 +5540,7 @@ where
                 if let Some(skipped) = parsed.unparsable_skip(display_name.clone()) {
                     return ParseOutcome::Skipped(skipped);
                 }
+                let partial_warning = parsed.partial_parse_skip(display_name.clone());
                 // Retain source for all languages up to 2 MB so Phase 3
                 // (type env build) can skip redundant disk re-reads.
                 // TS/JS must clone because `source` is still needed below
@@ -5532,6 +5563,7 @@ where
                     references: parsed.references,
                     type_bindings: parsed.type_bindings,
                     source: retained_source,
+                    partial_warning,
                 }
             }
             Err(err) => {
@@ -5588,6 +5620,7 @@ where
     let mut symbols_deleted = 0usize;
     let mut symbols_count = 0usize;
     let mut skipped_files: Vec<SkippedFile> = scan_skipped_files;
+    let mut partial_parse_reasons: HashMap<String, String> = HashMap::new();
     let mut actually_changed_files: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // Every file still present in the working tree this index, regardless of
@@ -5603,7 +5636,17 @@ where
             ParseOutcome::Unchanged {
                 rel_path,
                 refreshed,
+                partial_warning,
             } => {
+                let partial_parse_reason = partial_warning
+                    .as_ref()
+                    .map(|warning| warning.reason.clone());
+                if let Some(reason) = &partial_parse_reason {
+                    partial_parse_reasons.insert(rel_path.clone(), reason.clone());
+                }
+                if let Some(warning) = partial_warning {
+                    skipped_files.push(warning);
+                }
                 present_files.insert(rel_path.clone());
                 // Carry the cache entry forward — but prefer the REFRESHED stat
                 // when the content matched despite a moved mtime/size. Storing
@@ -5621,7 +5664,11 @@ where
                 references: raw_references,
                 type_bindings: raw_type_bindings,
                 refreshed,
+                partial_warning,
             } => {
+                if let Some(warning) = partial_warning {
+                    skipped_files.push(warning);
+                }
                 present_files.insert(rel_path.clone());
                 // Same as above: the refreshed stat wins when present.
                 if let Some(ref mut new_cache) = new_filemeta.as_deref_mut()
@@ -5652,7 +5699,11 @@ where
                 references: raw_references,
                 type_bindings: raw_type_bindings,
                 source,
+                partial_warning,
             } => {
+                if let Some(warning) = partial_warning {
+                    skipped_files.push(warning);
+                }
                 PublicationWriteSet {
                     r_uid: &r_uid,
                     repo_url,
@@ -5679,6 +5730,7 @@ where
                     references: raw_references,
                     type_bindings: raw_type_bindings,
                     source,
+                    partial_parse_reason,
                 });
             }
         }
@@ -5715,6 +5767,7 @@ where
                             .get(rel_path.as_str())
                             .cloned()
                             .unwrap_or_default(),
+                        partial_parse_reason: partial_parse_reasons.get(rel_path).cloned(),
                     },
                 );
             }
@@ -7666,7 +7719,7 @@ pub struct IncrementalResult {
 }
 
 enum IncrementalFileOutcome {
-    Indexed(usize),
+    Indexed(usize, Option<SkippedFile>),
     PolicySkipped(SkippedFile),
 }
 
@@ -7675,8 +7728,16 @@ fn record_incremental_file_outcome(
     outcome: IncrementalFileOutcome,
 ) -> bool {
     match outcome {
-        IncrementalFileOutcome::Indexed(symbols) => {
+        IncrementalFileOutcome::Indexed(symbols, partial_warning) => {
             result.symbols_added += symbols;
+            if let Some(skipped) = partial_warning
+                && !result.skipped_files.iter().any(|existing| {
+                    existing.path == skipped.path && existing.reason == skipped.reason
+                })
+            {
+                result.files_skipped += 1;
+                result.skipped_files.push(skipped);
+            }
             true
         }
         IncrementalFileOutcome::PolicySkipped(skipped) => {
@@ -7689,6 +7750,39 @@ fn record_incremental_file_outcome(
             false
         }
     }
+}
+
+/// Re-emit partial-parse coverage warnings on an unchanged incremental run.
+/// The parsed cache holds the diagnostic next to the recovered symbol prefix,
+/// so a no-op index can retain the warning without reparsing every SQL file.
+fn record_cached_partial_parse_warnings(
+    store: &GraphStore,
+    db_path: Option<&Path>,
+    repo_uid: &str,
+    result: &mut IncrementalResult,
+) -> Result<(), anyhow::Error> {
+    let Some(db_path) = db_path else {
+        return Ok(());
+    };
+    let cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
+    let cache = crate::parsed_cache::ParsedCache::load(&cache_path);
+    for (path, content_hash) in store.list_file_hashes_by_repo(repo_uid)? {
+        let Some(reason) = cache
+            .get(&content_hash)
+            .and_then(|parsed| parsed.partial_parse_reason.as_ref())
+        else {
+            continue;
+        };
+        record_incremental_file_outcome(
+            result,
+            IncrementalFileOutcome::PolicySkipped(SkippedFile::new(
+                path,
+                SkipReasonCode::ParseError,
+                reason.clone(),
+            )),
+        );
+    }
+    Ok(())
 }
 
 /// Drain a reader's prune recorder into an [`IncrementalResult`].
@@ -8183,9 +8277,13 @@ fn incremental_index_with_name_and_io_and_authority(
         // The missing-source preflight already walked this reader. Reuse its
         // disclosures rather than enumerate the same unchanged tree again.
         let mut result = unchanged_result;
+        let coverage_verified = unverified_coverage.is_none();
         match unverified_coverage {
             Some(error) => record_unverified_unchanged_coverage(&mut result, &error),
             None => drain_pruned_dirs_into_incremental(&policy_reader, &mut result),
+        }
+        if coverage_verified {
+            record_cached_partial_parse_warnings(&store, db_path, &r_uid, &mut result)?;
         }
         return Ok(result);
     }
@@ -8590,6 +8688,7 @@ fn incremental_index_with_name_and_io_and_authority(
     )?;
     append_incremental_parses(Some(db_path), &prepared_files);
     append_incremental_parses(Some(db_path), &missing_committed);
+    record_cached_partial_parse_warnings(&store, Some(db_path), &r_uid, &mut result)?;
 
     Ok(result)
 }
@@ -8697,6 +8796,7 @@ where
             let mut result = IncrementalResult::default();
             record_missing_committed_source_skips(&missing, &mut result);
             drain_pruned_dirs_into_incremental(reader, &mut result);
+            record_cached_partial_parse_warnings(store, store.db_path(), &r_uid, &mut result)?;
             return Ok(result);
         }
     }
@@ -9132,6 +9232,7 @@ where
     )?;
     append_incremental_parses(store.db_path(), &prepared_files);
     append_incremental_parses(store.db_path(), &missing_committed);
+    record_cached_partial_parse_warnings(store, store.db_path(), &r_uid, &mut result)?;
 
     Ok(result)
 }
@@ -9155,6 +9256,7 @@ fn append_incremental_parses(
                     symbols: file.parsed.symbols.clone(),
                     references: file.parsed.references.clone(),
                     type_bindings: file.parsed.type_bindings.clone(),
+                    partial_parse_reason: file.parsed.partial_parse_reason.clone(),
                 },
             )),
             _ => None,
@@ -9677,7 +9779,10 @@ fn write_prepared_incremental_file_txn(
             .with_context(|| format!("batch_insert_edges {}", rel_str))?;
     }
 
-    Ok(IncrementalFileOutcome::Indexed(sym_count))
+    Ok(IncrementalFileOutcome::Indexed(
+        sym_count,
+        prepared.parsed.partial_parse_skip(rel_str.clone()),
+    ))
 }
 
 /// Split a set of file changes into the parseable files that still exist after
@@ -22605,6 +22710,78 @@ module.exports = { check, plain };\n";
         assert!(
             names.contains(&"alpha".to_string()) && names.contains(&"partial".to_string()),
             "clean and recoverable files still index: {names:?}"
+        );
+    }
+
+    #[test]
+    fn sqlite_trigger_partial_parse_keeps_prefix_and_repeats_coverage_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("test.lbug");
+        fs::create_dir_all(repo.join("sql")).unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/sql/trigger_sqlite.sql");
+        fs::copy(fixture, repo.join("sql/trigger_sqlite.sql")).unwrap();
+        let git = commit_all_in(&repo, "initial");
+        let repo_url = "https://example.com/sqlite-partial-parse";
+        let head = git(&["rev-parse", "HEAD"]);
+        let opts = IndexOptions::new("test", repo_url, &head);
+
+        let first = index_directory_with_opts(&repo, &db, &opts).unwrap();
+        let store = GraphStore::open_or_create(&db).unwrap();
+        assert!(
+            store
+                .symbols_in_file("sql/trigger_sqlite.sql")
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol.name == "a1"),
+            "the parseable prefix stays published"
+        );
+        let assert_warning = |skipped: &[SkippedFile]| {
+            assert!(
+                skipped.iter().any(|file| {
+                    file.path == "sql/trigger_sqlite.sql"
+                        && file.reason_code == SkipReasonCode::ParseError
+                        && file.reason.starts_with("partial_parse:")
+                }),
+                "partial tail loss must remain visible in coverage: {skipped:?}"
+            );
+        };
+        assert_warning(&first.skipped_files);
+        drop(store);
+
+        let normal = incremental_index_with_name_and_limits(
+            &repo,
+            &db,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert_warning(&normal.skipped_files);
+        let forced = index_directory_with_opts(&repo, &db, &opts.force(true)).unwrap();
+        assert_warning(&forced.skipped_files);
+        let normal_again = incremental_index_with_name_and_limits(
+            &repo,
+            &db,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert_warning(&normal_again.skipped_files);
+        let store = GraphStore::open_read_only(&db).unwrap();
+        assert_eq!(
+            store
+                .symbols_in_file("sql/trigger_sqlite.sql")
+                .unwrap()
+                .iter()
+                .filter(|symbol| symbol.name == "a1")
+                .count(),
+            1,
+            "repeat and force paths must preserve one valid prefix symbol"
         );
     }
 

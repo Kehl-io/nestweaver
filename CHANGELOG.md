@@ -21,6 +21,8 @@ does not replace the stored symbols or CALLS edges. Pascal declaration spans,
 SystemVerilog function/task spans and some Objective-C/SQL symbols change;
 Rust UIDs remain unchanged while module-qualified CALLS edges may be added or
 corrected.
+SQLite trigger grammar failures also disclose a partial-parse warning while
+keeping symbols recovered before the trigger error available.
 
 Markdown derivation version **4** updates eligible vaults on daemon startup.
 If a vault still reports that it needs refreshing, run

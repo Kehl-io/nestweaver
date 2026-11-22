@@ -2317,6 +2317,7 @@ impl CodeWatcher {
                             symbols: file.raw_symbols.clone(),
                             references: file.raw_references.clone(),
                             type_bindings: file.type_bindings.clone(),
+                            partial_parse_reason: file.partial_parse_reason.clone(),
                         },
                     )),
                     PreparedPath::Delete { .. } => None,
@@ -4175,6 +4176,7 @@ struct PreparedCodeFile {
     raw_symbols: Vec<nestweaver_parser::RawSymbol>,
     raw_references: Vec<nestweaver_parser::RawReference>,
     type_bindings: Vec<nestweaver_parser::AstTypeBinding>,
+    partial_parse_reason: Option<String>,
     /// The exact snapshot parsed, for the batch resolution's type
     /// environments (never re-read after the batch is frozen).
     source: String,
@@ -4301,6 +4303,7 @@ fn prepare_code_file(
         raw_symbols: parsed.symbols,
         raw_references: parsed.references,
         type_bindings: parsed.type_bindings,
+        partial_parse_reason: parsed.partial_parse_reason,
         source,
     })
 }
