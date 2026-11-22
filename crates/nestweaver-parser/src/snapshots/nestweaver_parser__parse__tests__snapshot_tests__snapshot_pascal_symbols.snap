@@ -14,11 +14,23 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   type_info: ~
   parent_name: ~
   scope_chain: ~
-- name: FormatName
-  kind: Function
-  start_line: 24
-  end_line: 24
-  signature: "function FormatName(const First, Last: string): string;"
+- name: TAnimal
+  kind: Class
+  start_line: 8
+  end_line: 16
+  signature: TAnimal = class
+  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  is_entry_point: false
+  entry_point_kind: ~
+  visibility: Public
+  type_info: ~
+  parent_name: ~
+  scope_chain: ~
+- name: TDog
+  kind: Class
+  start_line: 18
+  end_line: 21
+  signature: TDog = class(TAnimal)
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -38,23 +50,11 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   type_info: ~
   parent_name: ~
   scope_chain: ~
-- name: TAnimal
-  kind: Class
-  start_line: 8
-  end_line: 16
-  signature: TAnimal = class
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Public
-  type_info: ~
-  parent_name: ~
-  scope_chain: ~
-- name: TDog
-  kind: Class
-  start_line: 18
-  end_line: 21
-  signature: TDog = class(TAnimal)
+- name: FormatName
+  kind: Function
+  start_line: 24
+  end_line: 24
+  signature: "function FormatName(const First, Last: string): string;"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
