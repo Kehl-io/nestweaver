@@ -5364,6 +5364,7 @@ where
             /// `ChangeVerdict::Unchanged`. Stored instead of the stale cached
             /// entry so the next run short-circuits at Tier 1.
             refreshed: Option<CachedFileMeta>,
+            partial_warning: Option<SkippedFile>,
         },
         Skipped(SkippedFile),
         /// Deleted between the scan and its read (a checkout or rebase in
@@ -5449,19 +5450,32 @@ where
                     // Check parsed cache: if we have cached symbols for this
                     // file's content hash, return CachedParsed so symbols are
                     // available for resolution while still counting as unchanged.
-                    let cached_parse = cache.get(&display_name).and_then(|cached_meta| {
+                    let cached_meta = refreshed.as_ref().or_else(|| cache.get(&display_name));
+                    let cached_parse = cached_meta.and_then(|cached_meta| {
                         pc_ref.and_then(|pc| pc.get(&cached_meta.content_hash))
                     });
-                    let partial_warning = cached_parse
-                        .filter(|_| *lang == Language::Sql)
-                        .and_then(|cached| cached.partial_parse_reason.as_ref())
-                        .map(|reason| {
-                            SkippedFile::new(
-                                display_name.clone(),
-                                SkipReasonCode::ParseError,
-                                reason.clone(),
-                            )
-                        });
+                    let partial_warning = if *lang == Language::Sql {
+                        cached_parse
+                            .and_then(|cached| cached.partial_parse_reason.clone())
+                            .or_else(|| {
+                                cached_meta.and_then(|meta| {
+                                    verify_sql_partial_parse(
+                                        reader,
+                                        Path::new(&display_name),
+                                        &meta.content_hash,
+                                    )
+                                })
+                            })
+                            .map(|reason| {
+                                SkippedFile::new(
+                                    display_name.clone(),
+                                    SkipReasonCode::ParseError,
+                                    reason,
+                                )
+                            })
+                    } else {
+                        None
+                    };
                     if let Some(cached_parse) = cached_parse {
                         return ParseOutcome::CachedParsed {
                             rel_path: display_name,
@@ -5475,6 +5489,7 @@ where
                     return ParseOutcome::Unchanged {
                         rel_path: display_name,
                         refreshed,
+                        partial_warning,
                     };
                 }
                 Ok(ChangeVerdict::Changed {
@@ -5635,7 +5650,11 @@ where
             ParseOutcome::Unchanged {
                 rel_path,
                 refreshed,
+                partial_warning,
             } => {
+                if let Some(warning) = partial_warning {
+                    skipped_files.push(warning);
+                }
                 present_files.insert(rel_path.clone());
                 // Carry the cache entry forward — but prefer the REFRESHED stat
                 // when the content matched despite a moved mtime/size. Storing
@@ -7745,6 +7764,32 @@ fn record_incremental_file_outcome(
     }
 }
 
+fn verify_sql_partial_parse(
+    reader: &dyn crate::content_reader::ContentReader,
+    path: &Path,
+    content_hash: &str,
+) -> Option<String> {
+    let unverified =
+        || Some("could not verify partial-parse coverage for published SQL".to_string());
+    let Ok(source) = reader.read_file(path) else {
+        return unverified();
+    };
+    if content_hash_hex(&source) != content_hash {
+        return unverified();
+    }
+    if !source
+        .as_bytes()
+        .windows(b"trigger".len())
+        .any(|word| word.eq_ignore_ascii_case(b"trigger"))
+    {
+        return None;
+    }
+    match parse_source(path, &source) {
+        Ok(parsed) => parsed.partial_parse_reason,
+        Err(_) => unverified(),
+    }
+}
+
 /// Re-emit partial-parse coverage warnings on an unchanged incremental run.
 /// The parsed cache holds the diagnostic next to the recovered symbol prefix,
 /// so a no-op index can retain the warning without reparsing every SQL file.
@@ -7774,30 +7819,9 @@ fn record_cached_partial_parse_warnings(
         let reason = cache
             .get(&content_hash)
             .and_then(|parsed| parsed.partial_parse_reason.clone())
-            .or_else(|| {
-                // A cache entry without a warning can belong to another
-                // language that was parsed from identical bytes.
-                let unverified = || {
-                    Some("could not verify partial-parse coverage for published SQL".to_string())
-                };
-                let Ok(source) = reader.read_file(Path::new(&path)) else {
-                    return unverified();
-                };
-                if content_hash_hex(&source) != content_hash {
-                    return unverified();
-                }
-                if !source
-                    .as_bytes()
-                    .windows(b"trigger".len())
-                    .any(|word| word.eq_ignore_ascii_case(b"trigger"))
-                {
-                    return None;
-                }
-                match parse_source(Path::new(&path), &source) {
-                    Ok(parsed) => parsed.partial_parse_reason,
-                    Err(_) => unverified(),
-                }
-            });
+            // A cache entry without a warning can belong to a different
+            // language that was parsed from identical bytes.
+            .or_else(|| verify_sql_partial_parse(reader, Path::new(&path), &content_hash));
         let Some(reason) = reason else { continue };
         record_incremental_file_outcome(
             result,
@@ -22793,6 +22817,11 @@ module.exports = { check, plain };\n";
         // reconstruct the warning from matching source bytes.
         let parse_cache = crate::sidecar_path(&db, ".parsed_cache.bin");
         fs::remove_file(&parse_cache).unwrap();
+        let warm_full = index_directory_with_opts(&repo, &db, &opts).unwrap();
+        assert_warning(&warm_full.skipped_files);
+        if parse_cache.exists() {
+            fs::remove_file(&parse_cache).unwrap();
+        }
         let normal = incremental_index_with_name_and_limits(
             &repo,
             &db,
