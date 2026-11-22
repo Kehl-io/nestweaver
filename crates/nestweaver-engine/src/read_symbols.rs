@@ -241,8 +241,9 @@ fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -
     let language = nestweaver_parser::detect_language(Path::new(file_path));
     let declaration = declaration_start(body, language);
     // Inspect only the remainder after annotations, never their arguments.
+    let mut header_groups = Vec::new();
     for line in declaration.lines().take(HEADER_LINES) {
-        let end = declaration_body_boundary(line, language);
+        let end = declaration_body_boundary(line, language, &mut header_groups);
         let header = end.map_or(line, |end| &line[..end]);
         if names_symbol(header, name) {
             return true;
@@ -255,7 +256,11 @@ fn span_holds_symbol(body: &str, name: &str, file_path: &str, signature: &str) -
 }
 
 // Ignore delimiters in quoted header values (e.g. default arguments).
-fn declaration_body_boundary(line: &str, language: Option<Language>) -> Option<usize> {
+fn declaration_body_boundary(
+    line: &str,
+    language: Option<Language>,
+    groups: &mut Vec<u8>,
+) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut quote = None;
     let mut i = 0;
@@ -279,7 +284,27 @@ fn declaration_body_boundary(line: &str, language: Option<Language>) -> Option<u
                     && bytes.get(i + 2) != Some(&b'\''))
         {
             quote = Some(byte);
-        } else if byte == b'{' || byte == b';' || bytes.get(i..i + 2) == Some(b"=>") {
+        } else if matches!(byte, b'(' | b'[')
+            || byte == b'{'
+                && (!groups.is_empty()
+                    || ["const", "let", "var"].iter().any(|keyword| {
+                        line[..i]
+                            .trim_end()
+                            .rsplit(|c: char| !is_ident_char(c))
+                            .next()
+                            == Some(*keyword)
+                    }))
+        {
+            groups.push(byte);
+        } else if matches!(byte, b')' | b']' | b'}') {
+            if groups.last().is_some_and(|open| {
+                matches!((*open, byte), (b'(', b')') | (b'[', b']') | (b'{', b'}'))
+            }) {
+                groups.pop();
+            }
+        } else if groups.is_empty()
+            && (byte == b'{' || byte == b';' || bytes.get(i..i + 2) == Some(b"=>"))
+        {
             return Some(i);
         }
         i += 1;
@@ -1144,6 +1169,28 @@ pub(crate) fn repo_local_root(store: &GraphStore, repo_uid: &str) -> Option<std:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn header_destructuring_does_not_hide_parameter_symbol() {
+        assert!(super::span_holds_symbol(
+            "const Header = ({ title }: { title: string }) => { return title; };",
+            "title",
+            "simple.tsx",
+            ""
+        ));
+        assert!(super::span_holds_symbol(
+            "const { title } = props;",
+            "title",
+            "simple.tsx",
+            ""
+        ));
+        assert!(!super::span_holds_symbol(
+            "function renamed({ value }) { old(); }",
+            "old",
+            "simple.tsx",
+            ""
+        ));
+    }
+
     #[test]
     fn annotation_remainders_validate_only_the_declaration() {
         for (path, body, name) in [
