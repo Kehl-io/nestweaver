@@ -5672,7 +5672,6 @@ fn rust_receiver_type(
 /// Rc or Box has its own method set and must retain its own receiver type.
 #[derive(Default)]
 struct RustPointerOrigins {
-    by_name: std::collections::HashMap<String, Vec<(usize, usize, bool)>>,
     globs: Vec<(usize, usize)>,
     resolved: std::collections::HashMap<String, Vec<(usize, usize, bool)>>,
 }
@@ -5696,6 +5695,8 @@ impl RustPointerOrigins {
             root = parent;
         }
         let mut result = Self::default();
+        let mut by_name: std::collections::HashMap<String, Vec<(usize, usize, bool)>> =
+            std::collections::HashMap::new();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             if node.kind() == "use_wildcard"
@@ -5708,11 +5709,10 @@ impl RustPointerOrigins {
                 && let Ok(spelling) = name.utf8_text(source)
                 && let Some(scope) = lexical_scope(name)
             {
-                result.by_name.entry(spelling.into()).or_default().push((
-                    scope.start,
-                    scope.end,
-                    false,
-                ));
+                by_name
+                    .entry(spelling.into())
+                    .or_default()
+                    .push((scope.start, scope.end, false));
             }
             if node.kind() == "use_declaration"
                 && let Some(scope) = lexical_scope(node)
@@ -5741,7 +5741,7 @@ impl RustPointerOrigins {
                         None
                     };
                     if let Some((name, standard)) = entry {
-                        result.by_name.entry(name.into()).or_default().push((
+                        by_name.entry(name.into()).or_default().push((
                             scope.start,
                             scope.end,
                             standard,
@@ -5754,9 +5754,12 @@ impl RustPointerOrigins {
         }
         // Compile lexical ranges into non-overlapping intervals. The active
         // set retains original DFS order to preserve equal-width tie behavior.
-        for (name, origins) in &result.by_name {
+        for (name, origins) in &by_name {
             let mut events = Vec::with_capacity(origins.len() * 2);
             for (index, &(start, end, _)) in origins.iter().enumerate() {
+                if start >= end {
+                    continue;
+                }
                 events.push((start, true, index));
                 events.push((end, false, index));
             }
@@ -5792,6 +5795,9 @@ impl RustPointerOrigins {
         result.globs.sort_unstable();
         let mut merged: Vec<(usize, usize)> = Vec::new();
         for &(start, end) in &result.globs {
+            if start >= end {
+                continue;
+            }
             if let Some(last) = merged.last_mut()
                 && start <= last.1
             {
@@ -6976,17 +6982,13 @@ mod tests {
             .unwrap();
         let tree = parser.parse(&source, None).unwrap();
         let index = RustPointerOrigins::build(tree.root_node(), source.as_bytes());
-        let origins = &index.by_name["Arc"];
         let intervals = &index.resolved["Arc"];
-        assert_eq!(origins.len(), 400);
-        assert!(intervals.len() <= origins.len() * 2);
-        for (start, end, _) in origins {
-            assert!(
-                intervals
-                    .iter()
-                    .any(|(a, b, standard)| a == start && b == end && *standard)
-            );
-        }
+        assert_eq!(intervals.len(), 400);
+        assert!(
+            intervals
+                .iter()
+                .all(|(start, end, standard)| start < end && *standard)
+        );
     }
 
     /// QA (post-#515): a `//go:build ignore` generator must be marked so the
