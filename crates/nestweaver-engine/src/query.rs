@@ -6451,6 +6451,55 @@ mod inline_body_tests {
         assert!(body.contains("function greet"), "got: {body:?}");
     }
 
+    #[test]
+    fn batched_symbols_match_ordered_single_reads_and_budget() {
+        use crate::index::index_directory_in_memory;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.js"),
+            "function first() { return 1; }\nfunction second() { return 2; }\n",
+        )
+        .unwrap();
+        let (_, store) =
+            index_directory_in_memory(dir.path(), "test", "https://example.com/repo", "abc123")
+                .unwrap();
+        let first = store.lookup_symbols_by_name("first").unwrap()[0]
+            .uid
+            .clone();
+        let second = store.lookup_symbols_by_name("second").unwrap()[0]
+            .uid
+            .clone();
+        for budget in [None, Some(1), Some(100)] {
+            let mut nodes = vec![
+                node(&first, "Symbol/Function", 1.0),
+                node(&second, "Symbol/Function", 0.9),
+            ];
+            let mut expected = Vec::new();
+            let mut used = 0;
+            for uid in [&first, &second] {
+                let body = super::fetch_node_body(&store, uid, dir.path(), None).unwrap();
+                let (body, complete) = super::truncate_body_to_chars(body, 16);
+                let cost = super::estimate_tokens(&body);
+                if budget.is_some_and(|limit| used > 0 && used + cost > limit) {
+                    expected.push(None);
+                } else {
+                    used += cost;
+                    expected.push(Some((body, complete)));
+                }
+            }
+            populate_inline_bodies(&store, &mut nodes, dir.path(), 0.0, 4, budget, None);
+            for (node, expected) in nodes.iter().zip(expected) {
+                assert_eq!(
+                    node.inline_body.as_ref(),
+                    expected.as_ref().map(|(body, _)| body)
+                );
+                if let Some((_, complete)) = expected {
+                    assert_eq!(node.body_complete, complete);
+                }
+            }
+        }
+    }
+
     /// In server mode the source lives in a bare clone with no working tree, so
     /// the default `FilesystemReader` path returns an empty body. Threading a
     /// reader resolver that yields a `GitBareReader` for the symbol's repo must
