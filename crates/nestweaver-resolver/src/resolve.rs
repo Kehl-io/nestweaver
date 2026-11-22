@@ -1709,6 +1709,13 @@ fn resolve_single_reference(
                 candidate_matches(reference, file_path, candidate_file, sym, language, graph)
                     && if language == Language::Rust && candidate_file.ends_with(".rs") {
                         rust_qualifier_denotes(file_path, candidate_file, sym, qualifier)
+                            || rust_imported_ownerless_path(
+                                file_path,
+                                candidate_file,
+                                sym,
+                                qualifier,
+                                graph,
+                            )
                     } else {
                         qualifier
                             .rsplit("::")
@@ -3417,10 +3424,32 @@ fn candidate_matches(
             }
         }
     }
+    // A bare type-like receiver must have local or imported provenance. A
+    // same-named sibling file alone cannot prove that `Vec` means its owner.
+    if language == Language::Rust
+        && source_file != candidate_file
+        && reference.receiver.as_deref().is_some_and(|receiver| {
+            !receiver.contains("::") && receiver.chars().next().is_some_and(char::is_uppercase)
+        })
+        && !graph
+            .imports_of(source_file)
+            .iter()
+            .any(|(_, target)| target == candidate_file)
+    {
+        return false;
+    }
     match reference.receiver.as_deref() {
         None => true,
         Some(receiver) if is_path_receiver(receiver) => {
             path_denotes(source_file, candidate_file, sym, receiver, language)
+                || language == Language::Rust
+                    && rust_imported_ownerless_path(
+                        source_file,
+                        candidate_file,
+                        sym,
+                        receiver,
+                        graph,
+                    )
         }
         Some(receiver) if is_self_receiver(receiver) => source_file == candidate_file,
         Some(receiver) => {
@@ -4077,6 +4106,45 @@ fn rust_module_names(candidate_file: &str) -> Vec<String> {
         names.push(stem.to_string());
     }
     names
+}
+
+/// Legacy ownerless symbols can still resolve through a concrete imported
+/// module, but a known owner must always match the qualified type.
+fn rust_imported_ownerless_path(
+    source_file: &str,
+    candidate_file: &str,
+    sym: &RawSymbol,
+    qualifier: &str,
+    graph: &ImportGraph,
+) -> bool {
+    let Some((module, owner)) = qualifier.split_once("::") else {
+        return false;
+    };
+    if sym.parent_name.is_some()
+        || owner.contains("::")
+        || !owner.chars().next().is_some_and(char::is_uppercase)
+        || rust_crate_identity(source_file) != rust_crate_identity(candidate_file)
+        || !rust_relative_module_names(candidate_file)
+            .last()
+            .is_some_and(|name| name == module)
+    {
+        return false;
+    }
+    graph
+        .imports_of(source_file)
+        .iter()
+        .any(|(specifier, target)| {
+            target == candidate_file
+                && specifier.trim_end_matches(".rs").rsplit(['/', ':']).next() == Some(module)
+        })
+        // Older synthetic inputs use `./module`, which Rust's import parser
+        // does not resolve. Restrict that compatibility form to the exact
+        // adjacent file; actual Rust paths still need resolved provenance.
+        || graph.bindings_of(source_file).iter().any(|binding| {
+            binding.source_file.is_none()
+                && binding.local_name == format!("./{module}")
+                && candidate_file == format!("{}/{module}.rs", parent_dir(source_file))
+        })
 }
 
 /// A Rust qualifier must contain a module name for the candidate, followed
@@ -4860,6 +4928,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn imported_path_does_not_ignore_a_known_wrong_owner() {
+        let mut caller = make_symbol("main", 5);
+        caller.end_line = 20;
+        let mut call = make_ref("new", ReferenceKind::Call, 10);
+        call.receiver = Some("store::GraphStore".to_string());
+        let mut wrong = make_symbol("new", 5);
+        wrong.kind = SymbolKind::Method;
+        wrong.parent_name = Some("OtherStore".into());
+        let files = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![caller],
+                vec![make_ref("./store", ReferenceKind::Import, 1), call],
+            ),
+            ("src/store.rs".to_string(), vec![wrong], vec![]),
+        ];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let wrong_uid = symbol_uid("repo:test:abc", "src/store.rs", "new", 5);
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == wrong_uid),
+            "{edges:?}"
+        );
+    }
+
+    #[test]
+    fn bare_rust_type_path_accepts_same_file_custom_owner() {
+        let mut caller = make_symbol("main", 1);
+        caller.end_line = 10;
+        let mut call = make_ref("len", ReferenceKind::Call, 3);
+        call.receiver = Some("Vec".into());
+        let mut method = make_symbol("len", 11);
+        method.kind = SymbolKind::Method;
+        method.parent_name = Some("Vec".into());
+        let files = vec![("src/main.rs".to_string(), vec![caller, method], vec![call])];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let expected = symbol_uid("repo:test:abc", "src/main.rs", "len", 11);
+        assert!(
+            edges.iter().any(|edge| edge.target_uid == expected),
+            "{edges:?}"
+        );
+    }
+
     /// Where else does this property hold? Priority 3 (re-exports) has the
     /// identical shape and the identical omission — one hop further out.
     #[test]
@@ -5388,6 +5499,11 @@ mod tests {
             ),
         ];
         let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let decoy = symbol_uid("repo:test:abc", "app/src/Vec.rs", "len", 1);
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == decoy),
+            "{edges:?}"
+        );
         assert!(
             edges.iter().all(|edge| edge.edge_type != EdgeType::Calls
                 || edge
