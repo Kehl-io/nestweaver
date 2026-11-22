@@ -5364,7 +5364,6 @@ where
             /// `ChangeVerdict::Unchanged`. Stored instead of the stale cached
             /// entry so the next run short-circuits at Tier 1.
             refreshed: Option<CachedFileMeta>,
-            partial_warning: Option<SkippedFile>,
         },
         Skipped(SkippedFile),
         /// Deleted between the scan and its read (a checkout or rebase in
@@ -5475,7 +5474,6 @@ where
                     return ParseOutcome::Unchanged {
                         rel_path: display_name,
                         refreshed,
-                        partial_warning,
                     };
                 }
                 Ok(ChangeVerdict::Changed {
@@ -5636,17 +5634,7 @@ where
             ParseOutcome::Unchanged {
                 rel_path,
                 refreshed,
-                partial_warning,
             } => {
-                let partial_parse_reason = partial_warning
-                    .as_ref()
-                    .map(|warning| warning.reason.clone());
-                if let Some(reason) = &partial_parse_reason {
-                    partial_parse_reasons.insert(rel_path.clone(), reason.clone());
-                }
-                if let Some(warning) = partial_warning {
-                    skipped_files.push(warning);
-                }
                 present_files.insert(rel_path.clone());
                 // Carry the cache entry forward — but prefer the REFRESHED stat
                 // when the content matched despite a moved mtime/size. Storing
@@ -5702,6 +5690,7 @@ where
                 partial_warning,
             } => {
                 if let Some(warning) = partial_warning {
+                    partial_parse_reasons.insert(rel_path.clone(), warning.reason.clone());
                     skipped_files.push(warning);
                 }
                 PublicationWriteSet {
@@ -7759,6 +7748,7 @@ fn record_cached_partial_parse_warnings(
     store: &GraphStore,
     db_path: Option<&Path>,
     repo_uid: &str,
+    reader: &dyn crate::content_reader::ContentReader,
     result: &mut IncrementalResult,
 ) -> Result<(), anyhow::Error> {
     let Some(db_path) = db_path else {
@@ -7767,18 +7757,32 @@ fn record_cached_partial_parse_warnings(
     let cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
     let cache = crate::parsed_cache::ParsedCache::load(&cache_path);
     for (path, content_hash) in store.list_file_hashes_by_repo(repo_uid)? {
-        let Some(reason) = cache
-            .get(&content_hash)
-            .and_then(|parsed| parsed.partial_parse_reason.as_ref())
-        else {
+        if detect_language(Path::new(&path)) != Some(Language::Sql) {
             continue;
+        }
+        let reason = match cache.get(&content_hash) {
+            Some(parsed) => parsed.partial_parse_reason.clone(),
+            None => {
+                let Ok(source) = reader.read_file(Path::new(&path)) else {
+                    continue;
+                };
+                let observed_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+                if observed_hash != content_hash {
+                    continue;
+                }
+                let Ok(parsed) = parse_source(Path::new(&path), &source) else {
+                    continue;
+                };
+                parsed.partial_parse_reason
+            }
         };
+        let Some(reason) = reason else { continue };
         record_incremental_file_outcome(
             result,
             IncrementalFileOutcome::PolicySkipped(SkippedFile::new(
                 path,
                 SkipReasonCode::ParseError,
-                reason.clone(),
+                reason,
             )),
         );
     }
@@ -8283,7 +8287,13 @@ fn incremental_index_with_name_and_io_and_authority(
             None => drain_pruned_dirs_into_incremental(&policy_reader, &mut result),
         }
         if coverage_verified {
-            record_cached_partial_parse_warnings(&store, db_path, &r_uid, &mut result)?;
+            record_cached_partial_parse_warnings(
+                &store,
+                db_path,
+                &r_uid,
+                &policy_reader,
+                &mut result,
+            )?;
         }
         return Ok(result);
     }
@@ -8688,7 +8698,7 @@ fn incremental_index_with_name_and_io_and_authority(
     )?;
     append_incremental_parses(Some(db_path), &prepared_files);
     append_incremental_parses(Some(db_path), &missing_committed);
-    record_cached_partial_parse_warnings(&store, Some(db_path), &r_uid, &mut result)?;
+    record_cached_partial_parse_warnings(&store, Some(db_path), &r_uid, &reader, &mut result)?;
 
     Ok(result)
 }
@@ -8796,7 +8806,13 @@ where
             let mut result = IncrementalResult::default();
             record_missing_committed_source_skips(&missing, &mut result);
             drain_pruned_dirs_into_incremental(reader, &mut result);
-            record_cached_partial_parse_warnings(store, store.db_path(), &r_uid, &mut result)?;
+            record_cached_partial_parse_warnings(
+                store,
+                store.db_path(),
+                &r_uid,
+                reader,
+                &mut result,
+            )?;
             return Ok(result);
         }
     }
@@ -9232,7 +9248,7 @@ where
     )?;
     append_incremental_parses(store.db_path(), &prepared_files);
     append_incremental_parses(store.db_path(), &missing_committed);
-    record_cached_partial_parse_warnings(store, store.db_path(), &r_uid, &mut result)?;
+    record_cached_partial_parse_warnings(store, store.db_path(), &r_uid, reader, &mut result)?;
 
     Ok(result)
 }
@@ -22750,6 +22766,11 @@ module.exports = { check, plain };\n";
         assert_warning(&first.skipped_files);
         drop(store);
 
+        // The published graph still has the source hash, but the parse cache
+        // may be absent after sidecar loss. The bounded SQL fallback must
+        // reconstruct the warning from matching source bytes.
+        let parse_cache = crate::sidecar_path(&db, ".parsed_cache.bin");
+        fs::remove_file(&parse_cache).unwrap();
         let normal = incremental_index_with_name_and_limits(
             &repo,
             &db,
@@ -22782,6 +22803,32 @@ module.exports = { check, plain };\n";
                 .count(),
             1,
             "repeat and force paths must preserve one valid prefix symbol"
+        );
+        drop(store);
+
+        // Once the trigger tail is removed and the source is committed, a
+        // normal incremental parse clears the old partial-coverage warning.
+        fs::write(
+            repo.join("sql/trigger_sqlite.sql"),
+            "CREATE TABLE a1 (id INTEGER);\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "remove unsupported trigger"]);
+        let cleared = incremental_index_with_name_and_limits(
+            &repo,
+            &db,
+            "test",
+            repo_url,
+            None,
+            crate::index_limits::IndexLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            !cleared.skipped_files.iter().any(|file| {
+                file.path == "sql/trigger_sqlite.sql" && file.reason.starts_with("partial_parse:")
+            }),
+            "recovered SQL with no swallowed tail clears the warning"
         );
     }
 
