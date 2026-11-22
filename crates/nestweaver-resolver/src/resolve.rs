@@ -1709,6 +1709,13 @@ fn resolve_single_reference(
                 candidate_matches(reference, file_path, candidate_file, sym, language, graph)
                     && if language == Language::Rust && candidate_file.ends_with(".rs") {
                         rust_qualifier_denotes(file_path, candidate_file, sym, qualifier)
+                            || rust_imported_qualified_path(
+                                file_path,
+                                candidate_file,
+                                sym,
+                                qualifier,
+                                graph,
+                            )
                             || rust_imported_ownerless_path(
                                 file_path,
                                 candidate_file,
@@ -3432,9 +3439,21 @@ fn candidate_matches(
             !receiver.contains("::") && receiver.chars().next().is_some_and(char::is_uppercase)
         })
         && !graph
-            .imports_of(source_file)
-            .iter()
-            .any(|(_, target)| target == candidate_file)
+            .bindings_named(
+                source_file,
+                reference.receiver.as_deref().unwrap_or_default(),
+            )
+            .any(|binding| binding.source_file.as_deref() == Some(candidate_file))
+    {
+        return false;
+    }
+    if language == Language::Rust
+        && source_file != candidate_file
+        && sym.parent_name.is_none()
+        && let Some(receiver) = reference.receiver.as_deref()
+        && !receiver.contains("::")
+        && !rust_qualifier_denotes(source_file, candidate_file, sym, receiver)
+        && !rust_imported_qualified_path(source_file, candidate_file, sym, receiver, graph)
     {
         return false;
     }
@@ -3442,6 +3461,14 @@ fn candidate_matches(
         None => true,
         Some(receiver) if is_path_receiver(receiver) => {
             path_denotes(source_file, candidate_file, sym, receiver, language)
+                || language == Language::Rust
+                    && rust_imported_qualified_path(
+                        source_file,
+                        candidate_file,
+                        sym,
+                        receiver,
+                        graph,
+                    )
                 || language == Language::Rust
                     && rust_imported_ownerless_path(
                         source_file,
@@ -4108,6 +4135,32 @@ fn rust_module_names(candidate_file: &str) -> Vec<String> {
     names
 }
 
+/// A resolved module import names exactly the module it binds; matching an
+/// unrelated import from the same file is not sufficient.
+fn rust_imported_qualified_path(
+    source_file: &str,
+    candidate_file: &str,
+    sym: &RawSymbol,
+    qualifier: &str,
+    graph: &ImportGraph,
+) -> bool {
+    let mut segments = qualifier.split("::");
+    let Some(module) = segments.next() else {
+        return false;
+    };
+    let rest: Vec<_> = segments.collect();
+    if rest.len() > 1
+        || rest
+            .first()
+            .is_some_and(|owner| sym.parent_name.as_deref() != Some(*owner))
+    {
+        return false;
+    }
+    graph.bindings_named(source_file, module).any(|binding| {
+        binding.original_name == "*" && binding.source_file.as_deref() == Some(candidate_file)
+    })
+}
+
 /// Legacy ownerless symbols can still resolve through a concrete imported
 /// module, but a known owner must always match the qualified type.
 fn rust_imported_ownerless_path(
@@ -4224,24 +4277,17 @@ fn rust_qualifier_denotes(
     let path_matches = if exact {
         module_path == candidate_path
     } else if same_crate {
-        module_path.len() <= candidate_path.len()
-            && candidate_path[candidate_path.len() - module_path.len()..] == module_path
+        let mut relative = rust_relative_module_names(source_file);
+        relative.extend(module_path.iter().cloned());
+        relative == rust_relative_module_names(candidate_file)
     } else if explicit_crate_alias {
         let candidate_relative = rust_relative_module_names(candidate_file);
         let requested_relative = module_path.iter().skip(1).cloned().collect::<Vec<_>>();
-        requested_relative.len() <= candidate_relative.len()
-            && candidate_relative[candidate_relative.len() - requested_relative.len()..]
-                == requested_relative
+        requested_relative == candidate_relative
     } else {
         false
     };
-    let root_crate_alias = !exact
-        && module_path.len() == 2
-        && segments.len() == 2
-        && same_crate
-        && rust_crate_name(candidate_file).is_none()
-        && module_path[1..] == candidate_path;
-    (path_matches || root_crate_alias) && (!type_tail || sym.parent_name.is_some())
+    path_matches && (!type_tail || sym.parent_name.is_some())
 }
 
 fn rust_crate_name(path: &str) -> Option<String> {
@@ -4971,6 +5017,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bare_rust_type_path_accepts_explicitly_imported_owner() {
+        let mut caller = make_symbol("main", 5);
+        caller.end_line = 20;
+        let mut call = make_ref("len", ReferenceKind::Call, 10);
+        call.receiver = Some("Vec".into());
+        let mut method = make_symbol("len", 5);
+        method.kind = SymbolKind::Method;
+        method.parent_name = Some("Vec".into());
+        let files = vec![
+            (
+                "src/main.rs".to_string(),
+                vec![caller],
+                vec![
+                    make_ref("crate::custom::Vec", ReferenceKind::Import, 1),
+                    call,
+                ],
+            ),
+            ("src/custom.rs".to_string(), vec![method], vec![]),
+        ];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        let expected = symbol_uid("repo:test:abc", "src/custom.rs", "len", 5);
+        assert!(
+            edges.iter().any(|edge| edge.target_uid == expected),
+            "{edges:?}"
+        );
+    }
+
     /// Where else does this property hold? Priority 3 (re-exports) has the
     /// identical shape and the identical omission — one hop further out.
     #[test]
@@ -5347,7 +5421,7 @@ mod tests {
             &function,
             "alpha::beta"
         ));
-        assert!(rust_qualifier_denotes(
+        assert!(!rust_qualifier_denotes(
             "src/main.rs",
             "src/alpha/beta/mod.rs",
             &function,
@@ -5413,6 +5487,52 @@ mod tests {
             &function,
             "super::sibling"
         ));
+    }
+
+    #[test]
+    fn bare_nested_module_name_requires_correct_ancestor_or_import() {
+        let mut caller = make_symbol("run", 1);
+        caller.end_line = 10;
+        let mut call = make_ref("f", ReferenceKind::Call, 3);
+        call.receiver = Some("beta".into());
+        let target = symbol_uid("repo:test:abc", "src/alpha/beta.rs", "f", 1);
+        let files = vec![
+            (
+                "src/main.rs".into(),
+                vec![caller.clone()],
+                vec![call.clone()],
+            ),
+            (
+                "src/alpha/beta.rs".into(),
+                vec![make_symbol("f", 1)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&files, Language::Rust, "repo:test:abc");
+        assert!(
+            !edges.iter().any(|edge| edge.target_uid == target),
+            "{edges:?}"
+        );
+        let imported = vec![
+            (
+                "src/main.rs".into(),
+                vec![caller],
+                vec![
+                    make_ref("crate::alpha::beta", ReferenceKind::Import, 1),
+                    call,
+                ],
+            ),
+            (
+                "src/alpha/beta.rs".into(),
+                vec![make_symbol("f", 1)],
+                vec![],
+            ),
+        ];
+        let edges = resolve_references(&imported, Language::Rust, "repo:test:abc");
+        assert!(
+            edges.iter().any(|edge| edge.target_uid == target),
+            "{edges:?}"
+        );
     }
 
     #[test]
