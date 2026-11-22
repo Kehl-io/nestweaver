@@ -2250,6 +2250,13 @@ impl CodeWatcher {
             .commit_transaction(&txn)
             .context("commit code watcher batch transaction")?;
         drop(txn);
+        for path in &prepared_paths {
+            if let PreparedPath::Replace(file) = path
+                && let Some(reason) = &file.partial_parse_reason
+            {
+                tracing::warn!(path = %file.rel_path, %reason, "published partially parsed file");
+            }
+        }
         if let Some(resolution) = &batch_resolution {
             resolution.persist_resolution_deps(&self.db_path, r_uid, &removed);
         }

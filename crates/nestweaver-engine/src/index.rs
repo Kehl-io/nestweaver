@@ -5453,6 +5453,7 @@ where
                         pc_ref.and_then(|pc| pc.get(&cached_meta.content_hash))
                     });
                     let partial_warning = cached_parse
+                        .filter(|_| *lang == Language::Sql)
                         .and_then(|cached| cached.partial_parse_reason.as_ref())
                         .map(|reason| {
                             SkippedFile::new(
@@ -5689,6 +5690,9 @@ where
                 source,
                 partial_warning,
             } => {
+                let partial_parse_reason = partial_warning
+                    .as_ref()
+                    .map(|warning| warning.reason.clone());
                 if let Some(warning) = partial_warning {
                     partial_parse_reasons.insert(rel_path.clone(), warning.reason.clone());
                     skipped_files.push(warning);
@@ -7767,21 +7771,33 @@ fn record_cached_partial_parse_warnings(
         if detect_language(Path::new(&path)) != Some(Language::Sql) {
             continue;
         }
-        let reason = match cache.get(&content_hash) {
-            Some(parsed) => parsed.partial_parse_reason.clone(),
-            None => {
+        let reason = cache
+            .get(&content_hash)
+            .and_then(|parsed| parsed.partial_parse_reason.clone())
+            .or_else(|| {
+                // A cache entry without a warning can belong to another
+                // language that was parsed from identical bytes.
+                let unverified = || {
+                    Some("could not verify partial-parse coverage for published SQL".to_string())
+                };
                 let Ok(source) = reader.read_file(Path::new(&path)) else {
-                    continue;
+                    return unverified();
                 };
                 if content_hash_hex(&source) != content_hash {
-                    continue;
+                    return unverified();
                 }
-                let Ok(parsed) = parse_source(Path::new(&path), &source) else {
-                    continue;
-                };
-                parsed.partial_parse_reason
-            }
-        };
+                if !source
+                    .as_bytes()
+                    .windows(b"trigger".len())
+                    .any(|word| word.eq_ignore_ascii_case(b"trigger"))
+                {
+                    return None;
+                }
+                match parse_source(Path::new(&path), &source) {
+                    Ok(parsed) => parsed.partial_parse_reason,
+                    Err(_) => unverified(),
+                }
+            });
         let Some(reason) = reason else { continue };
         record_incremental_file_outcome(
             result,
@@ -8295,7 +8311,7 @@ fn incremental_index_with_name_and_io_and_authority(
         if coverage_verified {
             record_cached_partial_parse_warnings(
                 &store,
-                db_path,
+                Some(db_path),
                 &r_uid,
                 &policy_reader,
                 &mut result,
