@@ -4149,18 +4149,30 @@ fn rust_qualifier_denotes(
     if type_tail {
         module_path.pop();
     }
+    let same_crate = rust_crate_identity(source_file) == rust_crate_identity(candidate_file);
+    let explicit_crate_alias = rust_crate_name(candidate_file)
+        .as_deref()
+        .is_some_and(|crate_name| segments.first() == Some(&crate_name));
     let path_matches = if exact {
         module_path == candidate_path
-    } else {
+    } else if same_crate {
         module_path.len() <= candidate_path.len()
             && candidate_path[candidate_path.len() - module_path.len()..] == module_path
+    } else if explicit_crate_alias {
+        let candidate_relative = rust_relative_module_names(candidate_file);
+        let requested_relative = module_path.iter().skip(1).cloned().collect::<Vec<_>>();
+        requested_relative.len() <= candidate_relative.len()
+            && candidate_relative[candidate_relative.len() - requested_relative.len()..]
+                == requested_relative
+    } else {
+        false
     };
     let root_crate_alias = !exact
-        && module_path.len() == 1
+        && module_path.len() == 2
         && segments.len() == 2
-        && rust_crate_identity(source_file) == rust_crate_identity(candidate_file)
+        && same_crate
         && rust_crate_name(candidate_file).is_none()
-        && module_path == candidate_path;
+        && module_path[1..] == candidate_path;
     (path_matches || root_crate_alias) && (!type_tail || sym.parent_name.is_some())
 }
 
@@ -5248,6 +5260,18 @@ mod tests {
             &function,
             "other::alpha::beta"
         ));
+        assert!(!rust_qualifier_denotes(
+            "app/src/main.rs",
+            "other/src/beta.rs",
+            &function,
+            "beta"
+        ));
+        assert!(rust_qualifier_denotes(
+            "app/src/main.rs",
+            "crates/beta/src/lib.rs",
+            &function,
+            "beta"
+        ));
         assert!(rust_qualifier_denotes(
             "src/parent.rs",
             "src/parent/child.rs",
@@ -5265,6 +5289,18 @@ mod tests {
             "crates/b/src/beta.rs",
             &function,
             "crate::beta"
+        ));
+        assert!(!rust_qualifier_denotes(
+            "crates/one/a/src/main.rs",
+            "crates/two/a/src/child.rs",
+            &function,
+            "self::child"
+        ));
+        assert!(!rust_qualifier_denotes(
+            "crates/one/a/src/parent/child.rs",
+            "crates/two/a/src/parent/sibling.rs",
+            &function,
+            "super::sibling"
         ));
     }
 

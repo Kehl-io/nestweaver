@@ -16,9 +16,9 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   scope_chain: ~
 - name: FormatName
   kind: Function
-  start_line: 3
+  start_line: 24
   end_line: 24
-  signature: interface
+  signature: "function FormatName(const First, Last: string): string;"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~
@@ -28,9 +28,9 @@ expression: "parsed_symbols(\"simple.pas\", &source)"
   scope_chain: ~
 - name: PrintGreeting
   kind: Function
-  start_line: 3
-  end_line: 24
-  signature: interface
+  start_line: 23
+  end_line: 23
+  signature: "procedure PrintGreeting(const Name: string);"
   content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
   is_entry_point: false
   entry_point_kind: ~

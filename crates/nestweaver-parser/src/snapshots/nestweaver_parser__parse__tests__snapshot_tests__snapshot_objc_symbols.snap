@@ -26,18 +26,6 @@ expression: "parsed_symbols(\"simple.m\", &source)"
   type_info: ~
   parent_name: ~
   scope_chain: GreeterProtocol
-- name: NSObject
-  kind: Interface
-  start_line: 9
-  end_line: 11
-  signature: "@interface SimpleGreeter : NSObject <GreeterProtocol>"
-  content_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-  is_entry_point: false
-  entry_point_kind: ~
-  visibility: Public
-  type_info: ~
-  parent_name: ~
-  scope_chain: ~
 - name: SimpleGreeter
   kind: Interface
   start_line: 9
