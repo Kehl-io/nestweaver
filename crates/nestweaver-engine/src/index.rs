@@ -7755,8 +7755,15 @@ fn record_cached_partial_parse_warnings(
         return Ok(());
     };
     let cache_path = crate::sidecar_path(db_path, ".parsed_cache.bin");
+    let files = store.list_file_hashes_by_repo(repo_uid)?;
+    if !files
+        .iter()
+        .any(|(path, _)| detect_language(Path::new(path)) == Some(Language::Sql))
+    {
+        return Ok(());
+    }
     let cache = crate::parsed_cache::ParsedCache::load(&cache_path);
-    for (path, content_hash) in store.list_file_hashes_by_repo(repo_uid)? {
+    for (path, content_hash) in files {
         if detect_language(Path::new(&path)) != Some(Language::Sql) {
             continue;
         }
@@ -7766,8 +7773,7 @@ fn record_cached_partial_parse_warnings(
                 let Ok(source) = reader.read_file(Path::new(&path)) else {
                     continue;
                 };
-                let observed_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
-                if observed_hash != content_hash {
+                if content_hash_hex(&source) != content_hash {
                     continue;
                 }
                 let Ok(parsed) = parse_source(Path::new(&path), &source) else {
