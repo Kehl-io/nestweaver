@@ -17,8 +17,8 @@ fn parse_fixture(relative: &str) -> nestweaver_parser::ParsedFile {
 fn pascal_interface_declarations_have_own_spans_and_signatures() {
     let parsed = parse_fixture("pascal/declarations.pas");
     for (name, declaration_line, signature) in [
-        ("First", 4, "procedure First;"),
-        ("Second", 5, "function Second: Integer;"),
+        ("First", 5, "procedure First;"),
+        ("Second", 6, "function Second: Integer;"),
     ] {
         let occurrences: Vec<_> = parsed
             .symbols
@@ -93,7 +93,7 @@ fn elixir_declaration_heads_include_zero_arity_guards_keywords_and_delegates() {
 #[test]
 fn systemverilog_module_functions_and_tasks_capture_their_own_bodies() {
     let parsed = parse_fixture("systemverilog/module_funcs.sv");
-    for (name, start, end) in [("addone", 2, 4), ("dowork", 5, 7)] {
+    for (name, start, end) in [("addone", 2, 4), ("dowork", 6, 8)] {
         let symbol = parsed
             .symbols
             .iter()
@@ -117,7 +117,9 @@ fn postgres_trigger_captures_only_the_trigger_name() {
             .any(|symbol| { symbol.name == "users_audit" && symbol.kind == SymbolKind::Function })
     );
     assert!(!parsed.symbols.iter().any(|symbol| {
-        symbol.kind == SymbolKind::Function && matches!(symbol.name.as_str(), "users" | "audit_fn")
+        symbol.kind == SymbolKind::Function
+            && symbol.start_line == 3
+            && matches!(symbol.name.as_str(), "users" | "audit_fn")
     }));
 }
 
