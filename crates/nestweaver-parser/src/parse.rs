@@ -1048,10 +1048,10 @@ fn infer_visibility(name: &str, node_text: &str, lang: Language, exported: bool)
                 Visibility::Public
             }
         }
-        // Elixir: defp = private, def = public
+        // Elixir private function, macro and guard forms.
         Language::Elixir => {
             let sig = first_line(node_text);
-            if sig.contains("defp ") || sig.contains("defmacrop ") {
+            if sig.contains("defp ") || sig.contains("defmacrop ") || sig.contains("defguardp ") {
                 Visibility::Private
             } else {
                 Visibility::Public
