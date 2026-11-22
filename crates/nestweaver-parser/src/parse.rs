@@ -5671,6 +5671,7 @@ fn rust_receiver_type(
 struct RustPointerOrigins {
     by_name: std::collections::HashMap<String, Vec<(usize, usize, bool)>>,
     globs: Vec<(usize, usize)>,
+    resolved: std::collections::HashMap<String, Vec<(usize, usize, bool)>>,
 }
 
 fn rust_pointer_is_standard(path: &str) -> bool {
@@ -5748,6 +5749,55 @@ impl RustPointerOrigins {
             let mut cursor = node.walk();
             stack.extend(node.named_children(&mut cursor));
         }
+        // Compile lexical ranges into non-overlapping intervals. The active
+        // set retains original DFS order to preserve equal-width tie behavior.
+        for (name, origins) in &result.by_name {
+            let mut events = Vec::with_capacity(origins.len() * 2);
+            for (index, &(start, end, _)) in origins.iter().enumerate() {
+                events.push((start, true, index));
+                events.push((end, false, index));
+            }
+            events.sort_unstable();
+            let mut active = std::collections::BTreeSet::new();
+            let mut counts = std::collections::HashMap::<(usize, usize), usize>::new();
+            let mut intervals = Vec::new();
+            let mut i = 0;
+            while i < events.len() {
+                let at = events[i].0;
+                while i < events.len() && events[i].0 == at {
+                    let (_, entering, index) = events[i];
+                    let (start, end, _) = origins[index];
+                    let key = (end - start, index);
+                    if entering {
+                        active.insert(key);
+                        *counts.entry((start, end)).or_default() += 1;
+                    } else {
+                        active.remove(&key);
+                        if let Some(count) = counts.get_mut(&(start, end)) {
+                            *count -= 1;
+                        }
+                    }
+                    i += 1;
+                }
+                if let (Some(&(.., index)), Some(&(end, _, _))) = (active.first(), events.get(i)) {
+                    let (start, stop, standard) = origins[index];
+                    intervals.push((at, end, standard && counts[&(start, stop)] == 1));
+                }
+            }
+            result.resolved.insert(name.clone(), intervals);
+        }
+        result.globs.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for &(start, end) in &result.globs {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        result.globs = merged;
         result
     }
 }
@@ -5765,27 +5815,99 @@ fn rust_standard_pointer_origin(
     }
     let index = cache.get_or_init(|| RustPointerOrigins::build(ty, source));
     let at = ty.start_byte();
-    let visible = |(start, end, _): &&(usize, usize, bool)| *start <= at && at < *end;
-    let Some(origins) = index.by_name.get(spelling) else {
-        return spelling == "Box"
-            && !index
-                .globs
-                .iter()
-                .any(|(start, end)| *start <= at && at < *end);
+    if let Some(intervals) = index.resolved.get(spelling) {
+        let next = intervals.partition_point(|(start, _, _)| *start <= at);
+        if next > 0 {
+            let (_, end, standard) = intervals[next - 1];
+            if at < end {
+                return standard;
+            }
+        }
+    }
+    let next = index.globs.partition_point(|(start, _)| *start <= at);
+    spelling == "Box" && (next == 0 || at >= index.globs[next - 1].1)
+}
+
+#[cfg(test)]
+fn original_rust_standard_pointer_origin(ty: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    fn standard(path: &str) -> bool {
+        matches!(
+            path.trim_start_matches("::"),
+            "std::sync::Arc"
+                | "alloc::sync::Arc"
+                | "std::rc::Rc"
+                | "alloc::rc::Rc"
+                | "std::boxed::Box"
+                | "alloc::boxed::Box"
+        )
+    }
+    let Ok(spelling) = ty.utf8_text(source) else {
+        return false;
     };
-    let Some(&(start, end, _)) = origins
+    if spelling.contains("::") {
+        return standard(spelling);
+    }
+    let mut root = ty;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let at = ty.start_byte();
+    let mut origins = Vec::new();
+    let mut visible_glob = false;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "use_wildcard"
+            && lexical_scope(node).is_some_and(|scope| scope.start <= at && at < scope.end)
+        {
+            visible_glob = true;
+        }
+        if matches!(node.kind(), "struct_item" | "enum_item" | "type_item")
+            && let Some(name) = node.child_by_field_name("name")
+            && name.utf8_text(source) == Ok(spelling)
+            && lexical_scope(name).is_some_and(|scope| scope.start <= at && at < scope.end)
+            && let Some(scope) = node.child_by_field_name("name").and_then(lexical_scope)
+        {
+            origins.push((scope.start, scope.end, false));
+        }
+        if node.kind() == "use_declaration"
+            && let Some(scope) =
+                lexical_scope(node).filter(|scope| scope.start <= at && at < scope.end)
+        {
+            let mut references = Vec::new();
+            expand_rust_use_paths(&node, source, &mut references);
+            let aliases: Vec<_> = references
+                .iter()
+                .filter(|reference| reference.kind == ReferenceKind::ImportAlias)
+                .collect();
+            for reference in &references {
+                if reference.kind == ReferenceKind::ImportAlias && reference.name == spelling {
+                    origins.push((scope.start, scope.end, standard(&reference.context)));
+                } else if reference.kind == ReferenceKind::Import
+                    && reference.name.rsplit("::").next() == Some(spelling)
+                    && !aliases.iter().any(|alias| alias.context == reference.name)
+                {
+                    origins.push((scope.start, scope.end, standard(&reference.name)));
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let Some((start, end, _)) = origins
         .iter()
-        .filter(visible)
         .min_by_key(|(start, end, _)| end - start)
+        .copied()
     else {
-        return spelling == "Box"
-            && !index
-                .globs
-                .iter()
-                .any(|(start, end)| *start <= at && at < *end);
+        // A visible glob can override the prelude Box with a custom type.
+        return spelling == "Box" && !visible_glob;
     };
-    let mut selected = origins.iter().filter(|(a, b, _)| *a == start && *b == end);
-    selected.next().is_some_and(|origin| origin.2) && selected.next().is_none()
+    let selected: Vec<_> = origins
+        .iter()
+        .filter(|(candidate_start, candidate_end, _)| {
+            *candidate_start == start && *candidate_end == end
+        })
+        .collect();
+    selected.len() == 1 && selected[0].2
 }
 
 /// Destructuring an exact local function's tuple return supplies each binding's
@@ -6803,6 +6925,40 @@ mod tests {
         );
         let parsed = parse_source(Path::new("deep.rs"), &source).unwrap();
         assert!(parsed.references.iter().any(|r| r.name == "leaf"));
+    }
+
+    #[test]
+    fn indexed_rust_origins_match_original_scope_selection() {
+        let source = r#"use std::sync::Arc as A; use std::boxed::Box;
+            fn outer(x: A<u8>, y: Box<u8>, z: Vec<u8>) {
+                mod one { use custom::*; fn f(x: Box<u8>, y: A<u8>) {} }
+                mod two { struct A; use custom::Box; fn f(x: A<u8>, y: Box<u8>) {} }
+                { use custom::A; let _: A<u8>; }
+            }"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&build_ts_language(Language::Rust, Path::new("a.rs")))
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let cache = std::cell::OnceCell::new();
+        let mut stack = vec![tree.root_node()];
+        let mut checked = 0;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "generic_type"
+                && let Some(ty) = node.child_by_field_name("type")
+            {
+                assert_eq!(
+                    rust_standard_pointer_origin(ty, source.as_bytes(), &cache),
+                    original_rust_standard_pointer_origin(ty, source.as_bytes()),
+                    "{}",
+                    ty.utf8_text(source.as_bytes()).unwrap()
+                );
+                checked += 1;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert!(checked >= 8);
     }
 
     /// QA (post-#515): a `//go:build ignore` generator must be marked so the
