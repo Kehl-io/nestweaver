@@ -6991,6 +6991,61 @@ mod tests {
         );
     }
 
+    /// Opt-in corpus differential: set NW_RUST_ORIGIN_CORPUS to a source tree.
+    #[test]
+    fn rust_origin_corpus_matches_original() {
+        let Some(root) = std::env::var_os("NW_RUST_ORIGIN_CORPUS") else {
+            return;
+        };
+        let mut paths = vec![std::path::PathBuf::from(root)];
+        let mut checked = 0usize;
+        while let Some(path) = paths.pop() {
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                if matches!(
+                    path.file_name().and_then(|s| s.to_str()),
+                    Some("target" | ".git")
+                ) {
+                    continue;
+                }
+                paths.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                let mut parser = tree_sitter::Parser::new();
+                parser
+                    .set_language(&build_ts_language(Language::Rust, &path))
+                    .unwrap();
+                let tree = parser.parse(&source, None).unwrap();
+                let cache = std::cell::OnceCell::new();
+                let mut stack = vec![tree.root_node()];
+                while let Some(node) = stack.pop() {
+                    if node.kind() == "generic_type"
+                        && let Some(ty) = node.child_by_field_name("type")
+                    {
+                        assert_eq!(
+                            rust_standard_pointer_origin(ty, source.as_bytes(), &cache),
+                            original_rust_standard_pointer_origin(ty, source.as_bytes()),
+                            "{}:{}",
+                            path.display(),
+                            ty.start_position().row + 1
+                        );
+                        checked += 1;
+                    }
+                    let mut cursor = node.walk();
+                    stack.extend(node.named_children(&mut cursor));
+                }
+            }
+        }
+        assert!(checked > 0, "no generic types in corpus");
+    }
+
     /// QA (post-#515): a `//go:build ignore` generator must be marked so the
     /// resolver keeps it out of its directory's package.
     #[test]
