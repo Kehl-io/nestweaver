@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## [12.2.8](https://github.com/Kehl-io/nestweaver/compare/v12.2.7...v12.2.8) (2026-11-22)
 
-### Bug fixes
+### Highlights
 
 * Reuse lexical information while parsing Rust pointer types and nested
   macros, and share source parsing across inline symbol bodies.
@@ -13,7 +13,7 @@
 
 ### Upgrade notes
 
-The next release uses resolver generation **24** and parsed-cache version
+NestWeaver 12.2.8 uses resolver generation **24** and parsed-cache version
 **18**. Cache 18 reparses changed parser queries, while generation 24 marks
 existing graph rows stale. Run `nestweaver index --repo <path> --force` once
 per repository after upgrading to rebuild stored symbols and CALLS edges.
@@ -27,6 +27,46 @@ keeping symbols recovered before the trigger error available.
 Markdown derivation version **4** updates eligible vaults on daemon startup.
 If a vault still reports that it needs refreshing, run
 `nestweaver brain refresh <vault>` with its usual configuration and database.
+
+### Bug Fixes
+
+* **deps:** patch Quinn versions flagged by RustSec ([dc98e25](https://github.com/Kehl-io/nestweaver/commit/dc98e256f53ddbfa0fe365f1c47acd34d840ece9))
+* **deps:** upgrade url for RUSTSEC-2026-0592 ([b65bbde](https://github.com/Kehl-io/nestweaver/commit/b65bbde668b8dd4d7642b568f9a090ba3eed33b4))
+* **engine:** ignore quoted header delimiters ([2635e73](https://github.com/Kehl-io/nestweaver/commit/2635e7347ab955487080f98a28fe8b1b4ca2825c))
+* **engine:** preserve alias lookup key type ([b4b2686](https://github.com/Kehl-io/nestweaver/commit/b4b268631dfb868d177975a3030d23202446ee4c))
+* **engine:** preserve destructured header names ([6483003](https://github.com/Kehl-io/nestweaver/commit/64830032f4f11322a4bf616b63c453a0bfb93774))
+* **engine:** restrict source name checks to headers ([c441075](https://github.com/Kehl-io/nestweaver/commit/c441075ab3840159e1f505d066def043f2c293a1))
+* **engine:** validate declaration after annotation groups ([311e798](https://github.com/Kehl-io/nestweaver/commit/311e798c3bc7a94faaaa18a62be0210893db9621))
+* **index:** preserve partial SQL warnings across cache loss ([f51c502](https://github.com/Kehl-io/nestweaver/commit/f51c50236db007393e05ac1ae473154cb19a2d91))
+* **index:** preserve resolver coverage during Cargo alias edits ([72e9e17](https://github.com/Kehl-io/nestweaver/commit/72e9e1709ed3ac8f5ff28506eac4465a9f203276))
+* **index:** report partial SQL coverage on warm full indexes ([a691889](https://github.com/Kehl-io/nestweaver/commit/a6918895f9fa793e549f77ccf9ce9fb345852183))
+* **index:** verify SQL coverage when diagnostic provenance is absent ([72342a0](https://github.com/Kehl-io/nestweaver/commit/72342a0e73b2c2d6dd91fb65c59a49c02f4d522f))
+* **mcp:** reject unexpected registry server fields ([47c1927](https://github.com/Kehl-io/nestweaver/commit/47c1927ac29942b2b84366510a33b70f0c413d5e))
+* **parser,resolver:** repair query captures and Rust module paths ([44a496d](https://github.com/Kehl-io/nestweaver/commit/44a496d593cf4b44326dfcf13a4c11f60f5cef38))
+* **parser:** mark private Elixir guards private ([5dee914](https://github.com/Kehl-io/nestweaver/commit/5dee914ffdb84294ae0db64d7eca2ba9add7cf55))
+* **resolver:** preserve proven Rust path receivers ([4972021](https://github.com/Kehl-io/nestweaver/commit/49720216c61b2171369278e8145b8b8f0668249b))
+* **resolver:** reject ambiguous Rust module targets ([2eae533](https://github.com/Kehl-io/nestweaver/commit/2eae5339877f1cba45d0e87b474dbb7bd19ecddb))
+* **resolver:** require caller-relative or imported module paths ([e45048a](https://github.com/Kehl-io/nestweaver/commit/e45048a77accf92ecb221143ce197da7f320c17a))
+* **resolver:** validate scoped imports and conventional crate aliases ([e124f30](https://github.com/Kehl-io/nestweaver/commit/e124f303b891aaf549b6011ad741071d48720f9e))
+* **resolver:** verify root Rust library qualifiers against Cargo ([c0e6050](https://github.com/Kehl-io/nestweaver/commit/c0e60509a0378c428a75bf9efbf7517bcee09d38))
+* satisfy parser and source-reader lint checks ([053af7f](https://github.com/Kehl-io/nestweaver/commit/053af7f326655ab55b56a31284461612a4eabeee))
+* **sql:** disclose partial SQLite trigger coverage ([2fbc782](https://github.com/Kehl-io/nestweaver/commit/2fbc78238ded01c350febe221d86d442275e08d9))
+* **store:** preserve existing WAL quarantine artifacts ([aef0921](https://github.com/Kehl-io/nestweaver/commit/aef0921fcb47dc8c4b526de9d7727543a38b0284))
+* **store:** require exact live impact symbol hydration ([11ea01b](https://github.com/Kehl-io/nestweaver/commit/11ea01b65059b3b7c08b2187cb67ed070331362b))
+* **vault:** preserve CRLF frontmatter and Markdown prose boundaries ([bdb53d7](https://github.com/Kehl-io/nestweaver/commit/bdb53d7b7d63cc88e99473b0006155b82b89609e))
+* **watcher:** preserve manifest routing and scope Cargo resolver inputs ([eed46b3](https://github.com/Kehl-io/nestweaver/commit/eed46b33b4a0c35929e4581f9ff7d23cfea8088c))
+
+
+### Performance Improvements
+
+* **engine:** batch inline source reads by repository ([915d698](https://github.com/Kehl-io/nestweaver/commit/915d6983bcc55a832c7ed131621a3604b62f3804))
+* **engine:** bound cached inline body sizes ([44194c2](https://github.com/Kehl-io/nestweaver/commit/44194c2ec96289319d3f66159660e127fe7510c1))
+* **index:** skip partial cache lookup without SQL ([6c6fee4](https://github.com/Kehl-io/nestweaver/commit/6c6fee4b6c28588c5ffea489d2bac0aff8564059))
+* **parser:** discard temporary origin ranges ([ccc177f](https://github.com/Kehl-io/nestweaver/commit/ccc177fa37d3ef6005b4a87f5264fd18b2fb8a94))
+* **parser:** index Rust pointer origins once per parse ([3492f2f](https://github.com/Kehl-io/nestweaver/commit/3492f2fd53a3ac1b320c68c3c3e8f7f222959ecf))
+* **parser:** index scoped pointer origin intervals ([6049eb8](https://github.com/Kehl-io/nestweaver/commit/6049eb89e5a883c588622711aa7a37d7705282a4))
+* **parser:** reuse scope in nested Rust macros ([9f6b2ea](https://github.com/Kehl-io/nestweaver/commit/9f6b2eadf9114fdd4169084ff1776250fea212f7))
+* **parser:** share pointer origins across type extraction ([dfe4444](https://github.com/Kehl-io/nestweaver/commit/dfe4444e149576defc71d78863cbc806e88ac609))
 
 ## [12.2.7](https://github.com/Kehl-io/nestweaver/compare/v12.2.6...v12.2.7) (2026-11-12)
 

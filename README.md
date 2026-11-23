@@ -209,6 +209,11 @@ generation **23** and parsed cache **17**. Scala grammar 0.26.9 repairs Scala 2
 `given`/`enum` identifiers and other grammar boundaries. Force-index each
 repository once after upgrading from generation 22 as well.
 
+12.2.8 uses resolver generation **24** and parsed cache **18**. Re-index each
+repository to pick up corrected declaration spans, Rust module call edges, and
+partial SQLite parse diagnostics. Markdown derivation version **4** refreshes
+eligible vaults on daemon startup.
+
 Canonical publication PageRank now consistently covers the unified code and
 notes graph after indexing, watching and rebuilding. Older canonical sidecars
 with a code-only scope are disclosed and recomputed lazily on the first ranked
@@ -222,8 +227,8 @@ the same product version disclose skew without automatically replacing a writer.
 - A database from before LadybugDB 0.21 needs a **publication rebuild**, not
   just a forced index. Back it up and follow the error's recovery command and
   [storage-engine upgrade guide](docs/guide/publication-rebuild.md#storage-engine-upgrade-ladybugdb-021-rebuild-required).
-- For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.7
-  requires resolver generation **23** (12.2.6 used **22**). If your binary reports a generation-stale graph, run
+- For a compatible database, run `nestweaver stale-check --db <db>`. 12.2.8
+  requires resolver generation **24** (12.2.7 used **23**). If your binary reports a generation-stale graph, run
   `nestweaver index --repo <path> --db <db> --force` for each repository.
   A plain incremental index does not repair generation-stale graphs.
 - Generation 16 preserves declaring-package origin through Go factory-call
@@ -258,11 +263,11 @@ the same product version disclose skew without automatically replacing a writer.
   generation15 additionally handles inferred `var` slices, parenthesized range
   sources and single named factory results. Parsed cache10 reparses unchanged
   declarations for normalized return types and complete var/const/parameter shadow guards.
-- **Upgrading to 12.2.7 needs a forced re-index of every repository.** Run
+- **Upgrading to 12.2.8 needs a forced re-index of every repository.** Run
   `nestweaver index --repo <path> --force` once per repository, using your usual
   `--db` and `--config` bindings. Plain incremental indexing can leave an
   unchanged graph on its old generation. `stale-check` exits 2 until repaired.
-- **Refresh registered vaults if crossing the earlier Markdown derivation upgrade.** Run
+- **Refresh any vault that still reports stale Markdown derivation.** Run
   `nestweaver brain refresh <vault>` with the same bindings to re-derive
   note-to-code relationships against the rebuilt graph. If upgrading from before
   12.2.2, this also repairs frontmatter wikilinks and block references.
