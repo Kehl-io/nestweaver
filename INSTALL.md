@@ -197,7 +197,7 @@ daemon and back up with the previous binary before upgrading. Downgrading after
 migration requires restoring that backup with the previous binary. See the
 [LadybugDB 0.22 storage and rollback guide](docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback).
 
-For a compatible database, the current **`RESOLVER_GENERATION` is 23**.
+For a compatible database, the current **`RESOLVER_GENERATION` is 24**.
 Compatibility requires an exact match: a graph written by an older or newer
 resolver must be fully re-indexed before you trust its edges and rankings.
 
@@ -218,13 +218,14 @@ repairs Scala 2 `given`/`enum` identifiers and other grammar boundaries.
 LadybugDB 0.22.3 retains storage format 49 and adds a torn-WAL read-bounds fix.
 Force-index once after upgrading from generation 22 as well.
 
-If also crossing the earlier Markdown derivation upgrade, run
-`nestweaver brain refresh /path/to/vault` for each registered vault. Markdown
-derivation version 3 repairs encoded URL paths and absolute note paths
-contained within the registered vault. Vaults carry
-no code resolver generation and are not refreshed by a repository index. Users
-upgrading from before 12.2.2 also need this step for frontmatter wikilinks and
-block references. Preserve the usual `--db` and `--config` bindings for every command.
+12.2.8 uses generation 24/cache 18. Force re-index each repository once to
+refresh declaration spans, recovered symbols, and Rust module call edges.
+
+Markdown derivation version 4 updates eligible vaults on daemon startup.
+If a vault still reports that it needs refreshing, run
+`nestweaver brain refresh /path/to/vault`. This also incorporates the earlier
+encoded path, frontmatter wikilink, and block reference fixes. Preserve the usual
+`--db` and `--config` bindings for every command.
 
 See the [README upgrade notes](README.md#upgrading--re-index-before-you-trust-a-ranking)
 for the resolver history, Markdown derivation changes, and script/HTTP-client

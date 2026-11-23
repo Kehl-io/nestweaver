@@ -35,6 +35,12 @@ Scala grammar 0.26.9 changes declarations and references for unchanged source.
 After upgrading, force re-index each repository once so stored facts match
 fresh parses; rejecting old parse caches alone does not repair stored graphs.
 
+12.2.8 uses resolver generation 24 and parsed-cache version 18 with the same
+LadybugDB engine and storage format. Force re-index each repository once after
+upgrading. Markdown derivation version 4 updates eligible vaults on daemon
+startup. For any vault still reporting stale derivation, run
+`nestweaver brain refresh <vault>` with its usual configuration and database.
+
 ## Canonical ranking scope
 
 Indexing, code watching, publication rebuild and lazy ranking all use the

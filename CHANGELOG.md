@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## [12.2.8](https://github.com/Kehl-io/nestweaver/compare/v12.2.7...v12.2.8) (2026-11-22)
 
-### Bug fixes
+### Highlights
 
 * Reuse lexical information while parsing Rust pointer types and nested
   macros, and share source parsing across inline symbol bodies.
@@ -13,7 +13,7 @@
 
 ### Upgrade notes
 
-The next release uses resolver generation **24** and parsed-cache version
+NestWeaver 12.2.8 uses resolver generation **24** and parsed-cache version
 **18**. Cache 18 reparses changed parser queries, while generation 24 marks
 existing graph rows stale. Run `nestweaver index --repo <path> --force` once
 per repository after upgrading to rebuild stored symbols and CALLS edges.
@@ -27,9 +27,6 @@ keeping symbols recovered before the trigger error available.
 Markdown derivation version **4** updates eligible vaults on daemon startup.
 If a vault still reports that it needs refreshing, run
 `nestweaver brain refresh <vault>` with its usual configuration and database.
-
-## [12.2.8](https://github.com/Kehl-io/nestweaver/compare/v12.2.7...v12.2.8) (2026-11-22)
-
 
 ### Bug Fixes
 
