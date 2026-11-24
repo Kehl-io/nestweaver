@@ -17,7 +17,7 @@ tree-sitter-python = "0.25"
 tree-sitter-cpp = "0.23"
 tree-sitter-rust = "0.24"
 tree-sitter-c = "0.24"
-tree-sitter-c-sharp = "0.23"
+tree-sitter-c-sharp = "0.24"
 # Pinned to an exact rev: branch-pinned git deps drift and break `cargo build
 # --locked` in the release workflow on fresh runners (cargo refuses to update
 # the lock). Bump deliberately when a grammar update is needed.
