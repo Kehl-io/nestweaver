@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.2.9](https://github.com/Kehl-io/nestweaver/compare/v12.2.8...v12.2.9) (2026-11-25)
+
+
+### Bug Fixes
+
+* **deps:** preserve watcher and parser compatibility ([ebe3599](https://github.com/Kehl-io/nestweaver/commit/ebe35994ad7602955c02119594608b318a7576a3))
+
 ## [12.2.8](https://github.com/Kehl-io/nestweaver/compare/v12.2.7...v12.2.8) (2026-11-22)
 
 ### Highlights
