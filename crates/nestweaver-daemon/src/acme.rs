@@ -190,14 +190,10 @@ pub fn build_server_config(
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("create ACME cache dir {}", cache_dir.display()))?;
 
-    // ACME's internal directory client builds a rustls ClientConfig from the
-    // process-default crypto provider. With both ring and aws-lc-rs compiled
-    // (aws-lc-rs arrives transitively via reqwest) there is no unambiguous
-    // default, so install ring explicitly first. Idempotent — a prior install
-    // (e.g. the manual --tls-cert path) makes this a harmless no-op.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let mut config = AcmeConfig::new([domain])
+    // Use the same explicit provider for the ACME directory client and the
+    // public TLS listener, independent of the process-wide rustls default.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = AcmeConfig::new_with_crypto_provider([domain], Arc::clone(&provider))
         .cache(AtomicDirCache::new(cache_dir))
         .directory_lets_encrypt(!staging);
     if let Some(email) = email {
@@ -205,7 +201,6 @@ pub fn build_server_config(
     }
     let state = config.state();
 
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut server_config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("configure rustls protocol versions for ACME")?
