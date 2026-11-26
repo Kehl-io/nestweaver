@@ -8809,6 +8809,10 @@ mod tests {
         std::fs::create_dir_all(&repo_root).unwrap();
         let source_path = repo_root.join("service.js");
         std::fs::write(&source_path, "export function alpha() { return 1; }\n").unwrap();
+        // Stage the replacement outside the watched tree so the only visible
+        // source mutation is the atomic rename.
+        let replacement = dir.path().join("replacement.js");
+        std::fs::write(&replacement, "export function alpha() { return 2; }\n").unwrap();
         let root = std::fs::canonicalize(repo_root).unwrap();
         let repo_url = format!("file://{}", root.display());
         let db_path = dir.path().join("watch.lbug");
@@ -8819,7 +8823,9 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let watcher = CodeWatcher::new(&db_path, &root, "test")
             .with_debounce_ms(100)
-            .with_ready_signal(ready_tx);
+            .with_ready_callback(move || {
+                let _ = ready_tx.send(());
+            });
         let stop = watcher.shutdown_handle();
         let handle = thread::spawn(move || {
             watcher.run_with_store(
@@ -8831,10 +8837,14 @@ mod tests {
         });
         ready_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("code watcher should start");
-        thread::sleep(Duration::from_millis(100));
+            .expect("code watcher should finish startup reconciliation");
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            0,
+            "startup must leave the already indexed fixture unchanged"
+        );
 
-        std::fs::write(&source_path, "export function alpha() { return 2; }\n").unwrap();
+        std::fs::rename(&replacement, &source_path).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while notifications.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
