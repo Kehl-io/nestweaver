@@ -3,9 +3,22 @@
 ## [12.2.9](https://github.com/Kehl-io/nestweaver/compare/v12.2.8...v12.2.9) (2026-11-25)
 
 
-### Bug Fixes
+### Dependency updates
 
-* **deps:** preserve watcher and parser compatibility ([ebe3599](https://github.com/Kehl-io/nestweaver/commit/ebe35994ad7602955c02119594608b318a7576a3))
+* Update cc, clap, comrak, jsonschema, lru, tokio-rustls-acme, and walkdir.
+  The ACME client and public TLS listener share an explicit ring provider.
+  [PR #560](https://github.com/Kehl-io/nestweaver/pull/560)
+* Update the pinned GitHub Actions tool installer.
+  [PR #559](https://github.com/Kehl-io/nestweaver/pull/559)
+
+### Upgrade notes
+
+Back up with the previous binary before upgrading. 12.2.9 retains resolver
+generation 24, parsed-cache version 18, Markdown derivation 4, and LadybugDB
+0.22.3 storage format 49. A current 12.2.8 graph can be opened directly.
+Run `stale-check` and force-index any repository reported as
+`outdated_resolver`. Refresh a vault if the daemon still reports that it
+needs refreshing after startup.
 
 ## [12.2.8](https://github.com/Kehl-io/nestweaver/compare/v12.2.7...v12.2.8) (2026-11-22)
 

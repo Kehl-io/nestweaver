@@ -79,22 +79,21 @@ If optional dependencies were skipped, `nestweaver` exits 1 and names the platfo
 Before installing, follow [upgrade and backup instructions](https://github.com/Kehl-io/nestweaver/blob/main/INSTALL.md#upgrading-an-existing-database)
 to preserve the old binary and database and check storage rollback limits.
 
-Release 12.2.8 uses resolver generation **24** and parsed cache **18**, up from
-23/17 in 12.2.7. LadybugDB 0.22.3 retains storage format 49. Check the graph
-and re-index every repository with `--force` after upgrading. A plain `index`
-can skip a repository already at Git HEAD and leave its old edges in place.
+Check your existing graph after upgrading. Keep the same `--db` and
+`--config` bindings for each command.
 
 ```sh
 nestweaver stale-check
-nestweaver index --repo . --force
 ```
 
-`stale-check` exits 2 and reports `outdated_resolver` when a re-index is required.
-Keep your usual `--db` and `--config` bindings. Markdown derivation version **4**
-updates eligible vaults on daemon startup. If a vault still reports that it
-needs refreshing, run `nestweaver brain refresh <vault>` with the same bindings.
-See the [12.2.8 release notes](https://github.com/Kehl-io/nestweaver/releases/tag/v12.2.8)
-and the
+If `stale-check` reports `outdated_resolver`, force-index each affected
+repository with `nestweaver index --repo /path/to/repo --force`. An incremental
+index can skip a repository already at Git HEAD. If a vault still reports that
+it needs refreshing after daemon startup, run
+`nestweaver brain refresh /path/to/vault`.
+
+See the [release notes](https://github.com/Kehl-io/nestweaver/releases/latest)
+for version-specific requirements and the
 [storage and rollback guide](https://github.com/Kehl-io/nestweaver/blob/main/docs/guide/publication-rebuild.md#ladybugdb-022-storage-format-and-rollback)
 before opening a database with the new binary.
 
