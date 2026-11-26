@@ -5,10 +5,10 @@
 
 ### Dependency updates
 
-* Update cc, clap, comrak, jsonschema, lru, tokio-rustls-acme, and walkdir.
+* Update cc, clap, comrak, jsonschema, lru, tokio-rustls-acme, and walkdir ([ebe3599](https://github.com/Kehl-io/nestweaver/commit/ebe35994ad7602955c02119594608b318a7576a3))
   The ACME client and public TLS listener share an explicit ring provider.
   [PR #560](https://github.com/Kehl-io/nestweaver/pull/560)
-* Update the pinned GitHub Actions tool installer.
+* Update the pinned GitHub Actions tool installer ([76fa46f](https://github.com/Kehl-io/nestweaver/commit/76fa46f0416a598c95e28d3199683796238fb7bc))
   [PR #559](https://github.com/Kehl-io/nestweaver/pull/559)
 
 ### Upgrade notes
